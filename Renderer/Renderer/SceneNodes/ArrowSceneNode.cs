@@ -87,7 +87,7 @@ public class ArrowSceneNode : SceneNode
     public ArrowSceneNode(Scene scene, Vector3 start, Vector3 end, Color32 startColor, Color32 endColor, RenderTexture arrowTexture, float width = DefaultWidth)
         : base(scene)
     {
-        var shader = Scene.RendererContext.ShaderLoader.LoadShader("vrf.cs2_baked_bomb_damage");
+        var shader = Scene.RendererContext.ShaderLoader.LoadShader("vrf.entity_connection_arrow");
         meshName = $"arrow_{Interlocked.Increment(ref instanceCounter)}";
 
         material = new RenderMaterial(shader);

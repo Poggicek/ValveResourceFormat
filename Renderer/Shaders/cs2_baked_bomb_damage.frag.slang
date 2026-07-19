@@ -13,7 +13,7 @@
 
 uniform sampler2D g_tColor; // SrgbRead(true)
 
-in vec4 vtxColor;
+flat in vec4 vtxColor;
 in vec2 vtxUv;
 in vec4 vtxClipPos;
 in vec3 vtxWorldPos;
