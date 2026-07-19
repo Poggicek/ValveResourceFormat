@@ -31,6 +31,7 @@ namespace GUI.Types.GLViewers
         private ComboBox? cameraComboBox;
         private SavedCameraPositionsControl? savedCameraPositionsControl;
         private EntityInfoForm? entityInfoForm;
+        private readonly List<SceneNode> entityConnectionArrows = [];
         private bool ignoreLayersChangeEvents = true;
         private List<Matrix4x4> CameraMatrices = [];
         private WorldNodeLoader? LoadedWorldNode;
@@ -527,6 +528,7 @@ namespace GUI.Types.GLViewers
             Debug.Assert(SelectedNodeRenderer != null);
 
             SelectedNodeRenderer.SelectNode(node, forceDisableDepth: true);
+            ShowEntityConnections(node);
 
             var bbox = node.BoundingBox;
             var size = bbox.Size;
@@ -559,6 +561,35 @@ namespace GUI.Types.GLViewers
                     physicsGroupsComboBox.SetItemChecked(physId, true);
                 }
             }
+        }
+
+        // Replaces the entity connection arrows with the ones for the given entity node, or clears them if the node
+        // is not an entity. Call this from a thread where the GL context is NOT already current (e.g. the UI thread);
+        // it acquires the context itself. From the render thread, call RebuildEntityConnections directly instead.
+        private void ShowEntityConnections(SceneNode? node)
+        {
+            using var lockedGl = MakeCurrent();
+            RebuildEntityConnections(node);
+        }
+
+        // Actual arrow rebuild. Creating and deleting these nodes touches the GPU, so this must run with the GL
+        // context already current and the GL lock held.
+        private void RebuildEntityConnections(SceneNode? node)
+        {
+            foreach (var arrow in entityConnectionArrows)
+            {
+                Scene.Remove(arrow, true);
+                arrow.Delete();
+            }
+
+            entityConnectionArrows.Clear();
+
+            if (node?.EntityData != null && LoadedWorld != null)
+            {
+                entityConnectionArrows.AddRange(LoadedWorld.CreateEntityConnectionArrows(node.EntityData));
+            }
+
+            Scene.UpdateOctrees();
         }
 
         private void ShowSceneNodeDetails(SceneNode sceneNode)
@@ -750,6 +781,7 @@ namespace GUI.Types.GLViewers
             if (pixelInfo.ObjectId == 0 || pixelInfo.Unused2 != 0)
             {
                 SelectedNodeRenderer.SelectNode(null);
+                RebuildEntityConnections(null); // render thread, GL context already current
                 return;
             }
 
@@ -763,14 +795,21 @@ namespace GUI.Types.GLViewers
 
             if (pickingResponse.Intent == PickingIntent.Select)
             {
+                // Connection arrows are only shown for a single selected entity, not while multi-selecting.
+                var connectionNode = sceneNode;
+
                 if ((Control.ModifierKeys & Keys.Control) > 0)
                 {
                     SelectedNodeRenderer.ToggleNode(sceneNode);
+                    connectionNode = null;
                 }
                 else
                 {
                     SelectedNodeRenderer.SelectNode(sceneNode);
                 }
+
+                // Runs on the render thread with the GL context already current, so rebuild the arrows directly.
+                RebuildEntityConnections(connectionNode);
 
                 //Update the entity properties window if it was opened
                 if (entityInfoForm != null)

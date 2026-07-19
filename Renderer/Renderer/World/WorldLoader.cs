@@ -511,11 +511,6 @@ namespace ValveResourceFormat.Renderer.World
                 var transformationMatrix = EntityTransformHelper.CalculateTransformationMatrix(entity) * parentTransform;
                 var light = SceneLight.IsAccepted(classname);
 
-                if (entity.Connections != null)
-                {
-                    CreateEntityConnectionLines(entity, transformationMatrix.Translation);
-                }
-
                 var layerName = fromTemplate ? "Template Entities" : originalLayerName;
 
                 // group the point_template marker and its spawned children under the same layer
@@ -1516,55 +1511,92 @@ namespace ValveResourceFormat.Renderer.World
             }
         }
 
-        private void CreateEntityConnectionLines(Entity entity, Vector3 start)
+        private RenderTexture? entityConnectionArrowTexture;
+
+        /// <summary>
+        /// Creates arrow scene nodes visualizing both the outgoing and incoming IO connections of the given entity,
+        /// adds them to the scene as dynamic nodes, and returns them so the caller can remove them again when the
+        /// selection changes. Arrows always flow from the firing entity to the entity receiving the input.
+        /// </summary>
+        /// <param name="entity">The entity whose connections should be visualized.</param>
+        /// <returns>The created arrow nodes, added to the scene.</returns>
+        public List<SceneNode> CreateEntityConnectionArrows(Entity entity)
         {
-            if (entity.Connections == null)
+            var arrows = new List<SceneNode>();
+
+            void AddArrow(Entity fromEntity, Entity toEntity)
             {
-                return;
-            }
+                var start = EntityTransformHelper.CalculateTransformationMatrix(fromEntity).Translation;
+                var end = EntityTransformHelper.CalculateTransformationMatrix(toEntity).Translation;
 
-            var alreadySeen = new HashSet<Entity>(entity.Connections.Count);
+                entityConnectionArrowTexture ??= CS2BombDamageSceneNode.LoadArrowTexture(scene);
 
-            foreach (var connectionData in entity.Connections)
-            {
-                var targetType = connectionData.TargetType;
-
-                if (targetType != EntityIOTargetType.EntityNameOrClassName)
-                {
-                    RendererContext.Logger.LogDebug("Skipping entity i/o type {TargetType}", targetType);
-                    continue;
-                }
-
-                var targetName = connectionData.TargetName;
-                var endEntity = FindEntityByKeyValue("targetname", targetName);
-
-                if (endEntity == null)
-                {
-                    RendererContext.Logger.LogDebug("Did not find entity i/o output {TargetName}", targetName);
-                    continue;
-                }
-
-                if (!alreadySeen.Add(endEntity))
-                {
-                    continue;
-                }
-
-                var end = EntityTransformHelper.CalculateTransformationMatrix(endEntity).Translation;
-
-                var origin = (start + end) / 2f;
-                end -= origin;
-                var lineStart = start - origin;
-
-                var lineNode = new LineSceneNode(scene, lineStart, end, new Color32(0, 255, 0), new Color32(255, 0, 0))
+                var arrowNode = new ArrowSceneNode(scene, start, end, new Color32(0, 255, 0), new Color32(255, 0, 0), entityConnectionArrowTexture)
                 {
                     LayerName = "Entity Connections",
-                    Transform = Matrix4x4.CreateTranslation(origin),
 #if DEBUG
-                    Name = $"Line from {entity.GetStringProperty("hammeruniqueid")} to {endEntity.GetStringProperty("hammeruniqueid")}"
+                    Name = $"Arrow from {fromEntity.GetStringProperty("hammeruniqueid")} to {toEntity.GetStringProperty("hammeruniqueid")}"
 #endif
                 };
-                scene.Add(lineNode, true);
+                scene.Add(arrowNode, true);
+                arrows.Add(arrowNode);
             }
+
+            // Outgoing connections: this entity fires an output that targets another entity.
+            if (entity.Connections != null)
+            {
+                var seenTargets = new HashSet<Entity>(entity.Connections.Count);
+
+                foreach (var connectionData in entity.Connections)
+                {
+                    if (connectionData.TargetType != EntityIOTargetType.EntityNameOrClassName)
+                    {
+                        RendererContext.Logger.LogDebug("Skipping entity i/o type {TargetType}", connectionData.TargetType);
+                        continue;
+                    }
+
+                    var foundAny = false;
+
+                    // Multiple entities can share the same targetname, so draw an arrow to each of them.
+                    foreach (var endEntity in FindEntitiesByKeyValue("targetname", connectionData.TargetName))
+                    {
+                        foundAny = true;
+
+                        if (seenTargets.Add(endEntity))
+                        {
+                            AddArrow(entity, endEntity);
+                        }
+                    }
+
+                    if (!foundAny)
+                    {
+                        RendererContext.Logger.LogDebug("Did not find entity i/o output {TargetName}", connectionData.TargetName);
+                    }
+                }
+            }
+
+            // Incoming connections: another entity fires an output that targets this entity.
+            var seenSources = new HashSet<Entity>();
+
+            foreach (var connectionData in entity.GetInputConnections(Entities))
+            {
+                if (connectionData.TargetType != EntityIOTargetType.EntityNameOrClassName)
+                {
+                    continue;
+                }
+
+                var sourceEntity = connectionData.SourceEntity;
+
+                // Self-targeting connections are already handled by the outgoing loop above.
+                if (sourceEntity == entity || !seenSources.Add(sourceEntity))
+                {
+                    continue;
+                }
+
+                AddArrow(sourceEntity, entity);
+            }
+
+            return arrows;
         }
 
         private Entity? FindEntityByKeyValue(string keyToFind, string valueToFind)
@@ -1585,6 +1617,24 @@ namespace ValveResourceFormat.Renderer.World
             }
 
             return null;
+        }
+
+        private IEnumerable<Entity> FindEntitiesByKeyValue(string keyToFind, string valueToFind)
+        {
+            if (valueToFind == null)
+            {
+                yield break;
+            }
+
+            foreach (var entity in Entities)
+            {
+                if (entity.TryGetValue(keyToFind, out var propertyValue)
+                    && propertyValue.ValueType == ValveKeyValue.KVValueType.String
+                    && valueToFind.Equals((string)propertyValue, StringComparison.OrdinalIgnoreCase))
+                {
+                    yield return entity;
+                }
+            }
         }
 
         /// <summary>

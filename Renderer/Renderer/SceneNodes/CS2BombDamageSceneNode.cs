@@ -90,7 +90,10 @@ public class CS2BombDamageSceneNode : SceneNode
         Initialize(bombDamageData, bombsiteIndex);
     }
 
-    private static RenderTexture LoadArrowTexture(Scene scene)
+    /// <summary>
+    /// Loads the embedded scrolling arrow texture used by the bomb damage flow map and entity connection arrows.
+    /// </summary>
+    internal static RenderTexture LoadArrowTexture(Scene scene)
     {
         using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("Renderer.Resources.arrow.vtex_c");
         using var resource = new Resource()
