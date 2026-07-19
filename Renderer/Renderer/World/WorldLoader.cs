@@ -1514,24 +1514,35 @@ namespace ValveResourceFormat.Renderer.World
         private RenderTexture? entityConnectionArrowTexture;
 
         /// <summary>
+        /// A connection arrow created by <see cref="CreateEntityConnectionArrows"/>, paired with the entity on the
+        /// other end of the connection and the arrow's color (used to outline that entity with a matching color).
+        /// </summary>
+        /// <param name="Arrow">The arrow scene node, already added to the scene.</param>
+        /// <param name="ConnectedEntity">The entity at the other end of the connection from the selected entity.</param>
+        /// <param name="Color">The arrow's color.</param>
+        public readonly record struct EntityConnectionArrow(SceneNode Arrow, Entity ConnectedEntity, Color32 Color);
+
+        /// <summary>
         /// Creates arrow scene nodes visualizing both the outgoing and incoming IO connections of the given entity,
         /// adds them to the scene as dynamic nodes, and returns them so the caller can remove them again when the
-        /// selection changes. Arrows always flow from the firing entity to the entity receiving the input.
+        /// selection changes. Arrows always flow from the firing entity to the entity receiving the input, and each
+        /// gets its own random color.
         /// </summary>
         /// <param name="entity">The entity whose connections should be visualized.</param>
-        /// <returns>The created arrow nodes, added to the scene.</returns>
-        public List<SceneNode> CreateEntityConnectionArrows(Entity entity)
+        /// <returns>The created arrows, each paired with the entity it connects to and its color.</returns>
+        public List<EntityConnectionArrow> CreateEntityConnectionArrows(Entity entity)
         {
-            var arrows = new List<SceneNode>();
+            var arrows = new List<EntityConnectionArrow>();
 
-            void AddArrow(Entity fromEntity, Entity toEntity)
+            void AddArrow(Entity fromEntity, Entity toEntity, Entity connectedEntity)
             {
                 var start = EntityTransformHelper.CalculateTransformationMatrix(fromEntity).Translation;
                 var end = EntityTransformHelper.CalculateTransformationMatrix(toEntity).Translation;
+                var color = RandomArrowColor();
 
                 entityConnectionArrowTexture ??= CS2BombDamageSceneNode.LoadArrowTexture(scene);
 
-                var arrowNode = new ArrowSceneNode(scene, start, end, new Color32(0, 255, 0), new Color32(255, 0, 0), entityConnectionArrowTexture)
+                var arrowNode = new ArrowSceneNode(scene, start, end, color, entityConnectionArrowTexture)
                 {
                     LayerName = "Entity Connections",
 #if DEBUG
@@ -1539,7 +1550,7 @@ namespace ValveResourceFormat.Renderer.World
 #endif
                 };
                 scene.Add(arrowNode, true);
-                arrows.Add(arrowNode);
+                arrows.Add(new EntityConnectionArrow(arrowNode, connectedEntity, color));
             }
 
             // Outgoing connections: this entity fires an output that targets another entity.
@@ -1564,7 +1575,7 @@ namespace ValveResourceFormat.Renderer.World
 
                         if (seenTargets.Add(endEntity))
                         {
-                            AddArrow(entity, endEntity);
+                            AddArrow(entity, endEntity, endEntity);
                         }
                     }
 
@@ -1593,10 +1604,37 @@ namespace ValveResourceFormat.Renderer.World
                     continue;
                 }
 
-                AddArrow(sourceEntity, entity);
+                AddArrow(sourceEntity, entity, sourceEntity);
             }
 
             return arrows;
+        }
+
+        // Bright, saturated random color so each arrow is distinct and readable.
+        private static Color32 RandomArrowColor()
+        {
+            var hue = Random.Shared.NextSingle();
+            const float saturation = 0.7f;
+            const float value = 1.0f;
+
+            var h = hue * 6f;
+            var i = (int)h % 6;
+            var f = h - MathF.Floor(h);
+            var p = value * (1f - saturation);
+            var q = value * (1f - f * saturation);
+            var t = value * (1f - (1f - f) * saturation);
+
+            var (r, g, b) = i switch
+            {
+                0 => (value, t, p),
+                1 => (q, value, p),
+                2 => (p, value, t),
+                3 => (p, q, value),
+                4 => (t, p, value),
+                _ => (value, p, q),
+            };
+
+            return new Color32(r, g, b, 1f);
         }
 
         private Entity? FindEntityByKeyValue(string keyToFind, string valueToFind)

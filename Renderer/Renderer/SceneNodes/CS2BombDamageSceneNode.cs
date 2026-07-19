@@ -95,7 +95,7 @@ public class CS2BombDamageSceneNode : SceneNode
     /// </summary>
     internal static RenderTexture LoadArrowTexture(Scene scene)
     {
-        using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("Renderer.Resources.arrow.vtex_c");
+        using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("Renderer.Resources.arrow_io.vtex_c");
         using var resource = new Resource()
         {
             FileName = "arrow.vtex_c"

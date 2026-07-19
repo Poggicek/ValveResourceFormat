@@ -21,6 +21,7 @@ namespace ValveResourceFormat.Renderer
         private bool debugCubeMaps;
         private bool debugLightProbes;
         private readonly List<SceneNode> selectedNodes = new(1);
+        private readonly List<(SceneNode Node, Color32 Color)> highlightedNodes = [];
         private readonly List<SimpleVertex> vertices = new(48);
 
         private readonly Vector2 SelectedNodeNameOffset = new(0, -20);
@@ -97,6 +98,20 @@ namespace ValveResourceFormat.Renderer
             {
                 disableDepth = true;
             }
+        }
+
+        /// <summary>Replaces the set of nodes drawn with a colored outline (in addition to the current selection).</summary>
+        /// <param name="nodes">Nodes to outline and the color to outline each with.</param>
+        public void SetHighlightedNodes(IReadOnlyList<(SceneNode Node, Color32 Color)> nodes)
+        {
+            highlightedNodes.Clear();
+            highlightedNodes.AddRange(nodes);
+        }
+
+        /// <summary>Clears the colored highlight outlines.</summary>
+        public void ClearHighlightedNodes()
+        {
+            highlightedNodes.Clear();
         }
 
         /// <summary>Toggles the layer-enabled state of all currently selected nodes.</summary>
@@ -196,9 +211,9 @@ namespace ValveResourceFormat.Renderer
         /// <param name="updateContext">Update context providing the text renderer.</param>
         public void Update(Scene.RenderContext renderContext, Scene.UpdateContext updateContext)
         {
-            disableDepth = selectedNodes.Count > 1;
+            disableDepth = selectedNodes.Count > 1 || highlightedNodes.Count > 0;
 
-            if (selectedNodes.Count == 0)
+            if (selectedNodes.Count == 0 && highlightedNodes.Count == 0)
             {
                 // We don't need to reupload an empty array
                 vertexCount = 0;
@@ -326,6 +341,12 @@ namespace ValveResourceFormat.Renderer
                     CenterHorizontal = true,
                     TextOffset = SelectedNodeNameOffset
                 }, renderContext.Camera, fixedScale: false);
+            }
+
+            // Colored outlines for connection-highlighted nodes (e.g. entities tied to the selected entity's arrows).
+            foreach (var (node, color) in highlightedNodes)
+            {
+                AddBox(renderContext.Camera, updateContext.TextRenderer, vertices, node.Transform, node.LocalBoundingBox, color);
             }
 
             if (ScreenDebugText.Length > 0)

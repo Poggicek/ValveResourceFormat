@@ -10,6 +10,7 @@ using ValveResourceFormat.IO;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.SceneNodes;
+using ValveResourceFormat.Renderer.Utils;
 using ValveResourceFormat.Renderer.World;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
@@ -576,6 +577,8 @@ namespace GUI.Types.GLViewers
         // context already current and the GL lock held.
         private void RebuildEntityConnections(SceneNode? node)
         {
+            Debug.Assert(SelectedNodeRenderer != null);
+
             foreach (var arrow in entityConnectionArrows)
             {
                 Scene.Remove(arrow, true);
@@ -583,10 +586,26 @@ namespace GUI.Types.GLViewers
             }
 
             entityConnectionArrows.Clear();
+            SelectedNodeRenderer.ClearHighlightedNodes();
 
             if (node?.EntityData != null && LoadedWorld != null)
             {
-                entityConnectionArrows.AddRange(LoadedWorld.CreateEntityConnectionArrows(node.EntityData));
+                var highlights = new List<(SceneNode Node, Color32 Color)>();
+
+                foreach (var connection in LoadedWorld.CreateEntityConnectionArrows(node.EntityData))
+                {
+                    entityConnectionArrows.Add(connection.Arrow);
+
+                    // Outline the connected entity with the same color as its arrow.
+                    var connectedNode = Scene.Find(connection.ConnectedEntity) ?? SkyboxScene?.Find(connection.ConnectedEntity);
+
+                    if (connectedNode != null)
+                    {
+                        highlights.Add((connectedNode, connection.Color));
+                    }
+                }
+
+                SelectedNodeRenderer.SetHighlightedNodes(highlights);
             }
 
             Scene.UpdateOctrees();
