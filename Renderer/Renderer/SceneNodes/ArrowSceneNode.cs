@@ -6,14 +6,18 @@ using ValveResourceFormat.Blocks;
 namespace ValveResourceFormat.Renderer.SceneNodes;
 
 /// <summary>
-/// Scene node that renders a flat, camera-agnostic ribbon between two points, textured with the scrolling arrow
-/// flow map (the same texture and shader used by <see cref="CS2BombDamageSceneNode"/>). Useful for visualizing
-/// directed relationships such as entity IO connections, with the animation flowing from start to end.
+/// Scene node that renders a flat ribbon between two points, textured with the scrolling arrow flow map (the same
+/// texture and shader used by <see cref="CS2BombDamageSceneNode"/>). The ribbon billboards around its own axis every
+/// frame so its flat face always turns toward the camera. Useful for visualizing directed relationships such as
+/// entity IO connections, with the animation flowing from start to end.
 /// </summary>
 public class ArrowSceneNode : SceneNode
 {
-    /// <summary>World-space width of the arrow ribbon. Also drives how densely the arrow texture tiles along it.</summary>
-    public const float DefaultWidth = 16.0f;
+    /// <summary>World-space width of the arrow ribbon.</summary>
+    public const float DefaultWidth = 12.0f;
+
+    /// <summary>World-space length each arrow tile occupies along the ribbon. Smaller means the arrow repeats more densely.</summary>
+    public const float DefaultTileLength = 10.0f;
 
     private const int VertexPositionOffset = 0;
     private const int VertexUVOffset = 12;
@@ -47,7 +51,19 @@ public class ArrowSceneNode : SceneNode
     private readonly RenderMaterial material;
     private readonly string meshName;
     private readonly int vaoHandle;
+    private readonly int vboHandle;
     private readonly int indicesCount;
+
+    // Geometry that stays constant; only the perpendicular "side" vector is recomputed each frame to face the camera.
+    private readonly Vector3 start;
+    private readonly Vector3 end;
+    private readonly Vector3 direction;
+    private readonly float halfWidth;
+    private readonly float uMax;
+    private readonly float vMax;
+    private readonly Color32 startColor;
+    private readonly Color32 endColor;
+    private readonly VertexFormat[] vertices = new VertexFormat[4];
 
     /// <summary>
     /// Initializes a new arrow ribbon pointing from <paramref name="start"/> to <paramref name="end"/> using a single color.
@@ -84,8 +100,40 @@ public class ArrowSceneNode : SceneNode
         // The ribbon tiles the arrow along its length (UVs run past 1.0), so the texture must repeat rather than clamp.
         arrowTexture.SetWrapMode(TextureWrapMode.Repeat);
 
-        var vertexData = BuildRibbon(start, end, startColor, endColor, width, out var bounds);
-        BoundingBox = bounds;
+        var length = (end - start).Length();
+
+        if (length < 1e-4f)
+        {
+            // Degenerate arrow: give it a tiny extent along Z so it stays visible.
+            direction = Vector3.UnitZ;
+            length = width;
+            end = start + direction * length;
+        }
+        else
+        {
+            direction = (end - start) / length;
+        }
+
+        this.start = start;
+        this.end = end;
+        this.startColor = startColor;
+        this.endColor = endColor;
+        halfWidth = width * 0.5f;
+
+        // The shader multiplies incoming UVs by UV_SCALE, so pre-divide to land on the tiling we want:
+        // exactly one arrow column across the width, and one arrow tile per DefaultTileLength along the length.
+        const float UvScale = 2.0f;
+        vMax = 1f / UvScale;
+        uMax = length / DefaultTileLength / UvScale;
+
+        // Ribbon can rotate around its axis to any orientation, so its bounds are the segment padded by the half width.
+        var min = Vector3.Min(start, end) - new Vector3(halfWidth);
+        var max = Vector3.Max(start, end) + new Vector3(halfWidth);
+        BoundingBox = new AABB(min, max);
+
+        // Initial geometry with an arbitrary side; Render rebuilds it to face the camera before the first draw.
+        UpdateVertices(ComputeSide(start + Vector3.UnitZ));
+        var vertexData = MemoryMarshal.AsBytes(vertices.AsSpan()).ToArray();
 
         Span<int> indices = [0, 1, 2, 0, 2, 3];
         indicesCount = indices.Length;
@@ -95,7 +143,7 @@ public class ArrowSceneNode : SceneNode
         var vbib = new VBIB { Resource = null! };
         vbib.VertexBuffers.Add(new VBIB.OnDiskBufferData
         {
-            ElementCount = (uint)(vertexData.Length / VertexSize),
+            ElementCount = 4,
             ElementSizeInBytes = VertexSize,
             InputLayoutFields = InputLayout,
             Data = vertexData,
@@ -110,12 +158,13 @@ public class ArrowSceneNode : SceneNode
 
         var meshBufferCache = Scene.RendererContext.MeshBufferCache;
         var gpuBuffers = meshBufferCache.CreateVertexIndexBuffers(meshName, vbib);
+        vboHandle = gpuBuffers.VertexBuffers[0];
 
         VertexDrawBuffer[] vertexDrawBuffers =
         [
             new VertexDrawBuffer
             {
-                Handle = gpuBuffers.VertexBuffers[0],
+                Handle = vboHandle,
                 ElementSizeInBytes = VertexSize,
                 InputLayoutFields = InputLayout,
             },
@@ -124,53 +173,32 @@ public class ArrowSceneNode : SceneNode
         vaoHandle = meshBufferCache.GetVertexArrayObject(meshName, vertexDrawBuffers, material, gpuBuffers.IndexBuffers[0]);
     }
 
-    private static byte[] BuildRibbon(Vector3 start, Vector3 end, Color32 startColor, Color32 endColor, float width, out AABB bounds)
+    // Returns the half-width offset vector perpendicular to the arrow axis, oriented so the ribbon faces the camera.
+    private Vector3 ComputeSide(Vector3 cameraPosition)
     {
-        var direction = end - start;
-        var length = direction.Length();
+        var toCamera = cameraPosition - (start + end) * 0.5f;
+        var side = Vector3.Cross(direction, toCamera);
 
-        if (length < 1e-4f)
+        if (side.LengthSquared() < 1e-8f)
         {
-            direction = Vector3.UnitZ;
-            length = width;
-            end = start + direction * length;
-        }
-        else
-        {
-            direction /= length;
+            // Camera is (nearly) on the arrow axis; any perpendicular will do.
+            side = Vector3.Cross(direction, Vector3.UnitZ);
+
+            if (side.LengthSquared() < 1e-8f)
+            {
+                side = Vector3.Cross(direction, Vector3.UnitX);
+            }
         }
 
-        // Pick a width axis perpendicular to the ribbon. Prefer horizontal (perpendicular to world up),
-        // falling back to another axis when the connection is near-vertical.
-        var side = Vector3.Cross(direction, Vector3.UnitZ);
-        if (side.LengthSquared() < 1e-6f)
-        {
-            side = Vector3.Cross(direction, Vector3.UnitX);
-        }
-        side = Vector3.Normalize(side) * (width * 0.5f);
+        return Vector3.Normalize(side) * halfWidth;
+    }
 
-        // The shader multiplies incoming UVs by UV_SCALE, so pre-divide to land on the tiling we want:
-        // exactly one arrow column across the width, and square tiles repeating along the length.
-        const float UvScale = 2.0f;
-        var vMax = 1f / UvScale;
-        var uMax = length / width / UvScale;
-
-        var vertices = new VertexFormat[4];
+    private void UpdateVertices(Vector3 side)
+    {
         vertices[0] = new VertexFormat { Position = start + side, UVs = new Vector2(0f, 0f), Color = startColor };
         vertices[1] = new VertexFormat { Position = start - side, UVs = new Vector2(0f, vMax), Color = startColor };
         vertices[2] = new VertexFormat { Position = end - side, UVs = new Vector2(uMax, vMax), Color = endColor };
         vertices[3] = new VertexFormat { Position = end + side, UVs = new Vector2(uMax, 0f), Color = endColor };
-
-        var min = vertices[0].Position;
-        var max = min;
-        foreach (var vertex in vertices)
-        {
-            min = Vector3.Min(min, vertex.Position);
-            max = Vector3.Max(max, vertex.Position);
-        }
-        bounds = new AABB(min, max);
-
-        return MemoryMarshal.AsBytes(vertices.AsSpan()).ToArray();
     }
 
     /// <inheritdoc/>
@@ -180,6 +208,10 @@ public class ArrowSceneNode : SceneNode
         {
             return;
         }
+
+        // Billboard the ribbon around its axis so its flat face turns toward the camera, then re-upload the vertices.
+        UpdateVertices(ComputeSide(context.Camera.Location));
+        GL.NamedBufferSubData(vboHandle, IntPtr.Zero, VertexSize * vertices.Length, ref vertices[0]);
 
         var renderShader = context.ReplacementShader ?? material.Shader;
         renderShader.Use();
