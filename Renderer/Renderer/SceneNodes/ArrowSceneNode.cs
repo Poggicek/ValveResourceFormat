@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using OpenTK.Graphics.OpenGL;
@@ -6,40 +8,34 @@ using ValveResourceFormat.Blocks;
 namespace ValveResourceFormat.Renderer.SceneNodes;
 
 /// <summary>
-/// Scene node that renders a straight ribbon between two points, textured with the scrolling arrow flow map. The
-/// ribbon billboards around its axis every frame so its flat face turns toward the camera, and fades out toward each
-/// end. Useful for visualizing directed relationships such as entity IO connections, with the animation flowing from
-/// start to end.
+/// Scene node that renders a straight ribbon between two points, textured with a scrolling arrow flow map. The ribbon
+/// billboards around its axis every frame so its flat face turns toward the camera. Useful for visualizing directed
+/// relationships such as entity IO connections, with the animation flowing from start to end.
 /// </summary>
 public class ArrowSceneNode : SceneNode
 {
     /// <summary>World-space width of the arrow ribbon.</summary>
-    public const float DefaultWidth = 4.0f;
+    public const float DefaultWidth = 3.0f;
 
-    /// <summary>World-space length each arrow tile occupies along the ribbon. Smaller means the arrow repeats more densely.</summary>
+    /// <summary>World-space length each arrow tile occupies along the ribbon. Smaller repeats the arrow more densely.</summary>
     public const float DefaultTileLength = 4.0f;
 
-    /// <summary>Fraction of the ribbon at each end over which the arrow fades out toward the entities it connects.</summary>
-    private const float FadeZone = 0.00f;
-
-    /// <summary>Number of segments the ribbon is subdivided into (only needed so the end fade ramps smoothly).</summary>
-    private const int Segments = 24;
-
-    private const int SampleCount = Segments + 1;
+    // The shader multiplies incoming UVs by this, so pre-divide to get exactly one arrow column across the width.
+    private const float UvScale = 2.0f;
 
     private const int VertexPositionOffset = 0;
     private const int VertexUVOffset = 12;
     private const int VertexColorOffset = 20;
-    private const int VertexPhaseOffset = 24;
-    private const int VertexSize = 28;
+    private const int VertexSize = 24;
 
     private static readonly VBIB.RenderInputLayoutField[] InputLayout =
     [
         new() { SemanticName = "POSITION", Format = DXGI_FORMAT.R32G32B32_FLOAT, Offset = VertexPositionOffset },
         new() { SemanticName = "TEXCOORD", Format = DXGI_FORMAT.R32G32_FLOAT, Offset = VertexUVOffset },
         new() { SemanticName = "COLOR", Format = DXGI_FORMAT.R8G8B8A8_UNORM, Offset = VertexColorOffset },
-        new() { SemanticName = "PHASE", Format = DXGI_FORMAT.R32_FLOAT, Offset = VertexPhaseOffset },
     ];
+
+    private static readonly int[] Indices = [0, 1, 2, 0, 2, 3];
 
     [StructLayout(LayoutKind.Explicit, Size = VertexSize)]
     private struct VertexFormat
@@ -50,8 +46,6 @@ public class ArrowSceneNode : SceneNode
         public Vector2 UVs;
         [FieldOffset(VertexColorOffset)]
         public Color32 Color;
-        [FieldOffset(VertexPhaseOffset)]
-        public float Phase;
     }
 
     private static int instanceCounter;
@@ -60,18 +54,15 @@ public class ArrowSceneNode : SceneNode
     private readonly string meshName;
     private readonly int vaoHandle;
     private readonly int vboHandle;
-    private readonly int indicesCount;
 
-    // Centerline of the ribbon and per-sample data that stays constant; only the perpendicular "side" offset is
-    // recomputed each frame so the ribbon faces the camera.
-    private readonly Vector3[] centers = new Vector3[SampleCount];
-    private readonly Vector3[] tangents = new Vector3[SampleCount];
-    private readonly float[] us = new float[SampleCount];
+    // Constant geometry; only the perpendicular "side" offset is recomputed each frame so the ribbon faces the camera.
+    private readonly Vector3 start;
+    private readonly Vector3 end;
+    private readonly Vector3 direction;
     private readonly float halfWidth;
-    private readonly float vMax;
+    private readonly float uMax;
     private readonly Color32 color;
-    private readonly Color32[] sampleColors = new Color32[SampleCount];
-    private readonly VertexFormat[] vertices = new VertexFormat[SampleCount * 2];
+    private readonly VertexFormat[] vertices = new VertexFormat[4];
 
     /// <summary>
     /// Initializes a new straight arrow ribbon from <paramref name="start"/> to <paramref name="end"/>.
@@ -80,7 +71,7 @@ public class ArrowSceneNode : SceneNode
     /// <param name="start">The tail of the arrow (animation flows away from here).</param>
     /// <param name="end">The tip of the arrow.</param>
     /// <param name="color">Solid color of the arrow.</param>
-    /// <param name="arrowTexture">Scrolling arrow texture, see <see cref="CS2BombDamageSceneNode.LoadArrowTexture"/>.</param>
+    /// <param name="arrowTexture">Scrolling arrow texture, see <see cref="LoadTexture"/>.</param>
     /// <param name="width">World-space width of the ribbon.</param>
     public ArrowSceneNode(Scene scene, Vector3 start, Vector3 end, Color32 color, RenderTexture arrowTexture, float width = DefaultWidth)
         : base(scene)
@@ -98,22 +89,30 @@ public class ArrowSceneNode : SceneNode
         // The ribbon tiles the arrow along its length (UVs run past 1.0), so the texture must repeat rather than clamp.
         arrowTexture.SetWrapMode(TextureWrapMode.Repeat);
 
+        var length = (end - start).Length();
+
+        if (length < 1e-4f)
+        {
+            // Degenerate arrow: give it a tiny extent along Z so it stays visible.
+            direction = Vector3.UnitZ;
+            length = width;
+            end = start + direction * length;
+        }
+        else
+        {
+            direction = (end - start) / length;
+        }
+
+        this.start = start;
+        this.end = end;
         this.color = color;
         halfWidth = width * 0.5f;
+        uMax = length / DefaultTileLength / UvScale;
 
-        // The shader multiplies incoming UVs by UV_SCALE; exactly one arrow column across the width.
-        const float UvScale = 2.0f;
-        vMax = 1f / UvScale;
-
-        BuildLine(start, end, UvScale);
+        BoundingBox = new AABB(Vector3.Min(start, end) - new Vector3(halfWidth), Vector3.Max(start, end) + new Vector3(halfWidth));
 
         // Initial geometry with an arbitrary side; Render rebuilds it to face the camera before the first draw.
-        UpdateVertices(centers[0] + Vector3.UnitZ);
-        var vertexData = MemoryMarshal.AsBytes(vertices.AsSpan()).ToArray();
-
-        var indices = BuildIndices();
-        indicesCount = indices.Length;
-        var indexData = MemoryMarshal.AsBytes(indices.AsSpan()).ToArray();
+        UpdateVertices(start + Vector3.UnitZ);
 
         var vbib = new VBIB { Resource = null! };
         vbib.VertexBuffers.Add(new VBIB.OnDiskBufferData
@@ -121,14 +120,14 @@ public class ArrowSceneNode : SceneNode
             ElementCount = (uint)vertices.Length,
             ElementSizeInBytes = VertexSize,
             InputLayoutFields = InputLayout,
-            Data = vertexData,
+            Data = MemoryMarshal.AsBytes(vertices.AsSpan()).ToArray(),
         });
         vbib.IndexBuffers.Add(new VBIB.OnDiskBufferData
         {
-            ElementCount = (uint)indicesCount,
+            ElementCount = (uint)Indices.Length,
             ElementSizeInBytes = sizeof(int),
             InputLayoutFields = [],
-            Data = indexData,
+            Data = MemoryMarshal.AsBytes(Indices.AsSpan()).ToArray(),
         });
 
         var meshBufferCache = Scene.RendererContext.MeshBufferCache;
@@ -148,75 +147,32 @@ public class ArrowSceneNode : SceneNode
         vaoHandle = meshBufferCache.GetVertexArrayObject(meshName, vertexDrawBuffers, material, gpuBuffers.IndexBuffers[0]);
     }
 
-    // Samples the straight line between the two points, filling the centerline, tangents and UVs, and computing bounds.
-    private void BuildLine(Vector3 start, Vector3 end, float uvScale)
+    /// <summary>Loads the embedded scrolling arrow texture used for entity connection arrows.</summary>
+    /// <param name="scene">Scene providing the material loader.</param>
+    /// <returns>The loaded arrow texture.</returns>
+    public static RenderTexture LoadTexture(Scene scene)
     {
-        var chord = end - start;
-        var length = chord.Length();
+        using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("Renderer.Resources.arrow_io.vtex_c");
+        using var resource = new Resource { FileName = "arrow_io.vtex_c" };
 
-        var direction = length < 1e-4f ? Vector3.UnitZ : chord / length;
+        Debug.Assert(stream != null);
+        resource.Read(stream);
 
-        for (var i = 0; i < SampleCount; i++)
-        {
-            var t = (float)i / Segments;
-
-            centers[i] = Vector3.Lerp(start, end, t);
-            tangents[i] = direction;
-
-            // UV runs along the length so arrow tiles stay evenly spaced.
-            us[i] = t * length / DefaultTileLength / uvScale;
-
-            // Fade the ribbon out toward both ends so the knot of arrows at the selected entity reads lightly.
-            sampleColors[i] = color with { A = (byte)(color.A * FadeAlpha(t)) };
-        }
-
-        var min = Vector3.Min(start, end) - new Vector3(halfWidth);
-        var max = Vector3.Max(start, end) + new Vector3(halfWidth);
-        BoundingBox = new AABB(min, max);
+        return scene.RendererContext.MaterialLoader.LoadTexture(resource, srgbRead: true, isViewerRequest: true);
     }
 
-    // Smoothly ramps from 0 at either end of the ribbon to 1 in the middle.
-    private static float FadeAlpha(float t)
+    // Returns the half-width offset perpendicular to the arrow, oriented so the ribbon faces the camera.
+    private Vector3 ComputeSide(Vector3 cameraPosition)
     {
-        var edge = Math.Clamp(MathF.Min(t, 1f - t) / FadeZone, 0f, 1f);
-        return edge * edge * (3f - 2f * edge);
-    }
-
-    private static int[] BuildIndices()
-    {
-        var indices = new int[Segments * 6];
-
-        for (var i = 0; i < Segments; i++)
-        {
-            var topA = i * 2;
-            var botA = topA + 1;
-            var topB = topA + 2;
-            var botB = topA + 3;
-
-            var baseIndex = i * 6;
-            indices[baseIndex + 0] = topA;
-            indices[baseIndex + 1] = botA;
-            indices[baseIndex + 2] = botB;
-            indices[baseIndex + 3] = topA;
-            indices[baseIndex + 4] = botB;
-            indices[baseIndex + 5] = topB;
-        }
-
-        return indices;
-    }
-
-    // Per-sample perpendicular offset, oriented so the ribbon faces the camera at that point.
-    private Vector3 ComputeSide(Vector3 tangent, Vector3 center, Vector3 cameraPosition)
-    {
-        var side = Vector3.Cross(tangent, cameraPosition - center);
+        var side = Vector3.Cross(direction, cameraPosition - (start + end) * 0.5f);
 
         if (side.LengthSquared() < 1e-8f)
         {
-            side = Vector3.Cross(tangent, Vector3.UnitZ);
+            side = Vector3.Cross(direction, Vector3.UnitZ);
 
             if (side.LengthSquared() < 1e-8f)
             {
-                side = Vector3.Cross(tangent, Vector3.UnitX);
+                side = Vector3.Cross(direction, Vector3.UnitX);
             }
         }
 
@@ -225,15 +181,13 @@ public class ArrowSceneNode : SceneNode
 
     private void UpdateVertices(Vector3 cameraPosition)
     {
-        for (var i = 0; i < SampleCount; i++)
-        {
-            var side = ComputeSide(tangents[i], centers[i], cameraPosition);
-            var u = us[i];
-            var sampleColor = sampleColors[i];
+        var side = ComputeSide(cameraPosition);
+        const float vMax = 1f / UvScale;
 
-            vertices[i * 2] = new VertexFormat { Position = centers[i] + side, UVs = new Vector2(u, 0f), Color = sampleColor };
-            vertices[i * 2 + 1] = new VertexFormat { Position = centers[i] - side, UVs = new Vector2(u, vMax), Color = sampleColor };
-        }
+        vertices[0] = new VertexFormat { Position = start + side, UVs = new Vector2(0f, 0f), Color = color };
+        vertices[1] = new VertexFormat { Position = start - side, UVs = new Vector2(0f, vMax), Color = color };
+        vertices[2] = new VertexFormat { Position = end - side, UVs = new Vector2(uMax, vMax), Color = color };
+        vertices[3] = new VertexFormat { Position = end + side, UVs = new Vector2(uMax, 0f), Color = color };
     }
 
     /// <inheritdoc/>
@@ -254,7 +208,7 @@ public class ArrowSceneNode : SceneNode
         material.Render(renderShader);
         renderShader.SetUniform3x4("transform", Matrix4x4.Identity);
 
-        GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indicesCount, DrawElementsType.UnsignedInt, 0, 1, Id);
+        GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, Indices.Length, DrawElementsType.UnsignedInt, 0, 1, Id);
 
         material.PostRender();
         GL.BindVertexArray(0);

@@ -1540,7 +1540,7 @@ namespace ValveResourceFormat.Renderer.World
                 var end = EntityTransformHelper.CalculateTransformationMatrix(toEntity).Translation;
                 var color = RandomArrowColor();
 
-                entityConnectionArrowTexture ??= CS2BombDamageSceneNode.LoadArrowTexture(scene);
+                entityConnectionArrowTexture ??= ArrowSceneNode.LoadTexture(scene);
 
                 var arrowNode = new ArrowSceneNode(scene, start, end, color, entityConnectionArrowTexture)
                 {
