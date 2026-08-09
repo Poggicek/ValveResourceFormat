@@ -1976,6 +1976,9 @@ public partial class PlayerMovement
             result.MinimizeWith(TraceStaticPlane(from, to, halfExtents, normal, plane.W, detectStartSolid));
         }
 
+        // Brush entities are not part of the world's physics, so they get swept separately
+        Input.EntitySystem?.TraceAABB(from, to, halfExtents, detectStartSolid, ref result);
+
         return result;
     }
 
