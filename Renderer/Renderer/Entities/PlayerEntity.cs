@@ -12,8 +12,22 @@ namespace ValveResourceFormat.Renderer.Entities;
 /// </remarks>
 public sealed class PlayerEntity : BaseEntity
 {
+    /// <summary>
+    /// How far the player can reach to press something, in units. Source's <c>PLAYER_USE_RADIUS</c>.
+    /// </summary>
+    public const float UseRange = 80f;
+
     /// <summary>Gets the controller whose state this entity reflects.</summary>
     public IPlayerController Controller { get; }
+
+    /// <summary>Gets the buttons held as of this tick. Source's <c>m_nButtons</c>.</summary>
+    public PlayerButton Buttons { get; private set; }
+
+    /// <summary>Gets the buttons that went down this tick. Source's <c>m_afButtonPressed</c>.</summary>
+    public PlayerButton ButtonsPressed { get; private set; }
+
+    /// <summary>Gets the buttons that came up this tick. Source's <c>m_afButtonReleased</c>.</summary>
+    public PlayerButton ButtonsReleased { get; private set; }
 
     /// <summary>
     /// Creates the player entity for a movement controller.
@@ -49,11 +63,49 @@ public sealed class PlayerEntity : BaseEntity
         SyncFromController();
     }
 
+    /// <summary>
+    /// Presses whatever the player is looking at within <see cref="UseRange"/>, the <c>+use</c> command.
+    /// </summary>
+    /// <returns>The entity that was pressed, or <see langword="null"/> if nothing was in reach.</returns>
+    public BaseEntity? PressUse()
+    {
+        var from = Controller.EyePosition;
+        var target = EntitySystem.FindUseTarget(from, from + Controller.ViewForward * UseRange);
+
+        target?.Use(this);
+
+        return target;
+    }
+
+    /// <summary>Whether a button is currently held.</summary>
+    /// <param name="button">The button, or buttons, to test for.</param>
+    public bool IsButtonDown(PlayerButton button) => (Buttons & button) != 0;
+
+    /// <summary>Whether a button went down this tick.</summary>
+    /// <param name="button">The button, or buttons, to test for.</param>
+    public bool WasButtonPressed(PlayerButton button) => (ButtonsPressed & button) != 0;
+
+    /// <summary>Whether a button came up this tick.</summary>
+    /// <param name="button">The button, or buttons, to test for.</param>
+    public bool WasButtonReleased(PlayerButton button) => (ButtonsReleased & button) != 0;
+
     /// <inheritdoc/>
     protected override void PhysicsSimulate(float tickInterval)
     {
         // The controller owns the position, so there is nothing to integrate; just keep up with it
         SyncFromController();
+
+        // Collected here rather than when the key was hit, so what a button sets off runs on the tick
+        var buttons = Controller.ConsumeButtons();
+
+        Buttons = buttons.Held;
+        ButtonsPressed = buttons.Pressed;
+        ButtonsReleased = buttons.Released;
+
+        if (WasButtonPressed(PlayerButton.Use))
+        {
+            PressUse();
+        }
     }
 
     private void SyncFromController()

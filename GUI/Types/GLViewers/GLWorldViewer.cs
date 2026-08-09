@@ -260,7 +260,7 @@ namespace GUI.Types.GLViewers
         }
 
         /// <summary>
-        /// Starts point_soundevent entities with "Start On Spawn" set. The rest require entity I/O, which the viewer does not simulate.
+        /// Starts the map's soundscapes. <c>point_soundevent</c> is a simulated entity and starts itself.
         /// </summary>
         private void StartMapSoundEvents()
         {
@@ -268,10 +268,6 @@ namespace GUI.Types.GLViewers
             {
                 return;
             }
-
-            // Collect named entities first, to resolve "Source Entity Name" emitters
-            var namedEntities = new Dictionary<string, SceneNode>(StringComparer.OrdinalIgnoreCase);
-            var pointSoundEvents = new List<EntityLump.Entity>();
 
             foreach (var node in Scene.AllNodes)
             {
@@ -281,18 +277,8 @@ namespace GUI.Types.GLViewers
                     continue;
                 }
 
-                var targetname = entityData.GetStringProperty("targetname");
-                if (!string.IsNullOrEmpty(targetname))
-                {
-                    namedEntities.TryAdd(targetname, node);
-                }
-
                 switch (entityData.GetStringProperty("classname"))
                 {
-                    case "point_soundevent" or "snd_event_point":
-                        pointSoundEvents.Add(entityData);
-                        break;
-
                     case "env_soundscape" or "snd_soundscape":
                         if (entityData.GetBooleanProperty("startdisabled"))
                         {
@@ -320,53 +306,6 @@ namespace GUI.Types.GLViewers
                         break;
                 }
             }
-
-            foreach (var entityData in pointSoundEvents)
-            {
-                var soundName = entityData.GetStringProperty("soundname");
-
-                if (string.IsNullOrEmpty(soundName) || !entityData.GetBooleanProperty("startonspawn"))
-                {
-                    continue;
-                }
-
-                soundPlayer.Play(soundName, GetSoundEventPosition(entityData, namedEntities));
-            }
-        }
-
-        /// <summary>
-        /// Resolves where a point_soundevent emits from: null for "To Local Player" events, otherwise the source entity's position.
-        /// </summary>
-        private static Vector3? GetSoundEventPosition(EntityLump.Entity entityData, Dictionary<string, SceneNode> namedEntities)
-        {
-            if (entityData.GetBooleanProperty("tolocalplayer"))
-            {
-                return null;
-            }
-
-            var sourceEntityName = entityData.GetStringProperty("sourceentityname");
-
-            if (string.IsNullOrEmpty(sourceEntityName) || !namedEntities.TryGetValue(sourceEntityName, out var sourceNode))
-            {
-                return entityData.GetVector3Property("origin");
-            }
-
-            var attachmentName = entityData.GetStringProperty("sourceentityattachment");
-
-            if (!string.IsNullOrEmpty(attachmentName)
-                && sourceNode is ModelSceneNode sourceModel
-                && sourceModel.Attachments.ContainsKey(attachmentName))
-            {
-                return sourceModel.GetAttachmentTransform(attachmentName).Translation;
-            }
-
-            if (entityData.GetBooleanProperty("uselocaloffset"))
-            {
-                // Entities do not move in the viewer, so the source entity plus local offset is just this entity's origin
-                return entityData.GetVector3Property("origin");
-            }
-
-            return sourceNode.Transform.Translation;
         }
 
         protected override void AddUiControls()

@@ -288,6 +288,36 @@ public sealed class EntitySystem
     }
 
     /// <summary>
+    /// Finds the usable entity a reach trace hits first, with the world blocking the way.
+    /// </summary>
+    /// <param name="from">Trace start, normally an eye position.</param>
+    /// <param name="to">Trace end, the far edge of the reach.</param>
+    /// <returns>The nearest usable entity in reach, or <see langword="null"/> when there is none.</returns>
+    public BaseEntity? FindUseTarget(Vector3 from, Vector3 to)
+    {
+        // Seeded with the world, so a wall between the player and a button wins the trace
+        var nearest = Scene.PhysicsWorld?.TraceRay(from, to) ?? new Rubikon.TraceResult();
+        BaseEntity? target = null;
+
+        foreach (var entity in entities)
+        {
+            if (entity.IsRemoved
+                || (entity.ObjectCaps & EntityCapability.UsableMask) == 0
+                || entity.Collider is not { IsEmpty: false } collider)
+            {
+                continue;
+            }
+
+            if (nearest.MinimizeWith(collider.TraceRay(from, to)))
+            {
+                target = entity;
+            }
+        }
+
+        return target;
+    }
+
+    /// <summary>
     /// Fires an entity I/O input at one entity, after its delay has elapsed.
     /// </summary>
     /// <param name="target">The entity receiving the input.</param>
@@ -303,9 +333,10 @@ public sealed class EntitySystem
     }
 
     /// <summary>
-    /// Fires an entity I/O input at every entity whose targetname matches, wildcards included.
+    /// Fires an entity I/O input at every entity whose targetname matches, wildcards and the <c>!</c>
+    /// procedural names included.
     /// </summary>
-    /// <param name="targetName">Targetname to match, may contain <c>*</c> and <c>?</c>.</param>
+    /// <param name="targetName">Targetname to match, may contain <c>*</c> and <c>?</c>, or be a <c>!</c> name.</param>
     /// <param name="inputName">The input's name.</param>
     /// <param name="parameter">The parameter passed with the input, if any.</param>
     /// <param name="activator">The entity that started the I/O chain.</param>
@@ -314,10 +345,59 @@ public sealed class EntitySystem
     public void QueueInputByTargetName(string targetName, string inputName, string? parameter = null,
         BaseEntity? activator = null, BaseEntity? caller = null, float delay = 0f)
     {
+        if (IsProceduralName(targetName))
+        {
+            // A name the map means literally, so it never falls through to a search
+            if (ResolveProceduralName(targetName, activator, caller) is { } resolved)
+            {
+                QueueInput(resolved, inputName, parameter, activator, caller, delay);
+            }
+
+            return;
+        }
+
         foreach (var target in FindAllByTargetName(targetName))
         {
             QueueInput(target, inputName, parameter, activator, caller, delay);
         }
+    }
+
+    /// <summary>Whether a targetname is one of the <c>!</c> names that stand for an entity in the chain.</summary>
+    private static bool IsProceduralName(string targetName) => targetName.StartsWith('!');
+
+    /// <summary>
+    /// Resolves one of Source's <c>!</c> target names, the ones that name an entity by its part in the I/O
+    /// chain rather than by what it is called. Source's <c>FindEntityProcedural</c>.
+    /// </summary>
+    /// <remarks>
+    /// <c>!self</c> is the entity doing the lookup, which for an output is the one that fired it, so it
+    /// resolves to <paramref name="caller"/>.
+    /// </remarks>
+    /// <param name="targetName">The <c>!</c> name.</param>
+    /// <param name="activator">The entity that started the I/O chain.</param>
+    /// <param name="caller">The entity that fired the output.</param>
+    /// <returns>The entity named, or <see langword="null"/> when there is none or the name is unknown.</returns>
+    private BaseEntity? ResolveProceduralName(string targetName, BaseEntity? activator, BaseEntity? caller)
+    {
+        if (targetName.Equals("!self", StringComparison.OrdinalIgnoreCase)
+            || targetName.Equals("!caller", StringComparison.OrdinalIgnoreCase))
+        {
+            return caller;
+        }
+
+        if (targetName.Equals("!activator", StringComparison.OrdinalIgnoreCase))
+        {
+            return activator;
+        }
+
+        if (targetName.Equals("!player", StringComparison.OrdinalIgnoreCase))
+        {
+            return Player;
+        }
+
+        Logger.LogDebug("Entity I/O target '{TargetName}' is not a name the entity system knows", targetName);
+
+        return null;
     }
 
     /// <summary>

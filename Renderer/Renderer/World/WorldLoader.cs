@@ -576,7 +576,16 @@ namespace ValveResourceFormat.Renderer.World
                 // scene nodes themselves and create whatever geometry they need.
                 if (EntityFactory.IsRegistered(classname))
                 {
-                    scene.EntitySystem.CreateEntity(entity, parentTransform, layerName);
+                    var simulated = scene.EntitySystem.CreateEntity(entity, parentTransform, layerName);
+
+                    // A point entity draws nothing of its own, so it still wants the editor icon that
+                    // makes it findable and clickable; the entity adopts it so it moves with it.
+                    if (simulated is { HasSceneNodes: false }
+                        && CreateDefaultEntity(entity, classname, transformationMatrix, layerName: toolEntityLayer) is { } icon)
+                    {
+                        simulated.AdoptSceneNode(icon);
+                    }
+
                     return;
                 }
 
@@ -1553,8 +1562,10 @@ namespace ValveResourceFormat.Renderer.World
             }
         }
 
-        private void CreateDefaultEntity(Entity entity, string classname, Matrix4x4 transformationMatrix, ObjectTypeFlags flags = ObjectTypeFlags.None, string layerName = ToolEntitiesLayerName)
+        private SceneNode? CreateDefaultEntity(Entity entity, string classname, Matrix4x4 transformationMatrix, ObjectTypeFlags flags = ObjectTypeFlags.None, string layerName = ToolEntitiesLayerName)
         {
+            SceneNode? createdNode;
+
             var hammerEntity = HammerEntities.Get(classname);
             string? filename = null;
             Resource? resource = null;
@@ -1590,6 +1601,7 @@ namespace ValveResourceFormat.Renderer.World
                     Flags = flags,
                 };
                 scene.Add(boxNode, true);
+                createdNode = boxNode;
             }
             else if (resource.ResourceType == ResourceType.Model && resource.DataBlock is Model modelData)
             {
@@ -1610,6 +1622,7 @@ namespace ValveResourceFormat.Renderer.World
                 var isAnimated = modelNode.SetAnimationForWorldPreview("tools_preview");
 
                 scene.Add(modelNode, true);
+                createdNode = modelNode;
             }
             else if (resource.ResourceType == ResourceType.Material)
             {
@@ -1629,6 +1642,7 @@ namespace ValveResourceFormat.Renderer.World
                 }
 
                 scene.Add(spriteNode, true);
+                createdNode = spriteNode;
             }
             else
             {
@@ -1683,6 +1697,8 @@ namespace ValveResourceFormat.Renderer.World
                     scene.Add(lineNode, true);
                 }
             }
+
+            return createdNode;
         }
 
         private void CreateEntityConnectionLines(Entity entity, Vector3 start)

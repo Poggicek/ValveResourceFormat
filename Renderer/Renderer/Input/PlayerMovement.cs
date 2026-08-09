@@ -156,6 +156,55 @@ public partial class PlayerMovement : IPlayerController
     /// <summary>The current eye position</summary>
     public Vector3 EyePosition { get; private set; }
 
+    /// <summary>Gets the direction the player is looking, which use traces are cast along.</summary>
+    public Vector3 ViewForward => Input.Camera.Forward;
+
+    private PlayerButton heldButtons;
+    private PlayerButton pressedButtons;
+    private PlayerButton releasedButtons;
+
+    /// <summary>
+    /// Takes the buttons worked since this was last called, clearing the edges. Held for the entity tick
+    /// to collect, so a tap between two ticks still counts.
+    /// </summary>
+    /// <returns>What is held, and what went down or came up since the last call.</returns>
+    public PlayerButtonState ConsumeButtons()
+    {
+        var state = new PlayerButtonState(heldButtons, pressedButtons, releasedButtons);
+
+        pressedButtons = PlayerButton.None;
+        releasedButtons = PlayerButton.None;
+
+        return state;
+    }
+
+    /// <summary>
+    /// Folds this frame's keys into the button record. Movement itself still reads the keys it needs
+    /// directly; this is the view of the input that the entity world gets, on its own clock.
+    /// </summary>
+    private void SampleButtons()
+    {
+        var held = PlayerButton.None;
+
+        if (Input.Holding(TrackedKeys.W)) { held |= PlayerButton.Forward; }
+        if (Input.Holding(TrackedKeys.S)) { held |= PlayerButton.Back; }
+        if (Input.Holding(TrackedKeys.A)) { held |= PlayerButton.MoveLeft; }
+        if (Input.Holding(TrackedKeys.D)) { held |= PlayerButton.MoveRight; }
+        if (Input.Holding(TrackedKeys.Space)) { held |= PlayerButton.Jump; }
+        if (Input.Holding(TrackedKeys.Control)) { held |= PlayerButton.Duck; }
+        if (Input.Holding(TrackedKeys.Shift)) { held |= PlayerButton.Speed; }
+        if (Input.Holding(TrackedKeys.E)) { held |= PlayerButton.Use; }
+        if (Input.Holding(TrackedKeys.MouseLeft)) { held |= PlayerButton.Attack; }
+        if (Input.Holding(TrackedKeys.MouseRight)) { held |= PlayerButton.Attack2; }
+
+        // Edges accumulate, because several frames can pass between two entity ticks
+        var changed = held ^ heldButtons;
+
+        pressedButtons |= changed & held;
+        releasedButtons |= changed & ~held;
+        heldButtons = held;
+    }
+
     private float DuckSpeedModifierActive => (HoldingCtrl || CrouchBlend > 0f) ? DuckSpeedModifier : 1f;
     private Vector3 SnappedHullHalfExtents => HoldingCtrl ? DuckedHullHalfExtents : StandingHullHalfExtents;
 
@@ -309,6 +358,9 @@ public partial class PlayerMovement : IPlayerController
         CategorizePosition(ref position, playerHull);
 
         var justLanded = !WasOnGroundLastFrame && OnGround;
+
+        // Recorded, not acted on: what a button sets off is entity logic, which belongs to the entity tick
+        SampleButtons();
 
         var wantsToJump = AutoBunnyHop ? Input.Holding(TrackedKeys.Space) : Input.Pressed(TrackedKeys.Space);
         wantsToJump = wantsToJump || Input.Holding(TrackedKeys.MouseWheelDown) || Input.Holding(TrackedKeys.MouseWheelUp);

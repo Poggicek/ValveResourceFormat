@@ -31,10 +31,11 @@ namespace ValveResourceFormat.Renderer
 
         /// <summary>
         /// Gets or sets whether this node's layer is enabled. Marks the parent octree dirty on change.
+        /// A node under a hidden parent is hidden with it, so hiding one node hides what it drives.
         /// </summary>
         public virtual bool LayerEnabled
         {
-            get => field;
+            get => field && Parent?.LayerEnabled != false;
             set
             {
                 var valueChanged = value != field;

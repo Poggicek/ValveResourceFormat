@@ -251,6 +251,7 @@ public class UserInput
 
             PlayerMovement.ProcessMovement(Camera, deltaTime);
 
+
             Velocity = PlayerMovement.Velocity;
             Camera.Pitch -= MouseDeltaPitchYaw.X;
             Camera.Yaw -= MouseDeltaPitchYaw.Y;

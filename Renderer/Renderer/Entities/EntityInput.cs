@@ -54,6 +54,43 @@ public readonly struct EntityInputData
             ? value
             : defaultValue;
 
+    /// <summary>
+    /// Reads the parameter as a colour, <c>"R G B"</c> or <c>"R G B A"</c> with each channel 0-255.
+    /// Source's <c>inputdata.value.Color32()</c>.
+    /// </summary>
+    /// <param name="color">The colour, with each channel scaled to 0-1. Alpha defaults to opaque.</param>
+    /// <returns><see langword="true"/> when the parameter was a colour.</returns>
+    public bool TryGetColor(out Vector4 color)
+    {
+        color = Vector4.One;
+
+        if (string.IsNullOrEmpty(Parameter))
+        {
+            return false;
+        }
+
+        var channels = Parameter.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (channels.Length is < 3 or > 4)
+        {
+            return false;
+        }
+
+        Span<float> values = [255f, 255f, 255f, 255f];
+
+        for (var i = 0; i < channels.Length; i++)
+        {
+            if (!float.TryParse(channels[i], NumberStyles.Float, CultureInfo.InvariantCulture, out values[i]))
+            {
+                return false;
+            }
+        }
+
+        color = new Vector4(values[0], values[1], values[2], values[3]) / 255f;
+
+        return true;
+    }
+
     /// <summary>Reads the parameter as a boolean, accepting both <c>1</c> and <c>true</c>.</summary>
     /// <param name="defaultValue">Returned when there is no parameter or it does not parse.</param>
     public bool Bool(bool defaultValue = false)
