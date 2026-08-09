@@ -26,6 +26,7 @@ public static class EntityFactory
 
     static EntityFactory()
     {
+        Register<AmbientGeneric>("ambient_generic", static (system, spawnInfo) => new AmbientGeneric(system, spawnInfo));
         Register<FuncButton>("func_button", static (system, spawnInfo) => new FuncButton(system, spawnInfo));
         Register<FuncRotating>("func_rotating", static (system, spawnInfo) => new FuncRotating(system, spawnInfo));
         Register<PointSoundEvent>("point_soundevent", static (system, spawnInfo) => new PointSoundEvent(system, spawnInfo));
