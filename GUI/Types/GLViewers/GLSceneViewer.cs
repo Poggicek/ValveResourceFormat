@@ -226,9 +226,6 @@ namespace GUI.Types.GLViewers
                 Input.PhysicsWorld = Scene.PhysicsWorld;
             }
 
-            Input.EntitySystem = Scene.EntitySystem;
-            Scene.EntitySystem.SpawnPlayer(Input.PlayerMovement);
-
             SkyboxScene?.Initialize();
 
             if (Scene.FogInfo.CubeFogActive)

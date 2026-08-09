@@ -65,7 +65,8 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
             if (useQuat)
             {
                 // The offset's components map pitch, yaw, roll = Y, Z, X on this path
-                var offset = AngleQuaternion(rotationOffset.Y, rotationOffset.Z, rotationOffset.X);
+                var offset = EntityTransformHelper.CreateQuaternionFromEulerAngles(
+                    new Vector3(rotationOffset.Y, rotationOffset.Z, rotationOffset.X));
                 var final = offset * baseRotation;
 
                 var angles = QuaternionAngles(final);
@@ -115,20 +116,6 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
                 MathF.Cos(yaw) * MathF.Cos(pitch),
                 MathF.Sin(yaw) * MathF.Cos(pitch),
                 -MathF.Sin(pitch));
-        }
-
-        /// <summary>Quaternion from pitch/yaw/roll degrees in the Source convention.</summary>
-        private static Quaternion AngleQuaternion(float pitchDegrees, float yawDegrees, float rollDegrees)
-        {
-            var (sy, cy) = MathF.SinCos(float.DegreesToRadians(yawDegrees) * 0.5f);
-            var (sp, cp) = MathF.SinCos(float.DegreesToRadians(pitchDegrees) * 0.5f);
-            var (sr, cr) = MathF.SinCos(float.DegreesToRadians(rollDegrees) * 0.5f);
-
-            return new Quaternion(
-                sr * cp * cy - cr * sp * sy,
-                cr * sp * cy + sr * cp * sy,
-                cr * cp * sy - sr * sp * cy,
-                cr * cp * cy + sr * sp * sy);
         }
 
         /// <summary>Pitch/yaw/roll degrees from a quaternion in the Source convention.</summary>
