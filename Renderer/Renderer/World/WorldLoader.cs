@@ -291,7 +291,7 @@ namespace ValveResourceFormat.Renderer.World
 
             foreach (var node in scene.AllNodes)
             {
-                if (node is BaseEntity || node.Parent != null)
+                if (node.Parent != null || node.EntityInstance != null)
                 {
                     continue; // already driven by a simulated entity, which owns its transform
                 }
@@ -572,19 +572,11 @@ namespace ValveResourceFormat.Renderer.World
                     layerName = "Entities (disabled)";
                 }
 
-                // Classnames the entity system implements are spawned as simulated entities, which are
-                // scene nodes themselves and create whatever geometry they need.
+                // Classnames the entity system implements are spawned as simulated entities, which own
+                // whatever scene nodes they need, down to the editor box this loader would otherwise draw.
                 if (EntityFactory.IsRegistered(classname))
                 {
-                    var simulated = scene.EntitySystem.CreateEntity(entity, parentTransform, layerName);
-
-                    // A point entity draws nothing of its own, so it still wants the editor icon that
-                    // makes it findable and clickable; the entity adopts it so it moves with it.
-                    if (simulated is { HasSceneNodes: false }
-                        && CreateDefaultEntity(entity, classname, transformationMatrix, layerName: toolEntityLayer) is { } icon)
-                    {
-                        simulated.AdoptSceneNode(icon);
-                    }
+                    scene.EntitySystem.CreateEntity(entity, parentTransform, layerName);
 
                     return;
                 }

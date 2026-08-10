@@ -18,7 +18,7 @@ namespace ValveResourceFormat.Renderer.Entities;
 /// which movement collision normally prevents, so use activation is the path that matters here.
 /// </para>
 /// </remarks>
-public sealed class FuncButton : BaseEntity
+public sealed class FuncButton : BaseModelEntity
 {
     /// <summary>What a <c>func_button</c>'s <c>spawnflags</c> mean.</summary>
     [Flags]
@@ -132,8 +132,6 @@ public sealed class FuncButton : BaseEntity
     public override void Spawn()
     {
         ResolveMoveDirection();
-
-        SetModel();
 
         Speed = KeyValues.GetFloatProperty("speed", 40f);
 

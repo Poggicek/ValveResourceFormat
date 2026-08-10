@@ -31,11 +31,16 @@ namespace ValveResourceFormat.Renderer
 
         /// <summary>
         /// Gets or sets whether this node's layer is enabled. Marks the parent octree dirty on change.
-        /// A node under a hidden parent is hidden with it, so hiding one node hides what it drives.
+        /// A node under a hidden parent is hidden with it, so hiding one node hides what it drives, and a
+        /// node an entity owns is hidden while that entity is not drawn.
         /// </summary>
+        /// <remarks>
+        /// The entity's state is read here rather than written into the field, so that toggling a visibility
+        /// layer, which writes the field for every node, cannot switch a hidden entity back on.
+        /// </remarks>
         public virtual bool LayerEnabled
         {
-            get => field && Parent?.LayerEnabled != false;
+            get => field && Parent?.LayerEnabled != false && EntityInstance?.IsDrawn != false;
             set
             {
                 var valueChanged = value != field;
@@ -147,6 +152,13 @@ namespace ValveResourceFormat.Renderer
         /// Gets or sets the associated entity data from the map.
         /// </summary>
         public EntityLump.Entity? EntityData { get; set; }
+
+        /// <summary>
+        /// Gets the entity that owns this node and drives its transform, or <see langword="null"/> when
+        /// nothing simulates it. Where <see cref="EntityData"/> is what the map authored, this is the live
+        /// entity built from it.
+        /// </summary>
+        public Entities.BaseEntity? EntityInstance { get; internal set; }
 
         private AABB localBoundingBox;
         private Matrix4x4 transform = Matrix4x4.Identity;

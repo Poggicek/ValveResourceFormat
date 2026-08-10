@@ -150,12 +150,12 @@ public sealed class AmbientGeneric : BaseEntity
     }
 
     /// <inheritdoc/>
-    public override void Delete()
+    protected override void OnRemove()
     {
         playing?.Stop();
         playing = null;
 
-        base.Delete();
+        base.OnRemove();
     }
 
     /// <summary>Starts the sound, unless a looping one is already playing.</summary>

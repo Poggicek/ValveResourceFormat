@@ -78,11 +78,11 @@ public sealed class PointSoundEvent : BaseEntity
     }
 
     /// <inheritdoc/>
-    public override void Delete()
+    protected override void OnRemove()
     {
         StopSound();
 
-        base.Delete();
+        base.OnRemove();
     }
 
     /// <summary>Starts the sound.</summary>
