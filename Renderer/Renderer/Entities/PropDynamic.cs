@@ -51,13 +51,26 @@ public sealed class PropDynamic : BaseModelEntity
             return;
         }
 
-        // The same setup the loader gives a prop it loads itself, so routing one through the entity
-        // system does not quietly cost it its animation or its body group
-        var animation = KeyValues.GetStringProperty("defaultanim") ?? KeyValues.GetStringProperty("idleanim");
+        // Source 2 authors these as StartingAnim and IdleAnim, compiled down to lowercase; the older
+        // names are the Source 1 ones the loader still reads, kept so a map authored either way animates.
+        // A prop plays its starting animation and settles into its idle one, so the idle is what a prop
+        // with both ends up showing.
+        var startingAnim = KeyValues.GetStringProperty("startinganim")
+            ?? KeyValues.GetStringProperty("defaultanim");
 
-        if (!string.IsNullOrEmpty(animation)
-            && model.SetAnimationForWorldPreview(animation)
-            && KeyValues.GetBooleanProperty("holdanimation"))
+        var idleAnim = KeyValues.GetStringProperty("idleanim");
+
+        if (!string.IsNullOrEmpty(startingAnim))
+        {
+            PlayAnimation(startingAnim, IsLooping("startinganimationloopmode"));
+        }
+        else if (!string.IsNullOrEmpty(idleAnim))
+        {
+            PlayAnimation(idleAnim, IsLooping("idleanimationloopmode"));
+        }
+
+        // Source 1's own way of saying "do not loop", which the loader honours for the props it draws
+        if (KeyValues.GetBooleanProperty("holdanimation"))
         {
             model.AnimationController.PauseLastFrame();
         }
@@ -103,14 +116,30 @@ public sealed class PropDynamic : BaseModelEntity
     /// <summary>Plays an animation by name, looping if the animation itself loops.</summary>
     /// <param name="data">Carries the animation name.</param>
     [EntityInput("SetAnimation")]
-    private void InputSetAnimation(EntityInputData data) => PlayAnimation(data.Parameter, holdLastFrame: false);
+    private void InputSetAnimation(EntityInputData data) => PlayAnimation(data.Parameter, looping: null);
 
-    /// <summary>Plays an animation once and holds on its last frame.</summary>
+    /// <summary>Plays an animation and forces it to loop.</summary>
+    /// <param name="data">Carries the animation name.</param>
+    [EntityInput("SetAnimationLooping")]
+    private void InputSetAnimationLooping(EntityInputData data) => PlayAnimation(data.Parameter, looping: true);
+
+    /// <summary>Plays an animation once, stopping on its last frame.</summary>
     /// <param name="data">Carries the animation name.</param>
     [EntityInput("SetAnimationNotLooping")]
-    private void InputSetAnimationNotLooping(EntityInputData data) => PlayAnimation(data.Parameter, holdLastFrame: true);
+    private void InputSetAnimationNotLooping(EntityInputData data) => PlayAnimation(data.Parameter, looping: false);
 
-    private void PlayAnimation(string? animationName, bool holdLastFrame)
+    /// <summary>Reads one of the loop-mode keyvalues, which name their setting rather than numbering it.</summary>
+    /// <param name="keyName">The keyvalue to read.</param>
+    private bool IsLooping(string keyName)
+        => KeyValues.GetStringProperty(keyName) is { } mode
+        && !mode.Contains("NOT_LOOPING", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Plays an animation, optionally overriding whether it repeats.
+    /// </summary>
+    /// <param name="animationName">The animation to play.</param>
+    /// <param name="looping">Whether to force looping on or off; <see langword="null"/> leaves the animation's own setting.</param>
+    private void PlayAnimation(string? animationName, bool? looping)
     {
         if (string.IsNullOrEmpty(animationName) || ModelNode is not { } model)
         {
@@ -119,9 +148,9 @@ public sealed class PropDynamic : BaseModelEntity
 
         model.SetAnimationByName(animationName);
 
-        if (holdLastFrame)
+        if (looping is { } shouldLoop)
         {
-            model.AnimationController.PauseLastFrame();
+            model.AnimationController.Looping = shouldLoop;
         }
     }
 }

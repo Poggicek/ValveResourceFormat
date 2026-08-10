@@ -27,11 +27,13 @@ public static class EntityFactory
     static EntityFactory()
     {
         Register<AmbientGeneric>("ambient_generic", static (system, spawnInfo) => new AmbientGeneric(system, spawnInfo));
+        Register<FilterActivatorTeam>("filter_activator_team", static (system, spawnInfo) => new FilterActivatorTeam(system, spawnInfo));
         Register<FuncBrush>("func_brush", static (system, spawnInfo) => new FuncBrush(system, spawnInfo));
         Register<FuncButton>("func_button", static (system, spawnInfo) => new FuncButton(system, spawnInfo));
         Register<FuncDoor>("func_door", static (system, spawnInfo) => new FuncDoor(system, spawnInfo));
         Register<FuncDoorRotating>("func_door_rotating", static (system, spawnInfo) => new FuncDoorRotating(system, spawnInfo));
-        Register<FuncDoor>("func_movelinear", static (system, spawnInfo) => new FuncDoor(system, spawnInfo));
+        Register<FuncMoveLinear>("func_movelinear", static (system, spawnInfo) => new FuncMoveLinear(system, spawnInfo));
+        Register<FuncTrackTrain>("func_tracktrain", static (system, spawnInfo) => new FuncTrackTrain(system, spawnInfo));
         Register<FuncRotating>("func_rotating", static (system, spawnInfo) => new FuncRotating(system, spawnInfo));
         Register<InfoParticleSystem>("info_particle_system", static (system, spawnInfo) => new InfoParticleSystem(system, spawnInfo));
         Register<LogicCase>("logic_case", static (system, spawnInfo) => new LogicCase(system, spawnInfo));
@@ -40,6 +42,7 @@ public static class EntityFactory
         Register<MathCounter>("math_counter", static (system, spawnInfo) => new MathCounter(system, spawnInfo));
         Register<PointTemplate>("point_template", static (system, spawnInfo) => new PointTemplate(system, spawnInfo));
         Register<PointTeleport>("point_teleport", static (system, spawnInfo) => new PointTeleport(system, spawnInfo));
+        Register<PathTrack>("path_track", static (system, spawnInfo) => new PathTrack(system, spawnInfo));
         Register<PointSoundEvent>("point_soundevent", static (system, spawnInfo) => new PointSoundEvent(system, spawnInfo));
         Register<PropDynamic>("prop_dynamic", static (system, spawnInfo) => new PropDynamic(system, spawnInfo));
         Register<PropDynamic>("prop_dynamic_override", static (system, spawnInfo) => new PropDynamic(system, spawnInfo));

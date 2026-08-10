@@ -66,6 +66,15 @@ public partial class PlayerMovement : IPlayerController
     /// </summary>
     public bool WasOnGroundLastFrame { get; private set; }
 
+    /// <summary>
+    /// Gets the simulated entity the player is standing on, or <see langword="null"/> when that is the
+    /// world. Source's <c>m_hGroundEntity</c>: what makes a moving platform carry whoever rides it.
+    /// </summary>
+    public Entities.BaseEntity? GroundEntity { get; private set; }
+
+    // Whatever entity the last sweep hit, so the ground probe can name what it landed on
+    private Entities.BaseEntity? lastTracedEntity;
+
     // Last known non-overlapping position, restored when stuck
     private Vector3 LastValidPosition;
     private bool HasValidPosition;
@@ -348,6 +357,8 @@ public partial class PlayerMovement : IPlayerController
         BlendDuckedHull(deltaTime, ref position, isDucking);
 
         var playerHull = HullHalfExtents;
+
+        CarryWithGroundEntity(ref position, deltaTime);
 
         WasOnGroundLastFrame = OnGround;
 
@@ -712,11 +723,37 @@ public partial class PlayerMovement : IPlayerController
     }
 
     /// <summary>
+    /// Moves the player along with whatever they are standing on, so a lift or a moving platform takes
+    /// its passengers with it. Source pushes riders from the mover's own physics; here the rider reads
+    /// the mover instead, which lands in the same place for a platform that does not turn.
+    /// </summary>
+    /// <remarks>
+    /// The mover's velocity is a tick quantity and this runs per frame, which is the same split the
+    /// interpolated render transform has: over a whole second the two agree, and within one they differ
+    /// by less than a tick of travel.
+    /// </remarks>
+    private void CarryWithGroundEntity(ref Vector3 position, float deltaTime)
+    {
+        if (!OnGround || GroundEntity is not { } ground || ground.CarryVelocity == Vector3.Zero)
+        {
+            return;
+        }
+
+        var carried = ground.CarryVelocity * deltaTime;
+
+        position += carried;
+        EyePosition += carried;
+    }
+
+    /// <summary>
     /// Checks for walkable ground within the 2-unit probe and snaps onto it.
     /// </summary>
     private void CategorizePosition(ref Vector3 position, Vector3 halfExtents)
     {
         var result = TraceBBox(position, position + new Vector3(0, 0, -GroundProbeDistance), halfExtents);
+
+        // Read before the quadrant probes below trace again over the top of it
+        var groundCandidate = lastTracedEntity;
 
         var grounded = IsWalkableGroundHit(result);
 
@@ -739,6 +776,8 @@ public partial class PlayerMovement : IPlayerController
         // (302 u/s) therefore keeps full air control until 140 u/s, and the dead window is just
         // the last stretch up to the apex, restoring the frame it passes.
         SurfaceFriction = !OnGround && Velocity.Z > 0f && Velocity.Z <= NonJumpVelocity ? JumpFriction : 1f;
+
+        GroundEntity = OnGround ? groundCandidate : null;
 
         if (OnGround && snapToHit)
         {
@@ -2031,7 +2070,8 @@ public partial class PlayerMovement : IPlayerController
         }
 
         // Brush entities are not part of the world's physics, so they get swept separately
-        Input.EntitySystem?.TraceAABB(from, to, halfExtents, detectStartSolid, ref result);
+        lastTracedEntity = null;
+        Input.EntitySystem?.TraceAABB(from, to, halfExtents, detectStartSolid, ref result, out lastTracedEntity);
 
         return result;
     }

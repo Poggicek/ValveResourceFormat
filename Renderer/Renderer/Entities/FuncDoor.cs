@@ -122,6 +122,20 @@ public class FuncDoor : BaseToggle
     /// <param name="opening">Whether it is heading for the open end.</param>
     protected virtual void StartMove(bool opening) => LinearMove(opening ? PositionOpen : PositionClosed);
 
+    /// <summary>
+    /// Sends the door to any point along its travel, for the inputs that place it rather than open or
+    /// close it. It counts as opening unless it is heading for the closed end exactly, so the arrival
+    /// still reports through the outputs a map listens to.
+    /// </summary>
+    /// <param name="destination">Where to travel to.</param>
+    protected void MoveTo(Vector3 destination)
+    {
+        State = destination == PositionClosed ? ToggleState.GoingDown : ToggleState.GoingUp;
+
+        SetNextThink(-1f);
+        LinearMove(destination);
+    }
+
     /// <inheritdoc/>
     public override void MoveDone()
     {

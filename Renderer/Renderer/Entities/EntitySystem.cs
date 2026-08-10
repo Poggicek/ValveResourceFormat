@@ -315,10 +315,12 @@ public sealed class EntitySystem
     /// <param name="halfExtents">Half-extents of the swept box.</param>
     /// <param name="detectStartSolid">Whether an overlap at <paramref name="from"/> reports as start-solid.</param>
     /// <param name="result">The trace to narrow; a nearer entity hit replaces it.</param>
+    /// <param name="hitEntity">The entity that produced the nearest hit, if one did.</param>
     /// <returns><see langword="true"/> when an entity produced the nearest hit.</returns>
-    public bool TraceAABB(Vector3 from, Vector3 to, Vector3 halfExtents, bool detectStartSolid, ref Rubikon.TraceResult result)
+    public bool TraceAABB(Vector3 from, Vector3 to, Vector3 halfExtents, bool detectStartSolid,
+        ref Rubikon.TraceResult result, out BaseEntity? hitEntity)
     {
-        var hitEntity = false;
+        hitEntity = null;
 
         foreach (var entity in entities)
         {
@@ -327,10 +329,13 @@ public sealed class EntitySystem
                 continue;
             }
 
-            hitEntity |= result.MinimizeWith(entity.Collider.TraceAABB(from, to, halfExtents, detectStartSolid));
+            if (result.MinimizeWith(entity.Collider.TraceAABB(from, to, halfExtents, detectStartSolid)))
+            {
+                hitEntity = entity;
+            }
         }
 
-        return hitEntity;
+        return hitEntity != null;
     }
 
     /// <summary>

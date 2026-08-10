@@ -128,6 +128,13 @@ public class BaseEntity
     /// </remarks>
     public virtual bool AllowsSceneParenting => false;
 
+    /// <summary>
+    /// Gets how fast this entity is carrying whatever rides it, in units per second. The same as
+    /// <see cref="Velocity"/> for an entity that moves itself, and for one a parent moves it is measured
+    /// off the node the parent writes, which is the only place that motion appears.
+    /// </summary>
+    public Vector3 CarryVelocity => isNodeDrivenExternally ? drivenVelocity : Velocity;
+
     /// <summary>Gets whether this entity has been removed from the world and is awaiting cleanup.</summary>
     public bool IsRemoved { get; private set; }
 
@@ -205,6 +212,8 @@ public class BaseEntity
     private readonly List<SceneNode> ownedNodes = [];
     private readonly List<(SceneNode Node, Matrix4x4 Local)> attachedNodes = [];
     private bool isNodeDrivenExternally;
+    private Vector3 drivenVelocity;
+    private Vector3 previousDrivenOrigin;
     private Vector3 origin;
     private Vector3 angles;
     private bool transformDirty = true;
@@ -442,7 +451,13 @@ public class BaseEntity
     /// Told when something else took over placing this entity's node, so that its collision shape follows
     /// the node rather than the origin the entity spawned at and never leaves.
     /// </summary>
-    internal void OnNodeParented() => isNodeDrivenExternally = true;
+    internal void OnNodeParented()
+    {
+        isNodeDrivenExternally = true;
+
+        // Seeded so the first tick measures no motion rather than a jump from the origin
+        previousDrivenOrigin = RootNode?.Transform.Translation ?? Origin;
+    }
 
     /// <summary>
     /// Closes every touch this entity currently holds, both sides, so whatever is inside hears that it
@@ -559,9 +574,17 @@ public class BaseEntity
 
         // A parented entity is moved by its parent writing the node, which the entity never sees, so its
         // shape is read back off the node instead. One frame behind, which is what a trace wants anyway.
-        if (isNodeDrivenExternally && Collider != null && RootNode is { } drivenNode)
+        if (isNodeDrivenExternally && RootNode is { } drivenNode)
         {
-            Collider.Transform = drivenNode.Transform;
+            var drivenOrigin = drivenNode.Transform.Translation;
+
+            drivenVelocity = (drivenOrigin - previousDrivenOrigin) / tickInterval;
+            previousDrivenOrigin = drivenOrigin;
+
+            if (Collider != null)
+            {
+                Collider.Transform = drivenNode.Transform;
+            }
         }
 
         if (NextThink > 0f && NextThink <= EntitySystem.CurrentTime)
