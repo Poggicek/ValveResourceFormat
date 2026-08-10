@@ -124,9 +124,10 @@ namespace ValveResourceFormat.ResourceTypes
                 public Frame[] Frames { get; set; } = [];
 
                 /// <summary>
-                /// Gets or sets the playback rate of this sequence in frames per second.
+                /// Gets or sets the time this sequence spans in total. The frames divide it between
+                /// themselves by their display times.
                 /// </summary>
-                public float FramesPerSecond { get; set; }
+                public float TotalTime { get; set; }
 
                 /// <summary>
                 /// Gets or sets the name of this sequence.
@@ -433,7 +434,7 @@ namespace ValveResourceFormat.ResourceTypes
                     sequence.NoAlpha = reader.ReadBoolean();
                     var framesOffset = reader.BaseStream.Position + reader.ReadUInt32();
                     var numFrames = reader.ReadUInt32();
-                    sequence.FramesPerSecond = reader.ReadSingle();
+                    sequence.TotalTime = reader.ReadSingle();
                     var nameOffset = reader.BaseStream.Position + reader.ReadUInt32();
                     var floatParamsOffset = reader.BaseStream.Position + reader.ReadUInt32();
                     var floatParamsCount = reader.ReadUInt32();
@@ -1216,7 +1217,7 @@ namespace ValveResourceFormat.ResourceTypes
                         writer.WriteLine("{0,-16}   m_bAlphaCrop      = {1}", string.Empty, sequence.AlphaCrop);
                         writer.WriteLine("{0,-16}   m_bNoColor        = {1}", string.Empty, sequence.NoColor);
                         writer.WriteLine("{0,-16}   m_bNoAlpha        = {1}", string.Empty, sequence.NoAlpha);
-                        writer.WriteLine("{0,-16}   m_flTotalTime     = {1:F6}", string.Empty, sequence.FramesPerSecond);
+                        writer.WriteLine("{0,-16}   m_flTotalTime     = {1:F6}", string.Empty, sequence.TotalTime);
                         writer.WriteLine("{0,-16}   {1} Float Params:", string.Empty, sequence.FloatParams.Count);
 
                         foreach (var (floatName, floatValue) in sequence.FloatParams)

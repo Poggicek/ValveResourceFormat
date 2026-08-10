@@ -1,4 +1,4 @@
-using ValveResourceFormat.Serialization.KeyValues;
+using ValveResourceFormat.Renderer.Particles.Utils;
 
 namespace ValveResourceFormat.Renderer.Particles.Emitters
 {
@@ -14,20 +14,40 @@ namespace ValveResourceFormat.Renderer.Particles.Emitters
 
         private readonly INumberProvider emitCount = new LiteralNumberProvider(100);
         private readonly INumberProvider startTime = new LiteralNumberProvider(0);
+
+        /// <summary>
+        /// Multiplies the burst by the parent system's live particle count. -1 leaves it unscaled.
+        /// </summary>
+        private readonly INumberProvider parentParticleScale = new LiteralNumberProvider(-1);
+
         private readonly int maxEmittedPerFrame = -1;
-        private readonly int snapshotControlPoint;
-        private readonly bool hasSnapshotSubset;
+
+        /// <summary>Scales the burst by how many parent particles died this frame, making it recur.</summary>
+        private readonly float initFromKilledParentParticles;
+        private readonly SnapshotBinding snapshotBinding;
 
         private float time;
         private int remainingToEmit;
+        private bool countResolved;
+        private bool snapshotResolved;
+
+        /// <summary>
+        /// The snapshot's creation-time column, when it carries one. Its presence turns the burst into
+        /// a timed release rather than a single instant.
+        /// </summary>
+        private float[]? snapshotTimes;
+
+        /// <summary>How far into the timed snapshot release the burst has got.</summary>
+        private int snapshotCursor;
 
         public InstantaneousEmitter(ParticleDefinitionParser parse) : base(parse)
         {
             emitCount = parse.NumberProvider("m_nParticlesToEmit", emitCount);
             startTime = parse.NumberProvider("m_flStartTime", startTime);
+            parentParticleScale = parse.NumberProvider("m_flParentParticleScale", parentParticleScale);
             maxEmittedPerFrame = parse.Int32("m_nMaxEmittedPerFrame", maxEmittedPerFrame);
-            snapshotControlPoint = parse.Int32("m_nSnapshotControlPoint", -1);
-            hasSnapshotSubset = !string.IsNullOrEmpty(parse.Data.GetStringProperty("m_strSnapshotSubset"));
+            initFromKilledParentParticles = parse.Float("m_flInitFromKilledParentParticles", initFromKilledParentParticles);
+            snapshotBinding = new SnapshotBinding(parse);
         }
 
         public override void Start(Action<float> particleEmitCallback)
@@ -37,7 +57,9 @@ namespace ValveResourceFormat.Renderer.Particles.Emitters
             IsFinished = false;
 
             time = 0;
-            remainingToEmit = -1;
+            remainingToEmit = 0;
+            countResolved = false;
+            snapshotCursor = 0;
         }
 
         public override void Stop()
@@ -62,40 +84,117 @@ namespace ValveResourceFormat.Renderer.Particles.Emitters
                 return;
             }
 
-            if (remainingToEmit < 0)
+            if (!snapshotResolved)
             {
-                remainingToEmit = (int)emitCount.NextNumber(particleSystemState);
+                snapshotResolved = true;
 
-                // When emitting from a whole snapshot, spawn one particle per snapshot element so each maps
-                // 1:1 to its snapshot index (C_INIT_InitFromCPSnapshot reads by particle id). A subset string
-                // selects a sub-range, which we don't support, so leave the literal count in that case.
-                if (snapshotControlPoint >= 0 && !hasSnapshotSubset)
+                if (snapshotBinding.ResolveAttribute(particleSystemState, ParticleField.CreationTime) is float[] times && times.Length > 0)
                 {
-                    var snapshot = particleSystemState.GetControlPointSnapshot(snapshotControlPoint);
-                    if (snapshot != null)
-                    {
-                        remainingToEmit = (int)snapshot.NumParticles;
-                    }
+                    snapshotTimes = times;
                 }
             }
 
-            var perFrameCap = maxEmittedPerFrame >= 0 ? maxEmittedPerFrame : 100000;
-            var numToEmit = Math.Min(remainingToEmit, (int)(perFrameCap * strength));
+            if (snapshotTimes != null)
+            {
+                if (snapshotCursor >= snapshotTimes.Length)
+                {
+                    IsFinished = true;
+                    return;
+                }
 
-            // Every burst particle is stamped with the start-time instant, not the frame it spawns in
-            var ageAtSpawn = time - nextStartTime;
+                remainingToEmit = CountDueSnapshotParticles();
+            }
+            else if (initFromKilledParentParticles > 0f)
+            {
+                remainingToEmit = ResolveEmitCount(particleSystemState);
+            }
+            else if (!countResolved)
+            {
+                countResolved = true;
+                remainingToEmit = ResolveEmitCount(particleSystemState);
+            }
+
+            // A negative cap means "no authored limit", which resolves to the pool size rather than
+            // to no limit at all, so an oversized burst drips out as slots free
+            var perFrameCap = maxEmittedPerFrame >= 0
+                ? maxEmittedPerFrame
+                : Math.Min(particleSystemState.Data?.ParticleCapacity ?? 20000, 20000);
+
+            // The burst budget is spent before the strength fade, so a faded frame loses its share outright
+            var claimed = Math.Min(remainingToEmit, perFrameCap);
+            remainingToEmit -= claimed;
+
+            var numToEmit = (int)(claimed * strength);
 
             for (var i = 0; i < numToEmit; i++)
             {
+                // Every particle is stamped at the start-time instant, offset by its snapshot release time
+                var ageAtSpawn = time - nextStartTime;
+
+                if (snapshotTimes != null)
+                {
+                    ageAtSpawn -= snapshotTimes[snapshotCursor];
+                    snapshotCursor++;
+                }
+
                 particleEmitCallback?.Invoke(ageAtSpawn);
             }
 
-            remainingToEmit -= numToEmit;
-
-            if (remainingToEmit <= 0)
+            if (snapshotTimes == null && initFromKilledParentParticles <= 0f && remainingToEmit <= 0)
             {
                 IsFinished = true;
             }
+        }
+
+        /// <summary>
+        /// How many entries of a timed snapshot have come due but not yet been released.
+        /// </summary>
+        private int CountDueSnapshotParticles()
+        {
+            var due = 0;
+
+            while (snapshotCursor + due < snapshotTimes!.Length && snapshotTimes[snapshotCursor + due] <= time)
+            {
+                due++;
+            }
+
+            return due;
+        }
+
+        /// <summary>
+        /// The size of the burst. Emitting from a whole snapshot spawns one particle per snapshot
+        /// element so each maps 1:1 to its snapshot index (<c>C_INIT_InitFromCPSnapshot</c> reads by
+        /// particle id); a subset string selects a sub-range, which is unsupported, so the authored
+        /// count stands there. Otherwise the authored count may be scaled by the parent's live
+        /// particle count.
+        /// </summary>
+        private int ResolveEmitCount(ParticleSystemRenderState particleSystemState)
+        {
+            if (snapshotBinding.IsBound)
+            {
+                return snapshotBinding.Count(particleSystemState);
+            }
+
+            var count = emitCount.NextNumber(particleSystemState);
+            var parentSystem = particleSystemState.ParentSystem;
+
+            // Spawning from killed parents is a per-frame count rather than a one-shot burst
+            if (initFromKilledParentParticles > 0f)
+            {
+                return (int)((parentSystem?.Data?.KilledLastPass ?? 0) * count * initFromKilledParentParticles);
+            }
+
+            if (!snapshotBinding.HasControlPoint && parentSystem != null)
+            {
+                var scale = parentParticleScale.NextNumber(particleSystemState);
+
+                if (scale != -1f)
+                {
+                    count *= (parentSystem.Data?.CurrentParticles.Length ?? 0) * scale;
+                }
+            }
+
+            return (int)count;
         }
     }
 }

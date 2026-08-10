@@ -1,3 +1,5 @@
+using ValveResourceFormat.Renderer.Particles.Utils;
+
 namespace ValveResourceFormat.Renderer.Particles.Operators
 {
     /// <summary>
@@ -30,7 +32,7 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
         {
             foreach (ref var particle in particles.Current)
             {
-                var fadeOutTime = GetFadeTime(ref particle);
+                var fadeOutTime = GetFadeTime(ref particle, particleSystemState);
 
                 var timeLeft = proportional
                     ? 1.0f - particle.NormalizedAge
@@ -42,7 +44,7 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
 
                     if (fadeBias != 0.5f)
                     {
-                        elapsedFraction /= ((1f / fadeBias - 2f) * (1f - elapsedFraction) + 1f);
+                        elapsedFraction = NumericBias.Standard(elapsedFraction, fadeBias);
                     }
 
                     particle.Alpha = (1f - elapsedFraction) * particle.GetInitialScalar(particles, ParticleField.Alpha);

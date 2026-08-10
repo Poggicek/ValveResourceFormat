@@ -1,3 +1,5 @@
+using ValveResourceFormat.Renderer.Particles.Utils;
+
 namespace ValveResourceFormat.Renderer.Particles.Initializers
 {
     /// <summary>
@@ -14,6 +16,7 @@ namespace ValveResourceFormat.Renderer.Particles.Initializers
         private readonly ITransformProvider transformInput = new ControlPointTransformProvider();
         private readonly bool localCoords; // offset in local space 0/1
         private readonly bool proportional; // offset proportional to radius 0/1
+        private readonly RangeSampler rangeSampler;
 
         public PositionOffset(ParticleDefinitionParser parse) : base(parse)
         {
@@ -22,15 +25,16 @@ namespace ValveResourceFormat.Renderer.Particles.Initializers
             transformInput = parse.TransformInput("m_TransformInput", transformInput);
             localCoords = parse.Boolean("m_bLocalCoords", localCoords);
             proportional = parse.Boolean("m_bProportional", proportional);
+            rangeSampler = RangeSampler.Parse(parse);
         }
 
         public override Particle Initialize(ref Particle particle, ParticleCollection particles, ParticleSystemRenderState particleSystemState)
         {
 
-            var offset = ParticleCollection.RandomBetweenPerComponent(
-                particle.ParticleID,
-                offsetMin.NextVector(ref particle, particleSystemState),
-                offsetMax.NextVector(ref particle, particleSystemState));
+            var posMin = offsetMin.NextVector(ref particle, particleSystemState);
+            var posMax = offsetMax.NextVector(ref particle, particleSystemState);
+
+            var offset = rangeSampler.NextVectorBetween(ref particle, particleSystemState, posMin, posMax);
 
             if (proportional)
             {

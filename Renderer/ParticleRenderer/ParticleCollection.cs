@@ -33,6 +33,11 @@ namespace ValveResourceFormat.Renderer.Particles
         public float PreviousFrameTime { get; internal set; }
 
         /// <summary>
+        /// Duration of the step being simulated right now; 0 until the first step begins.
+        /// </summary>
+        public float CurrentFrameTime { get; internal set; }
+
+        /// <summary>
         /// Initializes a new <see cref="ParticleCollection"/> with the given constant particle template and capacity.
         /// </summary>
         public ParticleCollection(Particle constants, int maxParticles)
@@ -62,6 +67,12 @@ namespace ValveResourceFormat.Renderer.Particles
         /// <summary>
         /// Removes all particles that have been marked as killed, compacting the live array.
         /// </summary>
+        /// <summary>
+        /// How many particles the last <see cref="PruneExpired"/> removed. Emitters that spawn from
+        /// killed parent particles read it from their parent system.
+        /// </summary>
+        public int KilledLastPass { get; private set; }
+
         public void PruneExpired()
         {
             var alive = 0;
@@ -76,6 +87,7 @@ namespace ValveResourceFormat.Renderer.Particles
                     alive++;
                 }
             }
+            KilledLastPass = Count - alive;
             Count = alive;
         }
 
@@ -85,58 +97,6 @@ namespace ValveResourceFormat.Renderer.Particles
         public void Clear()
         {
             Count = 0;
-        }
-
-        /// <summary>
-        /// Returns a deterministic pseudo-random float in [0, 1) for the given particle ID.
-        /// </summary>
-        public static float RandomSingle(int particleId)
-        {
-            // Unsigned modulo keeps the index valid for any id, including ids that wrapped negative
-            return RandomFloats.List[(uint)particleId % RandomFloats.List.Length]; // TODO: Add seed
-        }
-
-        /// <summary>
-        /// Returns a deterministic pseudo-random float in [<paramref name="min"/>, <paramref name="max"/>] for the given particle ID.
-        /// </summary>
-        public static float RandomBetween(int particleId, float min, float max)
-        {
-            return float.Lerp(min, max, RandomSingle(particleId));
-        }
-
-        /// <summary>
-        /// Returns a deterministic pseudo-random vector uniformly interpolated between <paramref name="min"/> and <paramref name="max"/>.
-        /// </summary>
-        public static Vector3 RandomBetween(int particleId, Vector3 min, Vector3 max)
-        {
-            return Vector3.Lerp(min, max, RandomSingle(particleId));
-        }
-
-        /// <summary>
-        /// Returns a deterministic pseudo-random vector with each component independently interpolated between the corresponding components of <paramref name="min"/> and <paramref name="max"/>.
-        /// </summary>
-        public static Vector3 RandomBetweenPerComponent(int particleId, Vector3 min, Vector3 max)
-        {
-            return new Vector3(
-                RandomBetween(particleId, min.X, max.X),
-                RandomBetween(particleId + 1, min.Y, max.Y),
-                RandomBetween(particleId + 2, min.Z, max.Z));
-        }
-
-        /// <summary>
-        /// Returns a non-deterministic random vector with each component independently interpolated between the corresponding components of <paramref name="min"/> and <paramref name="max"/>.
-        /// </summary>
-        public static Vector3 RandomBetweenPerComponent(Vector3 min, Vector3 max)
-        {
-            return RandomBetweenPerComponent(Random.Shared.Next(), min, max);
-        }
-
-        /// <summary>
-        /// Returns a deterministic pseudo-random float in [<paramref name="min"/>, <paramref name="max"/>] biased by raising the random value to <paramref name="exponent"/>.
-        /// </summary>
-        public static float RandomWithExponentBetween(int particleId, float exponent, float min, float max)
-        {
-            return float.Lerp(min, max, MathF.Pow(RandomSingle(particleId), exponent));
         }
 
         private void MoveParticleIndex(int currentIndex, int newIndex)

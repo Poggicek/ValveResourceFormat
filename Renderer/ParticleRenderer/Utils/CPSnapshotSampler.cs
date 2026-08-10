@@ -9,23 +9,31 @@ namespace ValveResourceFormat.Renderer.Particles.Utils
     static class CPSnapshotSampler
     {
         /// <summary>
-        /// Picks the snapshot element index for a particle. The returned index is always in
-        /// <c>[0, numParticles)</c> (<paramref name="numParticles"/> must be positive).
+        /// Picks the snapshot element index for a particle, walking the snapshot by
+        /// <paramref name="creationIndex"/> or drawing at random. A non-zero <paramref name="randomSeed"/>
+        /// (<c>m_nRandomSeed</c>) moves the random draw onto <paramref name="privateSampleCounter"/>, a counter
+        /// private to the calling function, instead of the system's shared draw counter; either way the counter
+        /// advances once per particle. The returned index is always in <c>[0, numParticles)</c>
+        /// (<paramref name="numParticles"/> must be positive).
         /// </summary>
-        public static int SelectIndex(int particleId, int numParticles, bool random, bool reverse, int startPoint, int increment)
+        public static int SelectIndex(int creationIndex, int numParticles, bool random, bool reverse, int startPoint, int increment,
+            int randomSeed, ref int privateSampleCounter, ParticleSystemRenderState particleSystemState)
         {
             if (random)
             {
-                // Sampling (int)(n * rand01) keeps the last element reachable; RandomSingle is in
-                // [0, 1) so the Min is only a safety clamp. ParticleID can be driven negative, so mask the
-                // sign off before it reaches RandomSingle's array index.
-                return Math.Min((int)(numParticles * ParticleCollection.RandomSingle(particleId & int.MaxValue)), numParticles - 1);
+                var sample = randomSeed != 0
+                    ? ParticleRandom.ForSample(particleSystemState.Random.Seed + randomSeed + privateSampleCounter++)
+                    : particleSystemState.Random.Next();
+
+                // Sampling (int)(n * rand01) keeps the last element reachable; the table tops out below 1.0
+                // so the Min only guards against that changing.
+                return Math.Min((int)(numParticles * sample), numParticles - 1);
             }
 
             // Walk the snapshot from the start point by the increment per particle (defaults 0/1 reproduce the
-            // plain particle-id mapping). ParticleID is writable and C# % keeps the dividend's sign, so wrap
+            // plain ordinal mapping). The ordinal is writable and C# % keeps the dividend's sign, so wrap
             // explicitly to keep the index non-negative and in range.
-            var raw = startPoint + (particleId * increment);
+            var raw = startPoint + (creationIndex * increment);
             var wrapped = ((raw % numParticles) + numParticles) % numParticles;
 
             return reverse ? numParticles - 1 - wrapped : wrapped;

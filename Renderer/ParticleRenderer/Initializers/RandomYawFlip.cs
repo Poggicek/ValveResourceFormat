@@ -15,7 +15,7 @@ namespace ValveResourceFormat.Renderer.Particles.Initializers
 
         public override Particle Initialize(ref Particle particle, ParticleCollection particles, ParticleSystemRenderState particleSystemState)
         {
-            if (Random.Shared.NextSingle() < percent)
+            if (particleSystemState.Random.Next() < percent)
             {
                 particle.SetScalar(ParticleField.Yaw, particle.GetScalar(ParticleField.Yaw) + MathF.PI);
             }
