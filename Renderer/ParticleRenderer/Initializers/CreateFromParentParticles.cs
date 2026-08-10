@@ -1,3 +1,5 @@
+using ValveResourceFormat.Renderer.Particles.Utils;
+
 namespace ValveResourceFormat.Renderer.Particles.Initializers
 {
     /// <summary>
@@ -13,6 +15,21 @@ namespace ValveResourceFormat.Renderer.Particles.Initializers
         private readonly bool subFrame = true;
         private readonly bool setRopeSegmentID;
 
+        /// <summary>
+        /// Whether the increment carries a fractional part. It selects both the index formula the
+        /// random walk uses and whether a child blends between two neighbouring parents.
+        /// </summary>
+        private readonly bool fractionalIncrement;
+
+        private float currentParentIndex;
+        private int randomCounter;
+
+        public override void Reset()
+        {
+            currentParentIndex = 0f;
+            randomCounter = 0;
+        }
+
         public CreateFromParentParticles(ParticleDefinitionParser parse) : base(parse)
         {
             velocityScale = parse.Float("m_flVelocityScale", velocityScale);
@@ -21,8 +38,15 @@ namespace ValveResourceFormat.Renderer.Particles.Initializers
             randomSeed = parse.Int32("m_nRandomSeed", randomSeed);
             subFrame = parse.Boolean("m_bSubFrame", subFrame);
             setRopeSegmentID = parse.Boolean("m_bSetRopeSegmentID", setRopeSegmentID);
+
+            fractionalIncrement = increment != MathF.Floor(increment);
         }
 
+        /// <summary>
+        /// Binds the new particle to a parent and places it along the parent's step for this frame,
+        /// keeping the share of the parent's velocity left once the particle is born. The emit path
+        /// encodes that velocity back into Position/PositionPrevious after initializers run.
+        /// </summary>
         public override Particle Initialize(ref Particle particle, ParticleCollection particles, ParticleSystemRenderState particleSystemState)
         {
             var parentData = particleSystemState.ParentSystem?.Data;
@@ -34,50 +58,96 @@ namespace ValveResourceFormat.Renderer.Particles.Initializers
             var parentParticles = parentData.CurrentParticles;
             if (parentParticles.Length == 0)
             {
+                // A child with no parent to bind to is born dead rather than left at the origin
+                particle.Lifetime = 0f;
                 return particle;
             }
 
-            var parentIndex = Math.Clamp(GetParentIndex(parentParticles.Length, particle.ParticleID), 0, parentParticles.Length - 1);
+            var lastIndex = parentParticles.Length - 1;
+            var walkIndex = NextParentIndex(lastIndex, particleSystemState);
+            var parentIndex = Math.Clamp((int)MathF.Floor(walkIndex), 0, lastIndex);
             particle.ParentParticleIndex = parentIndex;
+
+            ref var parent = ref parentParticles[parentIndex];
+
+            particle.ParentParticleId = parent.ParticleId;
 
             if (setRopeSegmentID)
             {
-                particle.Sequence2 = parentIndex;
+                particle.RopeSegmentId = parent.ParticleId;
             }
 
-            // The child spawns at the parent particle and inherits its velocity, derived from the parent's
-            // Verlet step; the emit path encodes it back into Position/PositionPrevious after initializers.
-            ref var parent = ref parentParticles[parentIndex];
-            var parentStep = parent.Position - parent.PositionPrevious;
-            var parentFrameTime = parentData.CurrentFrameTime;
-            particle.Position = parent.Position;
-            particle.Velocity = parentFrameTime > 0f
-                ? (parentStep / parentFrameTime) * velocityScale
-                : parent.Velocity * velocityScale;
+            var parentPosition = parent.Position;
+            var parentPositionPrevious = parent.PositionPrevious;
 
-            // Subframe interpolation is not supported yet in this renderer.
-            _ = subFrame;
+            if (fractionalIncrement)
+            {
+                ref var nextParent = ref parentParticles[Math.Clamp((int)MathF.Ceiling(walkIndex), 0, lastIndex)];
+                var blend = walkIndex - MathF.Floor(walkIndex);
+                parentPosition = Vector3.Lerp(parentPosition, nextParent.Position, blend);
+                parentPositionPrevious = Vector3.Lerp(parentPositionPrevious, nextParent.PositionPrevious, blend);
+            }
+
+            var birthFraction = subFrame ? GetBirthFraction(particle, particles, particleSystemState) : 1f;
+
+            particle.Position = Vector3.Lerp(parentPositionPrevious, parentPosition, birthFraction);
+
+            var parentStep = parentPosition - parentPositionPrevious;
+            var parentFrameTime = parentData.CurrentFrameTime;
+            var parentVelocity = parentFrameTime > 0f
+                ? parentStep / parentFrameTime
+                : parent.Velocity;
+
+            particle.Velocity = parentVelocity * birthFraction * velocityScale;
 
             return particle;
         }
 
-        private int GetParentIndex(int parentCount, int particleId)
+        /// <summary>
+        /// Where inside the step being simulated the particle was born, as a fraction of it. A step of
+        /// no duration counts as fully elapsed unless the particle is stamped in the past.
+        /// </summary>
+        private static float GetBirthFraction(in Particle particle, ParticleCollection particles, ParticleSystemRenderState particleSystemState)
         {
-            if (parentCount <= 0)
+            var currentTime = particleSystemState.Age;
+            var previousTime = currentTime - particles.CurrentFrameTime;
+
+            if (previousTime == currentTime)
             {
-                return 0;
+                return particle.CreationTime >= currentTime ? 1f : 0f;
             }
 
+            return Math.Clamp((particle.CreationTime - previousTime) / (currentTime - previousTime), 0f, 1f);
+        }
+
+        /// <summary>
+        /// Advances the walk over the parent list and returns the index the new particle binds to. A
+        /// whole increment addresses one parent, a fractional one lands between two of them. The walk
+        /// restarts at the first parent once it passes the last, rather than folding back with a modulo.
+        /// A non-zero authored seed draws from a counter private to this initializer, leaving the
+        /// system's shared draw sequence untouched.
+        /// </summary>
+        private float NextParentIndex(int lastIndex, ParticleSystemRenderState particleSystemState)
+        {
             if (randomDistribution)
             {
-                var randomIndex = ParticleCollection.RandomBetween(particleId + randomSeed, 0, parentCount - 1);
-                return Math.Clamp((int)MathF.Floor(randomIndex), 0, parentCount - 1);
+                var sample = randomSeed != 0
+                    ? ParticleRandom.ForSample(particleSystemState.Random.Seed + randomSeed + randomCounter++)
+                    : particleSystemState.Random.Next();
+
+                currentParentIndex = fractionalIncrement
+                    ? sample * lastIndex
+                    : (int)(sample * (lastIndex + 1));
+            }
+            else if (currentParentIndex > lastIndex)
+            {
+                currentParentIndex = 0f;
             }
 
-            // Walk the parent list by the raw (possibly fractional) increment; the running
-            // index uses % which keeps the dividend's sign, so wrap explicitly.
-            var index = (int)MathF.Floor(particleId * increment);
-            return ((index % parentCount) + parentCount) % parentCount;
+            var index = currentParentIndex;
+            currentParentIndex += increment;
+
+            return index;
         }
     }
 }

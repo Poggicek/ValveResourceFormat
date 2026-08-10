@@ -31,6 +31,10 @@ namespace ValveResourceFormat.Renderer.Particles
                 case ParticleField.ScratchVector2:
                 case ParticleField.BoneIndices:
                 case ParticleField.BoneWeights:
+                case ParticleField.BoxMins:
+                case ParticleField.BoxMaxs:
+                case ParticleField.BoxAngles:
+                case ParticleField.RopeSegmentData:
                     return "vector";
                 case ParticleField.LifeDuration:
                 case ParticleField.Radius:
@@ -63,6 +67,10 @@ namespace ValveResourceFormat.Renderer.Particles
                 case ParticleField.NoneDisabled:
                 case ParticleField.ShaderExtraData1:
                 case ParticleField.ShaderExtraData2:
+                case ParticleField.BoxFlags:
+                case ParticleField.UserEventStates:
+                case ParticleField.ParentParticleId:
+                case ParticleField.RopeSegmentId:
                     return "float";
                 default:
                     return null;
@@ -83,14 +91,18 @@ namespace ValveResourceFormat.Renderer.Particles
                 ParticleField.CreationTime => particle.CreationTime,
                 ParticleField.LifeDuration => particle.Lifetime,
                 ParticleField.Yaw => particle.Rotation.X,
-                ParticleField.ParticleId => particle.ParticleID,
+                ParticleField.ParticleId => particle.ParticleId,
                 ParticleField.Pitch => particle.Rotation.Y,
                 ParticleField.Roll => particle.Rotation.Z,
                 ParticleField.RollSpeed => particle.RotationSpeed.Z,
-                ParticleField.SequenceNumber => particle.Sequence,
-                ParticleField.SecondSequenceNumber => particle.Sequence2,
+                ParticleField.SequenceNumber => particle.SequenceNumber,
+                ParticleField.SecondSequenceNumber => particle.SecondSequenceNumber,
                 ParticleField.ManualAnimationFrame => particle.ManualAnimationFrame,
                 ParticleField.ParentParticleIndex => particle.ParentParticleIndex,
+                ParticleField.ParentParticleId => particle.ParentParticleId,
+                ParticleField.RopeSegmentId => particle.RopeSegmentId,
+                ParticleField.UserEventStates => particle.UserEventStates,
+                ParticleField.BoxFlags => particle.BoxFlags,
                 ParticleField.ScratchFloat => particle.ScratchFloat0,
                 ParticleField.ScratchFloat1 => particle.ScratchFloat1,
                 ParticleField.ScratchFloat2 => particle.ScratchFloat2,
@@ -130,19 +142,31 @@ namespace ValveResourceFormat.Renderer.Particles
                     particle.Lifetime = value;
                     break;
                 case ParticleField.SequenceNumber:
-                    particle.Sequence = (int)value;
+                    particle.SequenceNumber = (int)value;
                     break;
                 case ParticleField.SecondSequenceNumber:
-                    particle.Sequence2 = (int)value;
+                    particle.SecondSequenceNumber = (int)value;
                     break;
                 case ParticleField.ManualAnimationFrame:
                     particle.ManualAnimationFrame = (int)value;
                     break;
                 case ParticleField.ParticleId:
-                    particle.ParticleID = (int)value;
+                    particle.ParticleId = (int)value;
                     break;
                 case ParticleField.ParentParticleIndex:
                     particle.ParentParticleIndex = (int)value;
+                    break;
+                case ParticleField.ParentParticleId:
+                    particle.ParentParticleId = (int)value;
+                    break;
+                case ParticleField.RopeSegmentId:
+                    particle.RopeSegmentId = (int)value;
+                    break;
+                case ParticleField.UserEventStates:
+                    particle.UserEventStates = (int)value;
+                    break;
+                case ParticleField.BoxFlags:
+                    particle.BoxFlags = value;
                     break;
                 case ParticleField.CreationTime:
                     particle.CreationTime = value;
@@ -168,11 +192,14 @@ namespace ValveResourceFormat.Renderer.Particles
         {
             return field switch
             {
-                ParticleField.SequenceNumber => particle.Sequence,
-                ParticleField.SecondSequenceNumber => particle.Sequence2,
+                ParticleField.SequenceNumber => particle.SequenceNumber,
+                ParticleField.SecondSequenceNumber => particle.SecondSequenceNumber,
                 ParticleField.ManualAnimationFrame => particle.ManualAnimationFrame,
                 ParticleField.ParentParticleIndex => particle.ParentParticleIndex,
-                ParticleField.ParticleId => particle.ParticleID, // dangerous to set, right?
+                ParticleField.ParentParticleId => particle.ParentParticleId,
+                ParticleField.RopeSegmentId => particle.RopeSegmentId,
+                ParticleField.UserEventStates => particle.UserEventStates,
+                ParticleField.ParticleId => particle.ParticleId,
                 _ => 0,
             };
         }
@@ -185,9 +212,13 @@ namespace ValveResourceFormat.Renderer.Particles
                 ParticleField.Position => particle.Position,
                 ParticleField.PositionPrevious => particle.PositionPrevious,
                 ParticleField.Color => particle.Color,
+                ParticleField.HitboxOffsetPosition => particle.HitboxOffsetPosition,
                 ParticleField.ScratchVector => particle.ScratchVector,
                 ParticleField.ScratchVector2 => particle.ScratchVector2,
                 ParticleField.Normal => particle.Normal,
+                ParticleField.BoxMins => particle.BoxMins,
+                ParticleField.BoxMaxs => particle.BoxMaxs,
+                ParticleField.BoxAngles => particle.BoxAngles,
                 _ => Vector3.Zero,
             };
         }
@@ -238,11 +269,23 @@ namespace ValveResourceFormat.Renderer.Particles
                 case ParticleField.PositionPrevious:
                     particle.PositionPrevious = value;
                     break;
+                case ParticleField.HitboxOffsetPosition:
+                    particle.HitboxOffsetPosition = value;
+                    break;
                 case ParticleField.ScratchVector:
                     particle.ScratchVector = value;
                     break;
                 case ParticleField.ScratchVector2:
                     particle.ScratchVector2 = value;
+                    break;
+                case ParticleField.BoxMins:
+                    particle.BoxMins = value;
+                    break;
+                case ParticleField.BoxMaxs:
+                    particle.BoxMaxs = value;
+                    break;
+                case ParticleField.BoxAngles:
+                    particle.BoxAngles = value;
                     break;
                 default:
                     break;
@@ -263,23 +306,34 @@ namespace ValveResourceFormat.Renderer.Particles
             return initialParticle.GetVector(field);
         }
 
+        /// <summary>
+        /// Rewrites a particle's spawn snapshot, which the endcap lerps do so that a fade starting
+        /// mid-life runs from where the particle currently is.
+        /// </summary>
+        public static void SetInitialScalar(this ref Particle particle, ParticleCollection particles, ParticleField field, float value)
+            => particles.Initial[particle.Index].SetScalar(field, value);
+
+        /// <inheritdoc cref="SetInitialScalar"/>
+        public static void SetInitialVector(this ref Particle particle, ParticleCollection particles, ParticleField field, Vector3 value)
+            => particles.Initial[particle.Index].SetVector(field, value);
+
         // Set methods, shared by a bunch of different operators and initializers.
         // The operator form: the particle has a spawn snapshot, so "initial" and "current" differ.
         public static float ModifyScalarBySetMethod(this ref Particle particle, ParticleCollection particles, ParticleField field, float value, ParticleSetMethod setMethod)
-            => ApplySetMethod(value, particle.GetInitialScalar(particles, field), particle.GetScalar(field), particle.Age, setMethod);
+            => ApplySetMethod(value, particle.GetInitialScalar(particles, field), particle.GetScalar(field), particles.CurrentFrameTime, setMethod);
 
         /// <summary>
         /// The initializer-time form. There is no spawn snapshot yet - the collection's initial array
         /// still holds the system's constant template - so the "initial value" an initializer scales or
         /// adds to is what earlier initializers in the same pass have already written to the particle.
         /// </summary>
-        public static float ModifyScalarBySetMethodAtSpawn(this ref Particle particle, ParticleField field, float value, ParticleSetMethod setMethod)
+        public static float ModifyScalarBySetMethodAtSpawn(this ref Particle particle, ParticleCollection particles, ParticleField field, float value, ParticleSetMethod setMethod)
         {
             var current = particle.GetScalar(field);
-            return ApplySetMethod(value, current, current, particle.Age, setMethod);
+            return ApplySetMethod(value, current, current, particles.CurrentFrameTime, setMethod);
         }
 
-        private static float ApplySetMethod(float value, float initialValue, float currentValue, float age, ParticleSetMethod setMethod)
+        private static float ApplySetMethod(float value, float initialValue, float currentValue, float deltaTime, ParticleSetMethod setMethod)
             => setMethod switch
             {
                 ParticleSetMethod.PARTICLE_SET_REPLACE_VALUE => value,
@@ -288,21 +342,21 @@ namespace ValveResourceFormat.Renderer.Particles
                 ParticleSetMethod.PARTICLE_SET_SCALE_CURRENT_VALUE => value * currentValue,
                 ParticleSetMethod.PARTICLE_SET_ADD_TO_CURRENT_VALUE => value + currentValue,
                 // new in DeskJob. Exponential, unlike other ramps
-                ParticleSetMethod.PARTICLE_SET_RAMP_CURRENT_VALUE => currentValue + (value * age),
+                ParticleSetMethod.PARTICLE_SET_RAMP_CURRENT_VALUE => currentValue + (value * deltaTime),
                 _ => throw new NotImplementedException($"Unknown particle set type {Enum.GetName(setMethod)}!"),
             };
 
         public static Vector3 ModifyVectorBySetMethod(this ref Particle particle, ParticleCollection particles, ParticleField field, Vector3 value, ParticleSetMethod setMethod)
-            => ApplySetMethod(value, particle.GetInitialVector(particles, field), particle.GetVector(field), particle.Age, setMethod);
+            => ApplySetMethod(value, particle.GetInitialVector(particles, field), particle.GetVector(field), particles.CurrentFrameTime, setMethod);
 
         /// <inheritdoc cref="ModifyScalarBySetMethodAtSpawn"/>
-        public static Vector3 ModifyVectorBySetMethodAtSpawn(this ref Particle particle, ParticleField field, Vector3 value, ParticleSetMethod setMethod)
+        public static Vector3 ModifyVectorBySetMethodAtSpawn(this ref Particle particle, ParticleCollection particles, ParticleField field, Vector3 value, ParticleSetMethod setMethod)
         {
             var current = particle.GetVector(field);
-            return ApplySetMethod(value, current, current, particle.Age, setMethod);
+            return ApplySetMethod(value, current, current, particles.CurrentFrameTime, setMethod);
         }
 
-        private static Vector3 ApplySetMethod(Vector3 value, Vector3 initialValue, Vector3 currentValue, float age, ParticleSetMethod setMethod)
+        private static Vector3 ApplySetMethod(Vector3 value, Vector3 initialValue, Vector3 currentValue, float deltaTime, ParticleSetMethod setMethod)
             => setMethod switch
             {
                 ParticleSetMethod.PARTICLE_SET_REPLACE_VALUE => value,
@@ -311,7 +365,7 @@ namespace ValveResourceFormat.Renderer.Particles
                 ParticleSetMethod.PARTICLE_SET_SCALE_CURRENT_VALUE => value * currentValue,
                 ParticleSetMethod.PARTICLE_SET_ADD_TO_CURRENT_VALUE => value + currentValue,
                 // new in DeskJob
-                ParticleSetMethod.PARTICLE_SET_RAMP_CURRENT_VALUE => currentValue + (value * age),
+                ParticleSetMethod.PARTICLE_SET_RAMP_CURRENT_VALUE => currentValue + (value * deltaTime),
                 _ => throw new NotImplementedException($"Unknown particle set type {Enum.GetName(setMethod)}!"),
             };
 

@@ -59,8 +59,8 @@ namespace ValveResourceFormat.Renderer.Particles
             Ceil,
         }
 
-        private readonly PfMapType MapType;
-        private readonly PfInputMode InputMode = PfInputMode.Clamped;
+        private readonly PfMapType mapType;
+        private readonly PfInputMode inputMode = PfInputMode.Clamped;
         private readonly PfRoundType roundType = PfRoundType.Nearest;
 
         private readonly float multFactor;
@@ -75,18 +75,18 @@ namespace ValveResourceFormat.Renderer.Particles
         private readonly float notchedOutputOutside;
         private readonly float notchedOutputInside;
 
-        //private readonly ParticleFloatBiasType biasType;
-        //private readonly float biasParameter;
+        private readonly ParticleFloatBiasType biasType;
+        private readonly float biasParameter;
 
         private readonly PiecewiseCurve? curve;
 
 
         public AttributeMapping(ParticleDefinitionParser parse)
         {
-            MapType = parse.EnumNormalized<PfMapType>("m_nMapType");
-            InputMode = parse.EnumNormalized<PfInputMode>("m_nInputMode", InputMode);
+            mapType = parse.EnumNormalized<PfMapType>("m_nMapType");
+            inputMode = parse.EnumNormalized<PfInputMode>("m_nInputMode", inputMode);
 
-            switch (MapType)
+            switch (mapType)
             {
                 case PfMapType.Direct:
                     break;
@@ -96,7 +96,6 @@ namespace ValveResourceFormat.Renderer.Particles
                     break;
 
                 case PfMapType.Remap:
-                case PfMapType.RemapBiased:
                     input0 = parse.Float("m_flInput0");
                     input1 = parse.Float("m_flInput1");
                     output0 = parse.Float("m_flOutput0");
@@ -112,9 +111,18 @@ namespace ValveResourceFormat.Renderer.Particles
 
                     break;
 
+                case PfMapType.RemapBiased:
+                    input0 = parse.Float("m_flInput0");
+                    input1 = parse.Float("m_flInput1");
+                    output0 = parse.Float("m_flOutput0");
+                    output1 = parse.Float("m_flOutput1");
+                    biasType = parse.Enum<ParticleFloatBiasType>("m_nBiasType");
+                    biasParameter = parse.Float("m_flBiasParameter");
+                    break;
+
                 case PfMapType.Curve:
                     var curveData = parse.Data.GetSubCollection("m_Curve");
-                    curve = new PiecewiseCurve(curveData, InputMode == PfInputMode.Looped);
+                    curve = new PiecewiseCurve(curveData, inputMode == PfInputMode.Looped);
                     break;
 
                 case PfMapType.Notched:
@@ -132,25 +140,17 @@ namespace ValveResourceFormat.Renderer.Particles
                     break;
 
             }
-
-#if false // TODO: implement
-            if (MapType == PfMapType.RemapBiased)
-            {
-                biasType = parse.Enum<ParticleFloatBiasType>("m_nBiasType");
-                biasParameter = parse.Float("m_flBiasParameter");
-            }
-#endif
         }
 
         public float ApplyMapping(float value)
         {
-            switch (MapType)
+            switch (mapType)
             {
                 case PfMapType.Mult:
                     return value * multFactor;
 
                 case PfMapType.Remap:
-                    var valueIn = InputMode switch
+                    var valueIn = inputMode switch
                     {
                         PfInputMode.Clamped => Math.Clamp(value, input0, input1),
                         PfInputMode.Looped => value % (input1 - input0),
@@ -162,13 +162,18 @@ namespace ValveResourceFormat.Renderer.Particles
                 case PfMapType.RemapBiased:
                     var remappedTo0_1RangeBiased = MathUtils.Remap(value, input0, input1);
 
-                    remappedTo0_1RangeBiased = InputMode == PfInputMode.Looped
+                    remappedTo0_1RangeBiased = inputMode == PfInputMode.Looped
                         ? MathUtils.Fract(remappedTo0_1RangeBiased)
-                        : MathUtils.Saturate(remappedTo0_1RangeBiased);
+                        : MathF.Min(remappedTo0_1RangeBiased, 1f);
 
-                    // TODO: Insert bias processing here. Shared with randombiased mode in INumberProvider
+                    var biased = NumericBias.FromBiasParameter(remappedTo0_1RangeBiased, biasParameter, biasType);
 
-                    return float.Lerp(output0, output1, remappedTo0_1RangeBiased);
+                    // The lower end of the input range is never clamped; the output range is what bounds
+                    // the result, and the bias curve is free to run past either end on the way there
+                    return Math.Clamp(
+                        float.Lerp(output0, output1, biased),
+                        MathF.Min(output0, output1),
+                        MathF.Max(output0, output1));
 
                 case PfMapType.Curve:
                     return curve!.Evaluate(value);

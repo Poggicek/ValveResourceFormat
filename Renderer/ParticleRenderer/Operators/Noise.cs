@@ -1,3 +1,5 @@
+using ValveResourceFormat.Renderer.Particles.Utils;
+
 namespace ValveResourceFormat.Renderer.Particles.Operators
 {
     /// <summary>
@@ -9,15 +11,15 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
     {
         private readonly INumberProvider outputMin = new LiteralNumberProvider(0);
         private readonly INumberProvider outputMax = new LiteralNumberProvider(1);
-        private readonly ParticleField OutputField = ParticleField.Radius;
-        private readonly bool Additive;
+        private readonly ParticleField outputField = ParticleField.Radius;
+        private readonly bool additive;
 
         public Noise(ParticleDefinitionParser parse) : base(parse)
         {
-            OutputField = parse.ParticleField("m_nFieldOutput", OutputField);
+            outputField = parse.ParticleField("m_nFieldOutput", outputField);
             outputMin = parse.NumberProvider("m_flOutputMin", outputMin);
             outputMax = parse.NumberProvider("m_flOutputMax", outputMax);
-            Additive = parse.Boolean("m_bAdditive", false);
+            additive = parse.Boolean("m_bAdditive", false);
         }
 
         public override void Operate(ParticleCollection particles, float frameTime, ParticleSystemRenderState particleSystemState, float strength)
@@ -25,7 +27,7 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
             var min = outputMin.NextNumber(particleSystemState);
             var max = outputMax.NextNumber(particleSystemState);
 
-            if (OutputField.IsAngleField())
+            if (outputField.IsAngleField())
             {
                 min = float.DegreesToRadians(min);
                 max = float.DegreesToRadians(max);
@@ -35,23 +37,23 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
             var valueScale = 0.5f * (max - min);
             var valueBase = min + valueScale;
 
-            if (Additive)
+            if (additive)
             {
                 valueScale *= frameTime;
                 valueBase *= frameTime;
             }
 
-            var setMethod = Additive ? ParticleSetMethod.PARTICLE_SET_ADD_TO_CURRENT_VALUE : ParticleSetMethod.PARTICLE_SET_REPLACE_VALUE;
+            var setMethod = additive ? ParticleSetMethod.PARTICLE_SET_ADD_TO_CURRENT_VALUE : ParticleSetMethod.PARTICLE_SET_REPLACE_VALUE;
 
             foreach (ref var particle in particles.Current)
             {
                 // Spatial noise is approximated here with per-particle randomness.
-                var noiseValue = ParticleCollection.RandomBetween(particle.ParticleID, -1f, 1f);
+                var noiseValue = ParticleRandom.ForSampleBetween(particle.ParticleId, -1f, 1f);
 
                 var finalValue = valueBase + valueScale * noiseValue;
-                finalValue = particle.ModifyScalarBySetMethod(particles, OutputField, finalValue, setMethod);
+                finalValue = particle.ModifyScalarBySetMethod(particles, outputField, finalValue, setMethod);
 
-                particle.SetScalar(OutputField, finalValue);
+                particle.SetScalar(outputField, finalValue);
             }
         }
     }

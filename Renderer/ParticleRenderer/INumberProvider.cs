@@ -51,6 +51,9 @@ namespace ValveResourceFormat.Renderer.Particles
     // Random Uniform/Random Biased
     class RandomNumberProvider : INumberProvider
     {
+        /// <summary>Displacement between the value draw and the draw that decides the sign.</summary>
+        private const int SignFlipOffset = 37;
+
         private readonly float minRange;
         private readonly float maxRange;
         private readonly ParticleFloatRandomMode randomMode;
@@ -61,17 +64,14 @@ namespace ValveResourceFormat.Renderer.Particles
 
         private readonly bool hasRandomSignFlip;
 
+        private readonly int sampleOffset;
+
         public RandomNumberProvider(ParticleDefinitionParser parse, bool isBiased = false)
         {
             minRange = parse.Float("m_flRandomMin");
             maxRange = parse.Float("m_flRandomMax");
             hasRandomSignFlip = parse.Boolean("m_bHasRandomSignFlip", hasRandomSignFlip);
-
-            // Should it be checking behavior version?
-            if (parse.Data.GetStringProperty("m_nType") != parse.Data.GetStringProperty("m_nRandomMode"))
-            {
-                randomMode = parse.Enum<ParticleFloatRandomMode>("m_nRandomMode", randomMode);
-            }
+            randomMode = parse.Enum<ParticleFloatRandomMode>("m_nRandomMode", randomMode);
 
             this.isBiased = isBiased;
 
@@ -80,23 +80,40 @@ namespace ValveResourceFormat.Renderer.Particles
                 biasParam = parse.Float("m_flBiasParameter");
                 biasType = parse.Enum<ParticleFloatBiasType>("m_nBiasType", biasType);
             }
+
+            // Only an input that is constant per particle needs its own slot; a varying one draws from
+            // the running counter and is already separated from its siblings.
+            if (randomMode == ParticleFloatRandomMode.PF_RANDOM_MODE_CONSTANT)
+            {
+                sampleOffset = parse.NextInputOrdinal();
+            }
         }
 
         public float NextNumber(ref Particle particle, ParticleSystemRenderState renderState)
         {
-            var random = Random.Shared.NextSingle();
+            var varying = randomMode == ParticleFloatRandomMode.PF_RANDOM_MODE_VARYING;
 
-            // currently does nothing as it's unclear how it's done
+            var random = varying
+                ? renderState.Random.Next()
+                : renderState.Random.ForParticle(particle.ParticleId, sampleOffset);
+
             if (isBiased)
             {
-                random = NumericBias.ApplyBias(random, biasParam, biasType);
+                random = NumericBias.FromBiasParameter(random, biasParam, biasType);
             }
 
             var value = float.Lerp(minRange, maxRange, random);
 
-            if (hasRandomSignFlip && Random.Shared.Next(0, 2) == 0) // 50% chance to flip sign
+            if (hasRandomSignFlip)
             {
-                value *= -1f;
+                var sign = varying
+                    ? renderState.Random.Next()
+                    : renderState.Random.ForParticle(particle.ParticleId, sampleOffset + SignFlipOffset);
+
+                if (sign < 0.5f)
+                {
+                    value = -value;
+                }
             }
 
             return value;
@@ -109,6 +126,14 @@ namespace ValveResourceFormat.Renderer.Particles
         private readonly AttributeMapping attributeMapping;
         public CollectionAgeNumberProvider(ParticleDefinitionParser parse) { attributeMapping = new AttributeMapping(parse); }
         public float NextNumber(ref Particle particle, ParticleSystemRenderState renderState) => attributeMapping.ApplyMapping(renderState.Age);
+    }
+
+    // How long the endcap has been running, 0 outside it
+    class EndCapAgeNumberProvider : INumberProvider
+    {
+        private readonly AttributeMapping attributeMapping;
+        public EndCapAgeNumberProvider(ParticleDefinitionParser parse) { attributeMapping = new AttributeMapping(parse); }
+        public float NextNumber(ref Particle particle, ParticleSystemRenderState renderState) => attributeMapping.ApplyMapping(renderState.EndCapAge);
     }
 
     class DetailLevelNumberProvider : INumberProvider
@@ -135,7 +160,7 @@ namespace ValveResourceFormat.Renderer.Particles
 
         public float NextNumber(ref Particle particle, ParticleSystemRenderState renderState)
         {
-            return tiers[Math.Clamp(renderState.DetailLevel, 0, 3)];
+            return tiers[Math.Clamp((int)renderState.DetailLevel, 0, tiers.Length - 1)];
         }
     }
 
@@ -204,7 +229,7 @@ namespace ValveResourceFormat.Renderer.Particles
     {
         private readonly AttributeMapping attributeMapping;
         public PerParticleCountNumberProvider(ParticleDefinitionParser parse) { attributeMapping = new AttributeMapping(parse); }
-        public float NextNumber(ref Particle particle, ParticleSystemRenderState renderState) => attributeMapping.ApplyMapping(particle.ParticleID);
+        public float NextNumber(ref Particle particle, ParticleSystemRenderState renderState) => attributeMapping.ApplyMapping(particle.UniqueParticleId);
     }
 
     // Particle Count Percent of Total Count (0-1)
@@ -215,7 +240,7 @@ namespace ValveResourceFormat.Renderer.Particles
         public float NextNumber(ref Particle particle, ParticleSystemRenderState renderState)
         {
             // Mapping input ranges for this provider type are authored in normalized 0-1 space.
-            // Index is the slot in the alive list; ParticleID is a lifetime spawn counter and would exceed the count.
+            // Index is the slot in the alive list; UniqueParticleId is a lifetime spawn counter and would exceed the count.
             return attributeMapping.ApplyMapping(particle.Index / (float)Math.Max(renderState.ParticleCount, 1));
         }
     }
@@ -263,9 +288,5 @@ namespace ValveResourceFormat.Renderer.Particles
 
     /* Unaccounted for params:
      * m_NamedValue
-     * m_flRandomMin
-     * m_flRandomMax
-     * m_bHasRandomSignFlip
-     * m_nRandomMode
      */
 }

@@ -1,3 +1,5 @@
+using ValveResourceFormat.Renderer.Particles.Utils;
+
 namespace ValveResourceFormat.Renderer.Particles.Operators
 {
     /// <summary>
@@ -40,13 +42,17 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
             transformInput = parse.TransformInput("m_TransformInput", transformInput);
             startTimeMin = parse.Float("m_flStartTime_min", startTimeMin);
             startTimeMax = parse.Float("m_flStartTime_max", startTimeMax);
-            startTimeExp = parse.Float("m_flStartTime_exp", startTimeExp);
+            startTimeExp = Math.Clamp(parse.Float("m_flStartTime_exp", startTimeExp), -255f, 255f);
             endTimeMin = parse.Float("m_flEndTime_min", endTimeMin);
             endTimeMax = parse.Float("m_flEndTime_max", endTimeMax);
-            endTimeExp = parse.Float("m_flEndTime_exp", endTimeExp);
+            endTimeExp = Math.Clamp(parse.Float("m_flEndTime_exp", endTimeExp), -255f, 255f);
             fadeRange = parse.Float("m_flRange", fadeRange);
             rangeBias = parse.NumberProvider("m_flRangeBias", rangeBias);
+
+            // The threshold is authored as a distance and squared once at load, so the per-frame
+            // test can compare against a squared delta
             instantJumpThreshold = parse.Float("m_flJumpThreshold", instantJumpThreshold);
+            instantJumpThreshold *= instantJumpThreshold;
             prevPosScale = parse.Float("m_flPrevPosScale", prevPosScale);
             lockRotation = parse.Boolean("m_bLockRot", lockRotation);
             componentScale = parse.VectorProvider("m_vecScale", componentScale);
@@ -59,7 +65,8 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
             // The transform delta must be computed once per frame, not per particle,
             // otherwise only the first particle ever observes the transform moving
             var transform = transformInput.NextTransform(particleSystemState);
-            var transformPosition = Vector3.Multiply(transform.Translation, componentScale.NextVector(particleSystemState));
+            var transformPosition = transform.Translation;
+            var scale = componentScale.NextVector(particleSystemState);
 
             if (previousTransformPosition.X == float.MaxValue)
             {
@@ -82,7 +89,7 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
 
             // A jump beyond the threshold teleports particles with the transform at full strength;
             // the squared delta is tested against the raw threshold value
-            var instantJump = delta.LengthSquared() > instantJumpThreshold;
+            var instantJump = instantJumpThreshold != 0f && delta.LengthSquared() > instantJumpThreshold;
 
             if (delta == Vector3.Zero && !lockRotation)
             {
@@ -92,25 +99,30 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
             // A start fadeout of 1 (the default) means the lock never fades and is applied every frame
             var alwaysLocked = startTimeMin >= 1f;
 
+            // The range bias is a collection-scope input, evaluated once for the whole frame
+            var bias = rangeBias.NextNumber(particleSystemState);
+
             foreach (ref var particle in particles.Current)
             {
-                var lockStrength = strength;
+                var timeFade = 1f;
 
                 if (!alwaysLocked)
                 {
-                    var startTime = ParticleCollection.RandomWithExponentBetween(particle.ParticleID, startTimeExp, startTimeMin, startTimeMax);
-                    var endTime = ParticleCollection.RandomWithExponentBetween(particle.ParticleID, endTimeExp, endTimeMin, endTimeMax);
+                    var startTime = ParticleRandom.ForSampleWithExponentBetween(particle.ParticleId, startTimeExp, startTimeMin, startTimeMax);
+                    var endTime = ParticleRandom.ForSampleWithExponentBetween(particle.ParticleId, endTimeExp, endTimeMin, endTimeMax);
 
                     // Fully locked until startTime, fading the lock out until endTime, using normalized lifetime
-                    lockStrength *= particle.NormalizedAge <= startTime
+                    timeFade = particle.NormalizedAge <= startTime
                         ? 1f
                         : 1f - MathUtils.Saturate(MathUtils.Remap(particle.NormalizedAge, startTime, endTime));
+
+                    if (instantJump)
+                    {
+                        timeFade = 1f;
+                    }
                 }
 
-                if (instantJump)
-                {
-                    lockStrength = strength;
-                }
+                var lockStrength = strength * timeFade;
 
                 if (lockStrength <= 0f)
                 {
@@ -119,15 +131,27 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
 
                 var currentPosition = particle.GetVector(outputField);
 
+                // A particle born partway through the step only travelled with the transform for the
+                // part of the step it existed for
+                var creationFraction = frameTime > 0f
+                    ? MathF.Min(particle.Age, frameTime) / frameTime
+                    : 1f;
+
+                var scaledDelta = delta * scale * (creationFraction * lockStrength);
+
+                // The always-locked loop weights the rotation by operator strength where the fading one
+                // weights it by the time fade alone
+                var rotationLockStrength = alwaysLocked ? strength : timeFade;
+
                 if (fadeRange > 0f)
                 {
-                    var distance = Vector3.Distance(transformPosition, currentPosition);
+                    // Distance is measured against the position the particle is about to occupy
+                    var distance = Vector3.Distance(transformPosition, currentPosition + scaledDelta);
                     var normalizedDistance = MathUtils.Saturate(distance / fadeRange);
-                    var bias = rangeBias.NextNumber(ref particle, particleSystemState);
-                    var remapped = bias <= 0f
-                        ? normalizedDistance
-                        : MathF.Pow(normalizedDistance, 1f / MathF.Max(0.0001f, bias));
-                    lockStrength *= 1f - remapped;
+                    var fade = NumericBias.Standard(normalizedDistance, bias);
+
+                    scaledDelta *= 1f - fade;
+                    rotationLockStrength = 1f - (fade * rotationLockStrength);
                 }
 
                 if (lockRotation)
@@ -137,15 +161,17 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
                     var rotatedPosition = Vector3.Transform(currentPosition, rotationLock);
                     var rotatedPrevious = Vector3.Transform(currentPrevious, rotationLock);
 
-                    particle.SetVector(outputFieldPrev, currentPrevious + (rotatedPrevious - currentPrevious) * (lockStrength * prevPosScale));
-                    particle.SetVector(outputField, currentPosition + (rotatedPosition - currentPosition) * lockStrength);
+                    var rotationStrength = rotationLockStrength * creationFraction;
+
+                    particle.SetVector(outputFieldPrev, currentPrevious + (rotatedPrevious - currentPrevious) * (rotationStrength * prevPosScale));
+                    particle.SetVector(outputField, currentPosition + (rotatedPosition - currentPosition) * rotationStrength);
                     particle.Normal = transformInput.GetOrientation(ref particle, particleSystemState);
                 }
                 else
                 {
                     // Translate the particle with the transform, preserving its offset from it
-                    particle.SetVector(outputFieldPrev, particle.GetVector(outputFieldPrev) + delta * (lockStrength * prevPosScale));
-                    particle.SetVector(outputField, currentPosition + delta * lockStrength);
+                    particle.SetVector(outputFieldPrev, particle.GetVector(outputFieldPrev) + (scaledDelta * prevPosScale));
+                    particle.SetVector(outputField, currentPosition + scaledDelta);
                 }
             }
         }

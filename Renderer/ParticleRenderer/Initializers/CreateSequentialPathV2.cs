@@ -5,16 +5,19 @@ namespace ValveResourceFormat.Renderer.Particles.Initializers
     /// <summary>
     /// Places successive particles along a Bezier path using one global parameter over the whole
     /// control point span, supporting reversed spans, exact endpoint landing, and closed-loop seam
-    /// deduplication. The running position carries over between emissions. Saving the path offset to
-    /// the hitbox offset field is not supported.
+    /// deduplication. The running position carries over between emissions.
     /// </summary>
     /// <seealso href="https://s2v.app/SchemaExplorer/cs2/particles/C_INIT_CreateSequentialPathV2">C_INIT_CreateSequentialPathV2</seealso>
     class CreateSequentialPathV2 : ParticleFunctionInitializer
     {
+        /// <summary>Distance from a span endpoint within which the running parameter snaps to it.</summary>
+        private const float PathParameterEpsilon = 1e-5f;
+
         private readonly INumberProvider maxDistance = new LiteralNumberProvider(0f);
         private readonly INumberProvider numToAssign = new LiteralNumberProvider(100f);
         private readonly bool loop = true;
         private readonly bool cpPairs;
+        private readonly bool saveOffset;
         private readonly ParticlePathParameters pathParams;
 
         private readonly int spanLength;
@@ -30,6 +33,7 @@ namespace ValveResourceFormat.Renderer.Particles.Initializers
             numToAssign = parse.NumberProvider("m_flNumToAssign", numToAssign);
             loop = parse.Boolean("m_bLoop", loop);
             cpPairs = parse.Boolean("m_bCPPairs", cpPairs);
+            saveOffset = parse.Boolean("m_bSaveOffset", saveOffset);
             pathParams = new ParticlePathParameters(parse);
 
             spanDirection = pathParams.EndControlPointNumber >= pathParams.StartControlPointNumber ? 1 : -1;
@@ -110,23 +114,29 @@ namespace ValveResourceFormat.Renderer.Particles.Initializers
 
             var position = ParticlePath.Evaluate(start, mid, end, t);
 
+            if (saveOffset)
+            {
+                particle.HitboxOffsetPosition = new Vector3(t, segmentStart, segmentEnd);
+            }
+
             var jitter = maxDistance.NextNumber(ref particle, particleSystemState);
-            position += ParticleCollection.RandomBetweenPerComponent(particle.ParticleID, new Vector3(-jitter), new Vector3(jitter));
+            position += particleSystemState.Random.NextBetweenPerComponent(new Vector3(-jitter), new Vector3(jitter));
 
             particle.Position = position;
+            particle.PositionPrevious = position;
 
             var previousParameter = pathParameter;
             pathParameter += parameterStep;
             var advanced = pathParameter;
 
-            if (parameterStep > 1e-5f)
+            if (parameterStep > 0f)
             {
-                if (MathF.Abs(advanced - spanLength) < 1e-5f)
+                if (MathF.Abs(advanced - spanLength) < PathParameterEpsilon)
                 {
                     advanced = spanLength;
                     pathParameter = advanced;
                 }
-                else if (MathF.Abs(advanced) < 1e-5f)
+                else if (MathF.Abs(advanced) < PathParameterEpsilon)
                 {
                     advanced = 0f;
                     pathParameter = 0f;

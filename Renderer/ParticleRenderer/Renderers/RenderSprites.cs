@@ -1,6 +1,7 @@
 using System.Buffers;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Serialization.KeyValues;
+using ValveResourceFormat.Renderer.Particles.Utils;
 
 namespace ValveResourceFormat.Renderer.Particles.Renderers
 {
@@ -44,7 +45,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         }
 
         private readonly Shader shader;
-        private readonly RendererContext RendererContext;
+        private readonly RendererContext rendererContext;
         private readonly int vaoHandle;
         private readonly TextureLayer[] layers;
 
@@ -54,6 +55,10 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         private readonly INumberProvider maxSize = new LiteralNumberProvider(5000f);
         private readonly INumberProvider startFadeSize = new LiteralNumberProvider(100000000f);
         private readonly INumberProvider endFadeSize = new LiteralNumberProvider(200000000f);
+        /// <summary>
+        /// Selects the signed distance field alpha treatment, which drives soft edges and outlines.
+        /// It has no bearing on the size clamp or the distance fade.
+        /// </summary>
         private readonly bool distanceAlpha;
 
         // m_flStartFadeDot/m_flEndFadeDot: the normal-aligned modes fade out as the card turns edge-on to
@@ -61,37 +66,17 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         private readonly float startFadeDot = 1f;
         private readonly float endFadeDot = 2f;
 
-        // m_flCenterXOffset/m_flCenterYOffset shift the quad within its own corner space, before the
-        // radius scale, so the card pivots about a point other than its middle.
-        private readonly INumberProvider centerXOffset = new LiteralNumberProvider(0f);
-        private readonly INumberProvider centerYOffset = new LiteralNumberProvider(0f);
-        // Both default on: shipped content only ever writes them as false, which is how the compiled KV
-        // reveals a default it omits.
-        private readonly bool gammaCorrectVertexColors = true;
-        private readonly bool saturateColorPreAlphaBlend = true;
 
         // m_bBlendFramesSeq0 cross-fades consecutive sheet frames instead of stepping between them.
         // m_bMaxLuminanceBlendingSequence0 swaps the plain lerp for a luminance-weighted one, which keeps
         // the brighter of the two frames dominant through the cross-fade.
         private readonly bool blendFrames = true;
-        private readonly bool maxLuminanceFrameBlend;
 
-        private readonly INumberProvider radiusScale = new LiteralNumberProvider(1f);
-        private readonly INumberProvider alphaScale = new LiteralNumberProvider(1f);
-        private readonly IVectorProvider colorScale = new LiteralVectorProvider(Vector3.One);
 
         private readonly bool animateInFps;
         private readonly ParticleBlendMode blendMode = ParticleBlendMode.PARTICLE_OUTPUT_BLEND_MODE_ALPHA;
-        private readonly INumberProvider overbrightFactor = new LiteralNumberProvider(1);
         private readonly ParticleOrientation orientationType;
-        private readonly INumberProvider diffuseAmount = new LiteralNumberProvider(1);
-        private readonly INumberProvider selfIllumAmount = new LiteralNumberProvider(0);
-        private readonly INumberProvider alphaMapToZero = new LiteralNumberProvider(0);
-        private readonly INumberProvider alphaMapToOne = new LiteralNumberProvider(1);
 
-        private readonly INumberProvider desaturation = new LiteralNumberProvider(0);
-        // -1 means no control point, so no shift.
-        private readonly int hsvShiftControlPoint = -1;
 
         private readonly bool outline;
         private readonly Vector4 outlineColor = Vector4.One;
@@ -102,11 +87,11 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
         public RenderSprites(ParticleDefinitionParser parse, RendererContext rendererContext) : base(parse)
         {
-            RendererContext = rendererContext;
+            this.rendererContext = rendererContext;
 
             blendMode = parse.Enum<ParticleBlendMode>("m_nOutputBlendMode", blendMode);
 
-            shader = RendererContext.ShaderLoader.LoadShader(ShaderName);
+            shader = rendererContext.ShaderLoader.LoadShader(ShaderName);
 
             // The same quad is reused for all particles
             vaoHandle = SetupQuadBuffer();
@@ -191,7 +176,6 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 #endif
 
             animateInFps = parse.Boolean("m_bAnimateInFPS", animateInFps);
-            overbrightFactor = parse.NumberProvider("m_flOverbrightFactor", overbrightFactor);
             orientationType = parse.Enum("m_nOrientationType", orientationType);
             animationRate = parse.Float("m_flAnimationRate", animationRate);
             minSize = parse.NumberProvider("m_flMinSize", minSize);
@@ -202,21 +186,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             startFadeDot = parse.Float("m_flStartFadeDot", startFadeDot);
             endFadeDot = parse.Float("m_flEndFadeDot", endFadeDot);
             animationType = parse.Enum<ParticleAnimationType>("m_nAnimationType", animationType);
-            radiusScale = parse.NumberProvider("m_flRadiusScale", radiusScale);
-            alphaScale = parse.NumberProvider("m_flAlphaScale", alphaScale);
-            colorScale = parse.VectorProvider("m_vecColorScale", colorScale);
-            diffuseAmount = parse.NumberProvider("m_flDiffuseAmount", diffuseAmount);
-            selfIllumAmount = parse.NumberProvider("m_flSelfIllumAmount", selfIllumAmount);
-            alphaMapToZero = parse.NumberProvider("m_flSourceAlphaValueToMapToZero", alphaMapToZero);
-            alphaMapToOne = parse.NumberProvider("m_flSourceAlphaValueToMapToOne", alphaMapToOne);
-            centerXOffset = parse.NumberProvider("m_flCenterXOffset", centerXOffset);
-            centerYOffset = parse.NumberProvider("m_flCenterYOffset", centerYOffset);
-            gammaCorrectVertexColors = parse.Boolean("m_bGammaCorrectVertexColors", gammaCorrectVertexColors);
-            saturateColorPreAlphaBlend = parse.Boolean("m_bSaturateColorPreAlphaBlend", saturateColorPreAlphaBlend);
             blendFrames = parse.Boolean("m_bBlendFramesSeq0", blendFrames);
-            maxLuminanceFrameBlend = parse.Boolean("m_bMaxLuminanceBlendingSequence0", maxLuminanceFrameBlend);
-            desaturation = parse.NumberProvider("m_flDesaturation", desaturation);
-            hsvShiftControlPoint = parse.Int32("m_nHSVShiftControlPoint", hsvShiftControlPoint);
 
             outline = parse.Boolean("m_bOutline", outline);
 
@@ -253,7 +223,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             GL.CreateVertexArrays(1, out int vao);
             GL.CreateBuffers(1, out vertexBufferHandle);
             GL.VertexArrayVertexBuffer(vao, 0, vertexBufferHandle, 0, stride);
-            GL.VertexArrayElementBuffer(vao, RendererContext.MeshBufferCache.QuadIndices.GLHandle);
+            GL.VertexArrayElementBuffer(vao, rendererContext.MeshBufferCache.QuadIndices.GLHandle);
 
             // A driver is free to drop an attribute whose only use sits behind a uniform branch, in which
             // case GetAttribLocation reports -1 and binding it would raise a GL error.
@@ -295,7 +265,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 return [];
             }
 
-            var stops = new ParticleDefinitionParser(gradient, textureInput.Logger).Array("m_Stops");
+            var stops = textureInput.Nested(gradient).Array("m_Stops");
             var parsed = new (float Position, Color32 Color)[stops.Length];
 
             for (var i = 0; i < stops.Length; i++)
@@ -322,18 +292,14 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 return (Vector2.Zero, Vector2.One, Vector2.Zero, Vector2.One);
             }
 
-            var sequence = spriteSheetData.Sequences[particle.Sequence % spriteSheetData.Sequences.Length];
+            var sequence = spriteSheetData.Sequences[particle.SequenceNumber % spriteSheetData.Sequences.Length];
 
-            var frame = sequence.Frames.Length > 1
-                ? GetSheetFrame(ref particle, sequence.FramesPerSecond, animationRate, animationType, animateInFps)
-                : 0f;
-
-            var frameId = (int)MathF.Floor(frame);
-            frameBlend = frame - frameId;
+            var (frame, nextFrame, blend) = GetSheetFrame(ref particle, sequence, animationRate, animationType, animateInFps);
+            frameBlend = blend;
 
             // TODO: Support more than one image per frame?
-            var currentImage = sequence.Frames[ResolveSheetFrame(frameId, sequence.Frames.Length, sequence.Clamp)].Images[0];
-            var nextImage = sequence.Frames[ResolveSheetFrame(frameId + 1, sequence.Frames.Length, sequence.Clamp)].Images[0];
+            var currentImage = sequence.Frames[frame].Images[0];
+            var nextImage = sequence.Frames[nextFrame].Images[0];
 
             return (currentImage.UncroppedMin, currentImage.UncroppedMax, nextImage.UncroppedMin, nextImage.UncroppedMax);
         }
@@ -362,14 +328,22 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         // A quad orientation matrix from a base (right, up) pair with the particle roll folded in, matching the
         // spritecard vertex shader. The axes are intentionally not re-normalized (some modes rely on that, e.g.
         // SCREEN_Z foreshortens as the camera tilts). The face row is only the normal and does not affect corners.
-        private static Matrix4x4 QuadBasis(Vector3 baseRight, Vector3 baseUp, float roll)
+        private static Matrix4x4 QuadBasis(Vector3 baseRight, Vector3 baseUp, float roll, float yaw)
         {
             var c = MathF.Cos(roll);
             var s = MathF.Sin(roll);
             var right = (baseRight * c) + (baseUp * s);
             var up = (baseUp * c) - (baseRight * s);
+
+            // Yaw turns the card about its own up axis, foreshortening it horizontally to nothing at 90
+            // degrees. Only the right axis is turned, and the axis is normalized without touching up.
+            if (yaw != 0f && up.LengthSquared() > Epsilon.LengthSquared)
+            {
+                right = Vector3.Transform(right, Matrix4x4.CreateFromAxisAngle(Vector3.Normalize(up), yaw));
+            }
+
             var face = Vector3.Cross(right, up);
-            face = face.LengthSquared() > 1e-12f ? Vector3.Normalize(face) : Vector3.UnitZ;
+            face = face.LengthSquared() > Epsilon.LengthSquared ? Vector3.Normalize(face) : Vector3.UnitZ;
             return new Matrix4x4(
                 right.X, right.Y, right.Z, 0f,
                 up.X, up.Y, up.Z, 0f,
@@ -381,39 +355,46 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         private static Vector3 CameraForward(Matrix4x4 billboard)
             => -new Vector3(billboard.M31, billboard.M32, billboard.M33);
 
+        // SCREEN_ALIGNED: the plain camera billboard, built from the camera's own right and up axes. The
+        // particle's pitch never enters, so a normal-setting operator cannot tilt the card out of plane.
+        private static Matrix4x4 ScreenAlignedBasis(Matrix4x4 billboard, float roll, float yaw)
+            => QuadBasis(
+                new Vector3(billboard.M11, billboard.M12, billboard.M13),
+                new Vector3(billboard.M21, billboard.M22, billboard.M23), roll, yaw);
+
         // SCREEN_Z_ALIGNED: up locked to world +Z, right = cross(worldZ, forward) left un-normalized, so the
         // sprite yaws about vertical to face the camera and foreshortens as the view tilts off-horizontal.
-        private static Matrix4x4 ScreenZAlignedBasis(Matrix4x4 billboard, float roll)
-            => QuadBasis(Vector3.Cross(Vector3.UnitZ, CameraForward(billboard)), Vector3.UnitZ, roll);
+        private static Matrix4x4 ScreenZAlignedBasis(Matrix4x4 billboard, float roll, float yaw)
+            => QuadBasis(Vector3.Cross(Vector3.UnitZ, CameraForward(billboard)), Vector3.UnitZ, roll, yaw);
 
         // WORLD_Z_ALIGNED: the quad lies flat in the world XY plane (normal = +Z), rolling about vertical,
         // independent of the camera.
-        private static Matrix4x4 WorldZAlignedBasis(float roll)
-            => QuadBasis(new Vector3(0f, -1f, 0f), new Vector3(1f, 0f, 0f), roll);
+        private static Matrix4x4 WorldZAlignedBasis(float roll, float yaw)
+            => QuadBasis(new Vector3(0f, -1f, 0f), new Vector3(1f, 0f, 0f), roll, yaw);
 
         // ALIGN_TO_PARTICLE_NORMAL: quad plane perpendicular to the particle normal, with the shader's canonical
         // tangent frame. The reference axis is world -Y once the normal tilts at all off horizontal, and world
         // +Z only while it is nearly horizontal; either choice stays clear of the normal.
-        private static Matrix4x4 ParticleNormalBasis(Vector3 normal, float roll)
+        private static Matrix4x4 ParticleNormalBasis(Vector3 normal, float roll, float yaw)
         {
             var reference = MathF.Abs(normal.Z) > 0.1f ? new Vector3(0f, -1f, 0f) : new Vector3(0f, 0f, 1f);
             var up = Vector3.Normalize(Vector3.Cross(normal, reference));
             var right = Vector3.Cross(up, normal);
-            return QuadBasis(right, up, roll);
+            return QuadBasis(right, up, roll, yaw);
         }
 
         // SCREENALIGN_TO_PARTICLE_NORMAL: the quad's right edge follows the particle normal while it turns toward
         // the camera about that normal. Falls back to a billboard when the normal points at the camera.
-        private static Matrix4x4 ScreenAlignToNormalBasis(Matrix4x4 billboard, Vector3 normal, float roll)
+        private static Matrix4x4 ScreenAlignToNormalBasis(Matrix4x4 billboard, Vector3 normal, float roll, float yaw)
         {
             var n = Vector3.Normalize(normal);
             var w = Vector3.Cross(n, CameraForward(billboard));
-            if (w.LengthSquared() < 1e-8f)
+            if (w.LengthSquared() < Epsilon.LengthSquared)
             {
                 return billboard;
             }
 
-            return QuadBasis(n, Vector3.Normalize(w), roll);
+            return QuadBasis(n, Vector3.Normalize(w), roll, yaw);
         }
 
         /// <summary>Fills and uploads the quad buffer, returning the number of quads actually emitted.</summary>
@@ -430,16 +411,15 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             modelViewRotation = Quaternion.Inverse(modelViewRotation);
             var billboardMatrix = Matrix4x4.CreateFromQuaternion(modelViewRotation);
 
-            // All four bounds are a radius per unit of camera distance, and the whole group is gated
-            // on m_bDistanceAlpha.
+            // All four bounds are a radius per unit of camera distance
             var minSizeSlope = minSize.NextNumber(systemRenderState);
             var maxSizeSlope = maxSize.NextNumber(systemRenderState);
             var startFadeSlope = startFadeSize.NextNumber(systemRenderState);
             var endFadeSlope = endFadeSize.NextNumber(systemRenderState);
 
             var centerOffset = new Vector2(
-                centerXOffset.NextNumber(systemRenderState),
-                centerYOffset.NextNumber(systemRenderState));
+                CenterXOffset.NextNumber(systemRenderState),
+                CenterYOffset.NextNumber(systemRenderState));
 
 
             // Distance from the quad centre to its furthest corner, in half-widths, so a particle can be
@@ -463,7 +443,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 var i = 0;
                 foreach (ref var particle in particles.Current)
                 {
-                    var radiusScale = this.radiusScale.NextNumber(ref particle, systemRenderState);
+                    var radiusScale = RadiusScale.NextNumber(ref particle, systemRenderState);
 
                     // Scales rgb and alpha alike, matching the shader's fade of the whole vertex colour.
                     var colorFade = 1f;
@@ -475,41 +455,36 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                     {
                         var toCamera = camera.Location - particle.Position;
 
-                        if (toCamera.LengthSquared() > 1e-12f)
+                        if (toCamera.LengthSquared() > Epsilon.LengthSquared)
                         {
                             var facing = MathF.Abs(Vector3.Dot(Vector3.Normalize(particle.Normal), Vector3.Normalize(toCamera)));
                             alphaFade = 1f - MathUtils.Smoothstep(startFadeDot, endFadeDot, facing);
                         }
                     }
 
-                    if (distanceAlpha)
+                    var cameraDistance = Vector3.Distance(camera.Location, particle.Position);
+                    var radius = particle.Radius * radiusScale;
+                    var fadeStart = startFadeSlope * cameraDistance;
+                    var fadeEnd = endFadeSlope * cameraDistance;
+
+                    // The fade reads the raw radius, independently of the size clamp below
+                    if (radius > fadeStart)
                     {
-                        var cameraDistance = Vector3.Distance(camera.Location, particle.Position);
-                        var radius = particle.Radius * radiusScale;
-                        var fadeStart = startFadeSlope * cameraDistance;
-                        var fadeEnd = endFadeSlope * cameraDistance;
-
-                        if (radius > fadeStart)
+                        if (radius >= fadeEnd)
                         {
-                            if (radius >= fadeEnd)
-                            {
-                                // Faded out entirely; emitting the quad would only cost overdraw.
-                                continue;
-                            }
-
-                            colorFade = 1f - ((radius - fadeStart) / (fadeEnd - fadeStart));
+                            continue;
                         }
 
-                        if (particle.Radius > 0f)
-                        {
-                            // Expressed back as a scale, because the corner transform takes one. Nested
-                            // min/max rather than a clamp: an inverted range has to resolve to the maximum
-                            // the way the shader's does, not throw.
-                            radiusScale = MathF.Min(MathF.Max(radius, minSizeSlope * cameraDistance), maxSizeSlope * cameraDistance) / particle.Radius;
-                        }
+                        colorFade = 1f - ((radius - fadeStart) / (fadeEnd - fadeStart));
                     }
 
-                    var alphaScale = this.alphaScale.NextNumber(ref particle, systemRenderState);
+                    // Nested min/max rather than a clamp, so an inverted range resolves to the maximum
+                    if (particle.Radius > 0f)
+                    {
+                        radiusScale = MathF.Min(MathF.Max(radius, minSizeSlope * cameraDistance), maxSizeSlope * cameraDistance) / particle.Radius;
+                    }
+
+                    var alphaScale = AlphaScale.NextNumber(ref particle, systemRenderState);
                     var alpha = particle.Alpha * alphaScale * colorFade * alphaFade;
                     var halfWidth = particle.Radius * radiusScale;
 
@@ -540,17 +515,17 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                         }
                     }
 
-                    // Per-mode quad orientation, ported from the spritecard vertex shader (roll = Rotation.Z).
-                    // SCREEN_ALIGNED is the plain camera billboard; FULL_3AXIS_ROTATION has no shader variant and
-                    // uses the particle's full rotation basis.
+                    // Per-mode quad orientation, ported from the spritecard vertex shader. Every mode folds in
+                    // roll and yaw and none of them read pitch; only FULL_3AXIS_ROTATION uses the full basis.
                     var roll = particle.Rotation.Z;
+                    var yaw = particle.Rotation.X;
                     var modelMatrix = orientationType switch
                     {
-                        ParticleOrientation.PARTICLE_ORIENTATION_SCREEN_ALIGNED => particle.GetRotationMatrix() * billboardMatrix * particle.GetTransformationMatrix(radiusScale),
-                        ParticleOrientation.PARTICLE_ORIENTATION_SCREEN_Z_ALIGNED => ScreenZAlignedBasis(billboardMatrix, roll) * particle.GetTransformationMatrix(radiusScale),
-                        ParticleOrientation.PARTICLE_ORIENTATION_WORLD_Z_ALIGNED => WorldZAlignedBasis(roll) * particle.GetTransformationMatrix(radiusScale),
-                        ParticleOrientation.PARTICLE_ORIENTATION_ALIGN_TO_PARTICLE_NORMAL => ParticleNormalBasis(particle.Normal, roll) * particle.GetTransformationMatrix(radiusScale),
-                        ParticleOrientation.PARTICLE_ORIENTATION_SCREENALIGN_TO_PARTICLE_NORMAL => ScreenAlignToNormalBasis(billboardMatrix, particle.Normal, roll) * particle.GetTransformationMatrix(radiusScale),
+                        ParticleOrientation.PARTICLE_ORIENTATION_SCREEN_ALIGNED => ScreenAlignedBasis(billboardMatrix, roll, yaw) * particle.GetTransformationMatrix(radiusScale),
+                        ParticleOrientation.PARTICLE_ORIENTATION_SCREEN_Z_ALIGNED => ScreenZAlignedBasis(billboardMatrix, roll, yaw) * particle.GetTransformationMatrix(radiusScale),
+                        ParticleOrientation.PARTICLE_ORIENTATION_WORLD_Z_ALIGNED => WorldZAlignedBasis(roll, yaw) * particle.GetTransformationMatrix(radiusScale),
+                        ParticleOrientation.PARTICLE_ORIENTATION_ALIGN_TO_PARTICLE_NORMAL => ParticleNormalBasis(particle.Normal, roll, yaw) * particle.GetTransformationMatrix(radiusScale),
+                        ParticleOrientation.PARTICLE_ORIENTATION_SCREENALIGN_TO_PARTICLE_NORMAL => ScreenAlignToNormalBasis(billboardMatrix, particle.Normal, roll, yaw) * particle.GetTransformationMatrix(radiusScale),
                         _ => particle.GetRotationMatrix() * particle.GetTransformationMatrix(radiusScale),
                     };
 
@@ -635,7 +610,17 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             // stop depth writes here; otherwise sprites are opaque. The cable renderer instead draws opaque with depth writes.
             GL.Enable(EnableCap.Blend);
             GL.DepthMask(false);
-            GL.BlendFunc(BlendingFactor.One, BlendingFactor.OneMinusSrcAlpha);
+
+            // Modulate-2x scales what is behind it, so it needs its own state; everything else composites
+            // premultiplied, with the additive path having zeroed its own alpha in the shader.
+            if (blendMode == ParticleBlendMode.PARTICLE_OUTPUT_BLEND_MODE_MOD2X)
+            {
+                GL.BlendFunc(BlendingFactor.DstColor, BlendingFactor.SrcColor);
+            }
+            else
+            {
+                GL.BlendFunc(BlendingFactor.One, BlendingFactor.OneMinusSrcAlpha);
+            }
 
             GL.Disable(EnableCap.CullFace);
 
@@ -660,26 +645,8 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 shader.SetUniform1(LayerEffectModeUniforms[layer], (int)layers[layer].EffectMode);
             }
 
-            shader.SetUniform1("uOverbrightFactor", overbrightFactor.NextNumber(systemRenderState));
-            shader.SetUniform1("uColorFactor", diffuseAmount.NextNumber(systemRenderState) + selfIllumAmount.NextNumber(systemRenderState));
-            shader.SetUniform1("uDesaturation", desaturation.NextNumber(systemRenderState));
-
-            // The control point carries (hue offset, saturation scale, value scale). Identity when absent.
-            shader.SetUniform3("uHsvShift", hsvShiftControlPoint >= 0
-                ? systemRenderState.GetControlPoint(hsvShiftControlPoint).Position
-                : new Vector3(0f, 1f, 1f));
-
-            // A smoothstep over the source alpha, sent unconditionally: the engine's own defaults are
-            // (0, 1), which its x < y guard accepts, so the remap is live unless an effect inverts it.
-            shader.SetUniform2("uAlphaRemapRange", new Vector2(
-                alphaMapToZero.NextNumber(systemRenderState),
-                alphaMapToOne.NextNumber(systemRenderState)));
-
-            shader.SetUniform3("uColorScale", colorScale.NextVector(systemRenderState));
-            shader.SetUniform1("uGammaCorrectVertexColors", gammaCorrectVertexColors);
-            shader.SetUniform1("uSaturateColorPreAlphaBlend", saturateColorPreAlphaBlend);
+            SetSharedUniforms(shader, systemRenderState);
             shader.SetUniform1("uBlendFrames", blendFrames);
-            shader.SetUniform1("uMaxLuminanceFrameBlend", maxLuminanceFrameBlend);
             shader.SetUniform1("uOutline", outline);
             shader.SetUniform4("uOutlineColor", outlineColor);
             shader.SetUniform4("uOutlineRanges", outlineRanges);

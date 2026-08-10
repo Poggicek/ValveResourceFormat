@@ -7,39 +7,45 @@ namespace ValveResourceFormat.Renderer.Particles.PreEmissionOperators
     /// <seealso href="https://s2v.app/SchemaExplorer/cs2/particles/C_OP_SetSingleControlPointPosition">C_OP_SetSingleControlPointPosition</seealso>
     class SetSingleControlPointPosition : ParticleFunctionPreEmissionOperator
     {
-        private readonly int CP1 = 1;
-        private readonly IVectorProvider CP1Pos = new LiteralVectorProvider(new Vector3(128, 0, 0));
+        private readonly int cp1 = 1;
+        private readonly IVectorProvider cp1Pos = new LiteralVectorProvider(new Vector3(128, 0, 0));
 
-        private readonly bool SetOnce;
-        private readonly bool UseWorldLocation;
-        private readonly int CPOffset;
+        private readonly bool setOnce;
+        private readonly ITransformProvider transformInput = new ControlPointTransformProvider();
 
-        private bool HasRunBefore;
+        private bool hasRunBefore;
 
         public SetSingleControlPointPosition(ParticleDefinitionParser parse) : base(parse)
         {
-            CP1 = parse.Int32("m_nCP1", CP1);
-            CP1Pos = parse.VectorProvider("m_vecCP1Pos", CP1Pos);
-            SetOnce = parse.Boolean("m_bSetOnce", SetOnce);
-            UseWorldLocation = parse.Boolean("m_bUseWorldLocation", UseWorldLocation);
-            CPOffset = parse.Int32("m_nHeadLocation", CPOffset);
+            cp1 = parse.Int32("m_nCP1", cp1);
+            cp1Pos = parse.VectorProvider("m_vecCP1Pos", cp1Pos);
+            setOnce = parse.Boolean("m_bSetOnce", setOnce);
+
+            // Content predating the transform input places the position with these two keys instead, and
+            // both spellings still ship: 63 CS2 systems author the transform, a handful the older pair.
+            if (parse.Data.ContainsKey("m_bUseWorldLocation") || parse.Data.ContainsKey("m_nHeadLocation"))
+            {
+                transformInput = parse.Boolean("m_bUseWorldLocation", false)
+                    ? new IdentityTransformProvider()
+                    : new ControlPointTransformProvider(parse.Int32("m_nHeadLocation", 0), useOrientation: true);
+            }
+            else
+            {
+                transformInput = parse.TransformInput("m_transformInput", transformInput);
+            }
         }
 
         public override void Operate(ref ParticleSystemRenderState particleSystemState, float frameTime)
         {
-            if (!(SetOnce && HasRunBefore))
+            if (!(setOnce && hasRunBefore))
             {
-                var position = CP1Pos.NextVector(particleSystemState);
+                var position = cp1Pos.NextVector(particleSystemState);
 
-                if (!UseWorldLocation)
-                {
-                    // The position is an offset in the head control point's frame.
-                    position = ControlPointTransformProvider.TransformPosition(particleSystemState, CPOffset, position);
-                }
+                position = Vector3.Transform(position, transformInput.NextTransform(ref Particle.Default, particleSystemState));
 
-                particleSystemState.SetControlPointValue(CP1, position);
+                particleSystemState.SetControlPointValue(cp1, position);
 
-                HasRunBefore = true;
+                hasRunBefore = true;
             }
         }
     }

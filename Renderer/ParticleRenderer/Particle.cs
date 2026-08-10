@@ -12,8 +12,33 @@ namespace ValveResourceFormat.Renderer.Particles
         /// <summary>Gets a reference to the shared default particle instance.</summary>
         public static ref Particle Default => ref @default;
 
-        /// <summary>Gets or sets the unique particle ID, starting at 0 for each emission.</summary>
-        public int ParticleID { get; set; } // starts at 0
+        /// <summary>
+        /// Gets or sets <b>where this particle sits in the emission order</b>: the count of particles
+        /// the system spawned before it, from 0 over the system's lifetime. Use it to address a
+        /// particle by its place in the sequence, which is what grid and control point placement,
+        /// count remaps, sound ordering, cable chain order and snapshot row mapping all want.
+        /// Never index the random table with it: consecutive particles would read consecutive slots.
+        /// </summary>
+        /// <remarks>
+        /// The engine calls this <c>m_nUniqueParticleId</c>. Despite the name it is a plain counter,
+        /// and it is <b>not</b> the engine's particle id attribute, which is <see cref="ParticleId"/>.
+        /// </remarks>
+        public int UniqueParticleId { get; set; }
+
+        /// <summary>
+        /// Gets or sets <b>the particle's identity for deterministic randomness</b>: its
+        /// <see cref="UniqueParticleId"/> displaced by the owning system's
+        /// <see cref="Utils.ParticleRandom.Seed"/>. Every random draw that must stay
+        /// constant for a particle over its life is indexed from this, and the seed is what makes two
+        /// instances of one effect draw differently. Never use it to order particles: the seed makes
+        /// it an arbitrary large number, not a position.
+        /// </summary>
+        /// <remarks>
+        /// This is the engine's particle id <i>attribute</i>, the one <c>PF_TYPE_PARTICLE_ID</c>
+        /// reads, not its <c>m_nUniqueParticleId</c> counter, which is
+        /// <see cref="UniqueParticleId"/>.
+        /// </remarks>
+        public int ParticleId { get; set; }
 
         // Varying properties (read from initializers but then change afterwards)
         /// <summary>Gets or sets the current world-space position of the particle.</summary>
@@ -58,11 +83,13 @@ namespace ValveResourceFormat.Renderer.Particles
         public Vector3 Velocity { get; set; } = Vector3.Zero;
 
         /// <summary>
-        /// Gets or sets the normalized direction vector derived from the particle's yaw/pitch rotation.
+        /// Gets or sets the particle's normal, the engine's own attribute rather than anything derived
+        /// from <see cref="Rotation"/>. A zero write is ignored, and the value is stored as given: the
+        /// normal-aligned quad basis leaves its axes un-normalized, so a longer normal widens the card.
         /// </summary>
         public Vector3 Normal
         {
-            readonly get => Vector3.Transform(new Vector3(0, 0, 1), GetRotationMatrix());
+            readonly get => normal;
             set
             {
                 if (value == Vector3.Zero)
@@ -70,14 +97,11 @@ namespace ValveResourceFormat.Renderer.Particles
                     return;
                 }
 
-                var normal = Vector3.Normalize(value);
-
-                var yaw = MathF.Atan2(normal.X, normal.Z);
-                // The getter yields Y = -sin(pitch), so the pitch must be negated here for get/set round trips
-                var pitch = MathF.Asin(-Math.Clamp(normal.Y, -1f, 1f));
-                Rotation = new Vector3(yaw, pitch, Rotation.Z);
+                normal = value;
             }
         }
+
+        private Vector3 normal = new(0f, 0f, 1f);
 
         /// <summary>Gets the particle's age as a fraction of its lifetime. May exceed 1 if the particle outlives its lifetime.</summary>
         public readonly float NormalizedAge => Age / Math.Max(0.0001f, Lifetime); //Old version: 1 - (Lifetime / ConstantLifetime);
@@ -93,18 +117,57 @@ namespace ValveResourceFormat.Renderer.Particles
         /// </summary>
         public Vector3 ForceAccumulator { get; set; } = Vector3.Zero;
 
-        /// <summary>Gets or sets the sprite sheet sequence number.</summary>
-        public int Sequence { get; set; } = 0;
+        /// <summary>
+        /// Gets or sets which of the sprite sheet's animation sequences this particle plays. One sheet
+        /// can carry several separate animations, and the renderers index into them with this.
+        /// </summary>
+        public int SequenceNumber { get; set; } = 0;
 
         /// <summary>Gets or sets the manually selected animation frame index.</summary>
         public int ManualAnimationFrame { get; set; } = 0;
 
         // Varying properties that we don't really support but are here in case they're used across operators
-        /// <summary>Gets or sets a secondary sprite sheet sequence number.</summary>
-        public int Sequence2 { get; set; } = 0;
+        /// <summary>
+        /// Gets or sets the second sprite sheet sequence, which the engine's spritecard can sample
+        /// alongside <see cref="SequenceNumber"/>. Authored as <c>m_nConstantSequenceNumber1</c>, so the
+        /// engine's suffix is 1 where this is the second. No renderer reads it yet.
+        /// </summary>
+        public int SecondSequenceNumber { get; set; } = 0;
 
         /// <summary>Gets or sets the index of the particle's parent particle in a parent system.</summary>
         public int ParentParticleIndex { get; set; } = -1;
+
+        /// <summary>
+        /// Gets or sets the <see cref="ParticleId"/> of the parent particle this particle was created
+        /// from, or -1 when it has no parent. Unlike <see cref="ParentParticleIndex"/> this survives the
+        /// parent collection compacting around dead particles.
+        /// </summary>
+        public int ParentParticleId { get; set; } = -1;
+
+        /// <summary>Gets or sets the identifier of the rope segment this particle belongs to.</summary>
+        public int RopeSegmentId { get; set; } = 0;
+
+        /// <summary>Gets or sets the bit field of user events currently raised on this particle.</summary>
+        public int UserEventStates { get; set; } = 0;
+
+        /// <summary>Gets or sets the minimum corner of the particle's own bounding box.</summary>
+        public Vector3 BoxMins { get; set; } = Vector3.Zero;
+
+        /// <summary>Gets or sets the maximum corner of the particle's own bounding box.</summary>
+        public Vector3 BoxMaxs { get; set; } = Vector3.Zero;
+
+        /// <summary>Gets or sets the orientation of the particle's own bounding box.</summary>
+        public Vector3 BoxAngles { get; set; } = Vector3.Zero;
+
+        /// <summary>Gets or sets the flags describing how the particle's own bounding box is used.</summary>
+        public float BoxFlags { get; set; } = 0f;
+
+        /// <summary>
+        /// Gets or sets the per-segment payload carried alongside <see cref="RopeSegmentId"/>. Three
+        /// components, of which the engine's debug overlay prints X and Z as a segment position and
+        /// count, and <c>PF_TYPE_PARTICLE_ROPE_SEGMENT_NORMALIZED</c> reads Y.
+        /// </summary>
+        public Vector3 RopeSegmentData { get; set; } = Vector3.Zero;
 
         /// <summary>Gets or sets the alpha window threshold scratch value.</summary>
         public float AlphaWindowThreshold { get; set; } = 0f;
@@ -114,6 +177,12 @@ namespace ValveResourceFormat.Renderer.Particles
         public float ScratchFloat1 { get; set; } = 0f;
         /// <summary>Gets or sets the third general-purpose scratch float.</summary>
         public float ScratchFloat2 { get; set; } = 0f;
+        /// <summary>
+        /// Gets or sets the hitbox offset position attribute. The sequential path initializers store
+        /// (path parameter, segment start control point, segment end control point) here when saving
+        /// the path offset.
+        /// </summary>
+        public Vector3 HitboxOffsetPosition { get; set; } = Vector3.Zero;
         /// <summary>Gets or sets a general-purpose scratch vector.</summary>
         public Vector3 ScratchVector { get; set; } = Vector3.Zero;
         /// <summary>Gets or sets a second general-purpose scratch vector.</summary>
@@ -144,8 +213,8 @@ namespace ValveResourceFormat.Renderer.Particles
             Rotation = Rotation with { Z = float.DegreesToRadians(parse.Float("m_flConstantRotation", 0f)) };
             RotationSpeed = RotationSpeed with { Z = float.DegreesToRadians(parse.Float("m_flConstantRotationSpeed", 0f)) };
             Normal = parse.Vector3("m_ConstantNormal", Normal);
-            Sequence = parse.Int32("m_nConstantSequenceNumber", Sequence);
-            Sequence2 = parse.Int32("m_nConstantSequenceNumber1", Sequence2);
+            SequenceNumber = parse.Int32("m_nConstantSequenceNumber", SequenceNumber);
+            SecondSequenceNumber = parse.Int32("m_nConstantSequenceNumber1", SecondSequenceNumber);
         }
 
         /// <summary>

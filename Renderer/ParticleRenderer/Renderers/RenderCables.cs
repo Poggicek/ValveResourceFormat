@@ -4,6 +4,7 @@ using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.World;
 using ValveResourceFormat.Serialization.KeyValues;
+using ValveResourceFormat.Renderer.Particles.Utils;
 
 namespace ValveResourceFormat.Renderer.Particles.Renderers
 {
@@ -156,7 +157,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             var index = 0;
             foreach (ref var particle in particles.Current)
             {
-                chain[index++] = (particle.ParticleID, particle.Position, particle.Radius, particle.Color);
+                chain[index++] = (particle.UniqueParticleId, particle.Position, particle.Radius, particle.Color);
             }
 
             chain.Sort(ChainComparer);
@@ -273,7 +274,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             for (var i = 0; i < segmentCount; i++)
             {
                 var direction = positions[i + 1] - positions[i];
-                directions[i] = direction.LengthSquared() > 1e-8f ? Vector3.Normalize(direction) : Vector3.UnitX;
+                directions[i] = direction.LengthSquared() > Epsilon.LengthSquared ? Vector3.Normalize(direction) : Vector3.UnitX;
             }
 
             for (var i = 0; i < segmentCount; i++)

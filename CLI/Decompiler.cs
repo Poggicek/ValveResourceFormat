@@ -1292,6 +1292,9 @@ namespace CLI
                 var rawFileData = ArrayPool<byte>.Shared.Rent(totalLength);
                 ContentFile? contentFile = null;
 
+                // Must outlive DumpContentFile because content subfiles can be generated lazily from the resource.
+                Resource? resource = null;
+
                 try
                 {
                     package.ReadEntry(file, rawFileData);
@@ -1345,10 +1348,12 @@ namespace CLI
                         }
                         else
                         {
-                            using var resource = new Resource
+#pragma warning disable CA2000 // False positive, resource is disposed in the finally block
+                            resource = new Resource
                             {
                                 FileName = filePath,
                             };
+#pragma warning restore CA2000
                             resource.Read(memory);
 
                             if (GltfExportFormat != null && GltfModelExporter.CanExport(resource))
@@ -1399,6 +1404,7 @@ namespace CLI
                 finally
                 {
                     contentFile?.Dispose();
+                    resource?.Dispose();
                     ArrayPool<byte>.Shared.Return(rawFileData);
                 }
             }
