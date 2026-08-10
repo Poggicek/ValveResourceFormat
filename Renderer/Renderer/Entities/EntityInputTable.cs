@@ -29,8 +29,11 @@ internal static class EntityInputTable
 
         var handlers = new Dictionary<string, Action<BaseEntity, EntityInputData>>(StringComparer.OrdinalIgnoreCase);
 
-        // Instance methods here include the protected ones inherited from BaseEntity, so an entity keeps
-        // every input its bases declared without restating them.
+        // Instance methods here include the ones inherited from a base class, so an entity keeps every
+        // input its bases declared without restating them. Private ones are the exception: reflection
+        // returns a type's own private methods but never a base type's, so a handler a subclass must
+        // inherit has to be protected. Walking the base chain instead would mean reflecting on types the
+        // trimmer was never told to keep, which is what the annotation on T exists to avoid.
         foreach (var method in typeof(T).GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
         {
             var attribute = method.GetCustomAttribute<EntityInputAttribute>();
@@ -38,6 +41,14 @@ internal static class EntityInputTable
             if (attribute == null)
             {
                 continue;
+            }
+
+            // Caught here rather than discovered as an input that silently does nothing on a subclass
+            if (method.IsPrivate && !typeof(T).IsSealed)
+            {
+                throw new InvalidOperationException(
+                    $"'{typeof(T).Name}.{method.Name}' handles the '{attribute.Name}' input but is private, "
+                    + $"and '{typeof(T).Name}' can be derived from. A subclass would not inherit it: make it protected.");
             }
 
             var handler = method.CreateDelegate<Action<T, EntityInputData>>();

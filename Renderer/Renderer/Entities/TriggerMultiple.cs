@@ -78,17 +78,17 @@ public class TriggerMultiple : BaseTrigger
     /// <summary>Lets the trigger react to what enters it again.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Enable")]
-    private void InputEnable(EntityInputData data) => SetEnabled(true);
+    protected void InputEnable(EntityInputData data) => SetEnabled(true);
 
     /// <summary>Stops the trigger reacting, and closes whatever it currently holds.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Disable")]
-    private void InputDisable(EntityInputData data) => SetEnabled(false);
+    protected void InputDisable(EntityInputData data) => SetEnabled(false);
 
     /// <summary>Switches the trigger between enabled and disabled.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Toggle")]
-    private void InputToggle(EntityInputData data) => SetEnabled(!IsEnabled);
+    protected void InputToggle(EntityInputData data) => SetEnabled(!IsEnabled);
 
     /// <summary>
     /// Switching a trigger off clears <see cref="BaseEntity.IsTrigger"/>, which stops the touch pass from

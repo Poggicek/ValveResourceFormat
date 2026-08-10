@@ -76,7 +76,8 @@ public class FuncDoor : BaseToggle
     /// <inheritdoc/>
     public override void Spawn()
     {
-        ResolveMoveDirection();
+        // A door keeps its authored orientation: only a button spends its angles on the travel direction
+        ResolveMoveDirection(consumeAngles: false);
 
         Speed = KeyValues.GetFloatProperty("speed", 100f);
 
@@ -158,32 +159,32 @@ public class FuncDoor : BaseToggle
     /// <summary>Opens the door.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Open")]
-    private void InputOpen(EntityInputData data) => Open();
+    protected void InputOpen(EntityInputData data) => Open();
 
     /// <summary>Closes the door.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Close")]
-    private void InputClose(EntityInputData data) => Close();
+    protected void InputClose(EntityInputData data) => Close();
 
     /// <summary>Opens a closed door, closes an open one.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Toggle")]
-    private void InputToggle(EntityInputData data) => Toggle();
+    protected void InputToggle(EntityInputData data) => Toggle();
 
     /// <summary>Stops the door opening until it is unlocked.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Lock")]
-    private void InputLock(EntityInputData data) => IsLocked = true;
+    protected void InputLock(EntityInputData data) => IsLocked = true;
 
     /// <summary>Lets the door open again.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Unlock")]
-    private void InputUnlock(EntityInputData data) => IsLocked = false;
+    protected void InputUnlock(EntityInputData data) => IsLocked = false;
 
     /// <summary>Changes how fast the door travels.</summary>
     /// <param name="data">Carries the new speed in units per second.</param>
     [EntityInput("SetSpeed")]
-    private void InputSetSpeed(EntityInputData data) => Speed = MathF.Max(data.Float(Speed), 0f);
+    protected void InputSetSpeed(EntityInputData data) => Speed = MathF.Max(data.Float(Speed), 0f);
 
     /// <summary>Opens the door, unless it is locked or already going that way.</summary>
     public void Open()

@@ -160,7 +160,13 @@ public abstract class BaseToggle : BaseModelEntity
     /// Source 2 authors it as its own <c>movedir</c> keyvalue on some entities, and there the brush's own
     /// angles mean what they say, so they are left alone.
     /// </summary>
-    protected void ResolveMoveDirection()
+    /// <param name="consumeAngles">
+    /// Whether the angles are the travel direction and should be cleared once read, which is what
+    /// <c>CBaseButton::Spawn</c> does through <c>SetMovedir</c>. A door does not: <c>CBaseDoor::Spawn</c>
+    /// reads only the <c>movedir</c> keyvalue and leaves the brush's orientation alone, and a door that
+    /// swings needs those angles kept, since they are where its travel starts from.
+    /// </param>
+    protected void ResolveMoveDirection(bool consumeAngles = true)
     {
         var hasMoveDir = KeyValues.ContainsKey("movedir");
         var directionAngles = hasMoveDir ? KeyValues.GetVector3Property("movedir") : Angles;
@@ -172,7 +178,7 @@ public abstract class BaseToggle : BaseModelEntity
             _ => EntityTransformHelper.QAngleToForwardDirection(directionAngles),
         };
 
-        if (!hasMoveDir)
+        if (!hasMoveDir && consumeAngles)
         {
             Angles = Vector3.Zero;
         }
