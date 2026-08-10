@@ -18,7 +18,7 @@ namespace ValveResourceFormat.Renderer.Entities;
 /// which movement collision normally prevents, so use activation is the path that matters here.
 /// </para>
 /// </remarks>
-public sealed class FuncButton : BaseModelEntity
+public sealed class FuncButton : BaseToggle
 {
     /// <summary>What a <c>func_button</c>'s <c>spawnflags</c> mean.</summary>
     [Flags]
@@ -80,14 +80,8 @@ public sealed class FuncButton : BaseModelEntity
     /// <summary>Gets where the button is in its travel.</summary>
     public ButtonState State { get; private set; }
 
-    /// <summary>Gets the travel speed in units per second.</summary>
-    public float Speed { get; private set; }
-
     /// <summary>Gets the seconds the button stays in before returning; -1 means it stays in for good.</summary>
     public float Wait { get; private set; }
-
-    /// <summary>Gets the distance held back from a full brush-length travel, so the button stays proud.</summary>
-    public float Lip { get; private set; }
 
     /// <summary>Gets whether the button refuses to press.</summary>
     public bool IsLocked { get; private set; }
@@ -110,12 +104,9 @@ public sealed class FuncButton : BaseModelEntity
             ? EntityCapability.ImpulseUse
             : EntityCapability.None;
 
-    private Vector3 moveDirection;
     private Vector3 positionOut;
     private Vector3 positionIn;
-    private Vector3 finalDestination;
     private bool staysPushed;
-    private bool isLinearMoving;
     private MoveDoneFunction moveDoneFunction;
     private BaseEntity? lastActivator;
 
@@ -161,7 +152,7 @@ public sealed class FuncButton : BaseModelEntity
         IsTrigger = HasSpawnFlags(SpawnFlag.TouchActivates);
 
         positionOut = Origin;
-        positionIn = positionOut + moveDirection * GetTravelDistance();
+        positionIn = positionOut + MoveDirection * GetTravelDistance();
 
         // A button with nowhere to go fires in place
         if (HasSpawnFlags(SpawnFlag.DontMove) || (positionIn - positionOut).Length() < 1f)
@@ -215,13 +206,7 @@ public sealed class FuncButton : BaseModelEntity
     /// <inheritdoc/>
     public override void MoveDone()
     {
-        if (isLinearMoving)
-        {
-            // Land exactly on the destination rather than wherever the last tick left off
-            isLinearMoving = false;
-            Velocity = Vector3.Zero;
-            Origin = finalDestination;
-        }
+        FinishLinearMove();
 
         var next = moveDoneFunction;
         moveDoneFunction = MoveDoneFunction.None;
@@ -354,70 +339,5 @@ public sealed class FuncButton : BaseModelEntity
         EntitySystem.TriggerOutput(this, "OnOut", lastActivator);
     }
 
-    /// <summary>
-    /// Sets off towards a destination at <see cref="Speed"/>, arriving when the move-done comes due.
-    /// Source's <c>CBaseToggle::LinearMove</c>: constant velocity and a deadline, not a lerp.
-    /// </summary>
-    /// <param name="destination">Where the entity is heading.</param>
-    private void LinearMove(Vector3 destination)
-    {
-        finalDestination = destination;
 
-        if (destination == Origin)
-        {
-            // Nowhere to go, so the arrival is now
-            MoveDone();
-            return;
-        }
-
-        var delta = destination - Origin;
-        var travelTime = delta.Length() / Speed;
-
-        isLinearMoving = true;
-        Velocity = delta / travelTime;
-
-        SetMoveDoneTime(travelTime);
-    }
-
-    /// <summary>
-    /// Reads the direction the button travels. Source encodes it in <c>angles</c>, with two magic values
-    /// for straight up and down, and zeroes the angles afterwards because they were never an orientation.
-    /// Source 2 authors it as its own <c>movedir</c> keyvalue on some entities, and there the brush's own
-    /// angles mean what they say, so they are left alone.
-    /// </summary>
-    private void ResolveMoveDirection()
-    {
-        var hasMoveDir = KeyValues.ContainsKey("movedir");
-        var directionAngles = hasMoveDir ? KeyValues.GetVector3Property("movedir") : Angles;
-
-        moveDirection = directionAngles switch
-        {
-            { X: 0f, Y: -1f, Z: 0f } => new Vector3(0, 0, 1),   // straight up
-            { X: 0f, Y: -2f, Z: 0f } => new Vector3(0, 0, -1),  // straight down
-            _ => EntityTransformHelper.QAngleToForwardDirection(directionAngles),
-        };
-
-        if (!hasMoveDir)
-        {
-            Angles = Vector3.Zero;
-        }
-    }
-
-    /// <summary>
-    /// How far the button slides: its own length along the travel axis, less the lip that keeps it proud.
-    /// </summary>
-    /// <remarks>
-    /// Source subtracts a further 2 units because the engine hands it a brush bound that is 1 unit larger
-    /// in every direction. The bounds here come from the compiled collision hull and are not padded, so
-    /// the same authored <c>lip</c> lands in the same place without that correction.
-    /// </remarks>
-    private float GetTravelDistance()
-    {
-        var size = Collider?.LocalBounds.Size ?? Vector3.Zero;
-
-        return MathF.Abs(moveDirection.X * size.X)
-            + MathF.Abs(moveDirection.Y * size.Y)
-            + MathF.Abs(moveDirection.Z * size.Z)
-            - Lip;
-    }
 }

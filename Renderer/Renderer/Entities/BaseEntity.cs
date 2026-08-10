@@ -117,6 +117,17 @@ public class BaseEntity
     /// </summary>
     public float MoveDoneTime { get; private set; } = -1f;
 
+    /// <summary>
+    /// Gets whether the loader may hand this entity's nodes to a <c>parentname</c> parent to drive.
+    /// </summary>
+    /// <remarks>
+    /// Off by default, because an entity that moves itself owns its transform and a parent writing over it
+    /// each frame would fight the simulation. An entity that never moves after it spawns has nothing to
+    /// fight with, and parenting is the only thing that will ever move it, so those opt in. Until entity
+    /// parenting exists, this is the seam between the two systems.
+    /// </remarks>
+    public virtual bool AllowsSceneParenting => false;
+
     /// <summary>Gets whether this entity has been removed from the world and is awaiting cleanup.</summary>
     public bool IsRemoved { get; private set; }
 
@@ -192,6 +203,8 @@ public class BaseEntity
 
     private readonly HashSet<BaseEntity> touching = [];
     private readonly List<SceneNode> ownedNodes = [];
+    private readonly List<(SceneNode Node, Matrix4x4 Local)> attachedNodes = [];
+    private bool isNodeDrivenExternally;
     private Vector3 origin;
     private Vector3 angles;
     private bool transformDirty = true;
@@ -401,6 +414,59 @@ public class BaseEntity
     }
 
     /// <summary>
+    /// Takes over driving a node that named this entity as its <c>parentname</c>, keeping where it
+    /// currently sits relative to the entity. Its lifetime stays the loader's; only its placement moves.
+    /// </summary>
+    /// <remarks>
+    /// The scene's own parenting hangs a child off a <see cref="SceneNodes.ModelSceneNode"/>, which an
+    /// entity whose model has no meshes does not have. A brush compiled for collision alone is exactly
+    /// that, and it is still a perfectly good thing to be parented to, so the entity drives the child
+    /// itself in that case.
+    /// </remarks>
+    /// <param name="node">The node to drive.</param>
+    internal void AttachNodeKeepingTransform(SceneNode node)
+    {
+        node.EntityInstance?.OnNodeParented();
+
+        if (!Matrix4x4.Invert(Transform, out var inverse))
+        {
+            inverse = Matrix4x4.Identity;
+        }
+
+        attachedNodes.Add((node, node.Transform * inverse));
+
+        transformDirty = true;
+    }
+
+    /// <summary>
+    /// Told when something else took over placing this entity's node, so that its collision shape follows
+    /// the node rather than the origin the entity spawned at and never leaves.
+    /// </summary>
+    internal void OnNodeParented() => isNodeDrivenExternally = true;
+
+    /// <summary>
+    /// Closes every touch this entity currently holds, both sides, so whatever is inside hears that it
+    /// left. What a trigger being switched off owes the things standing in it.
+    /// </summary>
+    internal void ClearTouchLinks()
+    {
+        if (touching.Count == 0)
+        {
+            return;
+        }
+
+        // Copied out: closing a link removes it from the set being walked
+        var open = new BaseEntity[touching.Count];
+        touching.CopyTo(open);
+
+        foreach (var other in open)
+        {
+            UpdateTouchLink(other, isOverlapping: false);
+            other.UpdateTouchLink(this, isOverlapping: false);
+        }
+    }
+
+    /// <summary>
     /// Opens, sustains, or closes the touch link between this volume and <paramref name="other"/>, firing
     /// the matching handler on the edges.
     /// </summary>
@@ -490,6 +556,13 @@ public class BaseEntity
         // The state this tick starts from is the one frames interpolate out of
         previousOrigin = Origin;
         previousAngles = Angles;
+
+        // A parented entity is moved by its parent writing the node, which the entity never sees, so its
+        // shape is read back off the node instead. One frame behind, which is what a trace wants anyway.
+        if (isNodeDrivenExternally && Collider != null && RootNode is { } drivenNode)
+        {
+            Collider.Transform = drivenNode.Transform;
+        }
 
         if (NextThink > 0f && NextThink <= EntitySystem.CurrentTime)
         {
@@ -598,9 +671,19 @@ public class BaseEntity
 
         foreach (var node in ownedNodes)
         {
+            Place(node, Transform);
+        }
+
+        foreach (var (node, local) in attachedNodes)
+        {
+            Place(node, local * Transform);
+        }
+
+        void Place(SceneNode node, Matrix4x4 transform)
+        {
             var oldBounds = node.BoundingBox;
 
-            node.Transform = Transform;
+            node.Transform = transform;
 
             if (node.LayerEnabled && !oldBounds.Equals(node.BoundingBox))
             {

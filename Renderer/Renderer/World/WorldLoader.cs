@@ -291,19 +291,35 @@ namespace ValveResourceFormat.Renderer.World
 
             foreach (var node in scene.AllNodes)
             {
-                if (node.Parent != null || node.EntityInstance != null)
+                if (node.Parent != null || node.EntityInstance is { AllowsSceneParenting: false })
                 {
                     continue; // already driven by a simulated entity, which owns its transform
                 }
 
                 var parentName = node.EntityData?.GetStringProperty("parentname");
 
-                if (parentName is null || !modelsByTargetName.TryGetValue(parentName, out var parentNode))
+                if (parentName is null)
                 {
                     continue;
                 }
 
+                if (!modelsByTargetName.TryGetValue(parentName, out var parentNode))
+                {
+                    // No model node carries that name. A simulated entity may still answer to it, and one
+                    // whose model has no meshes always will, so it drives the child itself.
+                    foreach (var entity in scene.EntitySystem.FindAllByTargetName(parentName))
+                    {
+                        entity.AttachNodeKeepingTransform(node);
+                        break;
+                    }
+
+                    continue;
+                }
+
                 var attachmentName = node.EntityData!.GetStringProperty("parentattachmentname");
+
+
+                node.EntityInstance?.OnNodeParented();
 
                 if (attachmentName is null)
                 {
@@ -1386,6 +1402,69 @@ namespace ValveResourceFormat.Renderer.World
 
                     throw new InvalidDataException($"Failed to process entity '{classname}' (hammeruniqueid={id})", e);
                 }
+            }
+
+            AssignTemplateChildren(traversed);
+        }
+
+        /// <summary>
+        /// Hands each simulated <c>point_template</c> the nodes built from its child lump, so that its
+        /// spawn and delete inputs have something to act on. The loader is the only thing that knows which
+        /// entities came out of which template.
+        /// </summary>
+        /// <param name="traversed">Every entity the lump walk produced, template children included.</param>
+        private void AssignTemplateChildren(List<EntityLumpTraversal.TraversedEntity> traversed)
+        {
+            var childrenByTemplate = new Dictionary<Entity, HashSet<Entity>>();
+
+            foreach (var entry in traversed)
+            {
+                if (entry.Template is not { } template)
+                {
+                    continue;
+                }
+
+                if (!childrenByTemplate.TryGetValue(template, out var children))
+                {
+                    childrenByTemplate[template] = children = [];
+                }
+
+                children.Add(entry.Entity);
+            }
+
+            if (childrenByTemplate.Count == 0)
+            {
+                return;
+            }
+
+            var nodesByEntity = new Dictionary<Entity, List<SceneNode>>();
+
+            foreach (var node in scene.AllNodes)
+            {
+                if (node.EntityData is not { } data)
+                {
+                    continue;
+                }
+
+                if (!nodesByEntity.TryGetValue(data, out var nodes))
+                {
+                    nodesByEntity[data] = nodes = [];
+                }
+
+                nodes.Add(node);
+            }
+
+            foreach (var entity in scene.EntitySystem.Entities)
+            {
+                if (entity is not Entities.PointTemplate template
+                    || entity.Data is not { } data
+                    || !childrenByTemplate.TryGetValue(data, out var children))
+                {
+                    continue;
+                }
+
+                template.AdoptTemplateChildren(children
+                    .SelectMany(child => nodesByEntity.TryGetValue(child, out var nodes) ? nodes : []));
             }
         }
 

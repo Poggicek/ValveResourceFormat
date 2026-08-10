@@ -19,6 +19,13 @@ public abstract class BaseModelEntity : BaseEntity
     public ModelSceneNode? ModelNode { get; private set; }
 
     /// <summary>
+    /// Gets whether to build a <see cref="EntityCollider"/> from the model's physics. A class nothing
+    /// traces against overrides this to skip the BVH build, which is the expensive half of loading a model.
+    /// The physics-group nodes are drawn either way.
+    /// </summary>
+    protected virtual bool CreatesCollider => true;
+
+    /// <summary>
     /// Initializes a model entity from its keyvalues.
     /// </summary>
     /// <param name="system">The world this entity belongs to.</param>
@@ -69,8 +76,11 @@ public abstract class BaseModelEntity : BaseEntity
 
         if (EntityCollider.LoadPhysics(model, fileLoader) is { } physics)
         {
-            Collider = new EntityCollider(physics);
-            UpdateColliderTransform();
+            if (CreatesCollider)
+            {
+                Collider = new EntityCollider(physics);
+                UpdateColliderTransform();
+            }
 
             // Owned outright rather than hung off the model: a brush compiled for collision alone has no
             // model node to hang them from, and its hulls are then the only thing there is to show.

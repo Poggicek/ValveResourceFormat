@@ -13,7 +13,11 @@ namespace ValveResourceFormat.Utils
         /// <summary>
         /// An entity from <see cref="EnumerateEntities"/>, with the parent transform that applies to it and whether it came from a <c>point_template</c> child lump.
         /// </summary>
-        public readonly record struct TraversedEntity(Entity Entity, Matrix4x4 ParentTransform, bool FromTemplate);
+        /// <param name="Entity">The entity itself.</param>
+        /// <param name="ParentTransform">The transform of whatever spawned it.</param>
+        /// <param name="FromTemplate">Whether it came out of a <c>point_template</c>'s child lump.</param>
+        /// <param name="Template">The <c>point_template</c> whose lump it came from, or <see langword="null"/> for a top-level entity. Nested templates report the innermost one.</param>
+        public readonly record struct TraversedEntity(Entity Entity, Matrix4x4 ParentTransform, bool FromTemplate, Entity? Template = null);
 
         /// <summary>
         /// Enumerates <paramref name="lump"/>'s entities and, recursively, the entities of child lumps its
@@ -30,7 +34,7 @@ namespace ValveResourceFormat.Utils
             Matrix4x4 rootTransform,
             Action<string>? onMissingChildLump = null)
         {
-            return Traverse(lump, fileLoader, rootTransform, fromTemplate: false, [], [], onMissingChildLump);
+            return Traverse(lump, fileLoader, rootTransform, fromTemplate: false, template: null, [], [], onMissingChildLump);
         }
 
         // Lazily mutates childLumps/visited during enumeration; safe because both consumers materialize the result.
@@ -39,6 +43,7 @@ namespace ValveResourceFormat.Utils
             IFileLoader fileLoader,
             Matrix4x4 parentTransform,
             bool fromTemplate,
+            Entity? template,
             Dictionary<string, VEntityLump> childLumps,
             HashSet<string> visited,
             Action<string>? onMissingChildLump)
@@ -56,7 +61,7 @@ namespace ValveResourceFormat.Utils
 
             foreach (var entity in lump.GetEntities())
             {
-                yield return new TraversedEntity(entity, parentTransform, fromTemplate);
+                yield return new TraversedEntity(entity, parentTransform, fromTemplate, template);
 
                 if (entity.GetStringProperty("classname") != "point_template")
                 {
@@ -81,7 +86,7 @@ namespace ValveResourceFormat.Utils
 
                     var childTransform = EntityTransformHelper.CalculateRigidTransformationMatrix(entity) * parentTransform;
 
-                    foreach (var nested in Traverse(templateLump, fileLoader, childTransform, fromTemplate: true, childLumps, visited, onMissingChildLump))
+                    foreach (var nested in Traverse(templateLump, fileLoader, childTransform, fromTemplate: true, entity, childLumps, visited, onMissingChildLump))
                     {
                         yield return nested;
                     }

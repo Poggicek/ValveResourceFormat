@@ -379,6 +379,14 @@ public sealed class EntitySystem
     }
 
     /// <summary>
+    /// Drops the inputs an entity queued that have not fired yet, Source's <c>CancelPending</c>. Only the
+    /// ones it queued itself: an input another entity aimed at it is that entity's to cancel.
+    /// </summary>
+    /// <param name="caller">The entity whose queued inputs should be dropped.</param>
+    public void CancelQueuedInputsFrom(BaseEntity caller)
+        => inputQueue.RemoveAll(input => input.Caller == caller);
+
+    /// <summary>
     /// Fires an entity I/O input at every entity whose targetname matches, wildcards and the <c>!</c>
     /// procedural names included.
     /// </summary>
@@ -391,20 +399,36 @@ public sealed class EntitySystem
     public void QueueInputByTargetName(string targetName, string inputName, string? parameter = null,
         BaseEntity? activator = null, BaseEntity? caller = null, float delay = 0f)
     {
+        foreach (var target in FindTargets(targetName, activator, caller))
+        {
+            QueueInput(target, inputName, parameter, activator, caller, delay);
+        }
+    }
+
+    /// <summary>
+    /// Resolves a target name the way entity I/O does: the <c>!</c> procedural names first, then every
+    /// entity whose targetname matches, wildcards included.
+    /// </summary>
+    /// <param name="targetName">The name to resolve.</param>
+    /// <param name="activator">The entity that set the chain off, for <c>!activator</c>.</param>
+    /// <param name="caller">The entity doing the lookup, for <c>!self</c>.</param>
+    /// <returns>The entities the name stands for, which may be none.</returns>
+    public IEnumerable<BaseEntity> FindTargets(string targetName, BaseEntity? activator = null, BaseEntity? caller = null)
+    {
         if (IsProceduralName(targetName))
         {
             // A name the map means literally, so it never falls through to a search
             if (ResolveProceduralName(targetName, activator, caller) is { } resolved)
             {
-                QueueInput(resolved, inputName, parameter, activator, caller, delay);
+                yield return resolved;
             }
 
-            return;
+            yield break;
         }
 
         foreach (var target in FindAllByTargetName(targetName))
         {
-            QueueInput(target, inputName, parameter, activator, caller, delay);
+            yield return target;
         }
     }
 

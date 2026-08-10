@@ -404,7 +404,7 @@ namespace ValveResourceFormat.IO
                 rootTransform,
                 onMissingChildLump: name => ProgressReporter?.Report($"Failed to find child entity lump with name {name}."));
 
-            foreach (var (entity, parentTransform, _) in traversed)
+            foreach (var (entity, parentTransform, _, _) in traversed)
             {
                 var transform = EntityTransformHelper.CalculateTransformationMatrix(entity) * parentTransform;
                 var modelName = entity.GetStringProperty("model");
