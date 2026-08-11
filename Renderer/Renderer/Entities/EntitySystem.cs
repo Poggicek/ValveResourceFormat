@@ -7,6 +7,16 @@ using Entity = ValveResourceFormat.ResourceTypes.EntityLump.Entity;
 namespace ValveResourceFormat.Renderer.Entities;
 
 /// <summary>
+/// What an authored entity I/O connection addresses: a name, and how the map means it to be read.
+/// </summary>
+/// <param name="Name">
+/// The target name. May hold <c>*</c> and <c>?</c> wildcards, or be one of the <c>!</c> names that stand
+/// for an entity in the firing chain rather than for anything the map named.
+/// </param>
+/// <param name="Type">Whether the name is a targetname or a classname.</param>
+public readonly record struct EntityIOTarget(string Name, EntityIOTargetType Type);
+
+/// <summary>
 /// The entity context for a <see cref="Scene"/>: the world every simulated entity lives in. It owns the
 /// list of living entities, runs them on a fixed tick, and carries the entity I/O queue between them.
 /// </summary>
@@ -18,6 +28,18 @@ public sealed class EntitySystem
 {
     /// <summary>The fixed simulation tick, matching the engine's default 64 tick.</summary>
     public const float TickInterval = 1f / 64f;
+
+    /// <summary>
+    /// How many inputs one tick may deliver before the world is assumed to be looping.
+    /// </summary>
+    /// <remarks>
+    /// Not the engine's: <c>CEventQueue::ServiceEvents</c> has no limit at all, so a map that wires a
+    /// zero-delay cycle hangs the server, and that is accepted there. A viewer opening someone else's map
+    /// should refuse to hang instead. The figure is far above any real wiring - the busiest output in a
+    /// large jailbreak map reaches under two thousand connections across the whole map, and one tick
+    /// delivers a few dozen - so reaching it means a cycle rather than a busy moment.
+    /// </remarks>
+    private const int MaxInputsPerTick = 100_000;
 
     /// <summary>The most ticks one frame may run before the leftover time is dropped.</summary>
     public const int MaxTicksPerFrame = 8;
@@ -47,6 +69,17 @@ public sealed class EntitySystem
     /// <summary>Gets the current simulation time in seconds, the engine's <c>curtime</c>.</summary>
     public float CurrentTime { get; private set; }
 
+    /// <summary>
+    /// Rounds a time onto the tick it lands nearest, the way the engine's <c>TIME_TO_TICKS</c> does.
+    /// </summary>
+    /// <remarks>
+    /// Scheduling to the first tick at or after a time instead would round every interval up: a repeating
+    /// 0.1s think would come round every 7 ticks rather than 6, running about a sixth slow.
+    /// </remarks>
+    /// <param name="time">The absolute time to round.</param>
+    /// <returns>The time of the nearest tick.</returns>
+    public static float SnapToTick(float time) => (int)(0.5f + (time / TickInterval)) * TickInterval;
+
     /// <summary>Gets the number of ticks simulated so far.</summary>
     public int TickCount { get; private set; }
 
@@ -71,7 +104,8 @@ public sealed class EntitySystem
 
     private readonly List<BaseEntity> entities = [];
     private readonly List<QueuedInput> inputQueue = [];
-    private readonly List<QueuedInput> dueInputs = [];
+    private readonly Dictionary<EntityLump.Connection, int> firedCounts = [];
+    private long sequence;
     private float tickAccumulator;
     private bool hasRemovedEntities;
 
@@ -141,9 +175,11 @@ public sealed class EntitySystem
     /// </summary>
     public void Activate()
     {
-        foreach (var entity in entities)
+        // Indexed, because activating an entity may spawn another; one spawned here is activated too,
+        // which is what it needs
+        for (var i = 0; i < entities.Count; i++)
         {
-            entity.Activate();
+            entities[i].Activate();
         }
     }
 
@@ -158,10 +194,11 @@ public sealed class EntitySystem
             return;
         }
 
-        // Anything it was standing in should hear that it left before it stops existing
-        foreach (var other in entities)
+        // Anything it was standing in should hear that it left before it stops existing. Indexed, since
+        // a touch handler may spawn or remove entities.
+        for (var i = 0; i < entities.Count; i++)
         {
-            other.UpdateTouchLink(entity, isOverlapping: false);
+            entities[i].UpdateTouchLink(entity, isOverlapping: false);
         }
 
         entity.RemoveFromScene();
@@ -195,18 +232,22 @@ public sealed class EntitySystem
     /// </remarks>
     private void UpdateTouchLinks()
     {
-        // Read once: the player is the same for every trigger, and its bounds come off the live controller
-        if (Player is not { IsRemoved: false } player
-            || !player.TryGetTouchBounds(out var center, out var halfExtents))
+        // Indexed, because a touch handler may spawn or remove entities
+        for (var i = 0; i < entities.Count; i++)
         {
-            return;
-        }
+            var entity = entities[i];
 
-        foreach (var entity in entities)
-        {
             if (!entity.IsTrigger || entity.IsRemoved || entity.Collider is not { IsEmpty: false } volume)
             {
                 continue;
+            }
+
+            // Re-read every time rather than once: a trigger earlier in this pass may have teleported the
+            // player, and the rest of the pass has to test where they are now, not where they set off from
+            if (Player is not { IsRemoved: false } player
+                || !player.TryGetTouchBounds(out var center, out var halfExtents))
+            {
+                return;
             }
 
             // Overlaps rejects on world bounds first, so a trigger nowhere near costs one box test
@@ -226,7 +267,7 @@ public sealed class EntitySystem
         entities.Clear();
         Player = null;
         inputQueue.Clear();
-        dueInputs.Clear();
+        firedCounts.Clear();
         hasRemovedEntities = false;
         tickAccumulator = 0f;
         CurrentTime = 0f;
@@ -285,8 +326,6 @@ public sealed class EntitySystem
         TickCount++;
         CurrentTime = TickCount * TickInterval;
 
-        DispatchDueInputs();
-
         // Indexed, because an input or a think can spawn or remove entities mid-tick
         for (var i = 0; i < entities.Count; i++)
         {
@@ -305,6 +344,11 @@ public sealed class EntitySystem
         }
 
         UpdateTouchLinks();
+
+        // Last, as the engine services its event queue after everything has moved and touched. A touch
+        // handler's outputs therefore land in the tick that saw the touch rather than the one after it,
+        // and a think scheduled for the current time waits for the next tick, as it does there.
+        DispatchDueInputs();
     }
 
     /// <summary>
@@ -374,9 +418,8 @@ public sealed class EntitySystem
     /// <param name="delay">Seconds to wait before the input is delivered.</param>
     public void QueueInput(BaseEntity target, string inputName, string? parameter = null,
         BaseEntity? activator = null, BaseEntity? caller = null, float delay = 0f)
-    {
-        inputQueue.Add(new QueuedInput(target, inputName, parameter, activator, caller, CurrentTime + MathF.Max(delay, 0f)));
-    }
+        => Enqueue(new QueuedInput(target, null, inputName, parameter, activator, caller,
+            CurrentTime + MathF.Max(delay, 0f), sequence++, null));
 
     /// <summary>
     /// Drops the inputs an entity queued that have not fired yet, Source's <c>CancelPending</c>. Only the
@@ -398,76 +441,56 @@ public sealed class EntitySystem
     /// <param name="delay">Seconds to wait before the input is delivered.</param>
     public void QueueInputByTargetName(string targetName, string inputName, string? parameter = null,
         BaseEntity? activator = null, BaseEntity? caller = null, float delay = 0f)
-    {
-        foreach (var target in FindTargets(targetName, activator, caller))
-        {
-            QueueInput(target, inputName, parameter, activator, caller, delay);
-        }
-    }
+        => Enqueue(new QueuedInput(null, new EntityIOTarget(targetName, EntityIOTargetType.EntityNameOrClassName),
+            inputName, parameter, activator, caller, CurrentTime + MathF.Max(delay, 0f), sequence++, null));
 
     /// <summary>
-    /// Resolves a target name the way entity I/O does: the <c>!</c> procedural names first, then every
-    /// entity whose targetname matches, wildcards included.
+    /// Resolves a target name the way entity I/O does, for callers that have a name rather than an
+    /// authored connection: the <c>!</c> procedural names first, then names and classnames.
     /// </summary>
     /// <param name="targetName">The name to resolve.</param>
     /// <param name="activator">The entity that set the chain off, for <c>!activator</c>.</param>
-    /// <param name="caller">The entity doing the lookup, for <c>!self</c>.</param>
+    /// <param name="caller">The entity doing the lookup, for <c>!self</c> and <c>!caller</c>.</param>
     /// <returns>The entities the name stands for, which may be none.</returns>
     public IEnumerable<BaseEntity> FindTargets(string targetName, BaseEntity? activator = null, BaseEntity? caller = null)
-    {
-        if (IsProceduralName(targetName))
-        {
-            // A name the map means literally, so it never falls through to a search
-            if (ResolveProceduralName(targetName, activator, caller) is { } resolved)
-            {
-                yield return resolved;
-            }
-
-            yield break;
-        }
-
-        foreach (var target in FindAllByTargetName(targetName))
-        {
-            yield return target;
-        }
-    }
-
-    /// <summary>Whether a targetname is one of the <c>!</c> names that stand for an entity in the chain.</summary>
-    private static bool IsProceduralName(string targetName) => targetName.StartsWith('!');
+        => FindTargets(new EntityIOTarget(targetName, EntityIOTargetType.EntityNameOrClassName), activator, caller);
 
     /// <summary>
-    /// Resolves one of Source's <c>!</c> target names, the ones that name an entity by its part in the I/O
-    /// chain rather than by what it is called. Source's <c>FindEntityProcedural</c>.
+    /// Queues an input by target, the way an authored connection addresses one.
     /// </summary>
-    /// <remarks>
-    /// <c>!self</c> is the entity doing the lookup, which for an output is the one that fired it, so it
-    /// resolves to <paramref name="caller"/>.
-    /// </remarks>
-    /// <param name="targetName">The <c>!</c> name.</param>
+    /// <param name="target">The connection's target name and how to read it.</param>
+    /// <param name="inputName">The input's name.</param>
+    /// <param name="parameter">The parameter passed with the input, if any.</param>
     /// <param name="activator">The entity that started the I/O chain.</param>
     /// <param name="caller">The entity that fired the output.</param>
-    /// <returns>The entity named, or <see langword="null"/> when there is none or the name is unknown.</returns>
-    private BaseEntity? ResolveProceduralName(string targetName, BaseEntity? activator, BaseEntity? caller)
+    /// <param name="delay">Seconds to wait before the input is delivered.</param>
+    /// <param name="connection">The connection this came from, when one limits how often it may fire.</param>
+    private void QueueInputByTarget(EntityIOTarget target, string inputName, string? parameter,
+        BaseEntity? activator, BaseEntity? caller, float delay, EntityLump.Connection? connection)
+        => Enqueue(new QueuedInput(null, target, inputName, parameter, activator, caller,
+            CurrentTime + MathF.Max(delay, 0f), sequence++, connection));
+
+    private void Enqueue(QueuedInput input)
     {
-        if (targetName.Equals("!self", StringComparison.OrdinalIgnoreCase)
-            || targetName.Equals("!caller", StringComparison.OrdinalIgnoreCase))
+        // Kept in fire order, ties broken by the order they were queued, which is what the engine's
+        // time-ordered queue amounts to. Inserting into an almost-sorted list beats sorting at dispatch,
+        // and it keeps two connections with different delays from inverting inside one tick.
+        var index = inputQueue.Count;
+
+        while (index > 0)
         {
-            return caller;
+            var previous = inputQueue[index - 1];
+
+            if (previous.FireTime < input.FireTime
+                || (previous.FireTime == input.FireTime && previous.Sequence < input.Sequence))
+            {
+                break;
+            }
+
+            index--;
         }
 
-        if (targetName.Equals("!activator", StringComparison.OrdinalIgnoreCase))
-        {
-            return activator;
-        }
-
-        if (targetName.Equals("!player", StringComparison.OrdinalIgnoreCase))
-        {
-            return Player;
-        }
-
-        Logger.LogDebug("Entity I/O target '{TargetName}' is not a name the entity system knows", targetName);
-
-        return null;
+        inputQueue.Insert(index, input);
     }
 
     /// <summary>
@@ -477,7 +500,11 @@ public sealed class EntitySystem
     /// <param name="source">The entity firing the output.</param>
     /// <param name="outputName">The output's name, as authored in the map.</param>
     /// <param name="activator">The entity that started the I/O chain.</param>
-    public void TriggerOutput(BaseEntity source, string outputName, BaseEntity? activator = null)
+    /// <param name="value">
+    /// What the output reports, for the ones that carry a reading rather than only the fact that they
+    /// fired. A connection that was authored with its own parameter overrides it, as in the engine.
+    /// </param>
+    public void TriggerOutput(BaseEntity source, string outputName, BaseEntity? activator = null, string? value = null)
     {
         if (source.Data?.Connections == null)
         {
@@ -491,11 +518,20 @@ public sealed class EntitySystem
                 continue;
             }
 
+            // Hammer's "fire once only", which the map counts on for anything that must not repeat
+            if (connection.TimesToFire >= 0 && FiredCount(connection) >= connection.TimesToFire)
+            {
+                continue;
+            }
+
+            // The authored override wins over whatever the output reports, which is the precedence
+            // CBaseEntityOutput::FireOutput uses: a parameter on the connection replaces the value
             var parameter = string.IsNullOrEmpty(connection.OverrideParam) || connection.OverrideParam == "(null)"
-                ? null
+                ? value
                 : connection.OverrideParam;
 
-            QueueInputByTargetName(connection.TargetName, connection.InputName, parameter, activator, source, connection.Delay);
+            QueueInputByTarget(new EntityIOTarget(connection.TargetName, connection.TargetType),
+                connection.InputName, parameter, activator, source, connection.Delay, connection);
         }
     }
 
@@ -519,53 +555,186 @@ public sealed class EntitySystem
         && entity.TargetName != null
         && EntityLump.EntityNameMatches(pattern, entity.TargetName);
 
+    /// <summary>
+    /// Delivers everything the clock has reached, and everything those deliveries queue for now.
+    /// </summary>
+    /// <remarks>
+    /// The engine's <c>CEventQueue::ServiceEvents</c> restarts from the head of the queue after each
+    /// event, so a chain of zero-delay connections completes inside the tick that set it off. Taking one
+    /// snapshot instead would spread an N-hop chain of relays over N ticks, which a map that fires a
+    /// button and expects the result the same instant would notice. The one departure is
+    /// <see cref="MaxInputsPerTick"/>, which the engine does without.
+    /// </remarks>
     private void DispatchDueInputs()
     {
-        if (inputQueue.Count == 0)
+        // The engine has no guard here and will spin forever on a cycle; see MaxInputsPerTick
+        var budget = MaxInputsPerTick;
+
+        while (inputQueue.Count > 0 && inputQueue[0].FireTime <= CurrentTime)
+        {
+            var input = inputQueue[0];
+
+            inputQueue.RemoveAt(0);
+
+            if (--budget < 0)
+            {
+                Logger.LogWarning("Entity I/O ran away: more than {Limit} inputs in one tick, dropping the rest", MaxInputsPerTick);
+                inputQueue.Clear();
+                return;
+            }
+
+            Deliver(input);
+        }
+    }
+
+    /// <summary>
+    /// Hands one queued input to whoever answers to its target now. The target is resolved here rather
+    /// than when the input was queued, as the engine does: a delayed input goes to whatever holds the
+    /// name at delivery, including an entity that spawned during the delay.
+    /// </summary>
+    private void Deliver(QueuedInput input)
+    {
+        var data = new EntityInputData
+        {
+            Parameter = input.Parameter,
+            Activator = input.Activator,
+            Caller = input.Caller,
+        };
+
+        if (input.Connection is { } connection)
+        {
+            firedCounts[connection] = FiredCount(connection) + 1;
+        }
+
+        if (input.Target is { } bound)
+        {
+            if (!bound.IsRemoved)
+            {
+                bound.AcceptInput(input.InputName, data);
+            }
+
+            return;
+        }
+
+        if (input.NamedTarget is not { } target)
         {
             return;
         }
 
-        // Copied out first, in fire order, because handling an input can queue more of them
-        var remaining = 0;
+        // Copied out, and into a list of its own rather than a shared buffer: a handler may spawn or
+        // remove entities, and may deliver further inputs, either of which would disturb a walk over
+        // state the next delivery down also uses
+        var targets = new List<BaseEntity>();
 
-        for (var i = 0; i < inputQueue.Count; i++)
+        targets.AddRange(FindTargets(target, input.Activator, input.Caller));
+
+        foreach (var entity in targets)
         {
-            var input = inputQueue[i];
-
-            if (input.FireTime <= CurrentTime)
+            if (!entity.IsRemoved)
             {
-                dueInputs.Add(input);
+                entity.AcceptInput(input.InputName, data);
             }
-            else
+        }
+    }
+
+    /// <summary>Whether a target name is the given <c>!</c> name, whatever case the map wrote it in.</summary>
+    /// <param name="targetName">The name a connection addresses.</param>
+    /// <param name="proceduralName">The procedural name to test for, including its leading <c>!</c>.</param>
+    private static bool IsProceduralName(string targetName, string proceduralName)
+        => targetName.Equals(proceduralName, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>How many times a connection has fired, for the ones a map limited.</summary>
+    private int FiredCount(EntityLump.Connection connection)
+        => firedCounts.TryGetValue(connection, out var count) ? count : 0;
+
+    /// <summary>
+    /// Resolves what an authored connection addresses: the <c>!</c> names that stand for an entity in the
+    /// firing chain, then names and classnames.
+    /// </summary>
+    /// <param name="target">The connection's target name and how to read it.</param>
+    /// <param name="activator">The entity that started the chain, for <c>!activator</c>.</param>
+    /// <param name="caller">The entity that fired the output, for <c>!caller</c> and <c>!self</c>.</param>
+    /// <returns>The entities the target stands for, which may be none.</returns>
+    public IEnumerable<BaseEntity> FindTargets(EntityIOTarget target, BaseEntity? activator = null, BaseEntity? caller = null)
+    {
+        // The target type can name the chain outright, and so can the name, which is how the older
+        // spelling of the same idea reaches here. Source's FindEntityProcedural.
+        if (target.Type is EntityIOTargetType.SpecialActivator or EntityIOTargetType.SpecialCaller
+            || (target.Name.Length > 0 && target.Name[0] == '!'))
+        {
+            // Spelled the way a mapper writes them, and matched the way the engine matches them: its
+            // FindEntityProcedural compares with FStrEq, which is case-insensitive
+            var resolved = target.Type switch
             {
-                inputQueue[remaining++] = input;
+                EntityIOTargetType.SpecialActivator => activator,
+                EntityIOTargetType.SpecialCaller => caller,
+                _ when IsProceduralName(target.Name, "!activator") => activator,
+                _ when IsProceduralName(target.Name, "!caller") => caller,
+                _ when IsProceduralName(target.Name, "!self") => caller,
+                _ when IsProceduralName(target.Name, "!player") => Player,
+                _ => null,
+            };
+
+            if (resolved != null)
+            {
+                yield return resolved;
+            }
+
+            yield break;
+        }
+
+        if (string.IsNullOrEmpty(target.Name))
+        {
+            yield break;
+        }
+
+        // Anything else addresses entities by what they are called or what they are. The rest of the
+        // type set asks questions map data alone cannot answer - class inheritance, components, handles -
+        // and matches nothing rather than guessing.
+        var byName = target.Type is EntityIOTargetType.EntityName or EntityIOTargetType.EntityNameOrClassName;
+        var byClass = target.Type is EntityIOTargetType.ClassName or EntityIOTargetType.EntityNameOrClassName;
+
+        if (!byName && !byClass)
+        {
+            yield break;
+        }
+
+        var matchedName = false;
+
+        foreach (var entity in entities)
+        {
+            if (byName && !entity.IsRemoved && entity.TargetName != null
+                && EntityLump.EntityNameMatches(target.Name, entity.TargetName))
+            {
+                matchedName = true;
+                yield return entity;
             }
         }
 
-        inputQueue.RemoveRange(remaining, inputQueue.Count - remaining);
-
-        foreach (var input in dueInputs)
+        // A name that matches nothing falls back to the classname, as the loader's resolver does: the
+        // combined type is the map saying "whichever of the two this turns out to be"
+        if (!byClass || matchedName)
         {
-            if (!input.Target.IsRemoved)
-            {
-                input.Target.AcceptInput(input.InputName, new EntityInputData
-                {
-                    Parameter = input.Parameter,
-                    Activator = input.Activator,
-                    Caller = input.Caller,
-                });
-            }
+            yield break;
         }
 
-        dueInputs.Clear();
+        foreach (var entity in entities)
+        {
+            if (!entity.IsRemoved && EntityLump.EntityNameMatches(target.Name, entity.Classname))
+            {
+                yield return entity;
+            }
+        }
     }
 
     private readonly record struct QueuedInput(
-        BaseEntity Target,
+        BaseEntity? Target,
+        EntityIOTarget? NamedTarget,
         string InputName,
         string? Parameter,
         BaseEntity? Activator,
         BaseEntity? Caller,
-        float FireTime);
+        float FireTime,
+        long Sequence,
+        EntityLump.Connection? Connection);
 }

@@ -538,7 +538,8 @@ public class BaseEntity
 
     /// <summary>Schedules <see cref="Think"/> to run at an absolute time; -1 stops thinking.</summary>
     /// <param name="time">Absolute time in <see cref="EntitySystem.CurrentTime"/> seconds.</param>
-    public void SetNextThink(float time) => NextThink = time;
+    public void SetNextThink(float time)
+        => NextThink = time < 0f ? -1f : EntitySystem.SnapToTick(time);
 
     /// <summary>
     /// Schedules <see cref="MoveDone"/> to run after a delay, matching Source's <c>SetMoveDoneTime</c>.
@@ -575,7 +576,22 @@ public class BaseEntity
             return;
         }
 
-        PhysicsSimulate(tickInterval);
+        // Only as far as the scheduled arrival, never past it. Source's pusher does the same
+        // (physics_main.cpp: movetime is clamped to the frame), and without it a 0.1s ramp step would
+        // take a whole 7th tick of movement it was never given time for.
+        var moveTime = tickInterval;
+
+        if (MoveDoneTime > 0f)
+        {
+            var remaining = MoveDoneTime - (EntitySystem.CurrentTime - tickInterval);
+
+            if (remaining < moveTime)
+            {
+                moveTime = MathF.Max(remaining, 0f);
+            }
+        }
+
+        PhysicsSimulate(moveTime);
 
         if (MoveDoneTime > 0f && MoveDoneTime <= EntitySystem.CurrentTime)
         {
@@ -652,13 +668,15 @@ public class BaseEntity
     /// </remarks>
     internal void Update()
     {
-        var hasMoved = previousOrigin != origin || previousAngles != angles;
+        // A paused world has no span to interpolate across, and reading one would draw every entity at
+        // the tick it last started rather than where it stands, re-dirtying the transform every frame
+        var isMoving = EntitySystem.Enabled && (previousOrigin != origin || previousAngles != angles);
 
-        if (hasMoved || isInterpolating)
+        if (isMoving || isInterpolating)
         {
             // Once it stops moving, one last frame at the far end lands on the tick state exactly
-            UpdateRenderTransform(hasMoved ? EntitySystem.InterpolationFraction : 1f);
-            isInterpolating = hasMoved;
+            UpdateRenderTransform(isMoving ? EntitySystem.InterpolationFraction : 1f);
+            isInterpolating = isMoving;
         }
 
         // A still entity's nodes are already where they belong
@@ -702,6 +720,9 @@ public class BaseEntity
     {
         node.EntityData = Data;
         node.EntityInstance = this;
+
+        // A node that came with a layer keeps it: the editor box is built on the editor-only layer so it
+        // hides with the other markers, while geometry an entity really has belongs on the entity's own
         node.LayerName ??= LayerName;
         node.Transform = Transform;
 
