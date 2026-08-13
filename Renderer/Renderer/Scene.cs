@@ -1,4 +1,4 @@
-global using DepthOnlyDrawBuckets = System.Collections.Generic.Dictionary<ValveResourceFormat.Renderer.DepthOnlyProgram, System.Collections.Generic.List<ValveResourceFormat.Renderer.MeshBatchRenderer.Request>>;
+﻿global using DepthOnlyDrawBuckets = System.Collections.Generic.Dictionary<ValveResourceFormat.Renderer.DepthOnlyProgram, System.Collections.Generic.List<ValveResourceFormat.Renderer.MeshBatchRenderer.Request>>;
 
 using System.Diagnostics;
 using System.Linq;
@@ -435,7 +435,7 @@ namespace ValveResourceFormat.Renderer
                 var oldBox = node.BoundingBox;
                 node.Update(updateContext);
 
-                if (node.LayerEnabled && !oldBox.Equals(node.BoundingBox))
+                if (node.IsDrawn && !oldBox.Equals(node.BoundingBox))
                 {
                     DynamicOctree.Update(node, oldBox);
                 }
@@ -641,7 +641,7 @@ namespace ValveResourceFormat.Renderer
                                 firstIndex = (uint)(drawMeshletIndex * count);
                             }
 
-                            if (fragment.LayerEnabled == false)
+                            if (fragment.IsDrawn == false)
                             {
                                 count = 0;
                             }
@@ -1642,7 +1642,7 @@ namespace ValveResourceFormat.Renderer
 
                 foreach (var node in staticNodes)
                 {
-                    if (node.LayerEnabled)
+                    if (node.IsDrawn)
                     {
                         maxBounds = hasBounds ? maxBounds.Union(node.BoundingBox) : node.BoundingBox;
                         hasBounds = true;
@@ -1653,7 +1653,7 @@ namespace ValveResourceFormat.Renderer
 
                 foreach (var node in staticNodes)
                 {
-                    if (node.LayerEnabled)
+                    if (node.IsDrawn)
                     {
                         StaticOctree.Insert(node);
                     }
@@ -1669,7 +1669,7 @@ namespace ValveResourceFormat.Renderer
 
                 foreach (var node in dynamicNodes)
                 {
-                    if (node.LayerEnabled)
+                    if (node.IsDrawn)
                     {
                         DynamicOctree.Insert(node);
                     }

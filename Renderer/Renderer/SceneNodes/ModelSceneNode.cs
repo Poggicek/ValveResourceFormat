@@ -1,4 +1,4 @@
-using System.Buffers;
+﻿using System.Buffers;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -306,7 +306,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 child.Transform = localTransform * GetAttachmentOrSelfTransform(attachment.AttachmentName);
                 child.Update(context);
 
-                if (child.LayerEnabled)
+                if (child.IsDrawn)
                 {
                     child.Scene.DynamicOctree.Update(child, oldBounds);
                 }

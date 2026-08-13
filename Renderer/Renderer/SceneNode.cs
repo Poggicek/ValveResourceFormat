@@ -31,8 +31,10 @@ namespace ValveResourceFormat.Renderer
 
         /// <summary>
         /// Gets or sets whether this node's layer is enabled. Marks the parent octree dirty on change.
+        /// An entity that has switched its geometry off hides the nodes it owns through here too, so
+        /// everything that already skips a disabled layer skips those as well.
         /// </summary>
-        public virtual bool LayerEnabled
+        public bool LayerEnabled
         {
             get => field;
             set
@@ -45,6 +47,11 @@ namespace ValveResourceFormat.Renderer
                 }
             }
         } = true;
+
+        /// <summary>
+        /// Gets whether this node is drawn.
+        /// </summary>
+        public virtual bool IsDrawn => LayerEnabled && EntityInstance?.IsDrawn != false;
 
         /// <summary>
         /// Gets the world-space axis-aligned bounding box. Recomputed from <see cref="LocalBoundingBox"/> and

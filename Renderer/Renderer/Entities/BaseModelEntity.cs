@@ -52,7 +52,7 @@ public abstract class BaseModelEntity : BaseEntity
         var modelNode = new ModelSceneNode(Scene, model, Data?.GetStringProperty("skin"))
         {
             Name = modelName,
-            Tint = Data?.GetRenderTint() ?? Vector4.One,
+            Tint = RenderTint,
         };
 
         // Whether it draws anything is only knowable once it is built, so a collision-only model costs one

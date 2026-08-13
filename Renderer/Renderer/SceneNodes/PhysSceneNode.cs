@@ -17,7 +17,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         private static readonly Color32 ColorHull = new(1.0f, 0.2f, 0.1f, 0.65f);
 
         /// <inheritdoc/>
-        public override bool LayerEnabled => Enabled && base.LayerEnabled;
+        public override bool IsDrawn => Enabled && base.IsDrawn;
 
         /// <summary>Gets or sets whether this physics node is individually enabled for rendering.</summary>
         public bool Enabled

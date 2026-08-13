@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -756,7 +756,7 @@ namespace GUI.Types.GLViewers
                 var oldBounds = node.BoundingBox;
                 node.Transform = transform;
 
-                if (node.LayerEnabled)
+                if (node.IsDrawn)
                 {
                     node.Scene.DynamicOctree.Update(node, oldBounds);
                 }

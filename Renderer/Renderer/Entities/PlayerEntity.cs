@@ -1,3 +1,5 @@
+using ValveResourceFormat.Renderer.Input;
+
 namespace ValveResourceFormat.Renderer.Entities;
 
 /// <summary>
@@ -12,6 +14,11 @@ namespace ValveResourceFormat.Renderer.Entities;
 /// </remarks>
 public sealed class PlayerEntity : BaseEntity
 {
+    /// <summary>
+    /// How far the player can reach to press something, in units. Source's <c>PLAYER_USE_RADIUS</c>.
+    /// </summary>
+    public const float UseRange = 80f;
+
     /// <summary>Gets the controller whose state this entity reflects.</summary>
     public IPlayerController Controller { get; }
 
@@ -59,6 +66,51 @@ public sealed class PlayerEntity : BaseEntity
 
         // The controller owns the position, so there is nothing to integrate; just keep up with it
         SyncFromController();
+
+        if (Buttons.Pressed(TrackedKeys.E))
+        {
+            PressUse();
+        }
+    }
+
+    /// <summary>
+    /// Finds the usable entity a reach trace hits first, with the world blocking the way.
+    /// </summary>
+    /// <param name="from">Trace start, eye position.</param>
+    /// <param name="to">Trace end, the far edge of the reach.</param>
+    /// <returns>The nearest usable entity in reach, or <see langword="null"/> when there is none.</returns>
+    private BaseEntity? FindUseTarget(Vector3 from, Vector3 to)
+    {
+        var nearest = Scene.PhysicsWorld?.TraceRay(from, to) ?? new Rubikon.TraceResult();
+        BaseEntity? target = null;
+
+        foreach (var entity in EntitySystem.Entities)
+        {
+            if (entity.IsRemoved
+                || (entity.ObjectCaps & EntityCapability.UsableMask) == 0
+                || entity.Collider is not { IsEmpty: false } collider)
+            {
+                continue;
+            }
+
+            if (nearest.MinimizeWith(collider.TraceRay(from, to)))
+            {
+                target = entity;
+            }
+        }
+
+        return target;
+    }
+
+    /// <summary>
+    /// Presses whatever the player is looking at within <see cref="UseRange"/>
+    /// </summary>
+    private void PressUse()
+    {
+        var from = Controller.EyePosition;
+        var target = FindUseTarget(from, from + Controller.ViewForward * UseRange);
+
+        target?.Use(this);
     }
 
     private void SyncFromController()

@@ -133,13 +133,59 @@ public class BaseEntity
     public bool IsSolid { get; set; } = true;
 
     /// <summary>
-    /// Gets or sets whether the entity is a trigger volume: something passes through it and it reports
-    /// the touch, rather than blocking. Source's <c>FSOLID_TRIGGER</c>.
+    /// Gets or sets whether the entity reports what is inside its volume. Source's <c>FSOLID_TRIGGER</c>,
+    /// and independent of <see cref="IsSolid"/> in the same way: a trigger volume is a non-solid one that
+    /// reports touches, a touch-activated button is a solid one that also does.
     /// </summary>
     public bool IsTrigger { get; set; }
 
     /// <summary>Gets whether the entity currently takes part in collision traces.</summary>
-    public bool IsCollidable => IsSolid && !IsTrigger && Collider is { IsEmpty: false } && !IsRemoved;
+    public bool IsCollidable => IsSolid && Collider is { IsEmpty: false } && !IsRemoved;
+
+    /// <summary>
+    /// Gets or sets the colour and alpha the entity's models are drawn with, from <c>rendercolor</c> and
+    /// <c>renderamt</c>. Each channel runs 0-1. Setting it repaints the models already built.
+    /// </summary>
+    public Vector4 RenderTint
+    {
+        get;
+        set
+        {
+            field = value;
+
+            foreach (var node in ownedNodes)
+            {
+                if (node is ModelSceneNode model)
+                {
+                    model.Tint = value;
+                }
+            }
+        }
+    } = Vector4.One;
+
+    /// <summary>
+    /// Gets or sets whether the entity's geometry is drawn, Source's <c>EF_NODRAW</c>. Every node it owns
+    /// follows, and a visibility layer being switched off still hides it either way.
+    /// </summary>
+    public bool IsDrawn
+    {
+        get;
+        set
+        {
+            if (field == value)
+            {
+                return;
+            }
+
+            field = value;
+
+            // The nodes themselves do not change, but what the octree may skip does
+            foreach (var node in ownedNodes)
+            {
+                Scene.MarkParentOctreeDirty(node);
+            }
+        }
+    } = true;
 
     /// <summary>Gets the entities currently inside this one's volume.</summary>
     public IReadOnlyCollection<BaseEntity> TouchingEntities => touching;
@@ -170,6 +216,7 @@ public class BaseEntity
         EntityScale = data.GetVector3Property("scales", Vector3.One);
 
         ModelName = data.GetStringProperty("model");
+        RenderTint = data.GetRenderTint();
 
         origin = data.GetVector3Property("origin");
         angles = data.GetVector3Property("angles");
@@ -309,6 +356,20 @@ public class BaseEntity
     }
 
     /// <summary>
+    /// Gets what this entity can do, which is how the player's use trace decides whether it is worth
+    /// pressing.
+    /// </summary>
+    public virtual EntityCapability ObjectCaps => EntityCapability.None;
+
+    /// <summary>
+    /// Runs when something presses this entity.
+    /// </summary>
+    /// <param name="activator">The entity doing the pressing.</param>
+    public virtual void Use(BaseEntity? activator)
+    {
+    }
+
+    /// <summary>
     /// Moves the entity somewhere else outright, rather than by travelling there. Source's
     /// <c>CBaseEntity::Teleport</c>. Null angles keep the current ones.
     /// </summary>
@@ -365,6 +426,30 @@ public class BaseEntity
     /// <summary>Removes the entity from the world.</summary>
     [EntityInput("Kill")]
     protected void InputKill(EntityInputData data) => EntitySystem.Remove(this);
+
+    /// <summary>
+    /// Repaints the entity, Source's <c>Color</c> input. Alpha is left alone, as <c>SetRenderColor</c>
+    /// leaves it; the <c>Alpha</c> input is what changes that.
+    /// </summary>
+    /// <param name="data">Carries the colour as <c>"R G B"</c>.</param>
+    [EntityInput("Color")]
+    protected void InputColor(EntityInputData data)
+    {
+        if (data.TryGetColor(out var color))
+        {
+            RenderTint = new Vector4(color.X, color.Y, color.Z, RenderTint.W);
+        }
+    }
+
+    /// <summary>Sets how see-through the entity is, Source's <c>Alpha</c> input.</summary>
+    /// <param name="data">Carries the alpha, 0 to 255.</param>
+    [EntityInput("Alpha")]
+    protected void InputAlpha(EntityInputData data)
+    {
+        var alpha = Math.Clamp(data.Int(), 0, 255) / 255f;
+
+        RenderTint = new Vector4(RenderTint.X, RenderTint.Y, RenderTint.Z, alpha);
+    }
 
     /// <summary>
     /// Schedules <see cref="Think"/> to run at an absolute <see cref="EntitySystem.CurrentTime"/> in
@@ -510,7 +595,7 @@ public class BaseEntity
 
             node.Transform = Transform;
 
-            if (node.LayerEnabled && !oldBounds.Equals(node.BoundingBox))
+            if (node.IsDrawn && !oldBounds.Equals(node.BoundingBox))
             {
                 Scene.DynamicOctree.Update(node, oldBounds);
             }

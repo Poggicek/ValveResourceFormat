@@ -1,4 +1,4 @@
-using System.Linq;
+﻿using System.Linq;
 using Microsoft.Extensions.Logging;
 using ValveResourceFormat.Renderer.Input;
 using ValveResourceFormat.ResourceTypes;
@@ -603,7 +603,7 @@ public class ViewmodelSceneNode : ModelSceneNode
             UpdateTransforms(input, uptime);
 
             // don't render player model in noclip mode
-            if (LayerEnabled)
+            if (IsDrawn)
             {
                 Scene.DeactivateLayer(WorldLayerName);
                 Scene.DeactivateLayer(ViewmodelLayerName);
@@ -628,7 +628,7 @@ public class ViewmodelSceneNode : ModelSceneNode
             inAirExitTimer = MathF.Max(0f, inAirExitTimer - dt);
         }
 
-        if (!LayerEnabled)
+        if (!IsDrawn)
         {
             Scene.ActivateLayer(WorldLayerName);
             Scene.ActivateLayer(ViewmodelLayerName);
