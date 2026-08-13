@@ -6,6 +6,7 @@ using System.Windows.Forms;
 using GUI.Controls;
 using GUI.Forms;
 using GUI.Utils;
+using SteamDatabase.ValvePak;
 using ValveResourceFormat.Blocks;
 using ValveResourceFormat.IO;
 using ValveResourceFormat.Renderer;
@@ -36,6 +37,7 @@ namespace GUI.Types.GLViewers
         private SavedCameraPositionsControl? savedCameraPositionsControl;
         private EntityInfoForm? entityInfoForm;
         private bool ignoreLayersChangeEvents = true;
+        private bool levelChangeRequested;
         private List<Matrix4x4> CameraMatrices = [];
         private WorldNodeLoader? LoadedWorldNode;
         public WorldLoader? LoadedWorld;
@@ -242,6 +244,9 @@ namespace GUI.Types.GLViewers
 
                 Input.EntitySystem = Scene.EntitySystem;
                 Scene.EntitySystem.SpawnPlayer(Input.PlayerMovement);
+
+                // A map is walked around by default; noclip is a keypress away for when it is inspected instead
+                Input.EnterWalkMode();
             }
 
             if (!cameraSet)
@@ -263,8 +268,13 @@ namespace GUI.Types.GLViewers
 
             StartMapSoundEvents();
 
-            Input.MoveCamera(new Vector3(0, -150f, 0));
-            Input.MoveCamera(new Vector3(0, 150f, 0), transition: true);
+            // The ease-in is a flying camera's entrance, and it leaves walk mode to do it: skip it when the
+            // map opened walking, where the player is already standing where they belong
+            if (Input.NoClip)
+            {
+                Input.MoveCamera(new Vector3(0, -150f, 0));
+                Input.MoveCamera(new Vector3(0, 150f, 0), transition: true);
+            }
         }
 
         /// <summary>
@@ -1150,6 +1160,100 @@ namespace GUI.Types.GLViewers
             else
             {
                 physicsGroupsComboBox.Enabled = false;
+            }
+        }
+
+        /// <inheritdoc/>
+        protected override void OnPaint(float frameTime)
+        {
+            base.OnPaint(frameTime);
+
+            CheckLevelChange();
+        }
+
+        /// <summary>
+        /// Opens the next map when the world asks for a level change.
+        /// </summary>
+        /// <remarks>
+        /// The world only asks; which map is open is this viewer's business. The map is opened the same way
+        /// the file tree opens one, in its own tab, from the beginning: nothing is carried across, because
+        /// nothing here models what a level change carries.
+        /// </remarks>
+        private void CheckLevelChange()
+        {
+            if (Scene.EntitySystem.RequestedLevel is not { } nextMap || levelChangeRequested)
+            {
+                return;
+            }
+
+            // Latched, because the request stands until this world is gone and the open is not instant
+            levelChangeRequested = true;
+
+            var packagePath = $"maps/{nextMap}.vpk";
+            var foundPackage = GuiContext.FindFile(packagePath);
+
+            if (foundPackage.PathOnDisk == null && foundPackage.PackageEntry == null)
+            {
+                Log.Warn(nameof(GLWorldViewer), $"Level change to \"{nextMap}\" failed: {packagePath} was not found");
+                return;
+            }
+
+            // A map ships as its own package, so opening the package is not opening the map: the map is the
+            // one .vmap_c sitting at the root of it, and handing the package to the viewer only gets a file tree
+            var mapPath = $"maps/{nextMap}.vmap{GameFileLoader.CompiledFileSuffix}";
+
+            var package = new Package();
+            VrfGuiContext? packageContext = null;
+            VrfGuiContext? mapContext = null;
+
+            try
+            {
+                package.OptimizeEntriesForBinarySearch(StringComparison.OrdinalIgnoreCase);
+
+                if (foundPackage.PathOnDisk != null)
+                {
+                    package.Read(foundPackage.PathOnDisk);
+                }
+                else
+                {
+                    // A map packed inside another package, as the games that ship one big vpk do it
+                    package.SetFileName(packagePath);
+                    package.Read(GameFileLoader.GetPackageEntryStream(foundPackage.Package!, foundPackage.PackageEntry!));
+                }
+
+                var mapEntry = package.FindEntry(mapPath);
+
+                if (mapEntry == null)
+                {
+                    Log.Warn(nameof(GLWorldViewer), $"Level change to \"{nextMap}\" failed: {packagePath} has no {mapPath}");
+                    return;
+                }
+
+                packageContext = new VrfGuiContext(foundPackage.PathOnDisk ?? packagePath, null)
+                {
+                    CurrentPackage = package
+                };
+                package = null;
+
+                mapContext = new VrfGuiContext(mapEntry.GetFullPath(), packageContext);
+
+                FullScreenForm?.Close();
+
+                var contextToOpen = mapContext;
+                mapContext = null;
+
+                Program.MainForm.Invoke(() =>
+                {
+                    Program.MainForm.OpenFile(contextToOpen, mapEntry);
+                });
+            }
+            finally
+            {
+                package?.Dispose();
+                mapContext?.Dispose();
+
+                // The map context keeps this one alive; disposing it here only marks it for when that tab closes
+                packageContext?.Dispose();
             }
         }
 

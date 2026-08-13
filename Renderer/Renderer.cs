@@ -1015,6 +1015,9 @@ public class Renderer
 
         EnsureResolvedTextureSize(inputFramebuffer.Width, inputFramebuffer.Height);
 
+        // The world's own fade, which an env_fade drives and which covers the finished image
+        Postprocess.ScreenFade = Scene?.EntitySystem.ScreenFade ?? Vector4.Zero;
+
         Postprocess.Render(inputFramebuffer, outputFramebuffer, ResolvedSceneColor!, Camera, flipY);
     }
 

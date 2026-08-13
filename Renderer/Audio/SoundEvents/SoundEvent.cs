@@ -825,7 +825,13 @@ public abstract class SoundEvent
                 => new SoundEventHLVRDefault(definition),
             "hlvr_gun_layers_3d" or "hlvr_player_gun_layers_3d" => new SoundEventHLVRGunLayers(definition),
             "hlvr_start_soundevent" => new SoundEventHLVRStartSoundEvent(definition),
-            "hlvr_animate_soundevent" => new SoundEventHLVRMulti(definition),
+            // The whole "animate" family only differs in what it animates over the children's lifetime -
+            // volume over a curve, a position travelling along a line - which is not modelled; what they
+            // have in common is the child list, so they start their children and hold still
+            "hlvr_animate_soundevent" or "hlvr_music_animate_soundevent"
+                or "hlvr_animate_soundevent_ancestor_positions"
+                or "hlvr_animate_soundevent_random_range_indexed_positions"
+                => new SoundEventHLVRMulti(definition),
             "hlvr_start_multi" or "hlvr_start_multi_quad" or "hlvr_start_multi_24" or "hlvr_start_multi_simple"
                 or "hlvr_start_multi_aabb" or "hlvr_start_multi_bullet" or "hlvr_startup_start_multi"
                 or "hlvr_music_start_multi_quad"

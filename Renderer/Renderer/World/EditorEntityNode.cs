@@ -63,12 +63,17 @@ internal static class EditorEntityNode
         {
             var color = hammerEntity?.Color ?? new Color32(255, 0, 255, 255);
 
-            // Do not use transform because scales need to be ignored
-            EntityTransformHelper.DecomposeTransformationMatrix(entity, out _, out var rotationMatrix, out var positionVector);
+            // The box is a fixed size, so the scale comes off - but off the transform that was passed,
+            // not off the entity's own keyvalues. An entity spawned from a point_template holds an origin
+            // in the template's frame, and decomposing the keyvalues drops the spawner's placement with
+            // the scale, leaving every template child sitting at its local offset near the world origin.
+            var rigid = Matrix4x4.Decompose(transform, out _, out var rotation, out var translation)
+                ? Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(translation)
+                : Matrix4x4.CreateTranslation(transform.Translation);
 
             return new SimpleBoxSceneNode(scene, color, new Vector3(16f))
             {
-                Transform = rotationMatrix * Matrix4x4.CreateTranslation(positionVector),
+                Transform = rigid,
                 LayerName = layerName,
                 Name = filename,
                 EntityData = entity,

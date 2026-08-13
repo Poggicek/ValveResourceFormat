@@ -3,6 +3,10 @@
 #include "common/utils.slang"
 
 uniform bool g_bFlipY = false;
+
+// Screen fade, as env_fade drives it: rgb is the colour to fade towards, a is how far the fade has gone.
+// Applied after tonemapping and dithering, because a fade covers the finished image rather than the scene.
+uniform vec4 g_vScreenFade = vec4(0.0, 0.0, 0.0, 0.0);
 uniform bool g_bPostProcessEnabled = true;
 
 uniform float g_flToneMapScalarLinear;
@@ -120,6 +124,8 @@ void main()
 
         vColor.rgb = DitherColor(vColor.rgb);
     }
+
+    vColor.rgb = mix(vColor.rgb, g_vScreenFade.rgb, saturate(g_vScreenFade.a));
 
     outputColor = vColor;
 }

@@ -119,6 +119,7 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
             // Dither by one 255th of frame color originally. Modified to be twice that, because it looks better.
             shader.SetUniform("g_vBlueNoiseDitherParams", new Vector4(ditherOffset, 1.0f / 256.0f, 2.0f / 255.0f));
+            shader.SetUniform("g_vScreenFade", ScreenFade);
 
             shader.SetUniform("g_flExposureBiasScaleFactor", MathF.Pow(2.0f, TonemapSettings.ExposureBias));
             shader.SetUniform("g_flShoulderStrength", TonemapSettings.ShoulderStrength);
@@ -132,6 +133,12 @@ namespace ValveResourceFormat.Renderer.PostProcess
             shader.SetUniform("g_flWhitePoint", TonemapSettings.WhitePoint);
             shader.SetUniform("g_flWhitePointScale", 1.0f / tonemappedWhitePoint);
         }
+
+        /// <summary>
+        /// Gets or sets the screen fade to lay over the finished image: rgb the colour, a how far the
+        /// fade has gone. What <c>env_fade</c> drives.
+        /// </summary>
+        public Vector4 ScreenFade { get; set; }
 
         /// <summary>
         /// Resolves MSAA, applies DOF/bloom, tonemaps, and writes the final LDR image to <paramref name="colorBufferDraw"/>.

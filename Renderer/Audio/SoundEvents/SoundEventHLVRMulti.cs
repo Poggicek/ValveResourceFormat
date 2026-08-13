@@ -72,7 +72,7 @@ internal sealed class SoundEventHLVRMulti : SoundEvent
         var names = new List<string>();
         var volumes = new List<float>();
 
-        // "hlvr_animate_soundevent" lists its children in an array instead of numbered slots
+        // The "hlvr_animate_soundevent" family lists its children in an array instead of numbered slots
         foreach (var name in GetStringOrArrayProperty(data, "soundevents"))
         {
             names.Add(name);

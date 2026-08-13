@@ -61,10 +61,51 @@ public sealed class EntitySystem
     /// the ticks stop, so nothing thinks, moves, touches, or fires entity I/O. What is already spawned
     /// stays in the scene and stays drawn.
     /// </summary>
-    public bool Enabled { get; set; }
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Gets the screen fade the world currently wants drawn: rgb the colour, a how far it has gone. Laid
+    /// over the finished image by the post-processing pass; zero alpha means nothing is drawn.
+    /// </summary>
+    public Vector4 ScreenFade { get; private set; }
+
+    /// <summary>Gets the entity whose fade is on screen, so a later one takes over cleanly.</summary>
+    internal BaseEntity? ScreenFadeOwner { get; private set; }
+
+    /// <summary>
+    /// Sets what the screen fade should look like. Ownership goes with it, so a fade that ends after
+    /// another has begun hands back nothing rather than clearing the newer one.
+    /// </summary>
+    /// <param name="owner">The entity driving the fade.</param>
+    /// <param name="fade">The colour and how far the fade has gone; zero alpha draws nothing.</param>
+    internal void SetScreenFade(BaseEntity owner, Vector4 fade)
+    {
+        ScreenFade = fade;
+        ScreenFadeOwner = fade.W > 0f ? owner : null;
+    }
 
     /// <summary>Gets the player, once one has been spawned into this world.</summary>
     public PlayerEntity? Player { get; private set; }
+
+    /// <summary>
+    /// Gets the map a <see cref="TriggerChangeLevel"/> has asked for, once one has been walked into, or
+    /// <see langword="null"/> while the player is still in this one.
+    /// </summary>
+    /// <remarks>
+    /// Published rather than acted on: the world knows the player has reached the end of the level, but
+    /// which map is open is the viewer's business, not the world's. Whoever is hosting reads this and does
+    /// the opening. It is not cleared afterwards, since this world is on its way out either way.
+    /// </remarks>
+    public string? RequestedLevel { get; private set; }
+
+    /// <summary>Asks the host to open another map. The first request wins.</summary>
+    /// <param name="mapName">The map's name, without a path or an extension.</param>
+    public void RequestLevelChange(string mapName)
+    {
+        // A trigger volume the player is standing in reports every tick, and the far side of the level
+        // change should not be decided by whichever of those was last
+        RequestedLevel ??= mapName;
+    }
 
     /// <summary>Gets the current simulation time in seconds, the engine's <c>curtime</c>.</summary>
     public float CurrentTime { get; private set; }
@@ -268,6 +309,8 @@ public sealed class EntitySystem
         Player = null;
         inputQueue.Clear();
         firedCounts.Clear();
+        ScreenFade = Vector4.Zero;
+        ScreenFadeOwner = null;
         hasRemovedEntities = false;
         tickAccumulator = 0f;
         CurrentTime = 0f;
@@ -331,7 +374,8 @@ public sealed class EntitySystem
         {
             var entity = entities[i];
 
-            if (!entity.IsRemoved)
+            // A dormant entity has not been spawned into the world yet and is not there to simulate
+            if (!entity.IsRemoved && !entity.IsDormant)
             {
                 entity.Simulate(TickInterval);
             }
@@ -630,7 +674,9 @@ public sealed class EntitySystem
 
         foreach (var entity in targets)
         {
-            if (!entity.IsRemoved)
+            // A dormant entity is one the engine has not built yet, so a name that resolves to it here
+            // would have resolved to nothing there
+            if (!entity.IsRemoved && !entity.IsDormant)
             {
                 entity.AcceptInput(input.InputName, data);
             }

@@ -150,6 +150,18 @@ public sealed class LogicCase : BaseEntity
         }
     }
 
+    /// <summary>
+    /// Starts the shuffle over, so the next draw may be any case again and the one that came up last no
+    /// longer bars a repeat.
+    /// </summary>
+    /// <param name="data">The input's parameter and sender, unused.</param>
+    [EntityInput("ResetShuffle")]
+    private void InputResetShuffle(EntityInputData data)
+    {
+        shuffle.Clear();
+        lastShuffleCase = -1;
+    }
+
     /// <summary>Fires <c>OnUser1</c>, the pass-through the map wires for its own purposes.</summary>
     /// <param name="data">The input's parameter and sender, passed along.</param>
     [EntityInput("FireUser1")]

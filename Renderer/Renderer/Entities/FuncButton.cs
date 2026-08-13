@@ -18,7 +18,7 @@ namespace ValveResourceFormat.Renderer.Entities;
 /// which movement collision normally prevents, so use activation is the path that matters here.
 /// </para>
 /// </remarks>
-public sealed class FuncButton : BaseToggle
+public class FuncButton : BaseToggle
 {
     /// <summary>What a <c>func_button</c>'s <c>spawnflags</c> mean.</summary>
     [Flags]
@@ -233,7 +233,7 @@ public sealed class FuncButton : BaseToggle
     /// </summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Disable")]
-    private void InputDisable(EntityInputData data)
+    protected void InputDisable(EntityInputData data)
     {
         IsDisabled = true;
         IsSolid = false;
@@ -243,7 +243,7 @@ public sealed class FuncButton : BaseToggle
     /// <summary>Switches the button back on. Source's <c>Enable</c>.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Enable")]
-    private void InputEnable(EntityInputData data)
+    protected void InputEnable(EntityInputData data)
     {
         IsDisabled = false;
         IsSolid = true;
@@ -253,22 +253,22 @@ public sealed class FuncButton : BaseToggle
     /// <summary>Locks the button, so pressing it does nothing but report that it is locked.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Lock")]
-    private void InputLock(EntityInputData data) => IsLocked = true;
+    protected void InputLock(EntityInputData data) => IsLocked = true;
 
     /// <summary>Unlocks the button.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Unlock")]
-    private void InputUnlock(EntityInputData data) => IsLocked = false;
+    protected void InputUnlock(EntityInputData data) => IsLocked = false;
 
     /// <summary>Presses the button as though something had used it.</summary>
     /// <param name="data">Carries the entity that fired the output, which becomes the activator.</param>
     [EntityInput("Press")]
-    private void InputPress(EntityInputData data) => Use(data.Activator);
+    protected void InputPress(EntityInputData data) => Use(data.Activator);
 
     /// <summary>Drives the button in and leaves it there.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("PressIn")]
-    private void InputPressIn(EntityInputData data)
+    protected void InputPressIn(EntityInputData data)
     {
         if (State != ButtonState.AtBottom)
         {
@@ -282,7 +282,7 @@ public sealed class FuncButton : BaseToggle
     /// <summary>Drives the button back out.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("PressOut")]
-    private void InputPressOut(EntityInputData data)
+    protected void InputPressOut(EntityInputData data)
     {
         if (State == ButtonState.AtTop)
         {

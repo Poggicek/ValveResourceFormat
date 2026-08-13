@@ -88,6 +88,18 @@ public class BaseEntity
         set => SetOriginAndAngles(value, angles);
     }
 
+    /// <summary>
+    /// Gets where the entity actually is in the world.
+    /// </summary>
+    /// <remarks>
+    /// Not the same as <see cref="Origin"/>, which is the authored position in whatever frame the entity
+    /// was spawned in: an entity from a <c>point_template</c> holds an origin relative to the template,
+    /// and only <see cref="ParentTransform"/> carries it out to the world. Movement and the two ends of a
+    /// travel belong in the local frame, since the parent's placement applies to them either way; anything
+    /// comparing positions with something else in the world wants this instead.
+    /// </remarks>
+    public Vector3 WorldOrigin => Transform.Translation;
+
     /// <summary>Gets or sets the orientation as a QAngle (pitch, yaw, roll) in degrees. Setting it rebuilds <see cref="Transform"/>.</summary>
     public Vector3 Angles
     {
@@ -152,7 +164,50 @@ public class BaseEntity
     public bool IsTrigger { get; set; }
 
     /// <summary>Gets whether the entity currently takes part in collision traces.</summary>
-    public bool IsCollidable => IsSolid && Collider is { IsEmpty: false } && !IsRemoved;
+    public bool IsCollidable => IsSolid && Collider is { IsEmpty: false } && !IsRemoved && !IsDormant;
+
+    /// <summary>
+    /// Gets whether the entity is waiting to be brought into the world.
+    /// </summary>
+    /// <remarks>
+    /// The contents of a <see cref="PointTemplate"/> before anything has spawned it. The engine has not
+    /// built them yet, so they are nowhere: they do not think, move, collide, report touches or answer
+    /// entity I/O, and nothing draws them. Here they are built with the map and held in this state
+    /// instead, which is as close to not existing as something already made can be.
+    /// </remarks>
+    public bool IsDormant { get; private set; }
+
+    /// <summary>
+    /// Puts the entity into or out of the world. Restores what it was drawn and solid as, so waking one
+    /// does not make a prop the map authored as scenery start blocking the player.
+    /// </summary>
+    /// <param name="dormant">Whether the entity should be held out of the world.</param>
+    internal void SetDormant(bool dormant)
+    {
+        if (IsDormant == dormant)
+        {
+            return;
+        }
+
+        if (dormant)
+        {
+            drawnWhenAwake = IsDrawn;
+            solidWhenAwake = IsSolid;
+
+            IsDrawn = false;
+            IsSolid = false;
+            IsDormant = true;
+
+            // Whatever it was standing in should not still believe it is there
+            ClearTouchLinks();
+
+            return;
+        }
+
+        IsDormant = false;
+        IsDrawn = drawnWhenAwake;
+        IsSolid = solidWhenAwake;
+    }
 
     /// <summary>
     /// Gets or sets the colour and alpha the entity's models are drawn with, from <c>rendercolor</c> and
@@ -205,6 +260,8 @@ public class BaseEntity
     private readonly List<SceneNode> ownedNodes = [];
     private readonly List<(SceneNode Node, Matrix4x4 Local)> attachedNodes = [];
     private bool isNodeDrivenExternally;
+    private bool drawnWhenAwake = true;
+    private bool solidWhenAwake = true;
     private Vector3 origin;
     private Vector3 angles;
     private bool transformDirty = true;

@@ -1,4 +1,5 @@
 using System.Linq;
+using ValveResourceFormat.ResourceTypes.ModelAnimation;
 using ValveResourceFormat.Serialization.KeyValues;
 
 namespace ValveResourceFormat.Renderer.Entities;
@@ -19,7 +20,7 @@ namespace ValveResourceFormat.Renderer.Entities;
 /// it spawns, so the scene's parenting can drive it without the two fighting.
 /// </para>
 /// </remarks>
-public sealed class PropDynamic : BaseModelEntity
+public class PropDynamic : BaseModelEntity
 {
     /// <summary>Source's <c>SOLID_NONE</c>: the prop is scenery and nothing traces against it.</summary>
     private const int SolidNone = 0;
@@ -55,11 +56,22 @@ public sealed class PropDynamic : BaseModelEntity
         // system does not quietly cost it its animation or its body group
         var animation = KeyValues.GetStringProperty("defaultanim") ?? KeyValues.GetStringProperty("idleanim");
 
-        if (!string.IsNullOrEmpty(animation)
-            && model.SetAnimationForWorldPreview(animation)
-            && KeyValues.GetBooleanProperty("holdanimation"))
+        if (PlayAnimationByName(animation) >= 0f)
         {
-            model.AnimationController.PauseLastFrame();
+            if (KeyValues.GetBooleanProperty("holdanimation"))
+            {
+                model.AnimationController.PauseLastFrame();
+            }
+            else if (!model.AnimationController.Looping)
+            {
+                // A default animation that does not loop is a performance rather than a pose, and the map
+                // has something else in mind for when it happens: a choreographed scene, or a script. Run
+                // here it would play itself out at load, unwatched, leaving the entity standing in the pose
+                // it ends in - an actor who has already walked off before the player arrives. Its first
+                // frame is where that performance starts from, so that is what to hold.
+                model.AnimationController.IsPaused = true;
+                model.AnimationController.Frame = 0;
+            }
         }
 
         var body = KeyValues.GetInt32Property("body");
@@ -78,50 +90,87 @@ public sealed class PropDynamic : BaseModelEntity
     /// <summary>Draws the prop again.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Enable")]
-    private void InputEnable(EntityInputData data) => IsDrawn = true;
+    protected void InputEnable(EntityInputData data) => IsDrawn = true;
 
     /// <summary>Hides the prop.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Disable")]
-    private void InputDisable(EntityInputData data) => IsDrawn = false;
+    protected void InputDisable(EntityInputData data) => IsDrawn = false;
 
     /// <summary>Toggles whether the prop is drawn.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("Toggle")]
-    private void InputToggle(EntityInputData data) => IsDrawn = !IsDrawn;
+    protected void InputToggle(EntityInputData data) => IsDrawn = !IsDrawn;
 
     /// <summary>Makes the prop solid again. Only bites when it was authored with a collision shape.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("EnableCollision")]
-    private void InputEnableCollision(EntityInputData data) => IsSolid = true;
+    protected void InputEnableCollision(EntityInputData data) => IsSolid = true;
 
     /// <summary>Marks the prop non-solid.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("DisableCollision")]
-    private void InputDisableCollision(EntityInputData data) => IsSolid = false;
+    protected void InputDisableCollision(EntityInputData data) => IsSolid = false;
 
     /// <summary>Plays an animation by name, looping if the animation itself loops.</summary>
     /// <param name="data">Carries the animation name.</param>
     [EntityInput("SetAnimation")]
-    private void InputSetAnimation(EntityInputData data) => PlayAnimation(data.Parameter, holdLastFrame: false);
+    protected void InputSetAnimation(EntityInputData data) => PlayAnimation(data.Parameter, holdLastFrame: false);
 
     /// <summary>Plays an animation once and holds on its last frame.</summary>
     /// <param name="data">Carries the animation name.</param>
     [EntityInput("SetAnimationNotLooping")]
-    private void InputSetAnimationNotLooping(EntityInputData data) => PlayAnimation(data.Parameter, holdLastFrame: true);
+    protected void InputSetAnimationNotLooping(EntityInputData data) => PlayAnimation(data.Parameter, holdLastFrame: true);
 
     private void PlayAnimation(string? animationName, bool holdLastFrame)
     {
-        if (string.IsNullOrEmpty(animationName) || ModelNode is not { } model)
-        {
-            return;
-        }
+        PlayAnimationByName(animationName);
 
-        model.SetAnimationByName(animationName);
-
-        if (holdLastFrame)
+        if (holdLastFrame && ModelNode is { } model)
         {
             model.AnimationController.PauseLastFrame();
         }
+    }
+
+    /// <summary>
+    /// Plays one of the model's animations and reports how long it lasts, for the entities that drive a
+    /// model rather than being one. A <see cref="ScriptedSequence"/> needs both: the animation to start,
+    /// and when it will be over so the script can move on.
+    /// </summary>
+    /// <param name="animationName">The animation to play. An unknown name stops the current one, as
+    /// <see cref="SceneNodes.ModelSceneNode.SetAnimationByName"/> does.</param>
+    /// <param name="looping">
+    /// Whether to keep playing it. Left unset, the animation itself decides: the controller loops whatever
+    /// it is given, which for a one-shot means replaying its events for the rest of the map, so a button
+    /// told to play its press animation would sound its press once every cycle, forever. An animation graph
+    /// clip carries no such flag, and those are the ones authored to loop, so they keep looping.
+    /// </param>
+    /// <returns>
+    /// How long the animation runs in seconds, zero for a single-frame pose, or -1 when the model has no
+    /// animation by that name.
+    /// </returns>
+    public float PlayAnimationByName(string? animationName, bool? looping = null)
+    {
+        if (string.IsNullOrEmpty(animationName) || ModelNode is not { } model)
+        {
+            return -1f;
+        }
+
+        if (!model.Animations.TryGetValue(animationName, out var animation))
+        {
+            model.SetAnimation(null);
+            return -1f;
+        }
+
+        model.AnimationController.Looping = looping ?? animation is not SequenceAnimation { IsLooping: false };
+
+        // Playing means playing: the pause is on the controller rather than the clip, so an entity left
+        // holding a frame - by holdanimation, or by a default animation waiting to be performed - would
+        // otherwise stay frozen through every animation anything played on it afterwards
+        model.AnimationController.IsPaused = false;
+
+        model.SetAnimation(animation);
+
+        return animation.Duration;
     }
 }

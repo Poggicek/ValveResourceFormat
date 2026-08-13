@@ -40,7 +40,7 @@ namespace ValveResourceFormat.Renderer
         /// </remarks>
         public virtual bool LayerEnabled
         {
-            get => field && Parent?.LayerEnabled != false && EntityInstance?.IsDrawn != false;
+            get => field && EntityInstance?.IsDrawn != false;
             set
             {
                 var valueChanged = value != field;

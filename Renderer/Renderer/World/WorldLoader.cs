@@ -39,7 +39,34 @@ namespace ValveResourceFormat.Renderer.World
         public WorldNode? MainWorldNode { get; private set; }
 
         /// <summary>Layer names that should be visible by default, populated during loading.</summary>
-        public HashSet<string> DefaultEnabledLayers { get; } = ["No layer", "Entities", "Particles"];
+        /// <summary>The layer the map's own entities are drawn in.</summary>
+        private const string EntitiesLayerName = "Entities";
+
+        /// <summary>
+        /// The layer for entities the map spawns switched off. They are as much a part of the world as the
+        /// rest, and a switched-off entity is one the map is about to switch on.
+        /// </summary>
+        private const string DisabledEntitiesLayerName = "Entities (disabled)";
+
+        /// <summary>
+        /// The layer for what a <c>point_template</c> holds, and the template marker itself. Kept apart so
+        /// the contents of a template can be picked out from the map around them.
+        /// </summary>
+        private const string TemplateEntitiesLayerName = "Template Entities";
+
+        /// <summary>
+        /// Gets the layers shown when a map is first opened. Everything an entity belongs to is on, because
+        /// a map that simulates draws entities in all of them: a template's contents once it is spawned, and
+        /// a disabled entity once something enables it.
+        /// </summary>
+        public HashSet<string> DefaultEnabledLayers { get; } =
+        [
+            "No layer",
+            EntitiesLayerName,
+            DisabledEntitiesLayerName,
+            TemplateEntitiesLayerName,
+            "Particles",
+        ];
 
         /// <summary>Names of info_camera_link entities found in the world.</summary>
         public List<string> CameraNames { get; } = [];
@@ -248,7 +275,7 @@ namespace ValveResourceFormat.Renderer.World
                     continue;
                 }
 
-                LoadEntitiesFromLump(entityLump, "Entities", Matrix4x4.Identity);
+                LoadEntitiesFromLump(entityLump, EntitiesLayerName, Matrix4x4.Identity);
             }
 
             ResolveAttachmentParenting();
@@ -565,10 +592,12 @@ namespace ValveResourceFormat.Renderer.World
                     CreateEntityConnectionLines(entity, transformationMatrix.Translation, connectionTargets);
                 }
 
-                var layerName = fromTemplate ? "Template Entities" : originalLayerName;
+                var layerName = fromTemplate ? TemplateEntitiesLayerName : originalLayerName;
 
                 // group the point_template marker and its spawned children under the same layer
-                var toolEntityLayer = fromTemplate || classname == "point_template" ? "Template Entities" : EditorEntityNode.ToolEntitiesLayerName;
+                var toolEntityLayer = fromTemplate || classname == "point_template"
+                    ? TemplateEntitiesLayerName
+                    : EditorEntityNode.ToolEntitiesLayerName;
 
                 var disabled = entity.GetBooleanProperty("startdisabled");
 
@@ -577,9 +606,9 @@ namespace ValveResourceFormat.Renderer.World
                     disabled = !entity.GetBooleanProperty("enabled", true);
                 }
 
-                if (disabled && layerName == "Entities")
+                if (disabled && layerName == EntitiesLayerName)
                 {
-                    layerName = "Entities (disabled)";
+                    layerName = DisabledEntitiesLayerName;
                 }
 
                 // Classnames the entity system implements are spawned as simulated entities, which own

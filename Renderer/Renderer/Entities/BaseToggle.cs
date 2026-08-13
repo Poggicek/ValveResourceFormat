@@ -178,6 +178,15 @@ public abstract class BaseToggle : BaseModelEntity
             _ => EntityTransformHelper.QAngleToForwardDirection(directionAngles),
         };
 
+        // Authored in the brush's own frame rather than the world's, which is how Source 2 spells the
+        // direction for anything a mapper rotates as a unit. Read before the angles are given up below.
+        if (KeyValues.GetBooleanProperty("movedir_islocal"))
+        {
+            MoveDirection = Vector3.TransformNormal(
+                MoveDirection,
+                EntityTransformHelper.CreateRotationMatrixFromEulerAngles(Angles));
+        }
+
         if (!hasMoveDir && consumeAngles)
         {
             Angles = Vector3.Zero;

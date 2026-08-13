@@ -279,6 +279,18 @@ public class UserInput
     private ViewmodelSceneNode? Viewmodel { get; set; }
 
     /// <summary>
+    /// Switches to walk mode, dropping the player wherever the camera currently is - the same thing the
+    /// noclip toggle does, for a viewer that wants to start out walking rather than flying.
+    /// </summary>
+    public void EnterWalkMode()
+    {
+        NoClip = false;
+
+        // The controller has no position of its own until it takes one from the camera
+        PlayerMovement.Initialize = true;
+    }
+
+    /// <summary>
     /// Switches to noclip mode and begins a smooth camera transition from the current position.
     /// </summary>
     /// <param name="transitionDuration">Duration of the transition animation in seconds.</param>

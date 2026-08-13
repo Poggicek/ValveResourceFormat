@@ -1,3 +1,5 @@
+using ValveResourceFormat.Serialization.KeyValues;
+
 namespace ValveResourceFormat.Renderer.Entities;
 
 /// <summary>
@@ -43,6 +45,8 @@ public abstract class BaseTrigger : BaseModelEntity
     {
     }
 
+    private BaseFilter? filter;
+
     /// <summary>
     /// The setup every trigger shares: take the brush volume from the authored model, and stand aside from
     /// movement so things pass through instead of colliding. Source's <c>InitTrigger</c>.
@@ -61,19 +65,47 @@ public abstract class BaseTrigger : BaseModelEntity
     /// A trigger reacts only to what its spawnflags name, as the engine's does: one that names nothing it
     /// accepts never fires. Of the flags, only "everything" and "clients" can be satisfied here, the
     /// player being the one thing in the world that can enter a volume; a trigger that admits only NPCs,
-    /// pushables or physics props therefore stays shut. The <c>filtername</c> entity filters are not
-    /// consulted at all, so a trigger that passes its flags is not further narrowed by its filter.
+    /// pushables or physics props therefore stays shut. A trigger that also names a <c>filtername</c> is
+    /// narrowed further by it, and one whose filter names a class this viewer does not implement is left
+    /// unnarrowed rather than shut.
     /// </remarks>
     /// <param name="other">The entity inside the volume.</param>
     /// <returns><see langword="true"/> when the touch should register.</returns>
     protected override bool AcceptsTouchFrom(BaseEntity other)
     {
+        if (filter != null && !filter.PassesFilter(other))
+        {
+            return false;
+        }
+
         if (HasSpawnFlags(SpawnFlag.AllowAll))
         {
             return true;
         }
 
         return other is PlayerEntity && HasSpawnFlags(SpawnFlag.AllowClients);
+    }
+
+    /// <summary>
+    /// Finds the filter this trigger names, once every entity has spawned. Source's <c>m_hFilter</c>.
+    /// </summary>
+    public override void Activate()
+    {
+        var filterName = KeyValues.GetStringProperty("filtername");
+
+        if (string.IsNullOrEmpty(filterName))
+        {
+            return;
+        }
+
+        foreach (var target in EntitySystem.FindTargets(filterName, caller: this))
+        {
+            if (target is BaseFilter named)
+            {
+                filter = named;
+                break;
+            }
+        }
     }
 
     /// <inheritdoc/>

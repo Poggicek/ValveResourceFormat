@@ -238,6 +238,8 @@ public sealed class AmbientGeneric : BaseEntity
             return null;
         }
 
-        return soundSource?.Transform.Translation ?? Origin;
+        // The transform, not the origin: an entity from a point_template has an origin in the
+        // template's frame, and only the transform carries the spawner's placement
+        return soundSource?.Transform.Translation ?? Transform.Translation;
     }
 }

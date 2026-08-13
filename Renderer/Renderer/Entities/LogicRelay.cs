@@ -14,11 +14,11 @@ namespace ValveResourceFormat.Renderer.Entities;
 /// </remarks>
 public sealed class LogicRelay : BaseEntity
 {
-    /// <summary>What a <c>logic_relay</c>'s <c>spawnflags</c> mean.</summary>
+    /// <summary>What a <c>logic_relay</c>'s <c>spawnflags</c> mean, in the Source 1 maps that use them.</summary>
     [Flags]
     public enum SpawnFlag : uint
     {
-        /// <summary>Fires once and then switches itself off for good.</summary>
+        /// <summary>Fires once and is then gone.</summary>
         OnlyOnce = 1,
 
         /// <summary>May be triggered again while a previous trigger is still waiting on its delay.</summary>
@@ -27,6 +27,12 @@ public sealed class LogicRelay : BaseEntity
 
     /// <summary>Gets whether the relay passes anything on. The <c>Disable</c> input clears it.</summary>
     public bool IsEnabled { get; private set; } = true;
+
+    /// <summary>Gets whether the relay is gone once it has fired.</summary>
+    public bool TriggersOnce { get; private set; }
+
+    /// <summary>Gets whether a trigger arriving before the last one has finished is passed on anyway.</summary>
+    public bool AllowsFastRetrigger { get; private set; }
 
     private bool isWaiting;
 
@@ -43,6 +49,51 @@ public sealed class LogicRelay : BaseEntity
     public override void Spawn()
     {
         IsEnabled = !KeyValues.GetBooleanProperty("startdisabled");
+
+        // Source 1 spelled both of these as spawnflags; Source 2 gives them keyvalues of their own, and a
+        // map compiled from it carries no flags at all, so a relay read only from flags never triggers once
+        TriggersOnce = KeyValues.GetBooleanProperty("triggeronce") || HasSpawnFlags(SpawnFlag.OnlyOnce);
+        AllowsFastRetrigger = KeyValues.GetBooleanProperty("fastretrigger") || HasSpawnFlags(SpawnFlag.AllowFastRetrigger);
+    }
+
+    /// <inheritdoc/>
+    public override void Activate()
+    {
+        // Fired once the map is up rather than as the relay itself is built, so that whatever it drives
+        // exists to be driven. A relay that only triggers once is spent on this as much as on a Trigger.
+        if (!HasOnSpawn)
+        {
+            return;
+        }
+
+        EntitySystem.TriggerOutput(this, "OnSpawn", this);
+
+        if (TriggersOnce)
+        {
+            EntitySystem.Remove(this);
+        }
+    }
+
+    /// <summary>Whether the map wired anything to <c>OnSpawn</c>.</summary>
+    private bool HasOnSpawn
+    {
+        get
+        {
+            if (Data?.Connections == null)
+            {
+                return false;
+            }
+
+            foreach (var connection in Data.Connections)
+            {
+                if (connection.OutputName.Equals("OnSpawn", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
     }
 
     /// <summary>Passes the trigger on as <c>OnTrigger</c>.</summary>
@@ -50,7 +101,7 @@ public sealed class LogicRelay : BaseEntity
     [EntityInput("Trigger")]
     private void InputTrigger(EntityInputData data)
     {
-        if (!IsEnabled || (isWaiting && !HasSpawnFlags(SpawnFlag.AllowFastRetrigger)))
+        if (!IsEnabled || (isWaiting && !AllowsFastRetrigger))
         {
             return;
         }
@@ -62,9 +113,9 @@ public sealed class LogicRelay : BaseEntity
 
         isWaiting = false;
 
-        if (HasSpawnFlags(SpawnFlag.OnlyOnce))
+        if (TriggersOnce)
         {
-            IsEnabled = false;
+            EntitySystem.Remove(this);
         }
     }
 

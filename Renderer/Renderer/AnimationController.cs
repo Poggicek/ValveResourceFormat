@@ -69,6 +69,20 @@ namespace ValveResourceFormat.Renderer
             }
         }
 
+        /// <summary>
+        /// Raised for every event of a sequence animation crossed as the model's own animations play.
+        /// </summary>
+        /// <remarks>
+        /// The model's player rather than an external one: these are the events of the animations this
+        /// model owns, which is what an entity driving it - a scripted sequence watching for its script
+        /// events - is listening for.
+        /// </remarks>
+        public event Action<AnimationEvent>? SequenceEventFired
+        {
+            add => modelPlayer.SequenceEventFired += value;
+            remove => modelPlayer.SequenceEventFired -= value;
+        }
+
         /// <summary>Gets or sets whether animations should loop when reaching the end.</summary>
         public bool Looping { get; set; } = true;
 

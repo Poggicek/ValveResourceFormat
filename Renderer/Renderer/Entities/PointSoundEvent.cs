@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using ValveResourceFormat.Renderer.Audio;
 using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.Serialization.KeyValues;
@@ -65,7 +66,19 @@ public sealed class PointSoundEvent : BaseEntity
 
         StopSound();
 
-        playing = Sound.Play(SoundName, GetEmitPosition());
+        var position = GetEmitPosition();
+
+        playing = Sound.Play(SoundName, position);
+
+        // Logged either way: a sound the bank could not build reports null here, which is the difference
+        // between a name the map got wrong and one the sound system could not play
+        EntitySystem.Logger.LogInformation(
+            "{Classname} '{TargetName}' {Result} \"{SoundName}\" at {Position}",
+            Classname,
+            TargetName,
+            playing == null ? "could NOT play" : "playing",
+            SoundName,
+            position);
     }
 
     /// <summary>
@@ -99,6 +112,12 @@ public sealed class PointSoundEvent : BaseEntity
     /// Where the sound emits from, or <see langword="null"/> for an event played flat on the listener
     /// rather than placed in the world.
     /// </summary>
+    /// <remarks>
+    /// The entity's own position is read from <see cref="BaseEntity.Transform"/> rather than
+    /// <see cref="BaseEntity.Origin"/>: an entity spawned from a <c>point_template</c> carries an origin
+    /// in the template's frame, and only the transform composes the spawner's placement onto it. Reading
+    /// the origin puts such a sound near the world origin instead of where the map has it.
+    /// </remarks>
     private Vector3? GetEmitPosition()
     {
         if (KeyValues.GetBooleanProperty("tolocalplayer"))
@@ -111,7 +130,7 @@ public sealed class PointSoundEvent : BaseEntity
         if (string.IsNullOrEmpty(sourceEntityName)
             || Scene.FindNodeByTargetName(sourceEntityName) is not { } sourceNode)
         {
-            return Origin;
+            return Transform.Translation;
         }
 
         var attachmentName = KeyValues.GetStringProperty("sourceentityattachment");
@@ -126,7 +145,7 @@ public sealed class PointSoundEvent : BaseEntity
         // The offset is authored relative to the source, and this entity was placed at the result of it
         if (KeyValues.GetBooleanProperty("uselocaloffset"))
         {
-            return Origin;
+            return Transform.Translation;
         }
 
         return sourceNode.Transform.Translation;

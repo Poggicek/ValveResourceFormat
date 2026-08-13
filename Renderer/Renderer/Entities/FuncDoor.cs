@@ -58,6 +58,12 @@ public class FuncDoor : BaseToggle
     /// <summary>Gets where the door is in its travel.</summary>
     protected ToggleState State { get; private set; }
 
+    /// <summary>
+    /// Whether standing open is temporary. A door closes itself once it has been open for its <c>wait</c>,
+    /// which is what makes a doorway a doorway; a brush that merely travels stays where it was sent.
+    /// </summary>
+    protected virtual bool ReturnsAfterWait => true;
+
     /// <summary>Gets the place the door rests when closed.</summary>
     protected Vector3 PositionClosed { get; set; }
 
@@ -122,6 +128,20 @@ public class FuncDoor : BaseToggle
     /// <param name="opening">Whether it is heading for the open end.</param>
     protected virtual void StartMove(bool opening) => LinearMove(opening ? PositionOpen : PositionClosed);
 
+    /// <summary>
+    /// Sends the door to any point along its travel, for the inputs that place it rather than open or
+    /// close it. It counts as opening unless it is heading for the closed end exactly, so the arrival
+    /// still reports through the outputs a map listens to.
+    /// </summary>
+    /// <param name="destination">Where to travel to.</param>
+    protected void MoveTo(Vector3 destination)
+    {
+        State = destination == PositionClosed ? ToggleState.GoingDown : ToggleState.GoingUp;
+
+        SetNextThink(-1f);
+        LinearMove(destination);
+    }
+
     /// <inheritdoc/>
     public override void MoveDone()
     {
@@ -134,7 +154,7 @@ public class FuncDoor : BaseToggle
             EntitySystem.TriggerOutput(this, "OnFullyOpen");
 
             // A toggle door waits to be told; the rest close themselves after their wait
-            if (!HasSpawnFlags(SpawnFlag.Toggle) && Wait >= 0f)
+            if (ReturnsAfterWait && !HasSpawnFlags(SpawnFlag.Toggle) && Wait >= 0f)
             {
                 SetNextThink(EntitySystem.CurrentTime + Wait);
             }

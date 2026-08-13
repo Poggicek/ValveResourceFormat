@@ -13,11 +13,14 @@ public sealed class PointTeleport : BaseEntity
     [Flags]
     public enum SpawnFlag : uint
     {
-        /// <summary>Keeps whatever the target was facing instead of adopting this entity's angles.</summary>
-        IntoDuck = 1,
-
         /// <summary>Teleports the target home rather than here. Not simulated: nothing records a home.</summary>
-        TeleportHome = 2,
+        TeleportHome = 1,
+
+        /// <summary>Arrives crouched. Nothing here ducks on arrival.</summary>
+        IntoDuck = 2,
+
+        /// <summary>Turns the player to face this entity's angles, which in VR is a thing done deliberately.</summary>
+        ChangeViewDirection = 4,
     }
 
     /// <summary>
@@ -44,7 +47,7 @@ public sealed class PointTeleport : BaseEntity
 
         foreach (var target in EntitySystem.FindTargets(targetName, data.Activator, this))
         {
-            target.Teleport(Origin, Angles);
+            target.Teleport(WorldOrigin, Angles);
         }
     }
 }

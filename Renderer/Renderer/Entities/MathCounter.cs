@@ -1,3 +1,4 @@
+using System.Globalization;
 using ValveResourceFormat.Serialization.KeyValues;
 
 namespace ValveResourceFormat.Renderer.Entities;
@@ -7,10 +8,10 @@ namespace ValveResourceFormat.Renderer.Entities;
 /// of that range. How a map counts things: scores, lives, how many buttons are still to be pressed.
 /// </summary>
 /// <remarks>
-/// <c>OutValue</c> fires with no value attached. Entity I/O carries a parameter, but a connection's own
-/// <c>OverrideParam</c> is what the wiring in these maps relies on, and the counter's value would need a
-/// parameter to travel with the output; until outputs carry one, a target reading <c>OutValue</c> sees the
-/// firing but not the number.
+/// <c>OutValue</c> carries the number it now holds, which is the whole point of the entity: a counter wired
+/// into a <see cref="LogicCase"/> is how a map does "on the third press", and the case has nothing to match
+/// unless the value travels with the output. A connection authored with its own parameter still overrides
+/// it, as in the engine.
 /// </remarks>
 public sealed class MathCounter : BaseEntity
 {
@@ -27,6 +28,15 @@ public sealed class MathCounter : BaseEntity
     public bool IsEnabled { get; private set; } = true;
 
     /// <summary>
+    /// Whether the map authored a range to hold the value in. Both ends left at zero means none, which is
+    /// how the engine tells "count between these" from "just count".
+    /// </summary>
+    private bool HasRange => Min != 0f || Max != 0f;
+
+    private bool hitMin;
+    private bool hitMax;
+
+    /// <summary>
     /// Initializes a <c>math_counter</c> from its keyvalues.
     /// </summary>
     /// <param name="system">The world this entity belongs to.</param>
@@ -40,6 +50,14 @@ public sealed class MathCounter : BaseEntity
     {
         Min = KeyValues.GetFloatProperty("min");
         Max = KeyValues.GetFloatProperty("max");
+
+        // Authored the wrong way round the range would clamp everything to nothing, so the engine swaps
+        // them rather than honouring what the map said
+        if (Min > Max)
+        {
+            (Min, Max) = (Max, Min);
+        }
+
         Value = Clamp(KeyValues.GetFloatProperty("startvalue"));
         IsEnabled = !KeyValues.GetBooleanProperty("startdisabled");
     }
@@ -76,6 +94,13 @@ public sealed class MathCounter : BaseEntity
     private void InputSetHitMax(EntityInputData data)
     {
         Max = data.Float();
+
+        // A range cannot be inside out, so the other end gives way
+        if (Max < Min)
+        {
+            Min = Max;
+        }
+
         SetValue(Value, data.Activator);
     }
 
@@ -85,13 +110,23 @@ public sealed class MathCounter : BaseEntity
     private void InputSetHitMin(EntityInputData data)
     {
         Min = data.Float();
+
+        if (Max < Min)
+        {
+            Max = Min;
+        }
+
         SetValue(Value, data.Activator);
     }
 
-    /// <summary>Fires <c>OutValue</c> with the value the counter already holds.</summary>
+    /// <summary>
+    /// Reports the value the counter already holds, without changing it. Its own output rather than
+    /// <c>OutValue</c>, so that polling a counter is not mistaken for it having counted.
+    /// </summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
     [EntityInput("GetValue")]
-    private void InputGetValue(EntityInputData data) => EntitySystem.TriggerOutput(this, "OutValue", data.Activator);
+    private void InputGetValue(EntityInputData data)
+        => EntitySystem.TriggerOutput(this, "OnGetValue", data.Activator, FormatValue(Value));
 
     /// <summary>Lets the counter accept changes again.</summary>
     /// <param name="data">The input's parameter and sender, unused.</param>
@@ -110,29 +145,54 @@ public sealed class MathCounter : BaseEntity
             return;
         }
 
+        if (HasRange)
+        {
+            // Reaching a limit is an edge, not a state: a counter held at its maximum reports arriving
+            // there once, and reports leaving it once, however many times it is added to in between
+            UpdateLimit(value >= Max, ref hitMax, Max, "OnHitMax", "OnChangedFromMax", activator);
+            UpdateLimit(value <= Min, ref hitMin, Min, "OnHitMin", "OnChangedFromMin", activator);
+        }
+
         Value = Clamp(value);
 
-        EntitySystem.TriggerOutput(this, "OutValue", activator);
-
-        // The engine reports hitting a limit every time it lands there, not only on the way in
-        if (Max != 0f && Value >= Max)
-        {
-            EntitySystem.TriggerOutput(this, "OnHitMax", activator);
-        }
-        else if (Value <= Min && Min != 0f)
-        {
-            EntitySystem.TriggerOutput(this, "OnHitMin", activator);
-        }
+        EntitySystem.TriggerOutput(this, "OutValue", activator, FormatValue(Value));
     }
 
-    /// <summary>Clamps to the authored range, treating an unset maximum as no upper bound.</summary>
-    private float Clamp(float value)
+    /// <summary>
+    /// Reports one end of the range being reached or left. <paramref name="limit"/> is compared against the
+    /// value the counter still holds, since leaving an end is only news when it was sitting on it.
+    /// </summary>
+    private void UpdateLimit(bool reached, ref bool wasReached, float limit, string onHit, string onChanged, BaseEntity? activator)
     {
-        if (Max != 0f && value > Max)
+        if (reached)
         {
-            return Max;
+            if (!wasReached)
+            {
+                wasReached = true;
+
+                EntitySystem.TriggerOutput(this, onHit, activator);
+            }
+
+            return;
         }
 
-        return value < Min ? Min : value;
+        if (Value == limit)
+        {
+            EntitySystem.TriggerOutput(this, onChanged, activator);
+        }
+
+        wasReached = false;
     }
+
+    /// <summary>
+    /// Clamps to the authored range. A counter with neither end authored has no range at all rather than
+    /// one that runs from zero to zero, so it counts as far in either direction as the map drives it.
+    /// </summary>
+    private float Clamp(float value) => HasRange ? Math.Clamp(value, Min, Max) : value;
+
+    /// <summary>
+    /// The value as entity I/O carries it. Whole numbers are written without a fractional part, so that a
+    /// counter feeding a <see cref="LogicCase"/> matches a case authored as <c>1</c>.
+    /// </summary>
+    private static string FormatValue(float value) => value.ToString(CultureInfo.InvariantCulture);
 }
