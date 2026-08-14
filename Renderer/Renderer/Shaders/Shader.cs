@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 using ValveResourceFormat.ThirdParty;
 
 namespace ValveResourceFormat.Renderer.Shaders
@@ -158,6 +159,26 @@ namespace ValveResourceFormat.Renderer.Shaders
             foreach (var variant in variants.Values)
             {
                 variant.SetUniform1(name, value);
+            }
+        }
+
+        private GLPushConstantBlock? pushConstants;
+
+        /// <summary>
+        /// Gets the per-draw push constant block of this program. OpenGL has no push constants, so the block
+        /// writes its fields as loose program uniforms, diffed against the last value written to this program.
+        /// </summary>
+        /// <remarks>
+        /// Cached here rather than on the pipeline because uniform state belongs to the program: every
+        /// pipeline over this shader has to share one block, or they would each diff against a baseline the
+        /// others had already overwritten.
+        /// </remarks>
+        public GLPushConstantBlock PushConstants
+        {
+            get
+            {
+                EnsureLoaded();
+                return pushConstants ??= new GLPushConstantBlock(this);
             }
         }
 
@@ -781,6 +802,10 @@ namespace ValveResourceFormat.Renderer.Shaders
             ReservedTexturesUsed.UnionWith(shader.ReservedTexturesUsed);
 
             Uniforms.Clear();
+
+            // The replacement is a different program, so both the cached locations and the diff baseline
+            // belong to a program that no longer exists.
+            pushConstants = null;
         }
 #endif
     }

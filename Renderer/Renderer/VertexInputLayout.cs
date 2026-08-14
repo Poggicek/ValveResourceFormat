@@ -139,6 +139,10 @@ namespace ValveResourceFormat.Renderer
         /// <summary>This format as <see cref="VBIB"/> input layout fields, for the upload path.</summary>
         public VBIB.RenderInputLayoutField[] Fields() => fields;
 
+        /// <summary>The shader input location of each attribute, in the order <see cref="Fields"/> returns them.
+        /// What a pipeline's vertex input state is described from.</summary>
+        public ReadOnlySpan<int> Locations => locations;
+
         /// <summary>Creates a VAO binding one vertex buffer. An index buffer of 0 means non-indexed.</summary>
         public int CreateVertexArray(string? debugLabel, int vertexBuffer, int indexBuffer = 0)
         {
