@@ -1,7 +1,10 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Blocks;
 using ValveResourceFormat.Renderer.Buffers;
+using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 using ValveResourceFormat.Renderer.World;
 
 namespace ValveResourceFormat.Renderer
@@ -141,6 +144,20 @@ namespace ValveResourceFormat.Renderer
             public int LightmapGameVersionNumber;
             public bool IndirectDraw;
             public LightProbeType LightProbeType;
+
+            /// <summary>The command list to record through, or null to issue OpenGL calls directly.</summary>
+            public ICommandList? CommandList;
+
+            /// <summary>The device backing <see cref="CommandList"/>, which builds the pipelines.</summary>
+            public GLRendererDevice? Device;
+
+            /// <summary>The state tracker whose current pass every pipeline's state is composed over.</summary>
+            public RenderStateTracker? RenderState;
+
+            /// <summary>The attachment formats a pipeline for this pass must declare.</summary>
+            public RhiFormat[] ColorFormats;
+            public RhiFormat DepthFormat;
+            public int SampleCount;
         }
 
         /// <summary>Binds a per-draw texture over its reserved unit.</summary>
@@ -155,13 +172,28 @@ namespace ValveResourceFormat.Renderer
             Shader? shader = null;
             RenderMaterial? material = null;
             Uniforms uniforms = new();
+
+            var commandList = context.CommandList;
+            var framebuffer = context.Framebuffer;
+
             Config config = new()
             {
                 NeedsCubemapBinding = context.Scene.LightingInfo.CubemapType == CubemapType.IndividualCubemaps,
                 LightmapGameVersionNumber = context.Scene.LightingInfo.LightmapGameVersionNumber,
                 LightProbeType = context.Scene.LightingInfo.LightProbeType,
                 IndirectDraw = context.Scene.DrawMeshletsIndirect && context.RenderPass < RenderPass.Opaque,
+
+                CommandList = commandList,
+                Device = commandList is null ? null : (GLRendererDevice)commandList.Device,
+                RenderState = context.Scene.RendererContext.RenderState,
+                ColorFormats = framebuffer.Color is { } color ? [color.RhiFormat] : [],
+                DepthFormat = framebuffer.Depth?.RhiFormat ?? RhiFormat.Undefined,
+                SampleCount = Math.Max(1, framebuffer.NumSamples),
             };
+
+            // Set whenever the pipeline or the geometry a draw needs stops matching what is bound. The
+            // same three things that make the OpenGL path rebind: the shader, the material, and the VAO.
+            var rebindPipeline = false;
 
             var counters = PerfStats.Active;
 
@@ -259,6 +291,7 @@ namespace ValveResourceFormat.Renderer
 
                     material = requestMaterial;
                     material.Render(shader);
+                    rebindPipeline = true;
                 }
 
                 var requestVao = request.Call.GetVertexArrayObject();
@@ -268,8 +301,23 @@ namespace ValveResourceFormat.Renderer
                 if (vao != requestVao)
                 {
                     vao = requestVao;
-                    GL.BindVertexArray(vao);
                     counters.Count(Counter.VaoChange);
+                    rebindPipeline = true;
+
+                    // When recording, geometry is bound through the command list instead: the vertex
+                    // array comes from the pipeline's vertex input, so this mesh's own VAO is not what
+                    // fetches its attributes. It is still resolved above, because it is what keys the
+                    // change detection and what VertexArray.Validate checks against the shader.
+                    if (config.CommandList == null)
+                    {
+                        GL.BindVertexArray(vao);
+                    }
+                }
+
+                if (config.CommandList != null && rebindPipeline)
+                {
+                    BindPipelineAndGeometry(shader!, material!, request.Call, ref config);
+                    rebindPipeline = false;
                 }
 
                 Draw(shader!, ref uniforms, ref config, new(request.Mesh, request.Call, request.Node));
@@ -280,6 +328,149 @@ namespace ValveResourceFormat.Renderer
                 material!.PostRender();
             }
         }
+
+        /// <summary>
+        /// Binds the pipeline this draw call needs and the geometry it fetches from, for the recording path.
+        /// </summary>
+        /// <remarks>
+        /// Called on the same three changes that make the OpenGL path rebind, so a run of draws sharing a
+        /// material and a mesh costs one pipeline bind between them rather than one each.
+        /// </remarks>
+        private static void BindPipelineAndGeometry(Shader shader, RenderMaterial material, DrawCall call, ref Config config)
+        {
+            var commandList = config.CommandList!;
+            var vertexBuffers = VertexBuffersWithDefaults(call);
+
+            // The state the pipeline bakes has to be the state the OpenGL path applies, or the two
+            // backends stop being each other's oracle. A material-ignoring replacement shader applies
+            // none and draws under the pass baseline the batch scope latched; every other material
+            // composes its own over that baseline, which is exactly what RenderMaterial.Render applies.
+            var passState = config.RenderState!.CurrentPass;
+            var state = shader.IgnoreMaterialData ? passState : material.GetRenderState(in passState);
+
+            var pipeline = config.Device!.GetOrCreatePipeline(
+                shader,
+                in state,
+                DescribeVertexInput(call, vertexBuffers),
+                ToTopology(call.PrimitiveType),
+                config.ColorFormats,
+                config.DepthFormat,
+                config.SampleCount,
+                GLRendererDevice.DrawConstants);
+
+            commandList.BindPipeline(pipeline);
+
+            var meshBuffers = call.MeshBuffers;
+
+            for (var binding = 0; binding < vertexBuffers.Length; binding++)
+            {
+                // Offset zero, matching the vertex array: a draw call's own Offset is folded into the
+                // attribute offsets, not the buffer binding.
+                commandList.BindVertexBuffer(binding, meshBuffers.GetRhiBuffer(vertexBuffers[binding]));
+            }
+
+            if (call.IndexBuffer.Handle != 0)
+            {
+                var (indexType, _) = GPUMeshBufferCache.DescribeIndexedDraw(call);
+                commandList.BindIndexBuffer(meshBuffers.GetRhiBuffer(call.IndexBuffer), indexType);
+            }
+        }
+
+        private static readonly VBIB.RenderInputLayoutField[] DefaultColorLayout =
+        [
+            new VBIB.RenderInputLayoutField
+            {
+                SemanticName = "COLOR",
+                Format = DXGI_FORMAT.R32G32B32A32_FLOAT,
+            },
+        ];
+
+        /// <summary>
+        /// Returns the draw call's vertex buffers, with the default white COLOR stream appended when the
+        /// mesh has none.
+        /// </summary>
+        /// <remarks>
+        /// :VertexInputParity - mirrors <c>GPUMeshBufferCache.AddMissingAttributes</c>, which does the same
+        /// for the vertex array the OpenGL path fetches through. The two have to agree: a mesh whose COLOR
+        /// stream one path substitutes and the other does not renders with different vertex colours. The
+        /// substitute buffer has a stride of zero on purpose, which is what makes its single value apply to
+        /// every vertex.
+        /// </remarks>
+        private static VertexDrawBuffer[] VertexBuffersWithDefaults(DrawCall call)
+        {
+            foreach (var buffer in call.VertexBuffers)
+            {
+                foreach (var field in buffer.InputLayoutFields)
+                {
+                    if (field.SemanticName == "COLOR")
+                    {
+                        return call.VertexBuffers;
+                    }
+                }
+            }
+
+            return [.. call.VertexBuffers, new VertexDrawBuffer
+            {
+                Handle = call.MeshBuffers.VectorOneVertexBuffer,
+                ElementSizeInBytes = 0,
+                InputLayoutFields = DefaultColorLayout,
+            }];
+        }
+
+        /// <summary>
+        /// Describes a draw call's geometry as pipeline vertex input state.
+        /// </summary>
+        /// <remarks>
+        /// :VertexInputParity - mirrors <c>GPUMeshBufferCache.CreateVertexArrayObject</c> attribute for
+        /// attribute, because on the recording path this replaces it: the vertex array a draw fetches
+        /// through is built from the pipeline's vertex input, not from the mesh's own VAO. It resolves
+        /// locations the same way, skips the same attributes, and takes the same first-wins rule for a
+        /// location two buffers both claim, which the alias table allows.
+        /// </remarks>
+        private static VertexInputDesc DescribeVertexInput(DrawCall call, VertexDrawBuffer[] vertexBuffers)
+        {
+            var inputSignature = call.Material.Material.InputSignature;
+            var bindings = new VertexBindingDesc[vertexBuffers.Length];
+            var attributes = new List<VertexAttributeDesc>();
+            var boundLocations = 0;
+
+            for (var binding = 0; binding < vertexBuffers.Length; binding++)
+            {
+                var buffer = vertexBuffers[binding];
+                bindings[binding] = new VertexBindingDesc(binding, (int)buffer.ElementSizeInBytes);
+
+                foreach (var attribute in buffer.InputLayoutFields)
+                {
+                    var location = VertexAttributeLocations.Resolve(inputSignature, attribute, out _);
+
+                    // Unknown, or a location an earlier buffer already took
+                    if (location == -1 || (boundLocations & (1 << location)) != 0)
+                    {
+                        continue;
+                    }
+
+                    boundLocations |= 1 << location;
+
+                    attributes.Add(new VertexAttributeDesc(
+                        location,
+                        FormatTables.FromDxgiFormat(attribute.Format),
+                        (int)attribute.Offset,
+                        binding));
+                }
+            }
+
+            return new VertexInputDesc([.. attributes], bindings);
+        }
+
+        private static PrimitiveTopology ToTopology(PrimitiveType primitiveType) => primitiveType switch
+        {
+            PrimitiveType.Points => PrimitiveTopology.PointList,
+            PrimitiveType.Lines => PrimitiveTopology.LineList,
+            PrimitiveType.LineStrip => PrimitiveTopology.LineStrip,
+            PrimitiveType.Triangles => PrimitiveTopology.TriangleList,
+            PrimitiveType.TriangleStrip => PrimitiveTopology.TriangleStrip,
+            _ => throw new NotSupportedException($"Primitive type {primitiveType} has no {nameof(PrimitiveTopology)} member."),
+        };
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static void Draw(Shader shader, ref Uniforms uniforms, ref Config config, BatchRequest request)
@@ -327,6 +518,20 @@ namespace ValveResourceFormat.Renderer
                     var scene = agg.Scene;
                     if (scene.CompactMeshletDraws && agg.CompactionIndex >= 0)
                     {
+                        if (config.CommandList != null)
+                        {
+                            Debug.Assert(scene.CompactedDrawsGpu != null && scene.CompactedCountsGpu != null);
+
+                            config.CommandList.DrawIndexedIndirectCount(
+                                scene.CompactedDrawsGpu.RhiBuffer,
+                                agg.IndirectDrawByteOffset,
+                                scene.CompactedCountsGpu.RhiBuffer,
+                                agg.CompactionIndex * sizeof(uint),
+                                agg.IndirectDrawCount,
+                                0);
+                            return;
+                        }
+
                         GL.MultiDrawElementsIndirectCount(
                             request.Call.PrimitiveType,
                             request.Call.IndexType,
@@ -334,6 +539,18 @@ namespace ValveResourceFormat.Renderer
                             agg.CompactionIndex * sizeof(uint), // drawcount buffer offset
                             agg.IndirectDrawCount, // maxdrawcount
                             0); // stride
+                        return;
+                    }
+
+                    if (config.CommandList != null)
+                    {
+                        // Whichever buffer Scene bound to GL_DRAW_INDIRECT_BUFFER for this frame. The
+                        // compacted one is bound whenever compaction is on, even for an aggregate that
+                        // has no compaction slot and so takes this uncounted path.
+                        var arguments = scene.CompactMeshletDraws ? scene.CompactedDrawsGpu : scene.IndirectDrawsGpu;
+                        Debug.Assert(arguments != null);
+
+                        config.CommandList.DrawIndexedIndirect(arguments.RhiBuffer, agg.IndirectDrawByteOffset, agg.IndirectDrawCount, 0);
                         return;
                     }
 
@@ -396,6 +613,24 @@ namespace ValveResourceFormat.Renderer
             }
 
             PerfStats.Active.CountDrawCall(request.Node);
+
+            if (config.CommandList != null)
+            {
+                // StartIndex is a byte offset because that is the pointer glDrawElements takes, while
+                // firstIndex is an element count. DescribeIndexedDraw converts it, and returns the index
+                // type with it so the two cannot be applied by halves.
+                var (_, firstIndex) = GPUMeshBufferCache.DescribeIndexedDraw(request.Call);
+
+                // The node id travels as the base instance. The contract types it signed and the backend
+                // casts it back, so the bit pattern the shader reads as gl_BaseInstance is unchanged.
+                config.CommandList.DrawIndexed(
+                    request.Call.IndexCount,
+                    instanceCount,
+                    firstIndex,
+                    request.Call.BaseVertex,
+                    (int)request.Node.Id);
+                return;
+            }
 
             GL.DrawElementsInstancedBaseVertexBaseInstance(
                 request.Call.PrimitiveType,
