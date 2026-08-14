@@ -18,6 +18,14 @@ namespace ValveResourceFormat.Renderer.Buffers
         {
         }
 
+        /// <inheritdoc/>
+        /// <remarks>A persistently mapped buffer is host visible readback memory; everything else this
+        /// type allocates is device local. <see cref="RHI.OpenGL.GlBarrierTranslation"/> reads this to
+        /// decide whether a shader write has to be made visible to the client mapping.</remarks>
+        protected override RHI.BufferMemory RhiMemory => PersistentPtr != IntPtr.Zero
+            ? RHI.BufferMemory.HostReadback
+            : RHI.BufferMemory.DeviceLocal;
+
         /// <summary>Allocates a new storage buffer sized for the given number of elements.</summary>
         /// <remarks>
         /// BufferUsageHint.DynamicRead creates a mapped buffer

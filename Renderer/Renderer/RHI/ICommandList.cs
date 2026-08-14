@@ -108,8 +108,15 @@ public interface ICommandList : IDisposable
     /// <see cref="DescriptorSets.MaterialTextures"/>.</param>
     /// <param name="binding">The slot within that set.</param>
     /// <param name="texture">The texture to bind.</param>
-    /// <param name="sampler">The sampler to bind, or <see langword="null"/> for the device's default
-    /// linear-repeat sampler. Textures carry no sampler of their own.</param>
+    /// <param name="sampler">The sampler to bind, or <see langword="null"/> for the device default.</param>
+    /// <remarks>
+    /// The two backends differ on what the default means, and the difference is load bearing. On
+    /// OpenGL it is sampler object 0, which defers to the texture object's own parameters &#8212; the
+    /// behaviour <see cref="RenderTexture"/> and <see cref="Materials.MaterialLoader"/> rely on
+    /// today, and binding a real sampler there would override every texture and change the image.
+    /// Vulkan has no such fallback and must supply a genuine default, so textures cannot keep
+    /// carrying sampler state once that backend is live.
+    /// </remarks>
     void BindTexture(int descriptorSet, int binding, ITexture texture, ISampler? sampler = null);
 
     /// <summary>

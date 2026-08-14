@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 using ValveResourceFormat.ResourceTypes;
 
 namespace ValveResourceFormat.Renderer
@@ -41,6 +43,56 @@ namespace ValveResourceFormat.Renderer
         /// texture carried them.
         /// </summary>
         public float[]? RadianceCoefficients { get; }
+
+        /// <summary>
+        /// Gets or sets the RHI format of this texture's storage, or <see cref="RhiFormat.Undefined"/>
+        /// when it was allocated through a path that never recorded one.
+        /// </summary>
+        /// <remarks>Set by the allocating call site, which is the only place that knows it.
+        /// <see cref="RhiTexture"/> carries it through; nothing else reads it, so leaving it undefined
+        /// only costs the ability to upload to or create a view of this texture through the RHI.</remarks>
+        public RhiFormat RhiFormat { get; set; }
+
+        private GLTexture? rhiTexture;
+
+        /// <summary>
+        /// Gets this texture as an <see cref="ITexture"/>, so it can be passed to
+        /// <see cref="ICommandList.BindTexture"/>.
+        /// </summary>
+        /// <remarks>
+        /// A non-owning wrapper around the same OpenGL object, not a second allocation: this texture
+        /// keeps ownership and <see cref="Delete"/> is still what frees it. It is the bridge that lets
+        /// material and global texture bindings move onto the RHI before texture allocation does, and it
+        /// goes away as those allocations move onto <see cref="IDevice.CreateTexture"/>.
+        /// </remarks>
+        public ITexture RhiTexture
+        {
+            get
+            {
+                if (rhiTexture is null || rhiTexture.Handle != Handle)
+                {
+                    // Permissive usage on purpose: OpenGL ignores it at creation, and the only thing that
+                    // reads it is barrier translation, where a superset is the conservative answer.
+                    var desc = new TextureDesc(
+                        Math.Max(Width, 1),
+                        Math.Max(Height, 1),
+                        RhiFormat,
+                        TextureUsage.Sampled | TextureUsage.Storage | TextureUsage.CopySource | TextureUsage.CopyDestination,
+                        Name ?? string.Empty,
+                        Math.Max(Depth, 1),
+                        Math.Max(NumMipLevels, 1),
+                        1,
+                        GLTexture.ToDimension(Target));
+
+                    rhiTexture = GLTexture.Wrap(Handle, Target, in desc);
+                }
+
+                return rhiTexture;
+            }
+        }
+
+        /// <summary>Gets or sets the debug label last assigned through <see cref="SetLabel"/>.</summary>
+        public string? Name { get; private set; }
 
         RenderTexture(TextureTarget target)
         {
@@ -117,6 +169,30 @@ namespace ValveResourceFormat.Renderer
             return texture;
         }
 
+        /// <summary>Creates a 2D texture with immutable storage, in an RHI format.</summary>
+        /// <param name="width">Texture width in texels.</param>
+        /// <param name="height">Texture height in texels.</param>
+        /// <param name="format">Pixel format, translated through <see cref="FormatTables"/>.</param>
+        /// <param name="mips">When <see langword="true"/>, allocates a reduced mip chain (see <see cref="MaxMipCount"/>) rather than a single level.</param>
+        /// <returns>The newly created render texture, with <see cref="RhiFormat"/> recorded.</returns>
+        /// <remarks>Prefer this over the <see cref="SizedInternalFormat"/> overloads: it records the
+        /// format, which is what lets <see cref="RhiTexture"/> describe the texture completely.</remarks>
+        public static RenderTexture Create(int width, int height, RhiFormat format, bool mips = false)
+            => Create(width, height, format, mips ? MaxMipCount(width, height) : 1);
+
+        /// <summary>Creates a 2D texture with immutable storage and an explicit mip count, in an RHI format.</summary>
+        /// <param name="width">Texture width in texels.</param>
+        /// <param name="height">Texture height in texels.</param>
+        /// <param name="format">Pixel format, translated through <see cref="FormatTables"/>.</param>
+        /// <param name="mipCount">Number of mip levels to allocate.</param>
+        /// <returns>The newly created render texture, with <see cref="RhiFormat"/> recorded.</returns>
+        public static RenderTexture Create(int width, int height, RhiFormat format, int mipCount)
+        {
+            var texture = Create(width, height, FormatTables.ToGLSizedInternalFormat(format), mipCount);
+            texture.RhiFormat = format;
+            return texture;
+        }
+
         /// <summary>Creates a texture view that reinterprets a subrange of this texture's storage.</summary>
         /// <param name="internalFormat">The reinterpreted pixel format for the view.</param>
         /// <param name="minLevel">First mip level visible through the view.</param>
@@ -177,6 +253,7 @@ namespace ValveResourceFormat.Renderer
         /// <param name="label">Label string visible in graphics debuggers.</param>
         public void SetLabel(string label)
         {
+            Name = label;
             GL.ObjectLabel(ObjectLabelIdentifier.Texture, Handle, label.Length, label);
         }
 

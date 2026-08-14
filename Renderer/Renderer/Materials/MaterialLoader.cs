@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 using SkiaSharp;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 using ValveResourceFormat.ResourceTypes;
 using VrfMaterial = ValveResourceFormat.ResourceTypes.Material;
 
@@ -23,6 +24,7 @@ namespace ValveResourceFormat.Renderer.Materials
         private readonly Dictionary<string, RenderTexture> Textures = [];
         private readonly Dictionary<string, RenderTexture> TexturesSrgb = [];
         private readonly Dictionary<(int AddressU, int AddressV, bool AnisotropicFiltering), int> Samplers = [];
+        private readonly Dictionary<(int AddressU, int AddressV, bool AnisotropicFiltering), GLSampler> RhiSamplers = [];
         private readonly RendererContext RendererContext;
         private RenderTexture? ErrorTexture;
         private RenderTexture? DefaultNormal;
@@ -92,11 +94,14 @@ namespace ValveResourceFormat.Renderer.Materials
 
             TexturesSrgb.Clear();
 
-            foreach (var sampler in Samplers.Values)
+            // Every handle in Samplers belongs to a GLSampler in RhiSamplers: both accessors build through
+            // CreateSampler, which registers there. Disposing these frees both caches' objects exactly once.
+            foreach (var sampler in RhiSamplers.Values)
             {
-                GL.DeleteSampler(sampler);
+                sampler.Dispose();
             }
 
+            RhiSamplers.Clear();
             Samplers.Clear();
         }
 
@@ -248,28 +253,79 @@ namespace ValveResourceFormat.Renderer.Materials
                 return sampler;
             }
 
-            GL.CreateSamplers(1, out sampler);
-            GL.SamplerParameter(sampler, SamplerParameterName.TextureWrapS, (int)MapAddressMode(addressModeU));
-            GL.SamplerParameter(sampler, SamplerParameterName.TextureWrapT, (int)MapAddressMode(addressModeV));
-            GL.SamplerParameter(sampler, SamplerParameterName.TextureMinFilter, (int)(mipmaps ? TextureMinFilter.LinearMipmapLinear : TextureMinFilter.Linear));
-            GL.SamplerParameter(sampler, SamplerParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
-
-            if (anisotropicFiltering && MaxTextureMaxAnisotropy >= 4)
-            {
-                GL.SamplerParameter(sampler, (SamplerParameterName)ExtTextureFilterAnisotropic.TextureMaxAnisotropyExt, MaxTextureMaxAnisotropy);
-            }
+            sampler = CreateSampler(addressModeU, addressModeV, mipmaps, anisotropicFiltering).Handle;
 
             Samplers[key] = sampler;
             return sampler;
         }
 
-        private static TextureWrapMode MapAddressMode(int mode) => mode switch
+        /// <summary>
+        /// Gets the same sampler <see cref="GetOrCreateSampler"/> returns, as an RHI
+        /// <see cref="RHI.ISampler"/> for <see cref="RHI.ICommandList.BindTexture"/>.
+        /// </summary>
+        /// <param name="addressModeU">Raw Source 2 <c>g_nTextureAddressModeU</c> value.</param>
+        /// <param name="addressModeV">Raw Source 2 <c>g_nTextureAddressModeV</c> value.</param>
+        /// <param name="mipmaps">Whether to filter between mip levels.</param>
+        /// <param name="anisotropicFiltering">Whether to apply anisotropic filtering when
+        /// <see cref="MaxTextureMaxAnisotropy"/> is sufficient.</param>
+        /// <returns>The sampler, or <see langword="null"/> for the default sampler state, which on OpenGL
+        /// means the parameters set on the texture object itself.</returns>
+        /// <remarks>The same cache and the same objects as the OpenGL path: this is what that path is now
+        /// built from, so the two cannot drift apart.</remarks>
+        public RHI.ISampler? GetOrCreateRhiSampler(int addressModeU, int addressModeV, bool mipmaps = true, bool anisotropicFiltering = true)
         {
-            0 => TextureWrapMode.Repeat,
-            1 => TextureWrapMode.MirroredRepeat,
-            2 => TextureWrapMode.ClampToEdge,
-            3 => TextureWrapMode.ClampToBorder,
-            _ => TextureWrapMode.Repeat,
+            var key = (addressModeU, addressModeV, anisotropicFiltering);
+
+            if (key == (0, 0, true))
+            {
+                return null; // default sampler state with repeat wrap mode
+            }
+
+            if (RhiSamplers.TryGetValue(key, out var existing))
+            {
+                return existing;
+            }
+
+            var created = CreateSampler(addressModeU, addressModeV, mipmaps, anisotropicFiltering);
+
+            RhiSamplers[key] = created;
+            Samplers[key] = created.Handle;
+            return created;
+        }
+
+        private GLSampler CreateSampler(int addressModeU, int addressModeV, bool mipmaps, bool anisotropicFiltering)
+        {
+            var key = (addressModeU, addressModeV, anisotropicFiltering);
+
+            if (RhiSamplers.TryGetValue(key, out var existing))
+            {
+                return existing;
+            }
+
+            // Anisotropy is requested only when the device reports at least 4x, exactly as before;
+            // GLSampler applies the parameter only when the value exceeds 1, so the two agree.
+            var desc = new RHI.SamplerDesc(
+                MinFilter: RHI.FilterMode.Linear,
+                MagFilter: RHI.FilterMode.Linear,
+                MipFilter: mipmaps ? RHI.MipFilterMode.Linear : RHI.MipFilterMode.None,
+                AddressU: MapAddressMode(addressModeU),
+                AddressV: MapAddressMode(addressModeV),
+                AddressW: RHI.AddressMode.Repeat,
+                MaxAnisotropy: anisotropicFiltering && MaxTextureMaxAnisotropy >= 4 ? MaxTextureMaxAnisotropy : 1f);
+
+            var sampler = new GLSampler(in desc, $"Material sampler {addressModeU},{addressModeV}");
+
+            RhiSamplers[key] = sampler;
+            return sampler;
+        }
+
+        private static RHI.AddressMode MapAddressMode(int mode) => mode switch
+        {
+            0 => RHI.AddressMode.Repeat,
+            1 => RHI.AddressMode.MirroredRepeat,
+            2 => RHI.AddressMode.ClampToEdge,
+            3 => RHI.AddressMode.ClampToBorder,
+            _ => RHI.AddressMode.Repeat,
         };
 
         private RenderTexture LoadTexture(string name, bool srgbRead = false)
@@ -339,6 +395,14 @@ namespace ValveResourceFormat.Renderer.Materials
             }
 
             var sizedInternalFormat = srgbRead && format.InternalSrgbFormat is not null ? format.InternalSrgbFormat.Value : format.InternalFormat;
+            var uploadsAsSrgb = srgbRead && format.InternalSrgbFormat is not null;
+
+            // Recorded, not acted on: the GL enums above still drive every allocation and upload below, so
+            // this cannot change what is uploaded. It is what lets tex.RhiTexture describe itself fully.
+            // GetTextureFormat has already thrown for anything FormatTables cannot map, so this is total.
+            tex.RhiFormat = rgba8UncompressedFallback
+                ? (uploadsAsSrgb ? RHI.RhiFormat.R8G8B8A8_SRgb : RHI.RhiFormat.R8G8B8A8_UNorm)
+                : RHI.FormatTables.FromVTexFormat(data.Format, uploadsAsSrgb);
 
 #if DEBUG
             var textureName = System.IO.Path.GetFileName(textureResource.FileName);
