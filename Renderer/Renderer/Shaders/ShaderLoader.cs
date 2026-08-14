@@ -28,6 +28,22 @@ namespace ValveResourceFormat.Renderer.Shaders
     }
 
     /// <summary>
+    /// The GLSL dialect one shader source is generated in. The shader files themselves are written once and
+    /// preprocessed into whichever dialect the active backend consumes.
+    /// </summary>
+    public enum ShaderFlavour
+    {
+        /// <summary>Desktop OpenGL 4.6 GLSL, compiled by the GL driver. The default.</summary>
+        OpenGL = 0,
+
+        /// <summary>
+        /// Vulkan GLSL, compiled to SPIR-V. Adds explicit locations and <c>set</c>/<c>binding</c> decorations, moves
+        /// the per-draw uniforms into a push constant block, and drops constructs Vulkan GLSL rejects.
+        /// </summary>
+        Vulkan = 1,
+    }
+
+    /// <summary>
     /// Compiles and caches OpenGL shader programs from source files.
     /// </summary>
     public partial class ShaderLoader : IDisposable
@@ -56,7 +72,13 @@ namespace ValveResourceFormat.Renderer.Shaders
 
         private static readonly Dictionary<string, byte> EmptyArgs = [];
         private static readonly Lock ParserLock = new();
-        private static readonly Dictionary<string, ParsedShaderData> ParsedCache = [];
+        private static readonly Dictionary<(ShaderFlavour Flavour, string Name), ParsedShaderData> ParsedCache = [];
+
+        /// <summary>
+        /// Gets or sets the GLSL dialect shaders are generated in. Set it before any shader is parsed; sources
+        /// already in the cache keep the dialect they were parsed with.
+        /// </summary>
+        public static ShaderFlavour Flavour { get; set; } = ShaderFlavour.OpenGL;
 
         private static readonly ShaderParser Parser = new();
 
@@ -67,8 +89,32 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// </summary>
         public class ParsedShaderData
         {
+            /// <summary>Gets the GLSL dialect this shader was preprocessed into.</summary>
+            public ShaderFlavour Flavour { get; init; }
+
             /// <summary>Gets the map of define names to their default byte values extracted from the shader source.</summary>
             public Dictionary<string, byte> Defines { get; } = [];
+
+            /// <summary>
+            /// Gets the stage-to-stage varyings declared by any stage, by name. Collected for the Vulkan flavour only,
+            /// which has to give each one an explicit location.
+            /// </summary>
+            public Dictionary<string, ShaderVarying> Varyings { get; } = [];
+
+            /// <summary>Gets the first interface location allocated to each varying in <see cref="Varyings"/>.</summary>
+            public Dictionary<string, int> VaryingLocations { get; } = [];
+
+            /// <summary>
+            /// Gets the binding number given to each sampler that a material supplies, within
+            /// <see cref="VulkanGlsl.MaterialTextureSet"/>. Numbered per shader, in declaration order.
+            /// </summary>
+            public Dictionary<string, int> MaterialTextureBindings { get; } = [];
+
+            /// <summary>
+            /// Gets the constructs found in the source that Vulkan GLSL will not accept. Empty for the OpenGL
+            /// flavour, which accepts all of them.
+            /// </summary>
+            public List<string> VulkanDiagnostics { get; } = [];
 
             /// <summary>Gets the set of render mode names declared in the shader source.</summary>
             public HashSet<string> RenderModes { get; } = [];
@@ -210,12 +256,14 @@ namespace ValveResourceFormat.Renderer.Shaders
         {
             using var _ = ParserLock.EnterScope();
 
-            if (ParsedCache.TryGetValue(shaderFileName, out var cached))
+            var flavour = Flavour;
+
+            if (ParsedCache.TryGetValue((flavour, shaderFileName), out var cached))
             {
                 return cached;
             }
 
-            var parsedData = new ParsedShaderData();
+            var parsedData = new ParsedShaderData { Flavour = flavour };
 
             var availableStages = Parser.AvailableShaders.GetValueOrDefault(shaderFileName)
                 ?? throw new FileNotFoundException($"Shader '{shaderFileName}' does not exist.");
@@ -242,7 +290,10 @@ namespace ValveResourceFormat.Renderer.Shaders
 
             parsedData.GlobalsLayout = GlobalsLayout.Build(parsedData.GlobalsDeclarations);
 
-            ParsedCache[shaderFileName] = parsedData;
+            // Varyings can only be located once every stage that shares them has been read
+            ShaderParser.StampInterfaceLocations(parsedData);
+
+            ParsedCache[(flavour, shaderFileName)] = parsedData;
             return parsedData;
         }
 
@@ -399,7 +450,13 @@ namespace ValveResourceFormat.Renderer.Shaders
                 header.Append('\n');
             }
 
-            header.Append(parsedData.GlobalsLayout.BlockSource);
+            header.Append(parsedData.GlobalsLayout.GetBlockSource(parsedData.Flavour));
+
+            if (parsedData.Flavour == ShaderFlavour.Vulkan)
+            {
+                // The per-draw set, which GL sets one glProgramUniform at a time
+                header.Append(VulkanGlsl.PushConstantBlockSource);
+            }
 
             var headerText = header.ToString();
 
@@ -668,7 +725,11 @@ namespace ValveResourceFormat.Renderer.Shaders
             {
                 // If a named shader changed (not an include), then we can only reload this shader
                 name = ShaderNameFromPath(name!);
-                ParsedCache.Remove(name!);
+
+                foreach (var flavour in Enum.GetValues<ShaderFlavour>())
+                {
+                    ParsedCache.Remove((flavour, name!));
+                }
             }
             else
             {

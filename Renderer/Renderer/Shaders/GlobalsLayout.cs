@@ -101,6 +101,17 @@ public sealed class GlobalsLayout
     /// <summary>Gets the GLSL declaration of the uniform block, prepended to every stage of the shader.</summary>
     public string BlockSource { get; } = string.Empty;
 
+    /// <summary>
+    /// Gets the Vulkan GLSL declaration of the uniform block. Identical to <see cref="BlockSource"/> apart from the
+    /// descriptor set qualifier; the packed layout itself is the same, so one buffer feeds both backends.
+    /// </summary>
+    public string VulkanBlockSource { get; } = string.Empty;
+
+    /// <summary>Gets the declaration of the uniform block in the dialect the given backend expects.</summary>
+    /// <param name="flavour">The GLSL dialect the shader is being generated for.</param>
+    public string GetBlockSource(ShaderFlavour flavour)
+        => flavour == ShaderFlavour.Vulkan ? VulkanBlockSource : BlockSource;
+
     /// <summary>Gets the buffer contents a material starts from, with every member set to its shader source default.</summary>
     public ReadOnlySpan<byte> DefaultBytes => defaultBytes;
 
@@ -191,8 +202,8 @@ public sealed class GlobalsLayout
             bucket.Add(declaration);
         }
 
+        // Only the layout qualifier differs between the two dialects, so the member list is built once.
         var builder = new StringBuilder(declarations.Count * 32);
-        builder.Append(CultureInfo.InvariantCulture, $"layout(std140, binding = {(int)ReservedBufferSlots.Globals}) uniform {BlockName}\n{{\n");
 
         var offset = 0;
 
@@ -243,9 +254,12 @@ public sealed class GlobalsLayout
             Place(scalars[scalarIndex]);
         }
 
-        builder.Append("};\n");
+        var memberSource = builder.ToString();
+        var binding = ((int)ReservedBufferSlots.Globals).ToString(CultureInfo.InvariantCulture);
 
-        BlockSource = builder.ToString();
+        BlockSource = $"layout(std140, binding = {binding}) uniform {BlockName}\n{{\n{memberSource}}};\n";
+        VulkanBlockSource = $"layout(std140, set = {VulkanGlsl.UniformBufferSet}, binding = {binding}) uniform {BlockName}\n{{\n{memberSource}}};\n";
+
         Size = Align(offset, 16);
 
         if (Size > MaxBlockSize)

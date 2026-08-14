@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
@@ -5,10 +6,17 @@ using System.Linq;
 using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
+using ValveResourceFormat.Renderer.Buffers;
 using static ValveResourceFormat.Renderer.Shaders.ShaderLoader;
 
 namespace ValveResourceFormat.Renderer.Shaders
 {
+    /// <summary>A stage-to-stage varying declared by one shader.</summary>
+    /// <param name="Name">The varying name, which both stages declare it under.</param>
+    /// <param name="Type">The declared GLSL type.</param>
+    /// <param name="Locations">The number of interface locations the declaration consumes.</param>
+    public readonly record struct ShaderVarying(string Name, string Type, int Locations);
+
     /// <summary>
     /// Preprocesses shader source files and extracts defines and render modes.
     /// </summary>
@@ -83,6 +91,11 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <param name="shaderFile">The shader file path or embedded resource name (e.g. <c>complex.vert.slang</c>).</param>
         /// <param name="parsedData">The data container that accumulates extracted metadata across all stages.</param>
         /// <returns>The preprocessed GLSL source text ready for driver compilation.</returns>
+        /// <remarks>
+        /// The dialect comes from <see cref="ParsedShaderData.Flavour"/>. Stage-to-stage varyings cannot be located
+        /// until every stage has been read, so a Vulkan parse is only finished once
+        /// <see cref="StampInterfaceLocations"/> has run over all of them.
+        /// </remarks>
         public string PreprocessShader(string shaderFile, ParsedShaderData parsedData)
         {
             var sourceFileNumber = parsedData.SourceFiles.Count;
@@ -340,7 +353,53 @@ namespace ValveResourceFormat.Renderer.Shaders
 
             LoadShaderString(shaderFile, null, isInclude: false);
 
-            return declaredAttributes.Count > 0 ? StampAttributeLocations(builder.ToString(), declaredAttributes) : builder.ToString();
+            var source = builder.ToString();
+
+            if (declaredAttributes.Count > 0)
+            {
+                source = StampAttributeLocations(source, declaredAttributes);
+            }
+
+            if (parsedData.Flavour == ShaderFlavour.Vulkan)
+            {
+                source = VulkanGlsl.Decorate(source, GetTypeFromFileName(shaderFile), parsedData);
+            }
+
+            return source;
+        }
+
+        /// <summary>
+        /// Locates every stage-to-stage varying of a fully preprocessed Vulkan shader, rewriting each stage in
+        /// <see cref="ParsedShaderData.Sources"/> in place.
+        /// </summary>
+        /// <param name="parsedData">A shader whose stages have all been through <see cref="PreprocessShader"/>.</param>
+        /// <remarks>
+        /// A varying has to carry the same location in the stage that writes it and the stage that reads it, so the
+        /// numbers can only be handed out once the whole interface is known. Locations are allocated over the union
+        /// of the declarations of every stage, in name order, which both stages then agree on without either naming
+        /// the other. Declarations behind an inactive combo still consume their locations, since the combo is not
+        /// resolved until the shader is compiled.
+        /// </remarks>
+        public static void StampInterfaceLocations(ParsedShaderData parsedData)
+        {
+            ArgumentNullException.ThrowIfNull(parsedData);
+
+            if (parsedData.Flavour != ShaderFlavour.Vulkan || parsedData.Varyings.Count == 0)
+            {
+                return;
+            }
+
+            var locations = VulkanGlsl.AllocateVaryingLocations(parsedData.Varyings, parsedData.VaryingLocations);
+
+            foreach (var (name, location) in locations)
+            {
+                parsedData.VaryingLocations[name] = location;
+            }
+
+            foreach (var stage in parsedData.Sources.Keys.ToArray())
+            {
+                parsedData.Sources[stage] = VulkanGlsl.StampVaryings(parsedData.Sources[stage], stage, locations);
+            }
         }
 
         internal static readonly Dictionary<ShaderProgramType, string> ProgramTypeToExtension = new()
@@ -507,6 +566,523 @@ namespace ValveResourceFormat.Renderer.Shaders
 
                 return File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             }
+        }
+    }
+
+    /// <summary>
+    /// Rewrites preprocessed GLSL into the dialect Vulkan accepts: explicit locations on every stage interface,
+    /// <c>set</c> and <c>binding</c> decorations on every resource, the per-draw uniforms moved into a push
+    /// constant block, and the constructs Vulkan GLSL has no representation for taken out.
+    /// </summary>
+    /// <remarks>
+    /// The descriptor set numbering is the one fixed in <c>RHI/CONTRACT.md</c>. The binding numbers are the
+    /// existing <see cref="ReservedBufferSlots"/> and <see cref="ReservedTextureSlots"/> values, unchanged: those
+    /// two enums deliberately overlap their uniform and storage index spaces, which GL keeps apart per binding
+    /// target and Vulkan does not, so the sets are what makes the collision unrepresentable.
+    /// </remarks>
+    public static partial class VulkanGlsl
+    {
+        /// <summary>Descriptor set holding the uniform buffers, bound by <see cref="ReservedBufferSlots"/> UBO number.</summary>
+        public const int UniformBufferSet = 0;
+
+        /// <summary>Descriptor set holding the storage buffers, bound by <see cref="ReservedBufferSlots"/> SSBO number.</summary>
+        public const int StorageBufferSet = 1;
+
+        /// <summary>Descriptor set holding the globally bound textures and images, bound by <see cref="ReservedTextureSlots"/> number.</summary>
+        public const int GlobalTextureSet = 2;
+
+        /// <summary>Descriptor set holding the textures a material supplies, numbered per shader in declaration order.</summary>
+        public const int MaterialTextureSet = 3;
+
+        /// <summary>
+        /// The size of the per-draw push constant block in bytes, inside the 128 byte floor every Vulkan
+        /// implementation guarantees. Query <c>IDeviceLimits.MaxPushConstantSize</c> before growing it.
+        /// </summary>
+        public const int PushConstantSize = 92;
+
+        /// <summary>The name given to the generated push constant block.</summary>
+        public const string PushConstantBlockName = "VrfPushConstants";
+
+        // The uniform the shaders spell as a bool. A block member cannot be one, so it is carried as a uint and
+        // put back behind its original name by a macro.
+        private const string InstancingMemberName = "bIsInstancing";
+        private const string InstancingStorageName = "bIsInstancingValue";
+
+        /// <summary>
+        /// The per-draw set, in the order that packs it to exactly <see cref="PushConstantSize"/> bytes under
+        /// std430 rules. These are today's <c>glProgramUniform</c> call sites in <c>MeshBatchRenderer</c>.
+        /// </summary>
+        private static readonly (string Type, string Name, int Size)[] PushConstantMembers =
+        [
+            ("mat3x4", "transform", 48),
+            ("uvec3", "uAnimationData", 12),
+
+            // Fills the 4 byte hole the uvec3 leaves, so the vec2 lands on its 8 byte alignment without padding
+            ("int", "morphVertexIdOffset", 4),
+
+            ("vec2", "morphCompositeTextureSize", 8),
+            ("uint", "meshId", 4),
+            ("uint", "shaderId", 4),
+            ("uint", "shaderProgramId", 4),
+            ("uint", "vTint", 4),
+            ("uint", InstancingStorageName, 4),
+        ];
+
+        /// <summary>The type each push constant is declared with in the shader sources, by the name it is declared under.</summary>
+        private static readonly FrozenDictionary<string, string> PushConstantSourceTypes = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["transform"] = "mat3x4",
+            ["uAnimationData"] = "uvec3",
+            ["morphVertexIdOffset"] = "int",
+            ["morphCompositeTextureSize"] = "vec2",
+            ["meshId"] = "uint",
+            ["shaderId"] = "uint",
+            ["shaderProgramId"] = "uint",
+            ["vTint"] = "uint",
+            [InstancingMemberName] = "bool",
+        }.ToFrozenDictionary(StringComparer.Ordinal);
+
+        private static readonly FrozenDictionary<string, ReservedTextureSlots> ReservedTextureSlotByName = BuildReservedTextureSlots();
+
+        /// <summary>
+        /// Gets the push constant block, declared without an instance name so that its members keep the global
+        /// names the shader sources already use.
+        /// </summary>
+        public static string PushConstantBlockSource { get; } = BuildPushConstantBlock();
+
+        private static string BuildPushConstantBlock()
+        {
+            var builder = new StringBuilder(512);
+            builder.Append(CultureInfo.InvariantCulture, $"layout(push_constant) uniform {PushConstantBlockName}\n{{\n");
+
+            var offset = 0;
+
+            foreach (var (type, name, size) in PushConstantMembers)
+            {
+                builder.Append(CultureInfo.InvariantCulture, $"    layout(offset = {offset}) {type} {name};\n");
+                offset += size;
+            }
+
+            builder.Append("};\n");
+
+            // The block is the contract both sides read, so a member added without adjusting the documented size
+            // has to fail here rather than silently write past what the pipeline layout declares.
+            if (offset != PushConstantSize)
+            {
+                throw new ShaderCompilerException($"The push constant block is {offset} bytes, but the RHI contract fixes it at {PushConstantSize}.");
+            }
+
+            builder.Append(CultureInfo.InvariantCulture, $"#define {InstancingMemberName} ({InstancingStorageName} != 0u)\n");
+
+            return builder.ToString();
+        }
+
+        private static FrozenDictionary<string, ReservedTextureSlots> BuildReservedTextureSlots()
+        {
+            // Rebuilt from the same public enum MaterialLoader reads, which keeps its own copy private.
+            var slotByName = new Dictionary<string, ReservedTextureSlots>(StringComparer.Ordinal);
+
+            foreach (var field in typeof(ReservedTextureSlots).GetFields(BindingFlags.Public | BindingFlags.Static))
+            {
+                if (field.GetCustomAttribute<SamplerNameAttribute>() is not { } attribute)
+                {
+                    continue;
+                }
+
+                var slot = (ReservedTextureSlots)field.GetRawConstantValue()!;
+
+                foreach (var name in attribute.Names)
+                {
+                    slotByName.Add(name, slot);
+                }
+            }
+
+            return slotByName.ToFrozenDictionary(StringComparer.Ordinal);
+        }
+
+        // A uniform block. Matched on its packing qualifier, which every one of ours carries.
+        [GeneratedRegex(@"^layout\s*\(\s*(?<Qualifiers>[^)]*\bstd140\b[^)]*)\)", RegexOptions.Multiline)]
+        private static partial Regex RegexUniformBlockLayout();
+
+        // A shader storage block, likewise.
+        [GeneratedRegex(@"^layout\s*\(\s*(?<Qualifiers>[^)]*\bstd430\b[^)]*)\)", RegexOptions.Multiline)]
+        private static partial Regex RegexStorageBlockLayout();
+
+        // layout(binding = n, rgba8) uniform writeonly image2D name;
+        [GeneratedRegex(@"^layout\s*\(\s*(?<Qualifiers>[^)]*)\)\s*uniform\s+(?<Rest>[^;]*\b[iu]?image[0-9A-Za-z]*\s+[A-Za-z_][A-Za-z0-9_]*\s*;)", RegexOptions.Multiline)]
+        private static partial Regex RegexImageDeclaration();
+
+        // uniform sampler2D g_tFoo; and the macro typed sampler of texture_decode
+        [GeneratedRegex(@"^uniform\s+(?<Type>[iu]?sampler[0-9A-Za-z]*|TEXTURE_TYPE)\s+(?<Name>[A-Za-z_][A-Za-z0-9_]*)\s*;", RegexOptions.Multiline)]
+        private static partial Regex RegexSamplerDeclaration();
+
+        // A stage interface declaration. Requires the terminating semicolon, so that an 'in' or 'out' function
+        // parameter sitting on its own line cannot match.
+        [GeneratedRegex(@"^(?<Qualifiers>(?:(?:flat|noperspective|smooth|centroid|sample|precise|invariant)\s+)*)(?<Direction>in|out)\s+(?<Type>[A-Za-z_][A-Za-z0-9_]*)\s+(?<Name>[A-Za-z_][A-Za-z0-9_]*)\s*(?<Array>\[[^\]]*\])?\s*;", RegexOptions.Multiline)]
+        private static partial Regex RegexStageInterface();
+
+        // A fragment output that places itself, which the allocation works around rather than stamps
+        [GeneratedRegex(@"^layout\s*\(\s*location\s*=\s*(?<Location>[0-9]+)\s*\)\s*out\s+", RegexOptions.Multiline)]
+        private static partial Regex RegexLocatedOutput();
+
+        // A stage interface declaration that places itself, likewise
+        [GeneratedRegex(@"^layout\s*\(\s*location\s*=\s*(?<Location>[0-9]+)\s*\)\s*(?<Qualifiers>(?:(?:flat|noperspective|smooth|centroid|sample|precise|invariant)\s+)*)(?<Direction>in|out)\s+(?<Type>[A-Za-z_][A-Za-z0-9_]*)\s+(?<Name>[A-Za-z_][A-Za-z0-9_]*)\s*(?<Array>\[[^\]]*\])?\s*;", RegexOptions.Multiline)]
+        private static partial Regex RegexLocatedStageInterface();
+
+        // Any remaining default block uniform, which is what Vulkan GLSL has no representation for
+        [GeneratedRegex(@"^uniform\s+(?<Type>[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?)\s+(?<Name>[A-Za-z_][A-Za-z0-9_]*)\s*(?<Array>\[[^\]]*\])?(?:\s*=\s*[^;]+?)?\s*;[^\n]*", RegexOptions.Multiline)]
+        private static partial Regex RegexLooseUniform();
+
+        [GeneratedRegex(@"\bstruct\s+(?<Name>[A-Za-z_][A-Za-z0-9_]*)\s*\{(?<Body>[^}]*)\}")]
+        private static partial Regex RegexStructDefinition();
+
+        [GeneratedRegex(@"^\s*(?<Type>[A-Za-z_][A-Za-z0-9_]*)\s+(?<Name>[A-Za-z_][A-Za-z0-9_]*)\s*(?<Array>\[[^\]]*\])?\s*;", RegexOptions.Multiline)]
+        private static partial Regex RegexStructMember();
+
+        [GeneratedRegex(@"\bgl_VertexID\b")]
+        private static partial Regex RegexVertexIdBuiltin();
+
+        [GeneratedRegex(@"\bgl_InstanceID\b")]
+        private static partial Regex RegexInstanceIdBuiltin();
+
+        /// <summary>
+        /// Rewrites one preprocessed stage into Vulkan GLSL, and records what it found on <paramref name="parsedData"/>.
+        /// </summary>
+        /// <param name="source">The preprocessed stage source, with its vertex inputs already located.</param>
+        /// <param name="stage">The stage this source belongs to.</param>
+        /// <param name="parsedData">The shader being parsed, shared by every stage of it.</param>
+        /// <returns>The rewritten source. Stage-to-stage varyings are collected but not yet located.</returns>
+        /// <remarks>
+        /// Every rewrite replaces text within its own line, so the <c>#line</c> directives threaded through the
+        /// source keep pointing at the right place and compiler errors still name the file they came from.
+        /// </remarks>
+        internal static string Decorate(string source, ShaderProgramType stage, ParsedShaderData parsedData)
+        {
+            // Samplers and images first: both passes prefix a layout qualifier, which takes those declarations out
+            // of the way of the loose uniform pass that follows.
+            source = RegexSamplerDeclaration().Replace(source, match => DecorateSampler(match, parsedData));
+
+            source = RegexImageDeclaration().Replace(source,
+                match => $"layout(set = {GlobalTextureSet}, {match.Groups["Qualifiers"].Value}) uniform {match.Groups["Rest"].Value}");
+
+            source = RegexUniformBlockLayout().Replace(source, match => $"layout(set = {UniformBufferSet}, {match.Groups["Qualifiers"].Value})");
+            source = RegexStorageBlockLayout().Replace(source, match => $"layout(set = {StorageBufferSet}, {match.Groups["Qualifiers"].Value})");
+
+            source = RegexLooseUniform().Replace(source, match => RewriteLooseUniform(match, parsedData));
+
+            var structs = BuildStructLocationCounts(source);
+
+            source = CollectAndLocateStageInterface(source, stage, parsedData, structs);
+
+            // Vulkan spells these differently, and they cannot be macroed because a macro may not redefine a gl_ name.
+            source = RegexVertexIdBuiltin().Replace(source, "gl_VertexIndex");
+            source = RegexInstanceIdBuiltin().Replace(source, "(gl_InstanceIndex - gl_BaseInstance)");
+
+            return source;
+        }
+
+        private static string DecorateSampler(Match match, ParsedShaderData parsedData)
+        {
+            var name = match.Groups["Name"].Value;
+
+            int set, binding;
+
+            if (ReservedTextureSlotByName.TryGetValue(name, out var slot))
+            {
+                set = GlobalTextureSet;
+                binding = (int)slot;
+            }
+            else
+            {
+                set = MaterialTextureSet;
+
+                // Numbered per shader in declaration order, shared across its stages because the whole shader
+                // parses into one ParsedShaderData
+                if (!parsedData.MaterialTextureBindings.TryGetValue(name, out binding))
+                {
+                    binding = parsedData.MaterialTextureBindings.Count;
+                    parsedData.MaterialTextureBindings.Add(name, binding);
+                }
+            }
+
+            return $"layout(set = {set}, binding = {binding}) {match.Value}";
+        }
+
+        private static string RewriteLooseUniform(Match match, ParsedShaderData parsedData)
+        {
+            var name = match.Groups["Name"].Value;
+            var type = match.Groups["Type"].Value;
+
+            if (!PushConstantSourceTypes.TryGetValue(name, out var expectedType))
+            {
+                // Neither packed into the globals block nor part of the per-draw set, so nothing can carry it
+                parsedData.VulkanDiagnostics.Add($"'{type} {name}' is a default block uniform with nowhere to live in Vulkan GLSL.");
+                return match.Value;
+            }
+
+            if (type != expectedType)
+            {
+                // Same name as a push constant but a different type, so the block's member would collide with it
+                parsedData.VulkanDiagnostics.Add(
+                    $"'{name}' is declared as '{type}' but the push constant block declares it as '{expectedType}', which collides.");
+                return match.Value;
+            }
+
+            return $"// :VrfPushConstant {match.Value}";
+        }
+
+        private static string CollectAndLocateStageInterface(string source, ShaderProgramType stage, ParsedShaderData parsedData,
+            IReadOnlyDictionary<string, int> structs)
+        {
+            // A varying that places itself keeps the location it was given, and the rest allocate around it
+            foreach (Match located in RegexLocatedStageInterface().Matches(source))
+            {
+                var direction = located.Groups["Direction"].Value;
+
+                if (!IsVarying(stage, direction))
+                {
+                    continue;
+                }
+
+                var name = located.Groups["Name"].Value;
+                var type = located.Groups["Type"].Value;
+
+                parsedData.Varyings.TryAdd(name, new ShaderVarying(name, type, GetLocationCount(type, located.Groups["Array"].Value, structs)));
+                parsedData.VaryingLocations[name] = int.Parse(located.Groups["Location"].Value, CultureInfo.InvariantCulture);
+            }
+
+            // A fragment output is local to its stage, so it is allocated here. A varying has to agree with the
+            // stage on the other side of it, so it is only recorded, and located once every stage has been read.
+            var outputs = new Dictionary<string, int>(StringComparer.Ordinal);
+
+            if (stage == ShaderProgramType.Fragment)
+            {
+                var used = 0;
+
+                foreach (Match located in RegexLocatedOutput().Matches(source))
+                {
+                    used |= 1 << int.Parse(located.Groups["Location"].Value, CultureInfo.InvariantCulture);
+                }
+
+                var declared = new SortedSet<string>(StringComparer.Ordinal);
+
+                foreach (Match match in RegexStageInterface().Matches(source))
+                {
+                    if (match.Groups["Direction"].Value == "out")
+                    {
+                        declared.Add(match.Groups["Name"].Value);
+                    }
+                }
+
+                var free = 0;
+
+                foreach (var name in declared)
+                {
+                    while ((used & (1 << free)) != 0)
+                    {
+                        free++;
+                    }
+
+                    outputs[name] = free;
+                    used |= 1 << free;
+                }
+            }
+
+            return RegexStageInterface().Replace(source, match =>
+            {
+                var direction = match.Groups["Direction"].Value;
+                var name = match.Groups["Name"].Value;
+
+                if (stage == ShaderProgramType.Fragment && direction == "out")
+                {
+                    return $"layout(location = {outputs[name]}) {match.Value}";
+                }
+
+                if (!IsVarying(stage, direction))
+                {
+                    return match.Value;
+                }
+
+                var type = match.Groups["Type"].Value;
+                var locations = GetLocationCount(type, match.Groups["Array"].Value, structs);
+
+                if (parsedData.Varyings.TryGetValue(name, out var existing))
+                {
+                    if (existing.Locations != locations)
+                    {
+                        parsedData.VulkanDiagnostics.Add(
+                            $"Varying '{name}' spans {existing.Locations} location(s) as '{existing.Type}' in one stage and {locations} as '{type}' in another.");
+                    }
+                }
+                else
+                {
+                    parsedData.Varyings.Add(name, new ShaderVarying(name, type, locations));
+                }
+
+                // Located by StampInterfaceLocations, once the union of every stage's declarations is known
+                return match.Value;
+            });
+        }
+
+        /// <summary>
+        /// Hands out a location range to every varying, in name order, so that the stage writing one and the stage
+        /// reading it arrive at the same number independently.
+        /// </summary>
+        /// <param name="varyings">Every varying declared by any stage of one shader.</param>
+        /// <param name="pinned">
+        /// Varyings that place themselves with an explicit qualifier in the source. They keep the location they were
+        /// given, and the rest allocate around them.
+        /// </param>
+        /// <returns>The first location of each varying, by name.</returns>
+        internal static FrozenDictionary<string, int> AllocateVaryingLocations(IReadOnlyDictionary<string, ShaderVarying> varyings,
+            IReadOnlyDictionary<string, int>? pinned = null)
+        {
+            var locations = new Dictionary<string, int>(varyings.Count, StringComparer.Ordinal);
+            var used = new HashSet<int>();
+
+            if (pinned != null)
+            {
+                foreach (var (name, location) in pinned)
+                {
+                    locations[name] = location;
+
+                    var span = varyings.TryGetValue(name, out var varying) ? Math.Max(1, varying.Locations) : 1;
+
+                    for (var i = 0; i < span; i++)
+                    {
+                        used.Add(location + i);
+                    }
+                }
+            }
+
+            foreach (var name in varyings.Keys.Order(StringComparer.Ordinal))
+            {
+                if (locations.ContainsKey(name))
+                {
+                    continue;
+                }
+
+                var span = Math.Max(1, varyings[name].Locations);
+
+                // Lowest run of free locations wide enough to hold it
+                var start = 0;
+
+                while (Enumerable.Range(start, span).Any(used.Contains))
+                {
+                    start++;
+                }
+
+                locations[name] = start;
+
+                for (var i = 0; i < span; i++)
+                {
+                    used.Add(start + i);
+                }
+            }
+
+            return locations.ToFrozenDictionary(StringComparer.Ordinal);
+        }
+
+        /// <summary>Writes the allocated location into every varying declaration of one stage.</summary>
+        /// <param name="source">A stage already through <see cref="Decorate"/>.</param>
+        /// <param name="stage">The stage this source belongs to.</param>
+        /// <param name="locations">The allocation from <see cref="AllocateVaryingLocations"/>.</param>
+        /// <returns>The stage source with every varying located.</returns>
+        internal static string StampVaryings(string source, ShaderProgramType stage, IReadOnlyDictionary<string, int> locations)
+        {
+            return RegexStageInterface().Replace(source, match =>
+            {
+                return IsVarying(stage, match.Groups["Direction"].Value) && locations.TryGetValue(match.Groups["Name"].Value, out var location)
+                    ? $"layout(location = {location.ToString(CultureInfo.InvariantCulture)}) {match.Value}"
+                    : match.Value;
+            });
+        }
+
+        /// <summary>
+        /// Whether a declaration in this direction crosses between stages, rather than being a vertex input or a
+        /// fragment output.
+        /// </summary>
+        private static bool IsVarying(ShaderProgramType stage, string direction) => (stage, direction) switch
+        {
+            (ShaderProgramType.Vertex, "out") => true,
+            (ShaderProgramType.Fragment, "in") => true,
+            _ => false,
+        };
+
+        private static FrozenDictionary<string, int> BuildStructLocationCounts(string source)
+        {
+            var bodies = new Dictionary<string, string>(StringComparer.Ordinal);
+
+            foreach (Match match in RegexStructDefinition().Matches(source))
+            {
+                bodies[match.Groups["Name"].Value] = match.Groups["Body"].Value;
+            }
+
+            var counts = new Dictionary<string, int>(bodies.Count, StringComparer.Ordinal);
+
+            if (bodies.Count == 0)
+            {
+                return counts.ToFrozenDictionary(StringComparer.Ordinal);
+            }
+
+            // Repeated so that a struct built out of other structs settles; the nesting here is one or two deep
+            for (var pass = 0; pass < 4; pass++)
+            {
+                foreach (var (name, body) in bodies)
+                {
+                    var total = 0;
+
+                    foreach (Match member in RegexStructMember().Matches(body))
+                    {
+                        total += GetLocationCount(member.Groups["Type"].Value, member.Groups["Array"].Value, counts);
+                    }
+
+                    counts[name] = total;
+                }
+            }
+
+            return counts.ToFrozenDictionary(StringComparer.Ordinal);
+        }
+
+        /// <summary>
+        /// The number of interface locations one declaration consumes. A scalar or vector takes one, a matrix takes
+        /// one per column, a struct takes the sum of its members, and an array multiplies by its length.
+        /// </summary>
+        private static int GetLocationCount(string type, string array, IReadOnlyDictionary<string, int> structs)
+        {
+            var perElement = 1;
+
+            if (type.StartsWith("mat", StringComparison.Ordinal) || type.StartsWith("dmat", StringComparison.Ordinal))
+            {
+                // matN is N columns, and so is matNxM
+                foreach (var c in type)
+                {
+                    if (char.IsAsciiDigit(c))
+                    {
+                        perElement = c - '0';
+                        break;
+                    }
+                }
+            }
+            else if (structs.TryGetValue(type, out var members))
+            {
+                perElement = members;
+            }
+
+            return perElement * GetArrayLength(array);
+        }
+
+        private static int GetArrayLength(string array)
+        {
+            if (string.IsNullOrEmpty(array))
+            {
+                return 1;
+            }
+
+            var inner = array.AsSpan().Trim("[]").Trim();
+
+            // A length given by a define is not resolved until the shader compiles, so it cannot be sized here
+            return int.TryParse(inner, NumberStyles.Integer, CultureInfo.InvariantCulture, out var length) && length > 0 ? length : 1;
         }
     }
 }
