@@ -236,6 +236,10 @@ namespace ValveResourceFormat.Renderer
         private GLBuffer? vertexRhiBuffer;
         private GLBuffer? quadIndexRhiBuffer;
 
+        // Built once on first RHI draw rather than in a static initializer, so a layout the contract has
+        // no format for throws at the draw that needs it instead of as a type initializer failure.
+        private VertexInputDesc? vertexInputDesc;
+
         // :SharedQuadIndexCount - the shared index buffer GPUMeshBufferCache allocates, in indices.
         private const int SharedQuadIndexCount = 65532;
 
@@ -510,6 +514,23 @@ namespace ValveResourceFormat.Renderer
                 }
                 else
                 {
+                    var framebuffer = context!.Value.Framebuffer;
+                    var device = (GLRendererDevice)commandList.Device;
+
+                    vertexInputDesc ??= Vertex.InputLayout.ToVertexInputDesc();
+
+                    // Glyph quads, two triangles each through the shared quad index buffer.
+                    var pipeline = device.GetOrCreatePipeline(
+                        shader,
+                        RendererContext.RenderState.CurrentPass,
+                        vertexInputDesc,
+                        PrimitiveTopology.TriangleList,
+                        framebuffer.Color is { } color ? [color.RhiFormat] : [],
+                        framebuffer.Depth?.RhiFormat ?? RhiFormat.Undefined,
+                        Math.Max(1, framebuffer.NumSamples),
+                        GLRendererDevice.DrawConstants);
+
+                    commandList.BindPipeline(pipeline);
                     commandList.BindVertexBuffer(0, VertexRhiBuffer(verticesSize));
                     commandList.BindIndexBuffer(QuadIndexRhiBuffer(), IndexType.UInt16);
                     commandList.BindTexture(DescriptorSets.MaterialTextures, 0, fontTexture.RhiTexture);

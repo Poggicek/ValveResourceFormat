@@ -46,6 +46,10 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         private GLBuffer? vertexRhiBuffer;
         private GLBuffer? indexRhiBuffer;
 
+        // Built once on first RHI draw rather than in a static initializer, so a layout the contract has
+        // no format for throws at the draw that needs it instead of as a type initializer failure.
+        private VertexInputDesc? vertexInputDesc;
+
         /// <summary>Gets whether this shape uses normal-based shading.</summary>
         protected virtual bool Shaded { get; } = true;
 
@@ -418,6 +422,9 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
                 if (commandList != null)
                 {
+                    // Wireframe is a fill mode, not a topology: this still draws the triangle list, the
+                    // rasterizer just outlines it. Topology stays TriangleList.
+                    commandList.BindPipeline(PipelineFor(commandList, context, renderShader, in lineState));
                     commandList.DrawIndexed(indexCount);
                 }
                 else
@@ -434,24 +441,46 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 fillState.Rasterizer.DepthBias = 100f;
                 fillState.Rasterizer.DepthBiasClamp = 0.05f;
                 renderState.Apply(in fillState);
-                DrawPicking(commandList);
+                DrawPicking(commandList, context, renderShader, in fillState);
             }
             else
             {
-                DrawPicking(commandList);
+                DrawPicking(commandList, context, renderShader, in state);
             }
         }
 
         // The scene node id rides in the base instance, which is what the picking buffer reads back.
-        private void DrawPicking(ICommandList? commandList)
+        private void DrawPicking(ICommandList? commandList, Scene.RenderContext context, Shader renderShader, in RenderState state)
         {
             if (commandList != null)
             {
+                commandList.BindPipeline(PipelineFor(commandList, context, renderShader, in state));
                 commandList.DrawIndexed(indexCount, instanceCount: 1, firstIndex: 0, baseVertex: 0, firstInstance: (int)Id);
                 return;
             }
 
             GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
+        }
+
+        // The replacement shader changes between passes, and the two translucent draws differ in state,
+        // so the pipeline is resolved per draw. Lookups are cached on the pipeline key, so only the
+        // first of each distinct combination actually builds anything.
+        private GLGraphicsPipeline PipelineFor(ICommandList commandList, Scene.RenderContext context, Shader renderShader, in RenderState state)
+        {
+            var framebuffer = context.Framebuffer;
+            var device = (GLRendererDevice)commandList.Device;
+
+            vertexInputDesc ??= SimpleVertexNormal.InputLayout.ToVertexInputDesc();
+
+            return device.GetOrCreatePipeline(
+                renderShader,
+                in state,
+                vertexInputDesc,
+                PrimitiveTopology.TriangleList,
+                framebuffer.Color is { } color ? [color.RhiFormat] : [],
+                framebuffer.Depth?.RhiFormat ?? RhiFormat.Undefined,
+                Math.Max(1, framebuffer.NumSamples),
+                GLRendererDevice.DrawConstants);
         }
 
         /// <inheritdoc/>

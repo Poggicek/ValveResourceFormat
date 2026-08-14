@@ -37,6 +37,10 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         // wrote, so this renderer must keep a persistent allocation rather than stream.
         private GLBuffer? vertexRhiBuffer;
         private GLBuffer? indexRhiBuffer;
+
+        // Built once on first RHI draw rather than in a static initializer, so a layout the contract has
+        // no format for throws at the draw that needs it instead of as a type initializer failure.
+        private VertexInputDesc? vertexInputDesc;
         private int vertexBufferSizeBytes;
         private int indexBufferSizeBytes;
 
@@ -137,15 +141,15 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
         /// <inheritdoc/>
         public override void Render(ParticleCollection particles, ParticleSystemRenderState systemRenderState, Scene.RenderContext context)
-            => Render(particles, systemRenderState, context.Camera, context.CommandList);
+            => Render(particles, systemRenderState, context.Camera, context);
 
         /// <inheritdoc/>
         /// <remarks>Still overridden because the prewarm path reaches this renderer with only a camera:
         /// it starts in the viewer, which has no render context to thread through.</remarks>
         public override void Render(ParticleCollection particles, ParticleSystemRenderState systemRenderState, Camera camera)
-            => Render(particles, systemRenderState, camera, commandList: null);
+            => Render(particles, systemRenderState, camera, context: null);
 
-        private void Render(ParticleCollection particles, ParticleSystemRenderState systemRenderState, Camera camera, ICommandList? commandList)
+        private void Render(ParticleCollection particles, ParticleSystemRenderState systemRenderState, Camera camera, Scene.RenderContext? context)
         {
             if (particles.Count < 2)
             {
@@ -189,7 +193,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             if (!GeometryChanged(positions, levels, radii, colors))
             {
                 // :CableGeometryPersistence - redraws buffers written on an earlier frame.
-                DrawTube(commandList);
+                DrawTube(context);
                 return;
             }
 
@@ -258,7 +262,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 IndexArrayPool.Return(indexArray);
             }
 
-            DrawTube(commandList);
+            DrawTube(context);
         }
 
         /// <summary>
@@ -421,12 +425,14 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         // Grow-only: reused buffers are sliced to the live count, so shrinking never reallocates.
         private static T[] EnsureCapacity<T>(T[] buffer, int size) => buffer.Length >= size ? buffer : new T[size];
 
-        private void DrawTube(ICommandList? commandList)
+        private void DrawTube(Scene.RenderContext? context)
         {
             if (indexCount == 0)
             {
                 return;
             }
+
+            var commandList = context?.CommandList;
 
             shader.Use();
 
@@ -436,6 +442,9 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             }
             else
             {
+                // The tube is tessellated into a triangle list on the CPU, indexed with 32 bit indices
+                // because a max-tessellation tube exceeds what 16 bits can address.
+                commandList.BindPipeline(PipelineFor(commandList, context!.Value));
                 commandList.BindVertexBuffer(0, VertexRhiBuffer());
                 commandList.BindIndexBuffer(IndexRhiBuffer(), IndexType.UInt32);
             }
@@ -475,6 +484,33 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             }
 
             material.PostRender();
+        }
+
+        // Resolved per draw because the material supplies the blend and depth state the pipeline bakes in.
+        // Cached on the pipeline key, so only the first draw of each state builds one.
+        private GLGraphicsPipeline PipelineFor(ICommandList commandList, Scene.RenderContext context)
+        {
+            var framebuffer = context.Framebuffer;
+            var device = (GLRendererDevice)commandList.Device;
+
+            vertexInputDesc ??= CableVertex.InputLayout.ToVertexInputDesc();
+
+            // The material composes its own blend and depth state over the pass baseline and applies it
+            // in Render, so the pipeline has to bake that composed state rather than the bare baseline.
+            // Building from CurrentPass would leave the pipeline disagreeing with what actually draws --
+            // invisible on OpenGL, where the material's Apply wins anyway, and wrong on Vulkan, where the
+            // pipeline is the only thing that decides.
+            var passState = scene.RendererContext.RenderState.CurrentPass;
+
+            return device.GetOrCreatePipeline(
+                shader,
+                material.GetRenderState(in passState),
+                vertexInputDesc,
+                PrimitiveTopology.TriangleList,
+                framebuffer.Color is { } color ? [color.RhiFormat] : [],
+                framebuffer.Depth?.RhiFormat ?? RhiFormat.Undefined,
+                Math.Max(1, framebuffer.NumSamples),
+                GLRendererDevice.DrawConstants);
         }
 
         private GLBuffer VertexRhiBuffer()

@@ -515,6 +515,27 @@ public class Renderer
     }
 
     /// <summary>
+    /// Whether the renderer records through <see cref="RHI.ICommandList"/> instead of calling OpenGL
+    /// directly. Off until the migration can honour the contract end to end.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A draw needs two things neither of which it carries itself: an open render pass, and a bound
+    /// pipeline to take its topology and vertex input from. The passes now exist &#8212; the scene,
+    /// shadow and overlay work below all runs inside one &#8212; so turning this on gets as far as the
+    /// pipeline, and every scene that draws through the RHI then throws "a draw needs a graphics
+    /// pipeline bound".
+    /// </para>
+    /// <para>
+    /// Turn it on once the draw sites bind pipelines. With the golden harness on the recording device,
+    /// 25 of 33 scenes already render identically with this set; the 8 that do not are the ones
+    /// reaching <see cref="SceneNodes.ShapeSceneNode"/>, which is the only draw site the suite covers.
+    /// Expect that suite to be the thing that says whether it worked.
+    /// </para>
+    /// </remarks>
+    public static bool EnableRhiRecording { get; set; }
+
+    /// <summary>
     /// Acquires this frame's command list from <see cref="Device"/>, or returns <see langword="null"/>
     /// when there is no device or it does not record, in which case every pass draws through OpenGL as
     /// before.
@@ -524,21 +545,6 @@ public class Renderer
     /// and is the only thing that knows where a frame really begins: the renderer draws one part of one,
     /// with post-processing and overlays still to come after it returns.
     /// </remarks>
-    /// <summary>
-    /// Whether the renderer records through <see cref="RHI.ICommandList"/> instead of calling OpenGL
-    /// directly. Off until the migration can honour the contract end to end.
-    /// </summary>
-    /// <remarks>
-    /// Nine call sites already issue draws through a command list, and not one of them opens a render
-    /// pass or binds a pipeline first, because neither existed when they were written. Both are
-    /// mandatory: a draw carries no topology of its own, it comes from the bound pipeline. Turning
-    /// this on today throws "only valid inside a render pass" on the first scene that draws, which is
-    /// how the golden suite found it. Turn it on once <see cref="PostprocessRender"/> and the scene
-    /// passes wrap their work in render passes and the material path produces pipelines, and expect
-    /// the suite to be the thing that says whether it worked.
-    /// </remarks>
-    public static bool EnableRhiRecording { get; set; }
-
     private RHI.ICommandList? AcquireCommandList()
     {
         if (!EnableRhiRecording)
@@ -571,6 +577,100 @@ public class Renderer
 
             return null;
         }
+    }
+
+    /// <summary>
+    /// Holds an open render pass so it can be closed with <c>using</c>. The default value holds nothing
+    /// and closes nothing, which is what every helper returns while the renderer is not recording.
+    /// </summary>
+    private readonly struct RhiPass(RHI.ICommandList? commandList) : IDisposable
+    {
+        /// <summary>Ends the pass, if one was opened.</summary>
+        public void Dispose() => commandList?.EndRenderPass();
+    }
+
+    /// <summary>
+    /// Opens a render pass over the context's framebuffer, or does nothing when not recording.
+    /// </summary>
+    /// <param name="renderContext">The pass being drawn, supplying the framebuffer and command list.</param>
+    /// <param name="name">Debug label for the pass.</param>
+    /// <param name="keepContents">
+    /// <see langword="true"/> to load what the attachments already hold instead of clearing them. Every
+    /// pass after the first in a frame must set this, or it would erase what the earlier ones drew.
+    /// </param>
+    /// <returns>A guard that ends the pass.</returns>
+    /// <remarks>
+    /// A frame is split into several passes rather than one because transfers and compute dispatches are
+    /// not valid inside a pass, and the scene has both in the middle of it: the framebuffer grab and the
+    /// depth pyramid sit between the opaque and translucent halves.
+    /// </remarks>
+    private static RhiPass BeginPass(in Scene.RenderContext renderContext, string name, bool keepContents = false)
+        => BeginPass(renderContext.CommandList, renderContext.Framebuffer, name, keepContents);
+
+    /// <summary>
+    /// Opens a render pass over an explicit framebuffer, or does nothing when not recording.
+    /// </summary>
+    /// <param name="commandList">The command list to record into, or <see langword="null"/> to do nothing.</param>
+    /// <param name="framebuffer">The framebuffer whose attachments the pass renders into.</param>
+    /// <param name="name">Debug label for the pass.</param>
+    /// <param name="keepContents">Whether to load the attachments rather than clear them.</param>
+    /// <param name="clearDepth">
+    /// The depth value to clear to, or <see langword="null"/> for the reverse-Z far plane the framebuffer
+    /// itself describes. Only the barn light atlas needs this: it is the one target the renderer draws
+    /// with forward depth, so it clears to the opposite end of the range from everything else.
+    /// </param>
+    /// <returns>A guard that ends the pass.</returns>
+    private static RhiPass BeginPass(RHI.ICommandList? commandList, Framebuffer framebuffer, string name,
+        bool keepContents = false, float? clearDepth = null)
+    {
+        if (commandList is null)
+        {
+            return default;
+        }
+
+        var desc = framebuffer.RenderPass(name);
+
+        if (keepContents)
+        {
+            desc = KeepContents(in desc);
+        }
+
+        if (clearDepth is { } depth && desc.DepthAttachment is { } attachment)
+        {
+            desc = desc with { DepthAttachment = attachment with { ClearDepth = depth } };
+        }
+
+        commandList.BeginRenderPass(desc);
+
+        return new RhiPass(commandList);
+    }
+
+    /// <summary>
+    /// Rewrites a descriptor's load operations to preserve what its attachments already hold.
+    /// </summary>
+    /// <param name="desc">The descriptor to rewrite.</param>
+    /// <returns>The same attachments, loaded rather than cleared.</returns>
+    /// <remarks>A stencil aspect that was already <see cref="RHI.LoadOp.DontCare"/> stays that way: the
+    /// framebuffer marks it so when the depth format carries no stencil, and asking to load one that
+    /// does not exist is an error rather than a no-op.</remarks>
+    private static RHI.RenderPassDesc KeepContents(in RHI.RenderPassDesc desc)
+    {
+        var colors = new RHI.ColorAttachmentDesc[desc.ColorAttachments.Length];
+
+        for (var i = 0; i < colors.Length; i++)
+        {
+            colors[i] = desc.ColorAttachments[i] with { LoadOp = RHI.LoadOp.Load };
+        }
+
+        var depth = desc.DepthAttachment is { } attachment
+            ? attachment with
+            {
+                DepthLoadOp = RHI.LoadOp.Load,
+                StencilLoadOp = attachment.StencilLoadOp == RHI.LoadOp.DontCare ? RHI.LoadOp.DontCare : RHI.LoadOp.Load,
+            }
+            : (RHI.DepthAttachmentDesc?)null;
+
+        return desc with { ColorAttachments = colors, DepthAttachment = depth };
     }
 
     /// <summary>
@@ -706,6 +806,10 @@ public class Renderer
 
         UpdatePerViewGpuBuffers(Scene, renderContext.Camera, DeltaTime);
 
+        // The opaque half. Ends before the framebuffer grab, which copies and dispatches compute, and
+        // neither is valid inside a pass.
+        var opaquePass = BeginPass(in renderContext, "Scene Opaque");
+
         using (new GLDebugGroup("Viewmodel Opaque"))
         {
             var mainCamera = renderContext.Camera;
@@ -749,6 +853,9 @@ public class Renderer
             Scene.RenderOpaqueLayer(renderContext, isStandardPass ? depthOnlyShader : null);
         }
 
+        // Opened inside the block below, once the copies that have to sit between the two passes are done.
+        var translucentPass = default(RhiPass);
+
         //using (new GLDebugGroup("Sky Render"))
         {
             DepthRange.Sky.Apply();
@@ -785,6 +892,10 @@ public class Renderer
 
             copyColor |= computeFramebufferLuminance;
 
+            // Everything below copies or dispatches, so the opaque pass has to close first even when
+            // nothing ends up being copied.
+            opaquePass.Dispose();
+
             if (isMainFramebuffer)
             {
                 var generateDepthPyramid = Scene.EnableOcclusionCulling
@@ -807,6 +918,10 @@ public class Renderer
                     Scene.DepthPyramidValid = true;
                 }
             }
+
+            // The translucent half, loading rather than clearing so the opaque results it composites
+            // over survive.
+            translucentPass = BeginPass(in renderContext, "Scene Translucent", keepContents: true);
 
             if (render3DSkybox)
             {
@@ -857,6 +972,9 @@ public class Renderer
             ViewBuffer.Update();
         }
 
+        // Closed before the luminance histogram below, which dispatches compute.
+        translucentPass.Dispose();
+
         wireframeScope.Dispose();
 
         if (isStandardPass)
@@ -865,6 +983,10 @@ public class Renderer
             {
                 ComputeAverageLuminance(renderContext);
             }
+
+            // The overlays that draw on top of the finished scene, in a pass of their own because the
+            // histogram above had to run outside one.
+            using var overlayPass = BeginPass(in renderContext, "Scene Overlays", keepContents: true);
 
             if (Postprocess.HasOutlineObjects)
             {
@@ -925,6 +1047,8 @@ public class Renderer
         ViewBuffer.Data.SunLightShadowBias = Scene.LightingInfo.SunLightShadowBias;
         ViewBuffer.Update();
 
+        using var shadowPass = BeginPass(in renderContext, "Sun Shadows");
+
         using (new GLDebugGroup("Direct Light Shadows"))
         {
             PerfStats.Active.Count(Counter.DirectionalShadowMap);
@@ -966,6 +1090,11 @@ public class Renderer
                 Textures.Add(new(ReservedTextureSlots.BarnLightShadowDepth, "g_tBarnLightShadowDepth", BarnLightShadowBuffer.Depth!));
             }
 
+            // Opened before the scissor is enabled, since beginning a pass turns scissoring off. The
+            // atlas is the one target drawn with forward depth, so its far plane is 1 rather than 0.
+            using var barnPass = BeginPass(renderContext.CommandList, BarnLightShadowBuffer,
+                "Barn Light Shadows", clearDepth: 1f);
+
             GL.Enable(EnableCap.ScissorTest);
             GL.Viewport(0, 0, BarnLightShadowBuffer.Width, BarnLightShadowBuffer.Height);
             GL.Scissor(0, 0, BarnLightShadowBuffer.Width, BarnLightShadowBuffer.Height);
@@ -984,6 +1113,11 @@ public class Renderer
 
                 GL.Viewport(region.X, region.Y, region.Width, region.Height);
                 GL.Scissor(region.X, region.Y, region.Width, region.Height);
+
+                // The pass opens covering the whole atlas, so without this a recorded draw would ignore
+                // the caster's region and write over every other face.
+                renderContext.CommandList?.SetViewport(region.X, region.Y, region.Width, region.Height);
+                renderContext.CommandList?.SetScissor(region.X, region.Y, region.Width, region.Height);
 
                 ViewBuffer.Data.WorldToProjection = caster.WorldToFrustum;
                 ViewBuffer.Update();

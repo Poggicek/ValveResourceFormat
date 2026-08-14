@@ -36,6 +36,10 @@ namespace ValveResourceFormat.Renderer
         private GLBuffer? vertexRhiBuffer;
         private GLBuffer? quadIndexRhiBuffer;
 
+        // Built once on first RHI draw rather than in a static initializer, so a layout the contract has
+        // no format for throws at the draw that needs it instead of as a type initializer failure.
+        private VertexInputDesc? vertexInputDesc;
+
         // :SharedQuadIndexCount - the shared index buffer GPUMeshBufferCache allocates, in indices.
         private const int SharedQuadIndexCount = 65532;
 
@@ -143,6 +147,29 @@ namespace ValveResourceFormat.Renderer
             }
             else
             {
+                var device = (GLRendererDevice)commandList.Device;
+
+                vertexInputDesc ??= MorphRectVertex.InputLayout.ToVertexInputDesc();
+
+                // Colour only, no depth, never multisampled: this draws into the composite texture, not
+                // into the pass's framebuffer.
+                //
+                // :MorphCompositeFormat - CompositeTexture.RhiFormat is Undefined because the allocation
+                // is still Rgb16f, which the contract has no member for. The pipeline is built with what
+                // the texture actually reports rather than a guessed widening, so it stays honest and
+                // wrong in the same one place; deciding the format with the shader fixes both this and
+                // the render pass that cannot yet be described for this target.
+                var pipeline = device.GetOrCreatePipeline(
+                    shader,
+                    renderState.CurrentPass,
+                    vertexInputDesc,
+                    PrimitiveTopology.TriangleList,
+                    [CompositeTexture.RhiFormat],
+                    RhiFormat.Undefined,
+                    sampleCount: 1,
+                    GLRendererDevice.DrawConstants);
+
+                commandList.BindPipeline(pipeline);
                 commandList.BindVertexBuffer(0, VertexRhiBuffer(vertexSizeBytes));
                 commandList.BindIndexBuffer(QuadIndexRhiBuffer(), IndexType.UInt16);
                 commandList.BindTexture(DescriptorSets.MaterialTextures, 0, morphAtlas.RhiTexture);

@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Renderer.Buffers;
 using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 
 namespace ValveResourceFormat.Renderer
 {
@@ -151,13 +152,13 @@ namespace ValveResourceFormat.Renderer
             state.DepthStencil.DepthFunc = Comparison.Farther;
             renderState.Apply(in state);
             shader.SetUniform("g_vColor", new Vector4(0.0f, 1.0f, 0.0f, 0.9f));
-            DrawOccludedBounds(commandList);
+            DrawOccludedBounds(commandList, context, in state);
 
             // Second pass: in front/at depth buffer (incorrectly visible) - RED
             state.DepthStencil.DepthFunc = Comparison.CloserEqual;
             renderState.Apply(in state);
             shader.SetUniform("g_vColor", new Vector4(1.0f, 0.0f, 0.0f, 0.9f));
-            DrawOccludedBounds(commandList);
+            DrawOccludedBounds(commandList, context, in state);
 
             if (commandList == null)
             {
@@ -167,12 +168,29 @@ namespace ValveResourceFormat.Renderer
 
         // The vertex count and instance count both come from the GPU-written header, so this is a
         // non-indexed indirect draw: the arguments are a DrawArraysIndirectCommand, not the indexed form.
-        private void DrawOccludedBounds(ICommandList? commandList)
+        private void DrawOccludedBounds(ICommandList? commandList, Scene.RenderContext? context, in RenderState state)
         {
             Debug.Assert(OccludedBoundsDebugGpu is not null);
 
             if (commandList != null)
             {
+                // The bounds are generated procedurally from the vertex index against the storage buffer,
+                // so there is no vertex buffer and the layout is empty. The two draws differ only in
+                // depth function, which is part of the state, so each gets its own cached pipeline.
+                var framebuffer = context!.Value.Framebuffer;
+                var device = (GLRendererDevice)commandList.Device;
+
+                var pipeline = device.GetOrCreatePipeline(
+                    shader,
+                    in state,
+                    VertexInputDesc.Empty,
+                    PrimitiveTopology.LineList,
+                    framebuffer.Color is { } color ? [color.RhiFormat] : [],
+                    framebuffer.Depth?.RhiFormat ?? RhiFormat.Undefined,
+                    Math.Max(1, framebuffer.NumSamples),
+                    GLRendererDevice.DrawConstants);
+
+                commandList.BindPipeline(pipeline);
                 commandList.DrawIndirect(OccludedBoundsDebugGpu.RhiBuffer, IndirectArgsByteOffset, drawCount: 1);
                 return;
             }

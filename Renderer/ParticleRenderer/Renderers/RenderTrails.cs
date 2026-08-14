@@ -54,6 +54,10 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         private GLBuffer? vertexRhiBuffer;
         private GLBuffer? quadIndexRhiBuffer;
 
+        // Built once on first RHI draw rather than in a static initializer, so a layout the contract has
+        // no format for throws at the draw that needs it instead of as a type initializer failure.
+        private VertexInputDesc? vertexInputDesc;
+
         private readonly float animationRate = 0.1f;
         private readonly ParticleAnimationType animationType = ParticleAnimationType.ANIMATION_TYPE_FIXED_RATE;
         private readonly bool animateInFps;
@@ -394,16 +398,18 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
         /// <inheritdoc/>
         public override void Render(ParticleCollection particleBag, ParticleSystemRenderState systemRenderState, Scene.RenderContext context)
-            => Render(particleBag, systemRenderState, context.Camera, context.CommandList);
+            => Render(particleBag, systemRenderState, context.Camera, context);
 
         /// <inheritdoc/>
         /// <remarks>Still overridden because the prewarm path reaches this renderer with only a camera:
         /// it starts in the viewer, which has no render context to thread through.</remarks>
         public override void Render(ParticleCollection particleBag, ParticleSystemRenderState systemRenderState, Camera camera)
-            => Render(particleBag, systemRenderState, camera, commandList: null);
+            => Render(particleBag, systemRenderState, camera, context: null);
 
-        private void Render(ParticleCollection particleBag, ParticleSystemRenderState systemRenderState, Camera camera, ICommandList? commandList)
+        private void Render(ParticleCollection particleBag, ParticleSystemRenderState systemRenderState, Camera camera, Scene.RenderContext? context)
         {
+            var commandList = context?.CommandList;
+
             if (particleBag.Count == 0)
             {
                 return;
@@ -433,6 +439,8 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             }
             else
             {
+                // Ribbon quads, two triangles each through the shared quad index buffer.
+                commandList.BindPipeline(PipelineFor(commandList, context!.Value));
                 commandList.BindVertexBuffer(0, VertexRhiBuffer(quadCount * 4 * Vertex.InputLayout.Stride));
                 commandList.BindIndexBuffer(QuadIndexRhiBuffer(), IndexType.UInt16);
             }
@@ -463,6 +471,26 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             {
                 GL.DrawElements(PrimitiveType.Triangles, quadCount * 6, DrawElementsType.UnsignedShort, 0);
             }
+        }
+
+        // Resolved per draw because the blend state depends on the output blend mode, which the pipeline
+        // has to bake in. Cached on the pipeline key, so only the first draw of each state builds one.
+        private GLGraphicsPipeline PipelineFor(ICommandList commandList, Scene.RenderContext context)
+        {
+            var framebuffer = context.Framebuffer;
+            var device = (GLRendererDevice)commandList.Device;
+
+            vertexInputDesc ??= Vertex.InputLayout.ToVertexInputDesc();
+
+            return device.GetOrCreatePipeline(
+                shader,
+                rendererContext.RenderState.CurrentPass,
+                vertexInputDesc,
+                PrimitiveTopology.TriangleList,
+                framebuffer.Color is { } color ? [color.RhiFormat] : [],
+                framebuffer.Depth?.RhiFormat ?? RhiFormat.Undefined,
+                Math.Max(1, framebuffer.NumSamples),
+                GLRendererDevice.DrawConstants);
         }
 
         private GLBuffer VertexRhiBuffer(int sizeInBytes)

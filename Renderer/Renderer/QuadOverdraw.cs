@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 
 namespace ValveResourceFormat.Renderer;
 
@@ -171,10 +172,24 @@ public class QuadOverdraw(RendererContext rendererContext)
 
         using (rendererContext.RenderState.Scope(depthTest: false, depthWrite: false))
         {
-            // A fullscreen triangle generated from the vertex index: no vertex buffer, so a pipeline
-            // built for this draw takes VertexInputDesc.Empty.
+            // A fullscreen triangle generated from the vertex index: no vertex buffer, so the pipeline
+            // takes VertexInputDesc.Empty. Three vertices of one triangle, so TriangleList.
             if (commandList != null)
             {
+                var framebuffer = context!.Value.Framebuffer;
+                var device = (GLRendererDevice)commandList.Device;
+
+                var pipeline = device.GetOrCreatePipeline(
+                    visualizeShader,
+                    rendererContext.RenderState.CurrentPass,
+                    VertexInputDesc.Empty,
+                    PrimitiveTopology.TriangleList,
+                    framebuffer.Color is { } color ? [color.RhiFormat] : [],
+                    framebuffer.Depth?.RhiFormat ?? RhiFormat.Undefined,
+                    Math.Max(1, framebuffer.NumSamples),
+                    GLRendererDevice.DrawConstants);
+
+                commandList.BindPipeline(pipeline);
                 commandList.Draw(3);
             }
             else

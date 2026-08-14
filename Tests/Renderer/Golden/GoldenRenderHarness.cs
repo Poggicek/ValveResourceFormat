@@ -75,6 +75,14 @@ namespace Tests.Renderer.Golden
             device = new GLRecordingDevice(rendererContext, ValidationGate.OnMessage);
             rendererContext.Device = device;
 
+            // Set VRF_RHI_RECORDING=1 to run the scenes through the RHI instead of straight OpenGL.
+            // Off by default because the migration cannot yet honour the contract end to end, and a
+            // scene that cannot record fails loudly rather than quietly falling back. This is the
+            // switch that measures how far the port has actually got: with it on, a scene passing
+            // means the RHI produced the same pixels as the OpenGL path, which is the only claim
+            // about this migration worth making.
+            ValveResourceFormat.Renderer.Renderer.EnableRhiRecording = Environment.GetEnvironmentVariable("VRF_RHI_RECORDING") == "1";
+
             // Synchronous delivery, so a message is raised inside the call that caused it and on this
             // thread. Asynchronous delivery is allowed to straggle past the end of the scene, which would
             // make the validation gate attribute an error to whichever scene happened to run next.
