@@ -71,6 +71,19 @@ public enum TextureDimension
     TextureCubeArray,
 }
 
+/// <summary>Which aspect of a texture a view addresses. Only depth-stencil formats have more than one.</summary>
+public enum TextureAspect
+{
+    /// <summary>Every aspect the format has. Colour formats only ever use this.</summary>
+    All,
+    /// <summary>The depth aspect of a depth-stencil format.</summary>
+    Depth,
+    /// <summary>The stencil aspect of a depth-stencil format, so shaders can sample stencil.
+    /// Replaces <c>DepthStencilTextureMode.StencilIndex</c>, which <see cref="Framebuffer"/> uses
+    /// to build a stencil view of the depth attachment.</summary>
+    Stencil,
+}
+
 /// <summary>Texture minification and magnification filter.</summary>
 public enum FilterMode
 {

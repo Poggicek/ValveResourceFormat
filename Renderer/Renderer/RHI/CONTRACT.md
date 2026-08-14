@@ -89,6 +89,50 @@ separate pipeline stalls.
 - **Debug names.** Every descriptor takes one. They map to `glObjectLabel` and
   `VK_EXT_debug_utils`; preserve the naming already used at existing call sites.
 
+## Revision 2 — gaps closed after first-consumer review
+
+The viewer-layer and format-table agents were the first real consumers and found genuine holes.
+**Every change below is additive** except the removal of an unreachable type, so work already in
+flight against revision 1 still compiles.
+
+| Gap | Fix |
+|---|---|
+| No way to obtain an `IDevice` | `RendererContext.Device`, assigned by the presentation layer |
+| No GPU→CPU readback — `BufferMemory.HostReadback` was unfillable | `ICommandList.CopyTextureToBuffer` |
+| **No MSAA resolve** | `ColorAttachmentDesc.ResolveTexture` |
+| `IRenderTarget` had no producer and no consumer | Removed; render targets are the `ITexture` attachments of a `RenderPassDesc` |
+| No stencil aspect on `ITexture.CreateView` | `TextureAspect` parameter |
+| No max sample count | `IDeviceLimits.MaxSampleCount` |
+| `PushConstantRange.OffsetInBytes` unusable | `SetPushConstants(in T, int offsetInBytes = 0)` |
+| Nowhere for viewer- and pass-local uniform blocks | `ICommandList.BindTransientUniform<T>` |
+| No inbound diagnostics channel | `RhiMessageCallback`, supplied at device creation |
+| `DebugScope` needed a command list the caller lacks | `IDevice.DebugScope` |
+| `BindTexture` documented a texture "default sampler" that cannot exist | Null now means the device default sampler |
+| **Vertex integer formats missing** | `R8G8B8A8_UInt`, `R16G16_SInt`, `R16G16B16A16_UInt`, `R16G16B16A16_SInt`, `R32G32B32A32_SInt` |
+| ETC2 family missing | Four `ETC2_*` members |
+| `VertexInputDesc` had no empty value | `VertexInputDesc.Empty` |
+
+Two of these deserve their reasoning recorded, because both are silent on the GL oracle:
+
+**MSAA resolve.** `glBlitFramebuffer` resolves multisampled sources implicitly, so mapping a resolve
+onto `BlitTexture` works perfectly on OpenGL. `vkCmdBlitImage` rejects a multisampled source
+outright. That is the barrier-section hazard in another guise: correct on the oracle, hard failure
+on Vulkan. Use `ColorAttachmentDesc.ResolveTexture` and never `BlitTexture` for this.
+
+**Vertex integer formats.** Source 2 encodes `BLENDINDICES` as `R8G8B8A8_UINT`, `R16G16_SINT`,
+`R16G16B16A16_SINT` and the eight-joint variants — see the table at `VBIB.cs:392`. Without these
+members no skinned mesh could describe its vertex input at all.
+
+Still open, needing a decision rather than an addition:
+
+- **`R16G16B16_SFloat`** — `MorphComposite.cs:86` uses GL `Rgb16f`. Three-component 16-bit float is
+  optional in Vulkan and widely unsupported, so the port should move that texture to
+  `R16G16B16A16_SFloat` rather than the contract growing a member most devices cannot honour.
+- **`GLGraphViewer`** drives Skia's GL backend directly against a raw FBO handle
+  (`GRGlFramebufferInfo`), which has no RHI expression and would need a `VkDevice` handed out
+  through an otherwise handle-free interface. Likeliest answer is Skia CPU raster plus a texture
+  upload, but it needs deciding before anything touches that file.
+
 ## Not in this contract, by design
 
 - **Queries and timestamps** — `PerfStats` / `Timings` keep their own surface (agent `E2`).

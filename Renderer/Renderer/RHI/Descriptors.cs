@@ -102,7 +102,12 @@ public readonly record struct VertexBindingDesc(int Binding, int StrideInBytes, 
 /// <see cref="VertexInputLayout"/>, which already carries formats and canonical locations.</summary>
 /// <param name="Attributes">The vertex inputs.</param>
 /// <param name="Bindings">The buffer bindings the attributes draw from.</param>
-public readonly record struct VertexInputDesc(VertexAttributeDesc[] Attributes, VertexBindingDesc[] Bindings);
+public readonly record struct VertexInputDesc(VertexAttributeDesc[] Attributes, VertexBindingDesc[] Bindings)
+{
+    /// <summary>Gets the layout of a pipeline that fetches no vertex data, such as a fullscreen
+    /// triangle generated from <c>gl_VertexIndex</c>. The renderer has several such passes.</summary>
+    public static VertexInputDesc Empty { get; } = new([], []);
+}
 
 /// <summary>A range of push constants visible to a set of stages.</summary>
 /// <param name="OffsetInBytes">Byte offset within the push constant block.</param>
@@ -119,13 +124,24 @@ public readonly record struct PushConstantRange(int OffsetInBytes, int SizeInByt
 /// <param name="ClearColor">The clear value, used when <paramref name="LoadOp"/> is <see cref="RHI.LoadOp.Clear"/>.</param>
 /// <param name="MipLevel">Which mip level to render into.</param>
 /// <param name="ArrayLayer">Which array layer or cube face to render into.</param>
+/// <param name="ResolveTexture">A single-sampled texture to resolve into when the pass ends, or
+/// <see langword="null"/> for no resolve.</param>
+/// <remarks>
+/// <para><paramref name="ResolveTexture"/> is the ONLY correct way to resolve multisampled colour.
+/// Do not reach for <see cref="ICommandList.BlitTexture"/>: <c>glBlitFramebuffer</c> resolves
+/// implicitly, so a blit-based resolve passes on the OpenGL backend, while
+/// <c>vkCmdBlitImage</c> rejects a multisampled source outright and fails on Vulkan.</para>
+/// <para>Pair it with <see cref="StoreOp.DontCare"/> on the multisampled attachment, whose contents
+/// are not needed once resolved.</para>
+/// </remarks>
 public readonly record struct ColorAttachmentDesc(
     ITexture Texture,
     LoadOp LoadOp,
     StoreOp StoreOp,
     Vector4 ClearColor = default,
     int MipLevel = 0,
-    int ArrayLayer = 0);
+    int ArrayLayer = 0,
+    ITexture? ResolveTexture = null);
 
 /// <summary>The depth-stencil attachment of a render pass.</summary>
 /// <param name="Texture">The target texture or view.</param>

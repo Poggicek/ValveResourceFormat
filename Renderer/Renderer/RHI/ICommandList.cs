@@ -108,8 +108,20 @@ public interface ICommandList : IDisposable
     /// <see cref="DescriptorSets.MaterialTextures"/>.</param>
     /// <param name="binding">The slot within that set.</param>
     /// <param name="texture">The texture to bind.</param>
-    /// <param name="sampler">The sampler to bind, or <see langword="null"/> to use the texture's default.</param>
+    /// <param name="sampler">The sampler to bind, or <see langword="null"/> for the device's default
+    /// linear-repeat sampler. Textures carry no sampler of their own.</param>
     void BindTexture(int descriptorSet, int binding, ITexture texture, ISampler? sampler = null);
+
+    /// <summary>
+    /// Writes a block into a per-frame ring buffer and binds it as a uniform buffer for this draw.
+    /// </summary>
+    /// <typeparam name="T">The block type. Must be blittable and match the shader declaration.</typeparam>
+    /// <param name="binding">The slot within <see cref="DescriptorSets.UniformBuffers"/>.</param>
+    /// <param name="data">The value to write.</param>
+    /// <remarks>For per-pass and viewer-local constants that are neither a material's
+    /// <see cref="GlobalsLayout"/> block nor part of the 92-byte per-draw push constant range. The
+    /// allocation lives until the frame retires, so callers need not manage its lifetime.</remarks>
+    void BindTransientUniform<T>(int binding, in T data) where T : unmanaged;
 
     /// <summary>Binds a texture as a read/write storage image.</summary>
     /// <param name="binding">The slot within <see cref="DescriptorSets.ReservedTextures"/>.</param>
@@ -121,9 +133,11 @@ public interface ICommandList : IDisposable
     /// <typeparam name="T">The push constant block type. Must be blittable and match the shader
     /// declaration byte for byte.</typeparam>
     /// <param name="data">The value to write.</param>
+    /// <param name="offsetInBytes">Byte offset within the push constant block, matching a
+    /// <see cref="PushConstantRange.OffsetInBytes"/>.</param>
     /// <remarks>The renderer's per-draw block is 92 bytes. Check
     /// <see cref="IDeviceLimits.MaxPushConstantSize"/> before exceeding 128.</remarks>
-    void SetPushConstants<T>(in T data) where T : unmanaged;
+    void SetPushConstants<T>(in T data, int offsetInBytes = 0) where T : unmanaged;
 
     // ---- draws ----
 
@@ -210,6 +224,17 @@ public interface ICommandList : IDisposable
     /// <param name="destination">Destination texture.</param>
     /// <param name="mipLevel">Mip level to copy.</param>
     void CopyTexture(ITexture source, ITexture destination, int mipLevel = 0);
+
+    /// <summary>Copies texel data out of a texture into a buffer, for readback to the CPU.</summary>
+    /// <param name="source">Source texture, which must be in <see cref="ResourceState.CopySource"/>.</param>
+    /// <param name="mipLevel">Mip level to read.</param>
+    /// <param name="arrayLayer">Array layer or cube face to read.</param>
+    /// <param name="destination">Destination buffer, normally <see cref="BufferMemory.HostReadback"/>.</param>
+    /// <param name="destinationOffsetInBytes">Byte offset to write at.</param>
+    /// <remarks>The only route from a render target back to the CPU, and therefore what backs
+    /// screenshots, texture export and the package browser's thumbnails. Read the result through
+    /// <see cref="IBuffer.MappedData"/> after <see cref="IDevice.WaitIdle"/>.</remarks>
+    void CopyTextureToBuffer(ITexture source, int mipLevel, int arrayLayer, IBuffer destination, int destinationOffsetInBytes = 0);
 
     /// <summary>Blits between textures, scaling and converting format. Replaces
     /// <c>glBlitNamedFramebuffer</c>.</summary>

@@ -68,8 +68,15 @@ public interface ITexture : IRhiResource
     /// <param name="baseArrayLayer">First array layer in the view.</param>
     /// <param name="arrayLayerCount">Number of array layers in the view.</param>
     /// <param name="format">Format to reinterpret as, or <see cref="RhiFormat.Undefined"/> to keep the parent's.</param>
+    /// <param name="aspect">Which aspect to address. Only meaningful for depth-stencil formats.</param>
     /// <returns>The view.</returns>
-    ITexture CreateView(int baseMipLevel, int mipLevelCount, int baseArrayLayer, int arrayLayerCount, RhiFormat format = RhiFormat.Undefined);
+    ITexture CreateView(
+        int baseMipLevel,
+        int mipLevelCount,
+        int baseArrayLayer,
+        int arrayLayerCount,
+        RhiFormat format = RhiFormat.Undefined,
+        TextureAspect aspect = TextureAspect.All);
 }
 
 /// <summary>A sampler. Separate from the texture, as it already is in
@@ -102,22 +109,7 @@ public interface IComputePipeline : IRhiResource
     (int X, int Y, int Z) WorkgroupSize { get; }
 }
 
-/// <summary>A render target a command list can draw into. Either an offscreen texture set or a
-/// swapchain image.</summary>
-public interface IRenderTarget : IRhiResource
-{
-    /// <summary>Gets the width in pixels.</summary>
-    int Width { get; }
-
-    /// <summary>Gets the height in pixels.</summary>
-    int Height { get; }
-
-    /// <summary>Gets the sample count. 1 means not multisampled.</summary>
-    int SampleCount { get; }
-
-    /// <summary>Gets the colour attachment formats, in attachment order.</summary>
-    IReadOnlyList<RhiFormat> ColorFormats { get; }
-
-    /// <summary>Gets the depth-stencil format, or <see cref="RhiFormat.Undefined"/> when there is none.</summary>
-    RhiFormat DepthFormat { get; }
-}
+// There is deliberately no IRenderTarget type. Render targets are expressed as the ITexture
+// attachments of a RenderPassDesc, which is the dynamic-rendering idiom and needs no separate
+// object. The window backbuffer is surfaced as an ITexture by the presentation layer, which owns
+// its lifecycle because acquisition is tied to the swapchain and cannot be modelled here.

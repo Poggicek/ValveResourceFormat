@@ -75,6 +75,20 @@ public enum RhiFormat
     /// <summary>Single channel, 32 bit signed integer.</summary>
     R32_SInt,
 
+    // Vertex integer formats. Source 2 encodes BLENDINDICES in these, so every skinned mesh
+    // depends on them; see the format table at VBIB.cs:392.
+
+    /// <summary>Four channel, 8 bit unsigned integer. The common BLENDINDICES encoding.</summary>
+    R8G8B8A8_UInt,
+    /// <summary>Two channel, 16 bit signed integer. A BLENDINDICES encoding.</summary>
+    R16G16_SInt,
+    /// <summary>Four channel, 16 bit unsigned integer. An eight-joint BLENDINDICES encoding.</summary>
+    R16G16B16A16_UInt,
+    /// <summary>Four channel, 16 bit signed integer. A BLENDINDICES encoding.</summary>
+    R16G16B16A16_SInt,
+    /// <summary>Four channel, 32 bit signed integer. An eight-joint BLENDINDICES encoding.</summary>
+    R32G32B32A32_SInt,
+
     // Vertex-only float formats
 
     /// <summary>Three channel, 32 bit float. Vertex input only on most backends.</summary>
@@ -114,6 +128,14 @@ public enum RhiFormat
     BC7_UNorm,
     /// <summary>BC7, sRGB encoded.</summary>
     BC7_SRgb,
+    /// <summary>ETC2, RGB.</summary>
+    ETC2_R8G8B8_UNorm,
+    /// <summary>ETC2, RGB, sRGB encoded.</summary>
+    ETC2_R8G8B8_SRgb,
+    /// <summary>ETC2 with EAC alpha, RGBA.</summary>
+    ETC2_R8G8B8A8_UNorm,
+    /// <summary>ETC2 with EAC alpha, RGBA, sRGB encoded.</summary>
+    ETC2_R8G8B8A8_SRgb,
 
     // Depth and stencil
 
@@ -136,7 +158,7 @@ public static class RhiFormatInfo
     /// <summary>Gets a value indicating whether the format is block compressed.</summary>
     /// <param name="format">The format to test.</param>
     /// <returns><see langword="true"/> for the BC family.</returns>
-    public static bool IsCompressed(RhiFormat format) => format is >= RhiFormat.BC1_RGBA_UNorm and <= RhiFormat.BC7_SRgb;
+    public static bool IsCompressed(RhiFormat format) => format is >= RhiFormat.BC1_RGBA_UNorm and <= RhiFormat.ETC2_R8G8B8A8_SRgb;
 
     /// <summary>Gets a value indicating whether the format carries a depth channel.</summary>
     /// <param name="format">The format to test.</param>
@@ -153,7 +175,8 @@ public static class RhiFormatInfo
     /// <returns><see langword="true"/> for sRGB encoded formats.</returns>
     public static bool IsSRgb(RhiFormat format) => format
         is RhiFormat.R8G8B8A8_SRgb or RhiFormat.B8G8R8A8_SRgb or RhiFormat.R8G8B8_SRgb
-        or RhiFormat.BC1_RGBA_SRgb or RhiFormat.BC2_SRgb or RhiFormat.BC3_SRgb or RhiFormat.BC7_SRgb;
+        or RhiFormat.BC1_RGBA_SRgb or RhiFormat.BC2_SRgb or RhiFormat.BC3_SRgb or RhiFormat.BC7_SRgb
+        or RhiFormat.ETC2_R8G8B8_SRgb or RhiFormat.ETC2_R8G8B8A8_SRgb;
 
     /// <summary>Gets the edge length in texels of one compression block, or 1 for uncompressed formats.</summary>
     /// <param name="format">The format to measure.</param>

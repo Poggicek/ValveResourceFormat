@@ -39,6 +39,13 @@ public class RendererContext : IDisposable
     public RenderStateTracker RenderState { get; } = new();
 
     /// <summary>
+    /// The graphics device this context renders with, or <see langword="null"/> before
+    /// initialization. Assigned by the presentation layer once a backend has been brought up, since
+    /// device creation needs a window and a surface that the renderer does not own.
+    /// </summary>
+    public RHI.IDevice? Device { get; set; }
+
+    /// <summary>
     /// Maximum texture mip size to load in <see cref="MaterialLoader"/>.
     /// </summary>
     public int MaxTextureSize { get; set; } = 1024;

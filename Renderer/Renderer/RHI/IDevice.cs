@@ -25,6 +25,11 @@ public interface IDeviceLimits
     /// <summary>Gets the maximum anisotropy the sampler hardware supports.</summary>
     float MaxSamplerAnisotropy { get; }
 
+    /// <summary>Gets the highest sample count supported for multisampled render targets. Replaces
+    /// <c>GL.GetInteger(GetPName.MaxSamples)</c>, which the viewers clamp the user's anti-aliasing
+    /// setting against.</summary>
+    int MaxSampleCount { get; }
+
     /// <summary>Gets a value indicating whether indirect draws can read their count from a buffer,
     /// backing the renderer's <c>MultiDrawElementsIndirectCount</c> path.</summary>
     bool SupportsDrawIndirectCount { get; }
@@ -44,9 +49,28 @@ public interface IDeviceLimits
     bool SupportsFormat(RhiFormat format, TextureUsage usage);
 }
 
+/// <summary>Severity of a diagnostic message the graphics backend reports.</summary>
+public enum RhiMessageSeverity
+{
+    /// <summary>Informational.</summary>
+    Info,
+    /// <summary>A warning: legal but suspect.</summary>
+    Warning,
+    /// <summary>An error. The GUI breaks into the debugger on these.</summary>
+    Error,
+}
+
+/// <summary>Receives diagnostics from the graphics backend.</summary>
+/// <param name="severity">How serious the message is.</param>
+/// <param name="message">The message text.</param>
+/// <remarks>Backs the existing <c>GL.DebugMessageCallback</c> wiring. Vulkan installs its
+/// <c>VK_EXT_debug_utils</c> messenger at instance creation, so this must be supplied when the
+/// device is created rather than attached afterwards.</remarks>
+public delegate void RhiMessageCallback(RhiMessageSeverity severity, string message);
+
 /// <summary>
-/// Creates GPU resources and submits work. One device per rendering context; every
-/// <see cref="RendererContext"/> owns one.
+/// Creates GPU resources and submits work. One device per rendering context; obtain it from
+/// <see cref="RendererContext.Device"/>, which the presentation layer assigns during initialization.
 /// </summary>
 public interface IDevice : IDisposable
 {
@@ -134,4 +158,13 @@ public interface IDevice : IDisposable
     /// retired. Destroying a resource directly while it is still in flight is undefined.</summary>
     /// <param name="resource">The resource to destroy.</param>
     void DeferredDestroy(IRhiResource resource);
+
+    /// <summary>Opens a labelled scope in graphics debuggers spanning whatever is recorded inside it,
+    /// including work recorded by callees on their own command lists. Dispose to close it.</summary>
+    /// <param name="name">The label.</param>
+    /// <returns>A guard that closes the scope.</returns>
+    /// <remarks>The device-level counterpart of <see cref="ICommandList.DebugScope"/>, for callers
+    /// that want to name a region without owning a command list at that altitude. Backs the existing
+    /// free-standing <c>GLDebugGroup</c> usage.</remarks>
+    IDisposable DebugScope(string name);
 }
