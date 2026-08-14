@@ -262,6 +262,13 @@ namespace ValveResourceFormat.Renderer.Shaders
                                 }
                             }
 
+                            // Dropping the line without re-syncing would report every error below it
+                            // one line early per define removed, which the render mode branch above
+                            // avoids by emitting a replacement line. Includes and #endif re-sync often
+                            // enough to hide it, so the skew shows up as an error blamed on a
+                            // plausible-looking neighbour rather than as an obvious wrong number.
+                            AppendLineNumber(lineNum, currentSourceFileNumber);
+
                             continue;
                         }
 

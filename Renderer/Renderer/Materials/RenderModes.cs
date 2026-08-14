@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Immutable;
 
 namespace ValveResourceFormat.Renderer.Materials
@@ -69,12 +70,19 @@ namespace ValveResourceFormat.Renderer.Materials
             new("QuadOverdraw")
         ];
 
-        private readonly static Dictionary<string, byte> ShaderIds = new(Items.Count);
+        // Concurrent, and the registration is idempotent, because shader parsing runs on several
+        // threads: ShaderLoader kicks off a background pre-parse from its static constructor that can
+        // race any foreground parse. The caller checks GetShaderId before registering, so two threads
+        // can both read zero and both register. The value is derived from the render mode's index in
+        // Items, so it is the same on every thread and the second write is a no-op rather than a
+        // conflict. A plain Dictionary threw ArgumentException here, unpredictably.
+        private readonly static ConcurrentDictionary<string, byte> ShaderIds = new(concurrencyLevel: -1, capacity: Items.Count);
 
-        /// <summary>Registers the shader define index assigned to a render mode name during preprocessing.</summary>
+        /// <summary>Registers the shader define index assigned to a render mode name during preprocessing.
+        /// Idempotent, and safe to call from several threads at once.</summary>
         /// <param name="renderMode">The render mode name (without the <c>renderMode_</c> prefix).</param>
         /// <param name="value">The byte index assigned to this render mode in the shader define.</param>
-        public static void AddShaderId(string renderMode, byte value) => ShaderIds.Add(renderMode, value);
+        public static void AddShaderId(string renderMode, byte value) => ShaderIds[renderMode] = value;
 
         /// <summary>Returns the shader define index registered for the given render mode name, or 0 if none has been registered.</summary>
         /// <param name="renderMode">The render mode name (without the <c>renderMode_</c> prefix).</param>
