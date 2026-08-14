@@ -72,7 +72,7 @@ namespace Tests.Renderer.Golden
             // to the context is what the presentation layer does in the real application, so the renderer
             // sees the same shape here. It also installs the driver's debug message callback, which is how
             // a golden run reports a GL error today and a Vulkan validation error once that backend lands.
-            device = new GLDevice(ValidationGate.OnMessage);
+            device = new GLRecordingDevice(rendererContext, ValidationGate.OnMessage);
             rendererContext.Device = device;
 
             // Synchronous delivery, so a message is raised inside the call that caused it and on this

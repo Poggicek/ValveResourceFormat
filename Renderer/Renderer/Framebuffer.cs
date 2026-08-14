@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using OpenTK.Graphics.OpenGL;
 using OpenTK.Mathematics;
+using ValveResourceFormat.Renderer.RHI;
 
 namespace ValveResourceFormat.Renderer;
 
@@ -112,6 +113,85 @@ public class Framebuffer
     }
 
     /// <summary>
+    /// Describes this framebuffer as a render pass, so it can be handed to
+    /// <see cref="ICommandList.BeginRenderPass"/>.
+    /// </summary>
+    /// <param name="name">Debug label for the pass, or <see langword="null"/> to reuse the framebuffer's.</param>
+    /// <param name="colorMipLevel">Mip level of the colour attachment to render into. The RHI equivalent
+    /// of <see cref="AttachColorMipLevel"/>, which the bloom chain uses.</param>
+    /// <param name="resolveColorTo">A single-sampled texture to resolve colour into when the pass ends,
+    /// or <see langword="null"/> for no resolve. The only correct way to resolve MSAA: a blit resolves
+    /// implicitly on OpenGL and fails on Vulkan.</param>
+    /// <returns>The pass descriptor.</returns>
+    /// <remarks>
+    /// <para>
+    /// The load operations come from <see cref="ClearMask"/> and the clear values from
+    /// <see cref="ClearColor"/>, so a pass begun from this descriptor clears exactly what
+    /// <see cref="BindAndClear"/> would. Every attachment stores: nothing in the renderer discards its
+    /// results today, and <see cref="StoreOp.DontCare"/> here would change what later passes read.
+    /// </para>
+    /// <para>
+    /// Prefer this over <see cref="BindAndClear"/> in ported code. Clears obey the colour and stencil
+    /// write masks, and <see cref="BindAndClear"/> leaves that to its caller &#8212; only
+    /// <see cref="Renderer"/>'s frame entry actually opens a scope for it. The render pass path forces
+    /// the masks open around the clear itself, so it cannot inherit a restrictive mask from whatever
+    /// drew last.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">The framebuffer has no attachments to describe.</exception>
+    public RenderPassDesc RenderPass(string? name = null, int colorMipLevel = 0, ITexture? resolveColorTo = null)
+    {
+        if (Color == null && Depth == null)
+        {
+            throw new InvalidOperationException("Framebuffer has no attachments to describe as a render pass.");
+        }
+
+        var clearsColor = (ClearMask & ClearBufferMask.ColorBufferBit) != 0;
+        var clearsDepth = (ClearMask & ClearBufferMask.DepthBufferBit) != 0;
+
+        var colors = Color == null
+            ? []
+            : new[]
+            {
+                new ColorAttachmentDesc(
+                    Color.RhiTexture,
+                    clearsColor ? LoadOp.Clear : LoadOp.Load,
+                    StoreOp.Store,
+                    // Qualified: this file also has OpenTK's Vector4 in scope.
+                    new System.Numerics.Vector4(ClearColor.R, ClearColor.G, ClearColor.B, ClearColor.A),
+                    colorMipLevel,
+                    ArrayLayer: 0,
+                    resolveColorTo),
+            };
+
+        DepthAttachmentDesc? depth = null;
+
+        if (Depth != null)
+        {
+            // Only a format that has a stencil aspect may be told to clear one; asking for a stencil
+            // clear on a depth-only attachment is an OpenGL error rather than a no-op.
+            var hasStencil = RhiFormatInfo.IsStencil(Depth.RhiFormat);
+            var clearsStencil = hasStencil && (ClearMask & ClearBufferMask.StencilBufferBit) != 0;
+
+            // The depth clear value is 0: the renderer is reverse-Z, so 0 is the far plane, and that is
+            // also what GLEnvironment sets glClearDepth to for the path this replaces.
+            depth = new DepthAttachmentDesc(
+                Depth.RhiTexture,
+                clearsDepth ? LoadOp.Clear : LoadOp.Load,
+                StoreOp.Store,
+                ClearDepth: 0f,
+                hasStencil ? (clearsStencil ? LoadOp.Clear : LoadOp.Load) : LoadOp.DontCare,
+                hasStencil ? StoreOp.Store : StoreOp.DontCare,
+                ClearStencil: 0);
+        }
+
+        return new RenderPassDesc(colors, depth, name ?? DebugName);
+    }
+
+    /// <summary>Gets the debug label this framebuffer was created with.</summary>
+    public string DebugName { get; } = string.Empty;
+
+    /// <summary>
     /// Creates a new named OpenGL framebuffer object.
     /// </summary>
     /// <param name="name">Debug label applied to the framebuffer object.</param>
@@ -120,6 +200,7 @@ public class Framebuffer
         GL.CreateFramebuffers(1, out int handle);
         GL.ObjectLabel(ObjectLabelIdentifier.Framebuffer, handle, name.Length, name);
         FboHandle = handle;
+        DebugName = name;
     }
 
     #region Default OpenGL Framebuffer instance, and equality checks
@@ -317,6 +398,7 @@ public class Framebuffer
 
                 Stencil.SetLabel("FramebufferStencil");
                 Stencil.SetBaseMaxLevel(0, 0);
+                Stencil.RhiFormat = Depth.RhiFormat;
                 GL.TextureParameter(Stencil.Handle, TextureParameterName.DepthStencilTextureMode, (int)DepthStencilTextureMode.StencilIndex);
             }
         }
@@ -342,8 +424,55 @@ public class Framebuffer
         }
 
         attachment.SetBaseMaxLevel(0, mipCount - 1);
+        attachment.RhiFormat = ToRhiFormat(format.InternalFormat);
         return attachment;
     }
+
+    /// <summary>
+    /// Maps an attachment's OpenGL internal format back to the <see cref="RhiFormat"/> that describes it,
+    /// so <see cref="RenderTexture.RhiTexture"/> can carry it into a <see cref="RenderPassDesc"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Deliberately partial, and answers <see cref="RhiFormat.Undefined"/> rather than throwing for a
+    /// format it does not know. Colour attachments are not all statically known:
+    /// <c>GLTextureDecoder</c> asks the driver for its preferred export format, so the value depends on
+    /// the GPU. An undefined format still binds, samples and blits; it only costs the ability to upload
+    /// to or create a view of the texture through the RHI.
+    /// </para>
+    /// <para>
+    /// The depth formats are all mapped, and that is the part that has to be exact. The attachment point
+    /// a render pass picks turns on whether the format has a stencil aspect, so a depth-stencil buffer
+    /// that answered <see cref="RhiFormat.Undefined"/> would be attached as depth only and lose its
+    /// stencil silently. The one integer colour target the renderer has, the picking buffer, is mapped
+    /// for the same reason: its clear has to be an integer clear.
+    /// </para>
+    /// </remarks>
+    private static RhiFormat ToRhiFormat(PixelInternalFormat internalFormat) => internalFormat switch
+    {
+        PixelInternalFormat.Rgba8 => RhiFormat.R8G8B8A8_UNorm,
+        PixelInternalFormat.Srgb8Alpha8 => RhiFormat.R8G8B8A8_SRgb,
+        PixelInternalFormat.Rgba16f => RhiFormat.R16G16B16A16_SFloat,
+        PixelInternalFormat.Rgba16 => RhiFormat.R16G16B16A16_UNorm,
+        PixelInternalFormat.Rgba32f => RhiFormat.R32G32B32A32_SFloat,
+        PixelInternalFormat.R11fG11fB10f => RhiFormat.B10G11R11_UFloat,
+        PixelInternalFormat.Rgb10A2 => RhiFormat.R10G10B10A2_UNorm,
+        PixelInternalFormat.R8 => RhiFormat.R8_UNorm,
+        PixelInternalFormat.R16f => RhiFormat.R16_SFloat,
+        PixelInternalFormat.R32f => RhiFormat.R32_SFloat,
+        PixelInternalFormat.Rg16f => RhiFormat.R16G16_SFloat,
+
+        // The picking buffer. An integer target has to clear through the integer entry point.
+        PixelInternalFormat.Rgba32ui => RhiFormat.R32G32B32A32_UInt,
+        PixelInternalFormat.R32ui => RhiFormat.R32_UInt,
+
+        PixelInternalFormat.DepthComponent16 => RhiFormat.D16_UNorm,
+        PixelInternalFormat.DepthComponent32f => RhiFormat.D32_SFloat,
+        PixelInternalFormat.Depth24Stencil8 => RhiFormat.D24_UNorm_S8_UInt,
+        PixelInternalFormat.Depth32fStencil8 => RhiFormat.D32_SFloat_S8_UInt,
+
+        _ => RhiFormat.Undefined,
+    };
 
     /// <summary>
     /// Changes the attachment formats and recreates the GPU attachments at the current dimensions.

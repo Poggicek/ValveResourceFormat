@@ -12,7 +12,7 @@ using ValveResourceFormat.IO;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.RHI;
 using ValveResourceFormat.Renderer.SceneEnvironment;
-using GLDevice = ValveResourceFormat.Renderer.RHI.OpenGL.GLDevice;
+using GLRecordingDevice = ValveResourceFormat.Renderer.RHI.OpenGL.GLRecordingDevice;
 
 namespace GUI.Types.PackageViewer.ThumbnailRenderers;
 
@@ -29,6 +29,17 @@ internal abstract class ThumbnailRenderer : IDisposable
 {
     protected Renderer? SceneRenderer;
     private Framebuffer? framebuffer;
+
+    /// <summary>
+    /// Where the post-process chain writes the display-ready image that gets read back.
+    ///
+    /// An offscreen colour target rather than framebuffer 0. A thumbnail is never presented, so bouncing
+    /// through the window's default framebuffer only coupled this path to a surface that has no
+    /// <see cref="ITexture"/> on OpenGL and no equivalent at all on a headless Vulkan device. Rendering
+    /// into a target we own is also what makes the capture independent of the window's size.
+    /// </summary>
+    private Framebuffer? captureFramebuffer;
+
     private TextRenderer? textRenderer;
     private RendererContext? RendererContext;
     private NativeWindow? NativeWindow;
@@ -70,7 +81,7 @@ internal abstract class ThumbnailRenderer : IDisposable
         NativeWindow.MakeCurrent();
 
         // Thumbnails render on a background thread, so diagnostics are logged rather than broken on.
-        Device = new GLDevice(OnRhiMessage);
+        Device = new GLRecordingDevice(RendererContext, OnRhiMessage);
         RendererContext.Device = Device;
 
         GLEnvironment.Initialize(RendererContext.Logger);
@@ -92,6 +103,15 @@ internal abstract class ThumbnailRenderer : IDisposable
             new(PixelInternalFormat.Rgba16f, PixelFormat.Rgba, PixelType.HalfFloat),
             Framebuffer.DepthAttachmentFormat.Depth16);
         framebuffer.Initialize();
+
+        // Display-ready sRGB-encoded bytes, matching what the golden image harness captures. Reading back
+        // the Rgba16f scene target instead would capture pre-tonemap values.
+        captureFramebuffer = Framebuffer.Prepare("ThumbnailCapture", 4, 4, 0,
+            new(PixelInternalFormat.Rgba8, PixelFormat.Bgra, PixelType.UnsignedByte),
+            null);
+        captureFramebuffer.ClearColor = new OpenTK.Mathematics.Color4(0f, 128f / 255f, 0f, 1f);
+        captureFramebuffer.ClearMask = ClearBufferMask.ColorBufferBit;
+        captureFramebuffer.Initialize();
 
         SceneRenderer.Initialize();
         SceneRenderer.MainFramebuffer = framebuffer;
@@ -138,13 +158,19 @@ internal abstract class ThumbnailRenderer : IDisposable
 
     public Bitmap? ReadPixelsToBitmap()
     {
-        var currentSize = NativeWindow?.ClientSize.X ?? 256;
+        if (captureFramebuffer is null)
+        {
+            return null;
+        }
+
+        var currentSize = captureFramebuffer.Width;
 
         NativeWindow?.MakeCurrent();
         using var bitmap = new SkiaSharp.SKBitmap(currentSize, currentSize, SkiaSharp.SKColorType.Bgra8888, SkiaSharp.SKAlphaType.Opaque);
         var pixels = bitmap.GetPixels(out var length);
 
-        Framebuffer.GLDefaultFramebuffer.Bind(FramebufferTarget.ReadFramebuffer);
+        captureFramebuffer.Bind(FramebufferTarget.ReadFramebuffer);
+        GL.ReadBuffer(ReadBufferMode.ColorAttachment0);
         GL.ReadPixels(0, 0, currentSize, currentSize, PixelFormat.Bgra, PixelType.UnsignedByte, pixels);
 
         // Flip y
@@ -185,6 +211,7 @@ internal abstract class ThumbnailRenderer : IDisposable
         Debug.Assert(RendererContext != null, "RendererContext is not created.");
         Debug.Assert(SceneRenderer != null, "SceneRenderer is not loaded.");
         Debug.Assert(framebuffer is not null, "Framebuffer is not created.");
+        Debug.Assert(captureFramebuffer is not null, "Capture framebuffer is not created.");
         Debug.Assert(textRenderer != null, "TextRenderer is not created.");
 
         NativeWindow.MakeCurrent();
@@ -205,8 +232,8 @@ internal abstract class ThumbnailRenderer : IDisposable
         RendererContext.MaxTextureSize = size;
         NativeWindow.ClientSize = new(size);
         NativeWindow.Size = new OpenTK.Mathematics.Vector2i(size, size);
-        GL.Viewport(0, 0, size, size);
         framebuffer.Resize(size, size);
+        captureFramebuffer.Resize(size, size);
 
         NativeWindow.MakeCurrent();
 
@@ -219,18 +246,18 @@ internal abstract class ThumbnailRenderer : IDisposable
 
         SceneRenderer.Update(updateContext);
 
-        GL.ClearColor(Color.Green);
-        GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
+        // Green, so a thumbnail whose post-process produced nothing is obviously wrong rather than black.
+        captureFramebuffer.BindAndClear();
 
         SceneRenderer.Render(framebuffer);
-        framebuffer.Bind(FramebufferTarget.ReadFramebuffer);
-        Framebuffer.GLDefaultFramebuffer.Bind(FramebufferTarget.DrawFramebuffer);
-        SceneRenderer.PostprocessRender(framebuffer, Framebuffer.GLDefaultFramebuffer, flipY: false);
+        SceneRenderer.PostprocessRender(framebuffer, captureFramebuffer, flipY: false);
 
+        // Overlay text goes over the tonemapped image, in the target the post-process just wrote.
+        captureFramebuffer.Bind(FramebufferTarget.Framebuffer);
+        GL.Viewport(0, 0, size, size);
         textRenderer.Render(SceneRenderer.Camera);
 
-        // no need for this since we just want the pixels into bitmap
-        //NativeWindow.Context.SwapBuffers();
+        // Nothing is presented: the frame exists only to be read back, so there is no swap.
 
         // The contract's sanctioned use of WaitIdle: drain before reading back.
         Debug.Assert(Device is not null, "Device is not created.");
@@ -262,6 +289,9 @@ internal abstract class ThumbnailRenderer : IDisposable
 
             Device?.Dispose();
             Device = null;
+
+            framebuffer?.Delete();
+            captureFramebuffer?.Delete();
 
             RendererContext?.Dispose();
             SceneRenderer?.Dispose();

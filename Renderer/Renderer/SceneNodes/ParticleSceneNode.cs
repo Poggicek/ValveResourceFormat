@@ -516,7 +516,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 return;
             }
 
-            particleRenderer.Render(context.Camera, context.RenderPass);
+            particleRenderer.Render(context.Camera, context.RenderPass, context);
         }
 
         /// <inheritdoc/>

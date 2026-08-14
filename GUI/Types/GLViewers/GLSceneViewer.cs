@@ -602,11 +602,18 @@ namespace GUI.Types.GLViewers
             }, renderContext.Camera, depthMask: true);
         }
 
-        protected override void BlitFramebufferToScreen()
+        /// <inheritdoc/>
+        /// <remarks>
+        /// The post-process chain writes straight onto the presented surface, so tonemapping and
+        /// presenting are the same draw here. Once that chain records through an
+        /// <see cref="ICommandList"/> it has to write into an offscreen colour target instead, because a
+        /// render pass cannot name framebuffer 0, and this method becomes the copy from that target.
+        /// </remarks>
+        protected override void PresentToScreen()
         {
             if (MainFramebuffer == GLDefaultFramebuffer)
             {
-                return; // not required
+                return; // already on the presented surface
             }
 
             Debug.Assert(MainFramebuffer != null);
@@ -780,7 +787,7 @@ namespace GUI.Types.GLViewers
                 DrawLowerCornerText(fpsText, Color32.White);
             }
 
-            BlitFramebufferToScreen();
+            PresentToScreen();
 
             if (GrabbedMouse)
             {

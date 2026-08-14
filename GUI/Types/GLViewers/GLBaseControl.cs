@@ -12,7 +12,7 @@ using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.Input;
 using ValveResourceFormat.Renderer.RHI;
 using Windows.Win32;
-using GLDevice = ValveResourceFormat.Renderer.RHI.OpenGL.GLDevice;
+using GLRecordingDevice = ValveResourceFormat.Renderer.RHI.OpenGL.GLRecordingDevice;
 
 namespace GUI.Types.GLViewers;
 
@@ -780,7 +780,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         // Constructing the device enables debug output and installs the message callback, so the
         // severity filtering above is configured first. The device reads the current context's limits,
         // which is why this cannot move out of the MakeCurrent scope.
-        Device = new GLDevice(OnRhiMessage);
+        Device = new GLRecordingDevice(RendererContext, OnRhiMessage);
         RendererContext.Device = Device;
 
         GLEnvironment.Initialize(VrfGuiContext.Logger);
@@ -899,7 +899,26 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         GLNativeWindow.Context.MakeNoneCurrent();
     }
 
-    protected virtual void BlitFramebufferToScreen()
+    /// <summary>
+    /// Copies the finished frame onto the surface the window presents, and is the one step in a frame
+    /// that no backend can express through the RHI.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A render pass targets <see cref="ITexture"/> attachments, because that is all a
+    /// <see cref="RenderPassDesc"/> can name and all an OpenGL framebuffer object can be built from.
+    /// Framebuffer 0 is not a texture and has no handle to wrap, so on OpenGL the presented surface can
+    /// never appear in a render pass. Every viewer therefore renders into an offscreen colour target it
+    /// owns, and this method is where that target reaches the screen.
+    /// </para>
+    /// <para>
+    /// That asymmetry is the backend's, not the renderer's: a Vulkan swapchain image is a real
+    /// <c>VkImage</c> and can be rendered into directly, so its implementation of this step is an
+    /// acquire and a present rather than a copy. Keeping the copy behind this one virtual is what lets
+    /// the frame above it be identical on both.
+    /// </para>
+    /// </remarks>
+    protected virtual void PresentToScreen()
     {
         //
     }
@@ -933,7 +952,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
         using var lockedGl = MakeCurrent();
 
-        BlitFramebufferToScreen();
+        PresentToScreen();
 
         GLDefaultFramebuffer.Bind(FramebufferTarget.ReadFramebuffer);
         GL.ReadPixels(0, 0, GLDefaultFramebuffer.Width, GLDefaultFramebuffer.Height, PixelFormat.Bgra, PixelType.UnsignedByte, pixels);

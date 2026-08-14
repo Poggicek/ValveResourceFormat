@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using Microsoft.Extensions.Logging;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Renderer.Buffers;
 using ValveResourceFormat.Renderer.PostProcess;
@@ -66,12 +67,22 @@ public class Renderer
     public RendererContext RendererContext { get; }
 
     /// <summary>
-    /// The RHI command list this renderer records into, or <see langword="null"/> to keep drawing
-    /// through OpenGL directly. Set it once per frame, before <see cref="DrawMainScene"/> or
-    /// <see cref="Render(Framebuffer)"/>; both put it on the <see cref="Scene.RenderContext"/> they
-    /// build, which is what carries it to every scene node and renderer.
+    /// The RHI command list this renderer records into, or <see langword="null"/> when it is drawing
+    /// through OpenGL directly. Assigned per frame by <see cref="DrawMainScene"/> and
+    /// <see cref="Render(Scene.RenderContext)"/> from <see cref="Device"/>, and put on the
+    /// <see cref="Scene.RenderContext"/> they build, which carries it to every scene node and renderer.
     /// </summary>
+    /// <remarks>Re-read it after a render call rather than assigning it: both entry points take a fresh
+    /// list per frame, because acquiring one is what rewinds it. A caller that wants to own the lifetime
+    /// instead passes a <see cref="Scene.RenderContext"/> that already carries a list to
+    /// <see cref="Render(Scene.RenderContext)"/>, which then neither replaces nor submits it.</remarks>
     public RHI.ICommandList? CommandList { get; set; }
+
+    /// <summary>
+    /// A device whose <see cref="RHI.IDevice.BeginCommandList"/> threw, remembered so the probe is not
+    /// repeated every frame. Held by reference, so replacing the device retries.
+    /// </summary>
+    private RHI.IDevice? nonRecordingDevice;
 
     /// <summary>
     /// The graphics device this renderer draws with, assigned by the presentation layer on
@@ -504,6 +515,65 @@ public class Renderer
     }
 
     /// <summary>
+    /// Acquires this frame's command list from <see cref="Device"/>, or returns <see langword="null"/>
+    /// when there is no device or it does not record, in which case every pass draws through OpenGL as
+    /// before.
+    /// </summary>
+    /// <remarks>
+    /// Opening and closing the frame itself stays with the presentation layer, which owns the swapchain
+    /// and is the only thing that knows where a frame really begins: the renderer draws one part of one,
+    /// with post-processing and overlays still to come after it returns.
+    /// </remarks>
+    /// <summary>
+    /// Whether the renderer records through <see cref="RHI.ICommandList"/> instead of calling OpenGL
+    /// directly. Off until the migration can honour the contract end to end.
+    /// </summary>
+    /// <remarks>
+    /// Nine call sites already issue draws through a command list, and not one of them opens a render
+    /// pass or binds a pipeline first, because neither existed when they were written. Both are
+    /// mandatory: a draw carries no topology of its own, it comes from the bound pipeline. Turning
+    /// this on today throws "only valid inside a render pass" on the first scene that draws, which is
+    /// how the golden suite found it. Turn it on once <see cref="PostprocessRender"/> and the scene
+    /// passes wrap their work in render passes and the material path produces pipelines, and expect
+    /// the suite to be the thing that says whether it worked.
+    /// </remarks>
+    public static bool EnableRhiRecording { get; set; }
+
+    private RHI.ICommandList? AcquireCommandList()
+    {
+        if (!EnableRhiRecording)
+        {
+            return null;
+        }
+
+        var device = RendererContext.Device;
+
+        if (device is null || ReferenceEquals(device, nonRecordingDevice))
+        {
+            return null;
+        }
+
+        try
+        {
+            return device.BeginCommandList("Scene");
+        }
+        catch (NotSupportedException e)
+        {
+            // A device that creates resources but records nothing, which GLDevice documents as its own
+            // behaviour. Remembered so a viewer holding one does not pay a throw every frame.
+            nonRecordingDevice = device;
+
+            // Reported rather than swallowed: falling back is safe, but silently taking the OpenGL route
+            // on a device that was meant to record would look exactly like the RHI path working.
+            RendererContext.Logger.LogWarning(e,
+                "{Device} cannot record, so the renderer is drawing through OpenGL directly and no RHI path will run.",
+                device.GetType().Name);
+
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Renders the opaque and translucent layers of the main scene to <see cref="MainFramebuffer"/>.
     /// </summary>
     public void DrawMainScene()
@@ -512,6 +582,10 @@ public class Renderer
         {
             throw new InvalidOperationException("MainFramebuffer must be set before rendering");
         }
+
+        // Re-acquired every frame rather than kept: acquiring is what rewinds the OpenGL backend's one
+        // reused list, so skipping it would leak its transient uniform ring across frames.
+        CommandList = AcquireCommandList();
 
         var renderContext = new Scene.RenderContext
         {
@@ -528,6 +602,11 @@ public class Renderer
 
         Scene.RenderOpaqueLayer(renderContext);
         RenderTranslucentLayer(Scene, renderContext);
+
+        if (renderContext.CommandList is { } commandList)
+        {
+            RendererContext.Device?.Submit(commandList);
+        }
     }
 
     /// <summary>
@@ -536,11 +615,13 @@ public class Renderer
     /// <param name="framebuffer">Framebuffer with hdr color support.</param>
     public void Render(Framebuffer framebuffer)
     {
+        // No command list seeded from the property on purpose: it still holds the previous frame's list,
+        // and passing that back in would read as caller-owned, so Render would neither rewind nor
+        // resubmit it. Leaving it null is what makes Render take a fresh one for this frame.
         var renderContext = new Scene.RenderContext
         {
             Camera = Camera,
             Framebuffer = framebuffer,
-            CommandList = CommandList,
             Scene = Scene,
             Textures = Textures,
         };
@@ -554,6 +635,16 @@ public class Renderer
     /// </summary>
     public void Render(Scene.RenderContext renderContext)
     {
+        // A context that already carries a list belongs to whoever built it, so it is neither replaced
+        // nor submitted here. Otherwise this frame's list is ours to take and hand back.
+        var ownedCommandList = renderContext.CommandList is null ? AcquireCommandList() : null;
+
+        if (ownedCommandList is not null)
+        {
+            renderContext.CommandList = ownedCommandList;
+            CommandList = ownedCommandList;
+        }
+
         LoadShaderTextures();
 
         // Render backfaces into shadow maps
@@ -565,6 +656,11 @@ public class Renderer
         GL.FrontFace(FrontFaceDirection.Ccw);
 
         RenderScenesWithView(renderContext);
+
+        if (ownedCommandList is not null)
+        {
+            RendererContext.Device?.Submit(ownedCommandList);
+        }
     }
 
     /// <summary>
