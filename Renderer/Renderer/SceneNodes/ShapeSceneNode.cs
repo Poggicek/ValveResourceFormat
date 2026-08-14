@@ -367,38 +367,42 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
             VertexArray.Bind(vao, renderShader);
 
-            GL.DepthFunc(DepthFunction.Gequal);
+            var renderState = Scene.RendererContext.RenderState;
+            var state = renderState.CurrentPass;
+            state.DepthStencil.DepthFunc = Comparison.CloserEqual;
 
             if (isTranslucent)
             {
-                GL.Disable(EnableCap.CullFace);
-
-                // Lines
-                GL.PolygonMode(TriangleFace.FrontAndBack, PolygonMode.Line);
-                GL.Disable(EnableCap.Blend);
-                GL.DrawElements(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0);
-
-                // Triangles
-                GL.PolygonMode(TriangleFace.FrontAndBack, PolygonMode.Fill);
-                GL.Enable(EnableCap.Blend);
-                GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
-                GL.Enable(EnableCap.PolygonOffsetLine);
-                GL.Enable(EnableCap.PolygonOffsetFill);
-                GL.PolygonOffsetClamp(2, 100, 0.05f);
-
-                GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
-
-                GL.Disable(EnableCap.PolygonOffsetLine);
-                GL.Disable(EnableCap.PolygonOffsetFill);
-                GL.PolygonOffsetClamp(0, 0, 0);
-                GL.Enable(EnableCap.CullFace);
+                state.Rasterizer.CullMode = CullMode.None;
             }
-            else
+
+            using (new RenderPassScope(renderState, in state))
             {
-                GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
-            }
+                if (isTranslucent)
+                {
+                    // Lines
+                    var lineState = state;
+                    lineState.Rasterizer.FillMode = FillMode.Wireframe;
+                    lineState.Blend.BlendEnable = false;
+                    renderState.Apply(in lineState);
+                    GL.DrawElements(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0);
 
-            GL.DepthFunc(DepthFunction.Greater);
+                    // Triangles
+                    var fillState = state;
+                    fillState.Blend.BlendEnable = true;
+                    fillState.Blend.SrcBlend = BlendFactor.SrcAlpha;
+                    fillState.Blend.DstBlend = BlendFactor.OneMinusSrcAlpha;
+                    fillState.Rasterizer.SlopeScaledDepthBias = 2f;
+                    fillState.Rasterizer.DepthBias = 100f;
+                    fillState.Rasterizer.DepthBiasClamp = 0.05f;
+                    renderState.Apply(in fillState);
+                    GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
+                }
+                else
+                {
+                    GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
+                }
+            }
         }
 
         /// <inheritdoc/>

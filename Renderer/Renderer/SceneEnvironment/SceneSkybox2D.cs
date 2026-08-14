@@ -43,18 +43,18 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
         /// <summary>Renders the skybox using a fullscreen 36-vertex cube draw call.</summary>
         public void Render()
         {
-            GL.DepthFunc(DepthFunction.Equal);
+            // A baseline scope: the material composes its own state over it.
+            using (Material.Shader.RendererContext.RenderState.Scope(depthFunc: Comparison.Equal))
+            {
+                Material.Shader.Use();
+                Material.Render();
+                Material.SetUniform("g_vTint", Tint);
+                Material.SetUniform("g_matSkyRotation", Transform);
 
-            Material.Shader.Use();
-            Material.Render();
-            Material.SetUniform("g_vTint", Tint);
-            Material.SetUniform("g_matSkyRotation", Transform);
-
-            GL.BindVertexArray(vao);
-            GL.DrawArrays(PrimitiveType.Triangles, 0, 36);
-            Material.PostRender();
-
-            GL.DepthFunc(DepthFunction.Greater);
+                GL.BindVertexArray(vao);
+                GL.DrawArrays(PrimitiveType.Triangles, 0, 36);
+                Material.PostRender();
+            }
         }
     }
 }

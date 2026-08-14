@@ -469,29 +469,26 @@ namespace ValveResourceFormat.Renderer
                 GL.NamedBufferData(bufferHandle, verticesSize, vertexBuffer.FloatArray, BufferUsageHint.DynamicDraw);
             }
 
-            GL.Disable(EnableCap.DepthTest);
-            GL.Enable(EnableCap.Blend);
-            GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
-
             Debug.Assert(shader != null);
             Debug.Assert(fontTexture != null);
 
-            shader.Use();
-            shader.SetUniform4x4("transform", Matrix4x4.CreateOrthographicOffCenter(0f, camera.WindowSize.X, camera.WindowSize.Y, 0f, -100f, 100f));
-            shader.SetTexture(0, "msdf", fontTexture);
-
-            if (sceneDepth != null)
+            using (RendererContext.RenderState.Scope(depthTest: false,
+                blend: true, srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha))
             {
-                shader.SetTexture((int)ReservedTextureSlots.SceneDepth, "g_tSceneDepth", sceneDepth);
+                shader.Use();
+                shader.SetUniform4x4("transform", Matrix4x4.CreateOrthographicOffCenter(0f, camera.WindowSize.X, camera.WindowSize.Y, 0f, -100f, 100f));
+                shader.SetTexture(0, "msdf", fontTexture);
+
+                if (sceneDepth != null)
+                {
+                    shader.SetTexture((int)ReservedTextureSlots.SceneDepth, "g_tSceneDepth", sceneDepth);
+                }
+
+                shader.SetUniform("g_fRange", TextureRange);
+
+                VertexArray.Bind(vao, shader);
+                GL.DrawElements(PrimitiveType.Triangles, letters * 6, DrawElementsType.UnsignedShort, 0);
             }
-
-            shader.SetUniform("g_fRange", TextureRange);
-
-            VertexArray.Bind(vao, shader);
-            GL.DrawElements(PrimitiveType.Triangles, letters * 6, DrawElementsType.UnsignedShort, 0);
-
-            GL.Disable(EnableCap.Blend);
-            GL.Enable(EnableCap.DepthTest);
 
             PerfStats.Active.ResumeTriangleCounter();
 

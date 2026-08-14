@@ -590,56 +590,47 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
             // Draw it. The translucent pass leaves blend/depth state to each custom draw, so enable blending and
             // stop depth writes here; otherwise sprites are opaque. The cable renderer instead draws opaque with depth writes.
-            GL.Enable(EnableCap.Blend);
-            GL.DepthMask(false);
-
-            // Modulate-2x scales what is behind it, so it needs its own state; everything else composites
+            // Modulate-2x scales what is behind it, so it needs its own factors; everything else composites
             // premultiplied, with the additive path having zeroed its own alpha in the shader.
-            if (blendMode == ParticleBlendMode.PARTICLE_OUTPUT_BLEND_MODE_MOD2X)
+            var mod2x = blendMode == ParticleBlendMode.PARTICLE_OUTPUT_BLEND_MODE_MOD2X;
+            using (rendererContext.RenderState.Scope(blend: true, depthWrite: false, cullMode: CullMode.None,
+                srcBlend: mod2x ? BlendFactor.DstColor : BlendFactor.One,
+                dstBlend: mod2x ? BlendFactor.SrcColor : BlendFactor.OneMinusSrcAlpha))
             {
-                GL.BlendFunc(BlendingFactor.DstColor, BlendingFactor.SrcColor);
+                shader.Use();
+                VertexArray.Bind(vaoHandle, shader);
+
+                // Layer 0 keeps the plain uTexture name; the rest take a sampler each. Units past the layer
+                // count are never sampled, but they get layer 0's texture so no sampler is left unbound.
+                for (var layer = 0; layer < MaxTextureLayers; layer++)
+                {
+                    var source = layer < layers.Length ? layers[layer] : layers[0];
+                    shader.SetTexture(RenderMaterial.TextureUnitStart + layer, LayerTextureUniforms[layer], source.Texture);
+                }
+
+                shader.SetUniform1("uLayerCount", layers.Length);
+
+                for (var layer = 0; layer < layers.Length; layer++)
+                {
+                    shader.SetUniform1(LayerChannelsUniforms[layer], (int)layers[layer].Channels);
+                    shader.SetUniform1(LayerBlendModeUniforms[layer], (int)layers[layer].BlendMode);
+                    shader.SetUniform1(LayerBlendUniforms[layer], layers[layer].Blend.NextNumber(systemRenderState));
+                    shader.SetUniform1(LayerEffectModeUniforms[layer], (int)layers[layer].EffectMode);
+                }
+
+                SetSharedUniforms(shader, systemRenderState);
+                shader.SetUniform1("uBlendFrames", blendFrames);
+                shader.SetUniform1("uOutline", outline);
+                shader.SetUniform4("uOutlineColor", outlineColor);
+                shader.SetUniform4("uOutlineRanges", outlineRanges);
+
+                // Set every draw: the program is shared with every other sprite renderer, whatever their mode.
+                shader.SetUniform1("uBlendMode", (int)blendMode);
+
+                // DRAW
+                PerfStats.Active.Count(Counter.ParticleDraw);
+                GL.DrawElements(PrimitiveType.Triangles, quadCount * 6, DrawElementsType.UnsignedShort, 0);
             }
-            else
-            {
-                GL.BlendFunc(BlendingFactor.One, BlendingFactor.OneMinusSrcAlpha);
-            }
-
-            GL.Disable(EnableCap.CullFace);
-
-            shader.Use();
-            VertexArray.Bind(vaoHandle, shader);
-
-            // Layer 0 keeps the plain uTexture name; the rest take a sampler each. Units past the layer
-            // count are never sampled, but they get layer 0's texture so no sampler is left unbound.
-            for (var layer = 0; layer < MaxTextureLayers; layer++)
-            {
-                var source = layer < layers.Length ? layers[layer] : layers[0];
-                shader.SetTexture(RenderMaterial.TextureUnitStart + layer, LayerTextureUniforms[layer], source.Texture);
-            }
-
-            shader.SetUniform1("uLayerCount", layers.Length);
-
-            for (var layer = 0; layer < layers.Length; layer++)
-            {
-                shader.SetUniform1(LayerChannelsUniforms[layer], (int)layers[layer].Channels);
-                shader.SetUniform1(LayerBlendModeUniforms[layer], (int)layers[layer].BlendMode);
-                shader.SetUniform1(LayerBlendUniforms[layer], layers[layer].Blend.NextNumber(systemRenderState));
-                shader.SetUniform1(LayerEffectModeUniforms[layer], (int)layers[layer].EffectMode);
-            }
-
-            SetSharedUniforms(shader, systemRenderState);
-            shader.SetUniform1("uBlendFrames", blendFrames);
-            shader.SetUniform1("uOutline", outline);
-            shader.SetUniform4("uOutlineColor", outlineColor);
-            shader.SetUniform4("uOutlineRanges", outlineRanges);
-
-            // Set every draw: the program is shared with every other sprite renderer, whatever their mode.
-            shader.SetUniform1("uBlendMode", (int)blendMode);
-
-            PerfStats.Active.Count(Counter.ParticleDraw);
-            GL.DrawElements(PrimitiveType.Triangles, quadCount * 6, DrawElementsType.UnsignedShort, 0);
-
-            GL.Enable(EnableCap.CullFace);
         }
 
         public override IEnumerable<string> GetSupportedRenderModes() => shader.RenderModes;

@@ -74,35 +74,39 @@ namespace ValveResourceFormat.Renderer
                 return;
             }
 
-            GL.Enable(EnableCap.Blend);
-            GL.Enable(EnableCap.DepthTest);
-            GL.DepthMask(false);
-            GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+            var renderState = renderContext.RenderState;
+            var state = renderState.CurrentPass;
+            state.Blend.BlendEnable = true;
+            state.Blend.SrcBlend = BlendFactor.SrcAlpha;
+            state.Blend.DstBlend = BlendFactor.OneMinusSrcAlpha;
+            state.DepthStencil.DepthTestEnable = true;
+            state.DepthStencil.DepthWriteEnable = false;
+            using (new RenderPassScope(renderState, in state))
+            {
+                shader.Use();
 
-            shader.Use();
+                // Bind the occluded bounds buffer to shader
+                OccludedBoundsDebugGpu.BindBufferBase();
 
-            OccludedBoundsDebugGpu.BindBufferBase();
+                GL.BindVertexArray(renderContext.MeshBufferCache.EmptyVAO);
+                GL.BindBuffer(BufferTarget.DrawIndirectBuffer, OccludedBoundsDebugGpu.Handle);
 
-            GL.BindVertexArray(renderContext.MeshBufferCache.EmptyVAO);
-            GL.BindBuffer(BufferTarget.DrawIndirectBuffer, OccludedBoundsDebugGpu.Handle);
+                var indirectArgs = (IntPtr)IndirectArgsByteOffset;
 
-            var indirectArgs = (IntPtr)IndirectArgsByteOffset;
+                // First pass: behind depth buffer (correctly occluded) - GREEN
+                state.DepthStencil.DepthFunc = Comparison.Farther;
+                renderState.Apply(in state);
+                shader.SetUniform("g_vColor", new Vector4(0.0f, 1.0f, 0.0f, 0.9f));
+                GL.DrawArraysIndirect(PrimitiveType.Lines, indirectArgs);
 
-            // First pass: behind depth buffer (correctly occluded) - GREEN
-            GL.DepthFunc(DepthFunction.Less);
-            shader.SetUniform("g_vColor", new Vector4(0.0f, 1.0f, 0.0f, 0.9f));
-            GL.DrawArraysIndirect(PrimitiveType.Lines, indirectArgs);
+                // Second pass: in front/at depth buffer (incorrectly visible) - RED
+                state.DepthStencil.DepthFunc = Comparison.CloserEqual;
+                renderState.Apply(in state);
+                shader.SetUniform("g_vColor", new Vector4(1.0f, 0.0f, 0.0f, 0.9f));
+                GL.DrawArraysIndirect(PrimitiveType.Lines, indirectArgs);
 
-            // Second pass: in front/at depth buffer (incorrectly visible) - RED
-            GL.DepthFunc(DepthFunction.Gequal);
-            shader.SetUniform("g_vColor", new Vector4(1.0f, 0.0f, 0.0f, 0.9f));
-            GL.DrawArraysIndirect(PrimitiveType.Lines, indirectArgs);
-
-            // Restore defaults
-            GL.BindBuffer(BufferTarget.DrawIndirectBuffer, 0);
-            GL.DepthFunc(DepthFunction.Greater);
-            GL.DepthMask(true);
-            GL.Disable(EnableCap.Blend);
+                GL.BindBuffer(BufferTarget.DrawIndirectBuffer, 0);
+            }
         }
     }
 }

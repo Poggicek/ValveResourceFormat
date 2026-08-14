@@ -246,94 +246,91 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
             Debug.Assert(BlueNoise != null);
 
-            GL.DepthMask(false);
-            GL.Disable(EnableCap.DepthTest);
-
-            using (new GLDebugGroup("MSAA Resolve"))
+            using (RendererContext.RenderState.Scope(depthTest: false, depthWrite: false))
             {
-                var msaaResolveShader = DOF.Enabled ? DOF.MsaaResolveDof : shaderMsaaResolve;
+                using (new GLDebugGroup("MSAA Resolve"))
+                {
+                    var msaaResolveShader = DOF.Enabled ? DOF.MsaaResolveDof : shaderMsaaResolve;
 
-                msaaResolveShader.Use();
-                msaaResolveShader.SetTexture(0, "g_tSourceMsaa", colorBufferRead.Color);
-                GL.BindImageTexture(1, resolveTarget.Handle, 0, false, 0,
-                    TextureAccess.WriteOnly, SizedInternalFormat.Rgba16f);
-                msaaResolveShader.SetUniform("g_bFlipY", flipY);
+                    msaaResolveShader.Use();
+                    msaaResolveShader.SetTexture(0, "g_tSourceMsaa", colorBufferRead.Color);
+                    GL.BindImageTexture(1, resolveTarget.Handle, 0, false, 0,
+                        TextureAccess.WriteOnly, SizedInternalFormat.Rgba16f);
+                    msaaResolveShader.SetUniform("g_bFlipY", flipY);
+
+                    if (DOF.Enabled)
+                    {
+                        DOF.SetDofResolveShaderUniforms(msaaResolveShader, camera, colorBufferRead.Depth!);
+                    }
+
+                    var groupsX = (resolveTarget.Width + 7) / 8;
+                    var groupsY = (resolveTarget.Height + 7) / 8;
+                    GL.DispatchCompute(groupsX, groupsY, 1);
+                    GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+                }
+
+                RenderTexture resolvedScene = resolveTarget;
 
                 if (DOF.Enabled)
                 {
-                    DOF.SetDofResolveShaderUniforms(msaaResolveShader, camera, colorBufferRead.Depth!);
+                    resolvedScene = DOF.Render(resolveTarget);
                 }
 
-                var groupsX = (resolveTarget.Width + 7) / 8;
-                var groupsY = (resolveTarget.Height + 7) / 8;
-                GL.DispatchCompute(groupsX, groupsY, 1);
-                GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
-            }
-
-            RenderTexture resolvedScene = resolveTarget;
-
-            if (DOF.Enabled)
-            {
-                resolvedScene = DOF.Render(resolveTarget);
-            }
-
-            using (new GLDebugGroup("Tonemapping, Color Correction, Bloom"))
-            {
-                colorBufferDraw.Bind(FramebufferTarget.DrawFramebuffer);
-
-                var postProcessShader = State.HasBloom == true ? shaderPostProcessBloom : shaderPostProcess;
-
-                if (State.HasBloom)
+                using (new GLDebugGroup("Tonemapping, Color Correction, Bloom"))
                 {
-                    Bloom.Render(resolvedScene);
+                    colorBufferDraw.Bind(FramebufferTarget.DrawFramebuffer);
+
+                    var postProcessShader = State.HasBloom == true ? shaderPostProcessBloom : shaderPostProcess;
+
+                    if (State.HasBloom)
+                    {
+                        Bloom.Render(resolvedScene);
+                    }
+
+                    colorBufferDraw.Bind(FramebufferTarget.DrawFramebuffer);
+                    postProcessShader.Use();
+                    GL.Viewport(0, 0, colorBufferRead.Width, colorBufferRead.Height);
+
+                    postProcessShader.SetTexture(0, "g_tColorBuffer", resolvedScene);
+                    postProcessShader.SetTexture(2, "g_tColorCorrectionLUT",
+                        State.ColorCorrectionLUT ?? RendererContext.MaterialLoader.GetDefaultVolume());
+
+                    // Bound here too, in case post processing runs before the scene binds it.
+                    postProcessShader.SetTexture((int)ReservedTextureSlots.BlueNoise, "g_tBlueNoise", BlueNoise);
+
+                    if (State.HasBloom)
+                    {
+                        postProcessShader.SetTexture(4, "g_tBloom", Bloom.AccumulationResult);
+                        // these seem to all be needed at once due to transitions between post process volumes, we don't do that yet
+                        // NormalizedBloomStrengths seems to act as a blending factor "how much of each bloom mode do we have right now"
+                        var bloomStrengths = new Vector3(State.BloomSettings.AddBloomStrength, State.BloomSettings.ScreenBloomStrength, State.BloomSettings.BlurBloomStrength);
+                        var normalizedStrenghts = Vector3.Normalize(bloomStrengths);
+                        postProcessShader.SetUniform("g_vNormalizedBloomStrengths", normalizedStrenghts);
+                        postProcessShader.SetUniform("g_vUnNormalizedBloomStrengths", bloomStrengths);
+                    }
+                    postProcessShader.SetUniform("g_bFlipY", flipY);
+
+                    postProcessShader.SetUniform("g_bPostProcessEnabled", Enabled);
+
+                    postProcessShader.SetUniform("g_flToneMapScalarLinear", TonemapScalar);
+                    SetPostProcessUniforms(postProcessShader, State.TonemapSettings);
+
+                    var invDimensions = 1.0f / State.ColorCorrectionLutDimensions;
+                    var invRange = new Vector2(1.0f - invDimensions, 0.5f * invDimensions);
+                    postProcessShader.SetUniform("g_vColorCorrectionColorRange", invRange);
+                    postProcessShader.SetUniform("g_flColorCorrectionDefaultWeight", (State.NumLutsActive > 0 && ColorCorrectionEnabled) ? State.ColorCorrectionWeight : 0f);
+
+                    GL.BindVertexArray(RendererContext.MeshBufferCache.EmptyVAO);
+                    GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
                 }
 
-                colorBufferDraw.Bind(FramebufferTarget.DrawFramebuffer);
-                postProcessShader.Use();
-                GL.Viewport(0, 0, colorBufferRead.Width, colorBufferRead.Height);
-
-                postProcessShader.SetTexture(0, "g_tColorBuffer", resolvedScene);
-                postProcessShader.SetTexture(2, "g_tColorCorrectionLUT",
-                    State.ColorCorrectionLUT ?? RendererContext.MaterialLoader.GetDefaultVolume());
-
-                // Bound here too, in case post processing runs before the scene binds it.
-                postProcessShader.SetTexture((int)ReservedTextureSlots.BlueNoise, "g_tBlueNoise", BlueNoise);
-
-                if (State.HasBloom)
+                if (HasOutlineObjects)
                 {
-                    postProcessShader.SetTexture(4, "g_tBloom", Bloom.AccumulationResult);
-                    // these seem to all be needed at once due to transitions between post process volumes, we don't do that yet
-                    // NormalizedBloomStrengths seems to act as a blending factor "how much of each bloom mode do we have right now"
-                    var bloomStrengths = new Vector3(State.BloomSettings.AddBloomStrength, State.BloomSettings.ScreenBloomStrength, State.BloomSettings.BlurBloomStrength);
-                    var normalizedStrenghts = Vector3.Normalize(bloomStrengths);
-                    postProcessShader.SetUniform("g_vNormalizedBloomStrengths", normalizedStrenghts);
-                    postProcessShader.SetUniform("g_vUnNormalizedBloomStrengths", bloomStrengths);
+                    using var outlineGroup = new GLDebugGroup("Outline Edge");
+                    Debug.Assert(colorBufferRead.Stencil != null);
+                    Outline.Render(colorBufferRead.Stencil, colorBufferRead.NumSamples, flipY);
                 }
-                postProcessShader.SetUniform("g_bFlipY", flipY);
-
-                postProcessShader.SetUniform("g_bPostProcessEnabled", Enabled);
-
-                postProcessShader.SetUniform("g_flToneMapScalarLinear", TonemapScalar);
-                SetPostProcessUniforms(postProcessShader, State.TonemapSettings);
-
-                var invDimensions = 1.0f / State.ColorCorrectionLutDimensions;
-                var invRange = new Vector2(1.0f - invDimensions, 0.5f * invDimensions);
-                postProcessShader.SetUniform("g_vColorCorrectionColorRange", invRange);
-                postProcessShader.SetUniform("g_flColorCorrectionDefaultWeight", (State.NumLutsActive > 0 && ColorCorrectionEnabled) ? State.ColorCorrectionWeight : 0f);
-
-                GL.BindVertexArray(RendererContext.MeshBufferCache.EmptyVAO);
-                GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
             }
-
-            if (HasOutlineObjects)
-            {
-                using var _ = new GLDebugGroup("Outline Edge");
-                Debug.Assert(colorBufferRead.Stencil != null);
-                Outline.Render(colorBufferRead.Stencil, colorBufferRead.NumSamples, flipY);
-            }
-
-            GL.DepthMask(true);
-            GL.Enable(EnableCap.DepthTest);
         }
 
         /// <summary>

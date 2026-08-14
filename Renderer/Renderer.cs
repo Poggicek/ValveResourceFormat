@@ -484,13 +484,10 @@ public class Renderer
         scene.RenderOpaqueRefractLayer(renderContext);
         scene.RenderWaterLayer(renderContext);
 
-        GL.DepthMask(false);
-        GL.Enable(EnableCap.Blend);
-
-        scene.RenderTranslucentLayer(renderContext);
-
-        GL.Disable(EnableCap.Blend);
-        GL.DepthMask(true);
+        using (scene.RendererContext.RenderState.Scope(depthWrite: false, blend: true))
+        {
+            scene.RenderTranslucentLayer(renderContext);
+        }
     }
 
     /// <summary>
@@ -589,7 +586,11 @@ public class Renderer
         // TODO+: replace wireframe shaders with solid color
         if (isWireframe)
         {
-            GL.PolygonMode(TriangleFace.FrontAndBack, PolygonMode.Line);
+            // A baseline rather than a raw toggle, so sub-passes and materials compose over it
+            // and wireframe survives the whole frame.
+            var wireframeState = RendererContext.RenderState.CurrentPass;
+            wireframeState.Rasterizer.FillMode = FillMode.Wireframe;
+            RendererContext.RenderState.ApplyAsPassBaseline(in wireframeState);
         }
 
         UpdatePerViewGpuBuffers(Scene, renderContext.Camera, DeltaTime);
@@ -747,7 +748,9 @@ public class Renderer
 
         if (isWireframe)
         {
-            GL.PolygonMode(TriangleFace.FrontAndBack, PolygonMode.Fill);
+            var solidState = RendererContext.RenderState.CurrentPass;
+            solidState.Rasterizer.FillMode = FillMode.Solid;
+            RendererContext.RenderState.ApplyAsPassBaseline(in solidState);
         }
 
         if (isStandardPass)
@@ -836,60 +839,57 @@ public class Renderer
         using var _ = new GLDebugGroup("Barn Light Shadows");
         Debug.Assert(BarnLightShadowBuffer != null);
 
-        GL.DepthFunc(DepthFunction.Lequal);
-        GL.DepthRange(0.0, 1.0);
-        GL.ClearDepth(1.0);
-
-        GL.Enable(EnableCap.PolygonOffsetFill);
-        GL.PolygonOffset(2f, 0f);
-
-        BarnLightShadowBuffer.Bind(FramebufferTarget.Framebuffer);
-
-        var atlasSize = Scene.LightingInfo.BarnLightShadowAtlasSize;
-
-        if (BarnLightShadowBuffer.Resize(atlasSize, atlasSize))
+        // The barn shadow atlas uses forward depth, unlike the reverse-Z main view.
+        using (RendererContext.RenderState.Scope(depthFunc: Comparison.FartherEqual, slopeScaledDepthBias: 2f))
         {
-            BarnLightShadowBuffer.SetShadowDepthSamplerState(true);
-            Textures.RemoveAll(t => t.Slot == ReservedTextureSlots.BarnLightShadowDepth);
-            Textures.Add(new(ReservedTextureSlots.BarnLightShadowDepth, "g_tBarnLightShadowDepth", BarnLightShadowBuffer.Depth!));
-        }
+            GL.DepthRange(0.0, 1.0);
+            GL.ClearDepth(1.0);
 
-        GL.Enable(EnableCap.ScissorTest);
-        GL.Viewport(0, 0, BarnLightShadowBuffer.Width, BarnLightShadowBuffer.Height);
-        GL.Scissor(0, 0, BarnLightShadowBuffer.Width, BarnLightShadowBuffer.Height);
-        GL.Clear(ClearBufferMask.DepthBufferBit);
+            BarnLightShadowBuffer.Bind(FramebufferTarget.Framebuffer);
 
-        foreach (var caster in Scene.LightingInfo.ShadowMapper.ShadowCasters)
-        {
-            var region = caster.Region;
+            var atlasSize = Scene.LightingInfo.BarnLightShadowAtlasSize;
 
-            if (region.Width == 0)
+            if (BarnLightShadowBuffer.Resize(atlasSize, atlasSize))
             {
-                continue;
+                BarnLightShadowBuffer.SetShadowDepthSamplerState(true);
+                Textures.RemoveAll(t => t.Slot == ReservedTextureSlots.BarnLightShadowDepth);
+                Textures.Add(new(ReservedTextureSlots.BarnLightShadowDepth, "g_tBarnLightShadowDepth", BarnLightShadowBuffer.Depth!));
             }
 
-            PerfStats.Active.Count(Counter.BarnShadowMap);
+            GL.Enable(EnableCap.ScissorTest);
+            GL.Viewport(0, 0, BarnLightShadowBuffer.Width, BarnLightShadowBuffer.Height);
+            GL.Scissor(0, 0, BarnLightShadowBuffer.Width, BarnLightShadowBuffer.Height);
+            GL.Clear(ClearBufferMask.DepthBufferBit);
 
-            GL.Viewport(region.X, region.Y, region.Width, region.Height);
-            GL.Scissor(region.X, region.Y, region.Width, region.Height);
+            foreach (var caster in Scene.LightingInfo.ShadowMapper.ShadowCasters)
+            {
+                var region = caster.Region;
 
-            ViewBuffer.Data.WorldToProjection = caster.WorldToFrustum;
-            ViewBuffer.Update();
+                if (region.Width == 0)
+                {
+                    continue;
+                }
 
-            barnLightShadowFrustum.Update(caster.WorldToFrustum);
+                PerfStats.Active.Count(Counter.BarnShadowMap);
 
-            // This is performing culling mid render, reusing the scene draw lists.
-            // Should be in update loop.
-            Scene.SetupBarnLightFaceShadow(caster.Light, caster.FaceIndex, barnLightShadowFrustum);
+                GL.Viewport(region.X, region.Y, region.Width, region.Height);
+                GL.Scissor(region.X, region.Y, region.Width, region.Height);
 
-            Scene.RenderOpaqueShadows(renderContext, depthOnlyShader, caster.Light.FaceShadowCache[caster.FaceIndex].DrawCalls!);
+                ViewBuffer.Data.WorldToProjection = caster.WorldToFrustum;
+                ViewBuffer.Update();
+
+                barnLightShadowFrustum.Update(caster.WorldToFrustum);
+
+                // This is performing culling mid render, reusing the scene draw lists.
+                // Should be in update loop.
+                Scene.SetupBarnLightFaceShadow(caster.Light, caster.FaceIndex, barnLightShadowFrustum);
+
+                Scene.RenderOpaqueShadows(renderContext, depthOnlyShader, caster.Light.FaceShadowCache[caster.FaceIndex].DrawCalls!);
+            }
+
+            GL.Disable(EnableCap.ScissorTest);
+            GL.ClearDepth(0.0);
         }
-
-        GL.Disable(EnableCap.ScissorTest);
-        GL.Disable(EnableCap.PolygonOffsetFill);
-
-        GL.DepthFunc(DepthFunction.Greater);
-        GL.ClearDepth(0.0);
     }
 
     private void ComputeAverageLuminance(Scene.RenderContext renderContext)
@@ -940,22 +940,23 @@ public class Renderer
     {
         using var _ = new GLDebugGroup("Outline Stencil Write");
 
-        GL.DepthMask(false);
-        GL.Disable(EnableCap.DepthTest);
-        GL.Disable(EnableCap.CullFace);
+        var outlineState = RendererContext.RenderState.CurrentPass;
+        outlineState.DepthStencil.DepthWriteEnable = false;
+        outlineState.DepthStencil.DepthTestEnable = false;
+        outlineState.DepthStencil.Stencil = outlineState.DepthStencil.Stencil with
+        {
+            StencilEnable = true,
+            Func = Comparison.Always,
+            PassOp = StencilOperation.Replace,
+        };
+        outlineState.DepthStencil.StencilRef = 1;
+        outlineState.Rasterizer.CullMode = CullMode.None;
 
-        GL.Enable(EnableCap.StencilTest);
-        GL.StencilOp(StencilOp.Keep, StencilOp.Keep, StencilOp.Replace);
-        GL.StencilFunc(StencilFunction.Always, 1, 0xFF);
-        GL.StencilMask(0xFF);
-
-        SkyboxScene?.RenderOutlineLayer(renderContext);
-        Scene.RenderOutlineLayer(renderContext);
-
-        GL.Disable(EnableCap.StencilTest);
-        GL.Enable(EnableCap.CullFace);
-        GL.Enable(EnableCap.DepthTest);
-        GL.DepthMask(true);
+        using (new RenderPassScope(RendererContext.RenderState, in outlineState))
+        {
+            SkyboxScene?.RenderOutlineLayer(renderContext);
+            Scene.RenderOutlineLayer(renderContext);
+        }
     }
 
     private void EnsureResolvedTextureSize(int width, int height)

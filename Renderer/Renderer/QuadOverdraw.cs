@@ -32,6 +32,7 @@ public class QuadOverdraw(RendererContext rendererContext)
     private RenderTexture? quadLock;
     private RenderTexture? quadCount;
     private ClearBufferMask savedClearMask;
+    private RenderState savedPassState;
 
     /// <summary>Gets the replacement shader that counts quad overdraw while the scene renders.</summary>
     public Shader SceneShader => sceneShader ??= rendererContext.ShaderLoader.LoadShader("quad_overdraw");
@@ -98,7 +99,11 @@ public class QuadOverdraw(RendererContext rendererContext)
         savedClearMask = framebuffer.ClearMask;
         framebuffer.ClearMask &= ~ClearBufferMask.DepthBufferBit;
 
-        GL.DepthFunc(DepthFunction.Gequal);
+        savedPassState = rendererContext.RenderState.CurrentPass;
+        var countingState = savedPassState;
+        countingState.DepthStencil.DepthFunc = Comparison.CloserEqual;
+        rendererContext.RenderState.ApplyAsPassBaseline(in countingState);
+
         SceneShader.SetUniform1("bCountQuads", true);
     }
 
@@ -107,7 +112,7 @@ public class QuadOverdraw(RendererContext rendererContext)
     public void EndCountingPass(Framebuffer framebuffer)
     {
         framebuffer.ClearMask = savedClearMask;
-        GL.DepthFunc(DepthFunction.Greater);
+        rendererContext.RenderState.ApplyAsPassBaseline(in savedPassState);
     }
 
     /// <summary>
@@ -128,14 +133,11 @@ public class QuadOverdraw(RendererContext rendererContext)
         visualizeShader.Use();
         visualizeShader.SetTexture(0, "g_tQuadOverdraw", quadCount);
 
-        GL.Disable(EnableCap.DepthTest);
-        GL.DepthMask(false);
-
-        GL.BindVertexArray(rendererContext.MeshBufferCache.EmptyVAO);
-        GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
-
-        GL.DepthMask(true);
-        GL.Enable(EnableCap.DepthTest);
+        using (rendererContext.RenderState.Scope(depthTest: false, depthWrite: false))
+        {
+            GL.BindVertexArray(rendererContext.MeshBufferCache.EmptyVAO);
+            GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+        }
     }
 
     /// <summary>Releases the GPU textures owned by this visualization.</summary>

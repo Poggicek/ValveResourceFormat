@@ -18,6 +18,7 @@ namespace ValveResourceFormat.Renderer
 
         private readonly int frameBuffer;
         private readonly Shader shader;
+        private readonly RenderStateTracker renderState;
         private int vao;
         private int bufferHandle;
         private MorphRectVertex[] allVertices;
@@ -48,6 +49,7 @@ namespace ValveResourceFormat.Renderer
             ArgumentNullException.ThrowIfNull(morph.TextureResource);
             morphAtlas = renderContext.MaterialLoader.LoadTexture(morph.TextureResource);
             shader = renderContext.ShaderLoader.LoadShader("morph_composite");
+            renderState = renderContext.RenderState;
 
             var width = morph.Data.GetInt32Property("m_nWidth");
             var height = morph.Data.GetInt32Property("m_nHeight");
@@ -98,24 +100,21 @@ namespace ValveResourceFormat.Renderer
                 renderTargetInitialized = true;
             }
 
-            GL.Disable(EnableCap.CullFace);
-            GL.Enable(EnableCap.Blend);
-            GL.BlendFunc(BlendingFactor.DstAlpha, BlendingFactor.One);
+            using (renderState.Scope(cullMode: CullMode.None,
+                blend: true, srcBlend: BlendFactor.DstAlpha, dstBlend: BlendFactor.One))
+            {
+                GL.BindFramebuffer(FramebufferTarget.Framebuffer, frameBuffer);
+                shader.Use();
+                shader.SetTexture(0, "morphAtlas", morphAtlas);
 
-            GL.BindFramebuffer(FramebufferTarget.Framebuffer, frameBuffer);
-            shader.Use();
-            shader.SetTexture(0, "morphAtlas", morphAtlas);
+                GL.Viewport(0, 0, 2048, 2048);
+                GL.ClearColor(0, 0, 0, 0);
+                GL.Clear(ClearBufferMask.ColorBufferBit);
 
-            GL.Viewport(0, 0, 2048, 2048);
-            GL.ClearColor(0, 0, 0, 0);
-            GL.Clear(ClearBufferMask.ColorBufferBit);
+                VertexArray.Bind(vao, shader);
 
-            VertexArray.Bind(vao, shader);
-
-            GL.DrawElements(PrimitiveType.Triangles, usedRects.Count * 6, DrawElementsType.UnsignedShort, 0);
-
-            GL.Disable(EnableCap.Blend);
-            GL.Enable(EnableCap.CullFace);
+                GL.DrawElements(PrimitiveType.Triangles, usedRects.Count * 6, DrawElementsType.UnsignedShort, 0);
+            }
         }
 
         // Mutable because SetVertexMorphValue pokes the current weight into PositionWeights in place.

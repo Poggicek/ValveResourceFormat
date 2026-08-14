@@ -1397,9 +1397,8 @@ namespace ValveResourceFormat.Renderer
             if (depthPrepass)
             {
                 using (new GLDebugGroup("Depth Prepass"))
+                using (RendererContext.RenderState.Scope(colorWriteMask: 0))
                 {
-                    GL.ColorMask(false, false, false, false);
-
                     PerfStats.Active.SuspendTriangleCounter();
 
                     renderContext.RenderPass = RenderPass.DepthOnly;
@@ -1410,20 +1409,14 @@ namespace ValveResourceFormat.Renderer
                     }
 
                     PerfStats.Active.ResumeTriangleCounter();
-
-                    GL.ColorMask(true, true, true, true);
                 }
 
+                // The prepass already wrote depth, so shading only fills exactly those pixels.
                 using (new GLDebugGroup("Opaque Prepassed"))
+                using (RendererContext.RenderState.Scope(depthWrite: false, depthFunc: Comparison.Equal))
                 {
-                    GL.DepthMask(false);
-                    GL.DepthFunc(DepthFunction.Equal);
-
                     renderContext.RenderPass = RenderPass.OpaqueAggregate;
                     MeshBatchRenderer.Render(renderLists[renderContext.RenderPass], renderContext);
-
-                    GL.DepthMask(true);
-                    GL.DepthFunc(DepthFunction.Greater);
                 }
             }
 
@@ -1476,14 +1469,11 @@ namespace ValveResourceFormat.Renderer
         /// <param name="renderContext">The render context for this pass, expected to use the dedicated viewmodel camera and depth range.</param>
         public void RenderViewmodelTranslucentLayer(RenderContext renderContext)
         {
-            GL.DepthMask(false);
-            GL.Enable(EnableCap.Blend);
-
-            renderContext.RenderPass = RenderPass.Translucent;
-            MeshBatchRenderer.Render(viewmodelRenderLists[RenderPass.Translucent], renderContext);
-
-            GL.Disable(EnableCap.Blend);
-            GL.DepthMask(true);
+            using (RendererContext.RenderState.Scope(depthWrite: false, blend: true))
+            {
+                renderContext.RenderPass = RenderPass.Translucent;
+                MeshBatchRenderer.Render(viewmodelRenderLists[RenderPass.Translucent], renderContext);
+            }
         }
 
         /// <summary>

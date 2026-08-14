@@ -115,17 +115,15 @@ public static class GLEnvironment
     /// <summary>
     /// Sets the default OpenGL render state for Source 2 rendering.
     /// </summary>
-    public static void SetDefaultRenderState()
+    /// <param name="rendererContext">The renderer context owning the state tracker for this GL context.</param>
+    public static void SetDefaultRenderState(RendererContext rendererContext)
     {
         // Application semantics / default state
         GL.Enable(EnableCap.TextureCubeMapSeamless);
-        GL.Enable(EnableCap.CullFace);
-        GL.CullFace(TriangleFace.Back);
-        GL.Enable(EnableCap.DepthTest);
+        rendererContext.RenderState.ApplyAsPassBaseline(RenderState.Default);
 
         // reverse z
         GL.ClipControl(ClipOrigin.LowerLeft, ClipDepthMode.ZeroToOne);
-        GL.DepthFunc(DepthFunction.Greater);
         GL.ClearDepth(0.0f);
 
         EnableParallelShaderCompile();

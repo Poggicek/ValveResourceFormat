@@ -129,12 +129,14 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 return;
             }
 
-            GL.Disable(EnableCap.DepthTest);
-            foreach (var node in currentSet.SceneNodes)
+            // A baseline scope: the child nodes compose their own state over it.
+            using (Scene.RendererContext.RenderState.Scope(depthTest: false))
             {
-                node.Render(context);
+                foreach (var node in currentSet.SceneNodes)
+                {
+                    node.Render(context);
+                }
             }
-            GL.Enable(EnableCap.DepthTest);
         }
     }
 }

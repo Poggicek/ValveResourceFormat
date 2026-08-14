@@ -73,26 +73,25 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             renderShader.SetUniform3x4("transform", Transform);
             renderShader.SetBoneAnimationData(false);
 
-            GL.DepthMask(false);
-            GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
-            VertexArray.Bind(vao, renderShader);
+            using (Scene.RendererContext.RenderState.Scope(depthWrite: false, srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha))
+            {
+                VertexArray.Bind(vao, renderShader);
 
-            if (Scene.CurrentFramePvs == null)
-            {
-                GL.DrawArraysInstancedBaseInstance(PrimitiveType.Lines, 0, totalVertexCount, 1, Id);
-            }
-            else
-            {
-                foreach (var range in clusterDrawRanges)
+                if (Scene.CurrentFramePvs == null)
                 {
-                    if (range.ClusterId < (uint)(Scene.CurrentFramePvs.Length * 8) && (Scene.CurrentFramePvs[range.ClusterId >> 3] & (1 << (range.ClusterId & 7))) != 0)
+                    GL.DrawArraysInstancedBaseInstance(PrimitiveType.Lines, 0, totalVertexCount, 1, Id);
+                }
+                else
+                {
+                    foreach (var range in clusterDrawRanges)
                     {
-                        GL.DrawArraysInstancedBaseInstance(PrimitiveType.Lines, range.Start, range.Count, 1, Id);
+                        if (range.ClusterId < (uint)(Scene.CurrentFramePvs.Length * 8) && (Scene.CurrentFramePvs[range.ClusterId >> 3] & (1 << (range.ClusterId & 7))) != 0)
+                        {
+                            GL.DrawArraysInstancedBaseInstance(PrimitiveType.Lines, range.Start, range.Count, 1, Id);
+                        }
                     }
                 }
             }
-
-            GL.DepthMask(true);
         }
 
         private static Color32 GetClusterColor(ushort clusterId)

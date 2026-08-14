@@ -30,12 +30,10 @@ public class OutlineRenderer(RendererContext rendererContext)
 
         outlineEdge.SetTexture(0, "g_tStencilBuffer", stencil);
 
-        GL.Enable(EnableCap.Blend);
-        GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
-
-        GL.BindVertexArray(rendererContext.MeshBufferCache.EmptyVAO);
-        GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
-
-        GL.Disable(EnableCap.Blend);
+        using (rendererContext.RenderState.Scope(blend: true, srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha))
+        {
+            GL.BindVertexArray(rendererContext.MeshBufferCache.EmptyVAO);
+            GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+        }
     }
 }

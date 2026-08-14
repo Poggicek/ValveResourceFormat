@@ -97,22 +97,17 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
             VertexArray.Bind(vao, renderShader);
 
-            GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+            using (Scene.RendererContext.RenderState.Scope(srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha,
+                depthBias: 96f, depthBiasClamp: 0.0005f))
+            {
+                GL.Enable(EnableCap.PrimitiveRestart);
+                GL.PrimitiveRestartIndex(int.MaxValue);
+                GL.DrawElements(PrimitiveType.LineLoop, indexCount, DrawElementsType.UnsignedInt, 0);
 
-            GL.Enable(EnableCap.PolygonOffsetLine);
-            GL.Enable(EnableCap.PolygonOffsetFill);
-            GL.PolygonOffsetClamp(0, 96, 0.0005f);
+                GL.DrawElementsInstancedBaseInstance(PrimitiveType.TriangleFan, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
 
-            GL.Enable(EnableCap.PrimitiveRestart);
-            GL.PrimitiveRestartIndex(int.MaxValue);
-            GL.DrawElements(PrimitiveType.LineLoop, indexCount, DrawElementsType.UnsignedInt, 0);
-
-            GL.DrawElementsInstancedBaseInstance(PrimitiveType.TriangleFan, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
-
-            GL.Disable(EnableCap.PrimitiveRestart);
-            GL.Disable(EnableCap.PolygonOffsetLine);
-            GL.Disable(EnableCap.PolygonOffsetFill);
-            GL.PolygonOffsetClamp(0, 0, 0);
+                GL.Disable(EnableCap.PrimitiveRestart);
+            }
         }
 
         /// <inheritdoc/>
