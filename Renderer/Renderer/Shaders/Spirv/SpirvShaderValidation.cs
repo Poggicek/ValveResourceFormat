@@ -9,17 +9,24 @@ namespace ValveResourceFormat.Renderer.Shaders.Spirv;
 /// <summary>The outcome of putting one shader stage through the whole GLSL to SPIR-V round trip.</summary>
 /// <param name="ShaderName">The renderer shader name, without stage or extension.</param>
 /// <param name="Stage">The stage that was compiled.</param>
+/// <param name="Flavour">The dialect the source was preprocessed into before compiling.</param>
 /// <param name="Result">What the compiler returned.</param>
 /// <param name="Reflection">What the module declares, or <see langword="null"/> when it failed to compile.</param>
 /// <param name="ContractViolations">Descriptor set problems found by
 /// <see cref="SpirvReflection.ValidateDescriptorSets"/>.</param>
+/// <param name="SourceDiagnostics">Constructs the preprocessor found that Vulkan GLSL will not accept,
+/// from <see cref="ShaderLoader.ParsedShaderData.VulkanDiagnostics"/>. Worth reading even when the
+/// stage compiled, and worth reading instead of the compiler log when it did not: glslang reports only
+/// the first offending declaration per translation unit, so it undercounts how much work is left.</param>
 /// <param name="Elapsed">Wall clock time for the compile alone, excluding preprocessing.</param>
 public sealed record SpirvShaderValidationResult(
     string ShaderName,
     RHI.ShaderStage Stage,
+    ShaderFlavour Flavour,
     SpirvCompilationResult Result,
     SpirvReflectionResult? Reflection,
     ImmutableArray<string> ContractViolations,
+    ImmutableArray<string> SourceDiagnostics,
     TimeSpan Elapsed);
 
 /// <summary>
@@ -30,13 +37,19 @@ public sealed record SpirvShaderValidationResult(
 /// <para>
 /// This module is deliberately not wired into <see cref="ShaderLoader"/>. It reuses
 /// <see cref="ShaderParser"/> for preprocessing, which is the part that produces the <c>#line</c>
-/// directives diagnostics are mapped through, and rebuilds the compile header the same way the
-/// OpenGL path does. That duplication is temporary and collapses when the SPIR-V path is wired in.
+/// directives diagnostics are mapped through, and rebuilds the compile header the same way
+/// <see cref="ShaderLoader"/> does. That duplication is temporary and collapses when the SPIR-V path
+/// is wired in.
 /// </para>
 /// <para>
-/// Today's sources are GL flavoured GLSL and many of them will not compile as Vulkan GLSL until the
-/// explicit locations and set/binding decorations land. A failure here is expected information, not
-/// necessarily a defect.
+/// Because the header and the <see cref="ShaderLoader.ParsedShaderData"/> are rebuilt rather than
+/// borrowed, both have to carry the <see cref="ShaderFlavour"/> across explicitly. A
+/// <see cref="ShaderLoader.ParsedShaderData"/> constructed without one preprocesses as
+/// <see cref="ShaderFlavour.OpenGL"/> whatever <see cref="ShaderLoader.Flavour"/> says, which makes a
+/// Vulkan run silently measure the OpenGL sources instead.
+/// </para>
+/// <para>
+/// A failure here is information about how far the shader port has got, not necessarily a defect.
 /// </para>
 /// </remarks>
 public static class SpirvShaderValidation
@@ -55,17 +68,23 @@ public static class SpirvShaderValidation
     /// <param name="compiler">The compiler to use, or <see langword="null"/> for <see cref="SpirvCompiler.Shared"/>.</param>
     /// <param name="options">A template whose optimisation level, target and debug info are applied to
     /// every stage. The file name, header and source map are supplied per stage.</param>
+    /// <param name="flavour">The dialect to preprocess into, or <see langword="null"/> to follow
+    /// <see cref="ShaderLoader.Flavour"/>. Pass it explicitly to compare both dialects in one process
+    /// without disturbing the static property.</param>
     /// <returns>One result per stage the shader declares.</returns>
-    public static ImmutableArray<SpirvShaderValidationResult> CompileShader(string shaderName, SpirvCompiler? compiler = null, SpirvCompileOptions? options = null)
+    public static ImmutableArray<SpirvShaderValidationResult> CompileShader(string shaderName, SpirvCompiler? compiler = null, SpirvCompileOptions? options = null, ShaderFlavour? flavour = null)
     {
         ArgumentNullException.ThrowIfNull(shaderName);
 
         compiler ??= SpirvCompiler.Shared;
         options ??= SpirvCompileOptions.Default;
 
-        var parsed = Preprocess(shaderName);
+        var resolvedFlavour = flavour ?? ShaderLoader.Flavour;
+
+        var parsed = Preprocess(shaderName, resolvedFlavour);
         var header = BuildHeader(parsed);
         var sourceMap = new SpirvSourceMap(parsed.SourceFiles);
+        var sourceDiagnostics = parsed.VulkanDiagnostics.ToImmutableArray();
 
         var results = ImmutableArray.CreateBuilder<SpirvShaderValidationResult>();
 
@@ -99,7 +118,7 @@ public static class SpirvShaderValidation
                 violations = SpirvReflection.ValidateDescriptorSets(reflection);
             }
 
-            results.Add(new SpirvShaderValidationResult(shaderName, stage, result, reflection, violations, stopwatch.Elapsed));
+            results.Add(new SpirvShaderValidationResult(shaderName, stage, resolvedFlavour, result, reflection, violations, sourceDiagnostics, stopwatch.Elapsed));
         }
 
         return results.ToImmutable();
@@ -111,8 +130,10 @@ public static class SpirvShaderValidation
     /// <param name="progress">Receives one line per stage compiled, or <see langword="null"/> for none.</param>
     /// <param name="filter">Optional substring restricting which shaders are compiled.</param>
     /// <param name="options">Compile options applied to every stage.</param>
+    /// <param name="flavour">The dialect to preprocess into, or <see langword="null"/> to follow
+    /// <see cref="ShaderLoader.Flavour"/>.</param>
     /// <returns>Every stage result, and the total wall clock time.</returns>
-    public static (ImmutableArray<SpirvShaderValidationResult> Results, TimeSpan Total) CompileAll(IProgress<string>? progress = null, string? filter = null, SpirvCompileOptions? options = null)
+    public static (ImmutableArray<SpirvShaderValidationResult> Results, TimeSpan Total) CompileAll(IProgress<string>? progress = null, string? filter = null, SpirvCompileOptions? options = null, ShaderFlavour? flavour = null)
     {
         using var compiler = new SpirvCompiler();
 
@@ -132,7 +153,7 @@ public static class SpirvShaderValidation
 
             try
             {
-                shaderResults = CompileShader(shaderName, compiler, options);
+                shaderResults = CompileShader(shaderName, compiler, options, flavour);
             }
             catch (ShaderLoader.ShaderCompilerException e)
             {
@@ -166,13 +187,13 @@ public static class SpirvShaderValidation
             var primary = result.Result.PrimaryError;
 
             return string.Create(CultureInfo.InvariantCulture,
-                $"FAIL {result.ShaderName} [{result.Stage}] {primary?.ToString() ?? result.Result.Status.ToString()}");
+                $"FAIL {result.ShaderName} [{result.Stage}/{result.Flavour}] {primary?.ToString() ?? result.Result.Status.ToString()}");
         }
 
         var reflection = result.Reflection;
 
         return string.Create(CultureInfo.InvariantCulture,
-            $"ok   {result.ShaderName} [{result.Stage}] {result.Result.Spirv.Length} bytes, "
+            $"ok   {result.ShaderName} [{result.Stage}/{result.Flavour}] {result.Result.Spirv.Length} bytes, "
             + $"{reflection?.DescriptorBindings.Length ?? 0} descriptors, "
             + $"{reflection?.PushConstantSizeInBytes ?? 0} byte push block, "
             + $"{reflection?.VertexInputs.Length ?? 0} inputs, {result.Elapsed.TotalMilliseconds:F1} ms");
@@ -201,6 +222,32 @@ public static class SpirvShaderValidation
         ];
     }
 
+    /// <summary>
+    /// Collects the preprocessor's Vulkan diagnostics across a run, one entry per shader that raised
+    /// each message.
+    /// </summary>
+    /// <param name="results">The stage results to summarise.</param>
+    /// <returns>Each shader paired with a construct Vulkan GLSL will not accept, ordered by shader.</returns>
+    /// <remarks>
+    /// This is the honest count of remaining work. A stage's diagnostics come from the shared
+    /// <see cref="ShaderLoader.ParsedShaderData"/>, so they repeat across that shader's stages and are
+    /// deduplicated here; and glslang stops after the first offending declaration in a unit, so the
+    /// compiler log alone always reports fewer than there are.
+    /// </remarks>
+    public static ImmutableArray<(string ShaderName, string Message)> GroupSourceDiagnostics(IEnumerable<SpirvShaderValidationResult> results)
+    {
+        ArgumentNullException.ThrowIfNull(results);
+
+        return
+        [
+            .. results
+                .SelectMany(static r => r.SourceDiagnostics.Select(d => (r.ShaderName, Message: d)))
+                .Distinct()
+                .OrderBy(static p => p.ShaderName, StringComparer.Ordinal)
+                .ThenBy(static p => p.Message, StringComparer.Ordinal)
+        ];
+    }
+
     // glslang messages are "'token' : explanation". The token varies per shader, the explanation does not.
     private static string Normalize(string message)
     {
@@ -208,9 +255,12 @@ public static class SpirvShaderValidation
         return separator < 0 ? message : message[(separator + 3)..];
     }
 
-    private static ShaderLoader.ParsedShaderData Preprocess(string shaderName)
+    private static ShaderLoader.ParsedShaderData Preprocess(string shaderName, ShaderFlavour flavour)
     {
-        var parsed = new ShaderLoader.ParsedShaderData();
+        // The flavour has to be on the ParsedShaderData before the first PreprocessShader call, because
+        // that is what ShaderParser reads to decide whether to emit locations and set/binding
+        // decorations. Constructing it without one silently preprocesses as OpenGL.
+        var parsed = new ShaderLoader.ParsedShaderData { Flavour = flavour };
 
         var availableStages = Parser.AvailableShaders.GetValueOrDefault(shaderName)
             ?? throw new ShaderLoader.ShaderCompilerException($"Shader '{shaderName}' does not exist.");
@@ -232,13 +282,23 @@ public static class SpirvShaderValidation
 
         parsed.GlobalsLayout = GlobalsLayout.Build(parsed.GlobalsDeclarations);
 
+        // Varyings can only be located once every stage that shares them has been read, so this runs
+        // after the loop, exactly as ShaderLoader.GetOrParseShader does.
+        ShaderParser.StampInterfaceLocations(parsed);
+
         return parsed;
     }
 
     /// <summary>
-    /// Rebuilds the preamble the OpenGL path prepends: the version, the hoisted extensions, the
-    /// resolved defines and the packed globals block.
+    /// Rebuilds the preamble <see cref="ShaderLoader"/> prepends: the version, the hoisted extensions,
+    /// the resolved defines, the packed globals block for the flavour, and for Vulkan the per-draw push
+    /// constant block that OpenGL sets one <c>glProgramUniform</c> at a time.
     /// </summary>
+    /// <remarks>
+    /// This mirrors <c>ShaderLoader.CompileShaderObjects</c> and has to keep mirroring it while the
+    /// module stays unwired. Anything appended there and not here compiles differently under
+    /// validation than it does in the renderer, which is how the flavour gap went unnoticed.
+    /// </remarks>
     private static string BuildHeader(ShaderLoader.ParsedShaderData parsed)
     {
         var header = new StringBuilder();
@@ -263,7 +323,12 @@ public static class SpirvShaderValidation
             header.Append('\n');
         }
 
-        header.Append(parsed.GlobalsLayout.BlockSource);
+        header.Append(parsed.GlobalsLayout.GetBlockSource(parsed.Flavour));
+
+        if (parsed.Flavour == ShaderFlavour.Vulkan)
+        {
+            header.Append(VulkanGlsl.PushConstantBlockSource);
+        }
 
         return header.ToString();
     }
