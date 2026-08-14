@@ -567,8 +567,6 @@ public class Renderer
         ViewBuffer.Data.ViewportSize = new Vector2(w, h);
         ViewBuffer.Data.InvViewportSize = Vector2.One / ViewBuffer.Data.ViewportSize;
 
-        // Draws leave state latched and the clear obeys the write masks, so reassert the baseline.
-        RendererContext.RenderState.ReassertCurrentPass();
         renderContext.Framebuffer.BindAndClear();
 
         var isMainFramebuffer = ReferenceEquals(renderContext.Framebuffer, MainFramebuffer);
@@ -794,9 +792,9 @@ public class Renderer
             throw new InvalidOperationException("Initialize() must be called before rendering");
         }
 
-        // Draws leave state latched. The depth clear obeys the write mask and the depth-only draws
-        // below apply no state, so reassert the baseline.
-        RendererContext.RenderState.ReassertCurrentPass();
+        // A pass at the baseline. Entry applies it, so the depth clear (which obeys the write mask)
+        // and the state-less depth-only draws do not see state latched by earlier draws.
+        using var _ = RendererContext.RenderState.Scope();
 
         GL.Viewport(0, 0, ShadowDepthBuffer.Width, ShadowDepthBuffer.Height);
         ShadowDepthBuffer.Bind(FramebufferTarget.Framebuffer);

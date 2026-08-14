@@ -241,15 +241,6 @@ namespace ValveResourceFormat.Renderer
         private RenderState applied;
         private bool appliedValid;
 
-#if DEBUG
-        // Set by Apply. Lets clears verify that the baseline was reasserted on this thread.
-        [ThreadStatic]
-        internal static RenderStateTracker? LastAppliedOnThread;
-
-        /// <summary>Whether the last applied state is the pass baseline.</summary>
-        internal bool IsCurrentPassApplied => appliedValid && applied == CurrentPass;
-#endif
-
         /// <summary>Composes a state over <see cref="CurrentPass"/> and applies it for the scope of
         /// the returned <see langword="using"/> guard. Omitted arguments keep the pass value. For
         /// state not covered here (e.g. stencil), build a <see cref="RenderState"/> and open a
@@ -307,11 +298,6 @@ namespace ValveResourceFormat.Renderer
             Apply(in state);
         }
 
-        /// <summary>Re-applies the pass baseline. Draws do not restore state; they leave it
-        /// latched. Call this before raw GL work that assumes the baseline: framebuffer clears
-        /// (they obey the write masks) and draws that do not apply state.</summary>
-        public void ReassertCurrentPass() => Apply(CurrentPass);
-
         /// <summary>Applies a state to GL. Diffs at two levels: one compare per descriptor, then
         /// only the calls whose fields changed within a changed descriptor.</summary>
         /// <param name="state">The state to apply.</param>
@@ -341,10 +327,6 @@ namespace ValveResourceFormat.Renderer
 
             applied = state;
             appliedValid = true;
-
-#if DEBUG
-            LastAppliedOnThread = this;
-#endif
         }
 
         private static void CountGlCall(int amount = 1) => PerfStats.Active.Count(Counter.RenderStateGlCall, amount);

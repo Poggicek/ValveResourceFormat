@@ -1384,6 +1384,8 @@ namespace ValveResourceFormat.Renderer
         /// <param name="depthOnlyShader">Optional depth-only shader; when provided and <see cref="EnableDepthPrepass"/> is set, a depth prepass is performed.</param>
         public void RenderOpaqueLayer(RenderContext renderContext, Shader? depthOnlyShader = null)
         {
+            using var passScope = RendererContext.RenderState.Scope();
+
             var camera = renderContext.Camera;
 
             var depthPrepass = depthOnlyShader != null && EnableDepthPrepass;
@@ -1458,6 +1460,8 @@ namespace ValveResourceFormat.Renderer
         /// <param name="renderContext">The render context for this pass, expected to use the dedicated viewmodel camera and depth range.</param>
         public void RenderViewmodelOpaqueLayer(RenderContext renderContext)
         {
+            using var _ = RendererContext.RenderState.Scope();
+
             renderContext.RenderPass = RenderPass.Opaque;
             MeshBatchRenderer.Render(viewmodelRenderLists[RenderPass.Opaque], renderContext);
         }
@@ -1490,6 +1494,7 @@ namespace ValveResourceFormat.Renderer
             }
 
             using (new GLDebugGroup("Opaque Refract Render"))
+            using (RendererContext.RenderState.Scope())
             {
                 renderContext.RenderPass = RenderPass.OpaqueRefract;
                 MeshBatchRenderer.Render(requests, renderContext);
@@ -1508,6 +1513,7 @@ namespace ValveResourceFormat.Renderer
             }
 
             using (new GLDebugGroup("Fancy Water Render"))
+            using (RendererContext.RenderState.Scope())
             {
                 renderContext.RenderPass = RenderPass.Water;
                 MeshBatchRenderer.Render(requests, renderContext);

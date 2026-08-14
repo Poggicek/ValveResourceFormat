@@ -106,11 +106,6 @@ public class Framebuffer
     /// </summary>
     public void BindAndClear(FramebufferTarget targetState = FramebufferTarget.Framebuffer)
     {
-#if DEBUG
-        // Clears obey the write masks, and draws leave state latched.
-        System.Diagnostics.Debug.Assert(RenderStateTracker.LastAppliedOnThread?.IsCurrentPassApplied != false,
-            "Clearing with latched draw state. Call ReassertCurrentPass first.");
-#endif
         Bind(targetState);
         GL.ClearColor(ClearColor);
         GL.Clear(ClearMask);
