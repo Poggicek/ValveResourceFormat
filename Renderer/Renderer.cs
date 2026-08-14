@@ -586,14 +586,11 @@ public class Renderer
 
         // TODO: check if renderpass allows wireframe mode
         // TODO+: replace wireframe shaders with solid color
-        if (isWireframe)
-        {
-            // Set as a baseline so sub-passes and materials compose over it and wireframe
-            // survives the whole frame.
-            var wireframeState = RendererContext.RenderState.CurrentPass;
-            wireframeState.Rasterizer.FillMode = FillMode.Wireframe;
-            RendererContext.RenderState.ApplyAsPassBaseline(in wireframeState);
-        }
+        // A baseline so sub-passes and materials compose over it. Disposed before post-processing,
+        // which must not inherit wireframe.
+        var wireframeScope = isWireframe
+            ? RendererContext.RenderState.Scope(fillMode: FillMode.Wireframe)
+            : default;
 
         UpdatePerViewGpuBuffers(Scene, renderContext.Camera, DeltaTime);
 
@@ -748,12 +745,7 @@ public class Renderer
             ViewBuffer.Update();
         }
 
-        if (isWireframe)
-        {
-            var solidState = RendererContext.RenderState.CurrentPass;
-            solidState.Rasterizer.FillMode = FillMode.Solid;
-            RendererContext.RenderState.ApplyAsPassBaseline(in solidState);
-        }
+        wireframeScope.Dispose();
 
         if (isStandardPass)
         {

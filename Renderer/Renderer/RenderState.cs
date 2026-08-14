@@ -241,6 +241,15 @@ namespace ValveResourceFormat.Renderer
         private RenderState applied;
         private bool appliedValid;
 
+#if DEBUG
+        // Set by Apply. Lets clears verify that the baseline was reasserted on this thread.
+        [ThreadStatic]
+        internal static RenderStateTracker? LastAppliedOnThread;
+
+        /// <summary>Whether the last applied state is the pass baseline.</summary>
+        internal bool IsCurrentPassApplied => appliedValid && applied == CurrentPass;
+#endif
+
         /// <summary>Composes a state over <see cref="CurrentPass"/> and applies it for the scope of
         /// the returned <see langword="using"/> guard. Omitted arguments keep the pass value. For
         /// state not covered here (e.g. stencil), build a <see cref="RenderState"/> and open a
@@ -332,6 +341,10 @@ namespace ValveResourceFormat.Renderer
 
             applied = state;
             appliedValid = true;
+
+#if DEBUG
+            LastAppliedOnThread = this;
+#endif
         }
 
         private static void CountGlCall(int amount = 1) => PerfStats.Active.Count(Counter.RenderStateGlCall, amount);
@@ -565,7 +578,8 @@ namespace ValveResourceFormat.Renderer
             tracker.ApplyAsPassBaseline(in state);
         }
 
-        /// <summary>Restores the previous pass baseline.</summary>
-        public void Dispose() => tracker.ApplyAsPassBaseline(in previous);
+        /// <summary>Restores the previous pass baseline. A <see langword="default"/> scope does
+        /// nothing, so a scope can be conditional.</summary>
+        public void Dispose() => tracker?.ApplyAsPassBaseline(in previous);
     }
 }
