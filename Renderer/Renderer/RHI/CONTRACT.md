@@ -145,6 +145,44 @@ Still open, needing a decision rather than an addition:
   through an otherwise handle-free interface. Likeliest answer is Skia CPU raster plus a texture
   upload, but it needs deciding before anything touches that file.
 
+## A render pass never names the presented surface
+
+Revision 2 said the presentation layer surfaces the backbuffer as an `ITexture`. That is true on
+Vulkan and **unachievable on OpenGL**: framebuffer 0 has no texture handle and
+`glFramebufferTexture` cannot produce one. A `GLTexture` wrapping handle 0 would be an object on
+which sampling, copying, viewing, uploading and blitting are all invalid — the same
+documented-behaviour-that-cannot-exist shape as the old null-sampler wording.
+
+The rule instead:
+
+> Every frame renders into an offscreen colour `ITexture` the presentation layer owns. Getting that
+> texture onto the screen is a backend-specific step **outside** the RHI, performed once per frame by
+> the presentation layer. `IDevice` gains no present method and `ICommandList` gains nothing.
+
+On OpenGL that step is a blit from a texture-backed FBO into framebuffer 0, then a buffer swap. On
+Vulkan it is acquire, render into the acquired image, present — a swapchain image *is* a real
+`VkImage`, so Vulkan renders straight into it and skips the copy.
+
+Two consequences worth recording:
+
+- **OpenGL pays one full-screen blit per frame that Vulkan does not.** Forced by the API, not chosen.
+  Whoever eventually benchmarks the two backends should know why they differ before drawing
+  conclusions from it.
+- **Offscreen consumers have no present step at all.** Thumbnails, the golden harness and RenderTest
+  render into a capture texture and read back. That is the windowed path minus its last step, which
+  is the strongest evidence this shape is right: the two cases differ by exactly one operation.
+
+## Recording is gated until passes and pipelines exist
+
+`Renderer.EnableRhiRecording` is off. Nine call sites issue draws through a command list and none
+opens a render pass or binds a pipeline first, because neither existed when they were written. Both
+are mandatory — `DrawIndexed` carries no topology, it comes from `IGraphicsPipeline.Description` —
+so turning recording on throws on the first scene that draws.
+
+That is not a defect in those sites so much as an ordering artifact, and the golden suite is what
+surfaced it: with the flag on, every drawing scene fails identically. Turn the flag on once the scene
+passes are wrapped and the material path produces pipelines, and let the suite say whether it worked.
+
 ## `GLDebugGroup` is not a debug marker — do not port it to `DebugScope`
 
 `IDevice.DebugScope` and `ICommandList.DebugScope` exist for *marker* usage. `GLDebugGroup` is not
