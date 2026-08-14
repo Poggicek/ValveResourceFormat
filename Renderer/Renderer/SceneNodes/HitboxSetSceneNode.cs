@@ -130,12 +130,11 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             }
 
             // A baseline scope: the child nodes compose their own state over it.
-            using (Scene.RendererContext.RenderState.Scope(depthTest: false))
+            using var _ = Scene.RendererContext.RenderState.Scope(depthTest: false);
+
+            foreach (var node in currentSet.SceneNodes)
             {
-                foreach (var node in currentSet.SceneNodes)
-                {
-                    node.Render(context);
-                }
+                node.Render(context);
             }
         }
     }

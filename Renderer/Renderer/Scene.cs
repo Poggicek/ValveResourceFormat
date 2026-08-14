@@ -1469,11 +1469,10 @@ namespace ValveResourceFormat.Renderer
         /// <param name="renderContext">The render context for this pass, expected to use the dedicated viewmodel camera and depth range.</param>
         public void RenderViewmodelTranslucentLayer(RenderContext renderContext)
         {
-            using (RendererContext.RenderState.Scope(depthWrite: false, blend: true))
-            {
-                renderContext.RenderPass = RenderPass.Translucent;
-                MeshBatchRenderer.Render(viewmodelRenderLists[RenderPass.Translucent], renderContext);
-            }
+            using var _ = RendererContext.RenderState.Scope(depthWrite: false, blend: true);
+
+            renderContext.RenderPass = RenderPass.Translucent;
+            MeshBatchRenderer.Render(viewmodelRenderLists[RenderPass.Translucent], renderContext);
         }
 
         /// <summary>

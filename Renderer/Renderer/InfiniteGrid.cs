@@ -43,13 +43,12 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Renders the infinite grid for the current frame.</summary>
         public void Render()
         {
-            using (renderState.Scope(blend: true, srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha))
-            {
-                shader.Use();
-                VertexArray.Bind(vao, shader);
+            using var _ = renderState.Scope(blend: true, srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha);
 
-                GL.DrawArrays(PrimitiveType.Triangles, 0, 6);
-            }
+            shader.Use();
+            VertexArray.Bind(vao, shader);
+
+            GL.DrawArrays(PrimitiveType.Triangles, 0, 6);
         }
     }
 }

@@ -97,17 +97,16 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
             VertexArray.Bind(vao, renderShader);
 
-            using (Scene.RendererContext.RenderState.Scope(srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha,
-                depthBias: 96f, depthBiasClamp: 0.0005f))
-            {
-                GL.Enable(EnableCap.PrimitiveRestart);
-                GL.PrimitiveRestartIndex(int.MaxValue);
-                GL.DrawElements(PrimitiveType.LineLoop, indexCount, DrawElementsType.UnsignedInt, 0);
+            using var _ = Scene.RendererContext.RenderState.Scope(srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha,
+                depthBias: 96f, depthBiasClamp: 0.0005f);
 
-                GL.DrawElementsInstancedBaseInstance(PrimitiveType.TriangleFan, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
+            GL.Enable(EnableCap.PrimitiveRestart);
+            GL.PrimitiveRestartIndex(int.MaxValue);
+            GL.DrawElements(PrimitiveType.LineLoop, indexCount, DrawElementsType.UnsignedInt, 0);
 
-                GL.Disable(EnableCap.PrimitiveRestart);
-            }
+            GL.DrawElementsInstancedBaseInstance(PrimitiveType.TriangleFan, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
+
+            GL.Disable(EnableCap.PrimitiveRestart);
         }
 
         /// <inheritdoc/>

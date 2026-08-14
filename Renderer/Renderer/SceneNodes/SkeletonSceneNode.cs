@@ -137,14 +137,13 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
             var renderShader = context.ReplacementShader ?? lineBuffer.Shader;
 
-            using (Scene.RendererContext.RenderState.Scope(depthFunc: Comparison.Always))
-            {
-                renderShader.Use();
-                renderShader.SetUniform3x4("transform", Transform);
-                renderShader.SetBoneAnimationData(false);
+            using var _ = Scene.RendererContext.RenderState.Scope(depthFunc: Comparison.Always);
 
-                lineBuffer.Draw(Id);
-            }
+            renderShader.Use();
+            renderShader.SetUniform3x4("transform", Transform);
+            renderShader.SetBoneAnimationData(false);
+
+            lineBuffer.Draw(Id);
         }
     }
 }

@@ -484,10 +484,9 @@ public class Renderer
         scene.RenderOpaqueRefractLayer(renderContext);
         scene.RenderWaterLayer(renderContext);
 
-        using (scene.RendererContext.RenderState.Scope(depthWrite: false, blend: true))
-        {
-            scene.RenderTranslucentLayer(renderContext);
-        }
+        using var _ = scene.RendererContext.RenderState.Scope(depthWrite: false, blend: true);
+
+        scene.RenderTranslucentLayer(renderContext);
     }
 
     /// <summary>

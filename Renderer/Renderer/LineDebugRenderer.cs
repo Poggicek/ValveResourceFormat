@@ -32,14 +32,13 @@ namespace ValveResourceFormat.Renderer
                 return;
             }
 
-            using (renderState.Scope(depthTest: disableDepthTest ? false : null, depthWrite: false,
-                blend: true, srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha))
-            {
-                lineBuffer.Shader.Use();
-                lineBuffer.Shader.SetUniform3x4("transform", Matrix4x4.Identity);
+            using var _ = renderState.Scope(depthTest: disableDepthTest ? false : null, depthWrite: false,
+                blend: true, srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha);
 
-                lineBuffer.Draw();
-            }
+            lineBuffer.Shader.Use();
+            lineBuffer.Shader.SetUniform3x4("transform", Matrix4x4.Identity);
+
+            lineBuffer.Draw();
         }
 
         /// <summary>Deletes the GL objects.</summary>

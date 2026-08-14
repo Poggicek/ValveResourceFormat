@@ -402,27 +402,26 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             // Modulate-2x scales what is behind it, so it needs its own factors; see RenderSprites.
             // Trail quads are oriented by motion direction, so either side can face the camera.
             var mod2x = blendMode == ParticleBlendMode.PARTICLE_OUTPUT_BLEND_MODE_MOD2X;
-            using (rendererContext.RenderState.Scope(blend: true, depthWrite: false, cullMode: CullMode.None,
+            using var _ = rendererContext.RenderState.Scope(blend: true, depthWrite: false, cullMode: CullMode.None,
                 srcBlend: mod2x ? BlendFactor.DstColor : BlendFactor.One,
-                dstBlend: mod2x ? BlendFactor.SrcColor : BlendFactor.OneMinusSrcAlpha))
-            {
-                shader.Use();
+                dstBlend: mod2x ? BlendFactor.SrcColor : BlendFactor.OneMinusSrcAlpha);
 
-                VertexArray.Bind(vaoHandle, shader);
+            shader.Use();
 
-                shader.SetTexture(RenderMaterial.TextureUnitStart, "uTexture", texture);
+            VertexArray.Bind(vaoHandle, shader);
 
-                // TODO: This formula is a guess but still seems too bright compared to valve particles
-                SetSharedUniforms(shader, systemRenderState);
+            shader.SetTexture(RenderMaterial.TextureUnitStart, "uTexture", texture);
 
-                shader.SetUniform1("uBlendFrames", blendFrames);
+            // TODO: This formula is a guess but still seems too bright compared to valve particles
+            SetSharedUniforms(shader, systemRenderState);
 
-                // Set every draw: the program is shared with every other trail renderer, whatever their mode.
-                shader.SetUniform1("uBlendMode", (int)blendMode);
+            shader.SetUniform1("uBlendFrames", blendFrames);
 
-                PerfStats.Active.Count(Counter.ParticleDraw);
-                GL.DrawElements(PrimitiveType.Triangles, quadCount * 6, DrawElementsType.UnsignedShort, 0);
-            }
+            // Set every draw: the program is shared with every other trail renderer, whatever their mode.
+            shader.SetUniform1("uBlendMode", (int)blendMode);
+
+            PerfStats.Active.Count(Counter.ParticleDraw);
+            GL.DrawElements(PrimitiveType.Triangles, quadCount * 6, DrawElementsType.UnsignedShort, 0);
         }
 
         public override IEnumerable<string> GetSupportedRenderModes() => shader.RenderModes;

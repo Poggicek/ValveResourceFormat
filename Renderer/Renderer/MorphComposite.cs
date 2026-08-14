@@ -100,21 +100,20 @@ namespace ValveResourceFormat.Renderer
                 renderTargetInitialized = true;
             }
 
-            using (renderState.Scope(cullMode: CullMode.None,
-                blend: true, srcBlend: BlendFactor.DstAlpha, dstBlend: BlendFactor.One))
-            {
-                GL.BindFramebuffer(FramebufferTarget.Framebuffer, frameBuffer);
-                shader.Use();
-                shader.SetTexture(0, "morphAtlas", morphAtlas);
+            using var _ = renderState.Scope(cullMode: CullMode.None,
+                blend: true, srcBlend: BlendFactor.DstAlpha, dstBlend: BlendFactor.One);
 
-                GL.Viewport(0, 0, 2048, 2048);
-                GL.ClearColor(0, 0, 0, 0);
-                GL.Clear(ClearBufferMask.ColorBufferBit);
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, frameBuffer);
+            shader.Use();
+            shader.SetTexture(0, "morphAtlas", morphAtlas);
 
-                VertexArray.Bind(vao, shader);
+            GL.Viewport(0, 0, 2048, 2048);
+            GL.ClearColor(0, 0, 0, 0);
+            GL.Clear(ClearBufferMask.ColorBufferBit);
 
-                GL.DrawElements(PrimitiveType.Triangles, usedRects.Count * 6, DrawElementsType.UnsignedShort, 0);
-            }
+            VertexArray.Bind(vao, shader);
+
+            GL.DrawElements(PrimitiveType.Triangles, usedRects.Count * 6, DrawElementsType.UnsignedShort, 0);
         }
 
         // Mutable because SetVertexMorphValue pokes the current weight into PositionWeights in place.

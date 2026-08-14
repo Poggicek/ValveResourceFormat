@@ -376,32 +376,31 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 state.Rasterizer.CullMode = CullMode.None;
             }
 
-            using (new RenderPassScope(renderState, in state))
-            {
-                if (isTranslucent)
-                {
-                    // Lines
-                    var lineState = state;
-                    lineState.Rasterizer.FillMode = FillMode.Wireframe;
-                    lineState.Blend.BlendEnable = false;
-                    renderState.Apply(in lineState);
-                    GL.DrawElements(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0);
+            using var _ = new RenderPassScope(renderState, in state);
 
-                    // Triangles
-                    var fillState = state;
-                    fillState.Blend.BlendEnable = true;
-                    fillState.Blend.SrcBlend = BlendFactor.SrcAlpha;
-                    fillState.Blend.DstBlend = BlendFactor.OneMinusSrcAlpha;
-                    fillState.Rasterizer.SlopeScaledDepthBias = 2f;
-                    fillState.Rasterizer.DepthBias = 100f;
-                    fillState.Rasterizer.DepthBiasClamp = 0.05f;
-                    renderState.Apply(in fillState);
-                    GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
-                }
-                else
-                {
-                    GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
-                }
+            if (isTranslucent)
+            {
+                // Lines
+                var lineState = state;
+                lineState.Rasterizer.FillMode = FillMode.Wireframe;
+                lineState.Blend.BlendEnable = false;
+                renderState.Apply(in lineState);
+                GL.DrawElements(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0);
+
+                // Triangles
+                var fillState = state;
+                fillState.Blend.BlendEnable = true;
+                fillState.Blend.SrcBlend = BlendFactor.SrcAlpha;
+                fillState.Blend.DstBlend = BlendFactor.OneMinusSrcAlpha;
+                fillState.Rasterizer.SlopeScaledDepthBias = 2f;
+                fillState.Rasterizer.DepthBias = 100f;
+                fillState.Rasterizer.DepthBiasClamp = 0.05f;
+                renderState.Apply(in fillState);
+                GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
+            }
+            else
+            {
+                GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
             }
         }
 

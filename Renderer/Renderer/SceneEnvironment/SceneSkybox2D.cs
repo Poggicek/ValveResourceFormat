@@ -44,17 +44,16 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
         public void Render()
         {
             // A baseline scope: the material composes its own state over it.
-            using (Material.Shader.RendererContext.RenderState.Scope(depthFunc: Comparison.Equal))
-            {
-                Material.Shader.Use();
-                Material.Render();
-                Material.SetUniform("g_vTint", Tint);
-                Material.SetUniform("g_matSkyRotation", Transform);
+            using var _ = Material.Shader.RendererContext.RenderState.Scope(depthFunc: Comparison.Equal);
 
-                GL.BindVertexArray(vao);
-                GL.DrawArrays(PrimitiveType.Triangles, 0, 36);
-                Material.PostRender();
-            }
+            Material.Shader.Use();
+            Material.Render();
+            Material.SetUniform("g_vTint", Tint);
+            Material.SetUniform("g_matSkyRotation", Transform);
+
+            GL.BindVertexArray(vao);
+            GL.DrawArrays(PrimitiveType.Triangles, 0, 36);
+            Material.PostRender();
         }
     }
 }
