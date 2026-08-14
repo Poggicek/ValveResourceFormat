@@ -182,6 +182,36 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
+        private GLSamplerBindings? samplerBindings;
+
+        /// <summary>
+        /// Gets where each of this program's sampler uniforms sits in the RHI descriptor scheme, and the
+        /// texture unit that resolves to.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// This is the sampler reflection a pipeline carries, and what lets
+        /// <see cref="RHI.ICommandList.BindTexture"/> be the only call a texture binding needs. The
+        /// reserved globals are aimed at their units when the program links; the per-material samplers are
+        /// aimed as they bind, because a shader that does its own binding is entitled to units of its own.
+        /// Either way <see cref="BindTexture"/> handles it and the caller writes no sampler uniform.
+        /// </para>
+        /// <para>
+        /// Built during <see cref="EnsureLoaded"/> and reachable from inside it. The
+        /// <see cref="EnsureLoaded"/> call here is what makes it safe to touch from outside before the
+        /// program has linked; it is re-entrant because <see cref="IsLoaded"/> is set before the link work
+        /// begins.
+        /// </para>
+        /// </remarks>
+        public GLSamplerBindings SamplerBindings
+        {
+            get
+            {
+                EnsureLoaded();
+                return samplerBindings ??= new GLSamplerBindings(this);
+            }
+        }
+
         /// <summary>Gets the locations this program reads, as a mask. Checked in <see cref="VertexArray"/>.</summary>
         public int RequiredAttributes { get; private set; }
 
@@ -421,19 +451,10 @@ namespace ValveResourceFormat.Renderer.Shaders
         }
 
         /// <summary>Points every reserved texture sampler this program declares at its global texture unit.</summary>
-        private void BindReservedTextureSlots()
-        {
-            // Table driven: StoreUniformLocations does not classify array and shadow samplers.
-            foreach (var (name, slot) in MaterialLoader.ReservedTextureSlotByName)
-            {
-                var uniformLocation = GetUniformLocation(name);
-
-                if (uniformLocation > -1)
-                {
-                    GL.ProgramUniform1(Program, uniformLocation, (int)slot);
-                }
-            }
-        }
+        /// <remarks>A reserved sampler's unit is the same for every program, so this settles it once at
+        /// link time. The per-material samplers are aimed when they are bound, by
+        /// <see cref="BindTexture"/>, because their units belong to whoever binds them.</remarks>
+        private void BindReservedTextureSlots() => SamplerBindings.PointReservedSamplersAtUnits();
 
         /// <summary>
         /// Installs this shader program as part of the current rendering state, along with the constant buffer
@@ -772,8 +793,55 @@ namespace ValveResourceFormat.Renderer.Shaders
             {
                 return;
             }
+
             GL.BindTextureUnit(slot, texture.Handle);
             GL.ProgramUniform1(Program, uniformLocation, slot);
+        }
+
+        /// <summary>
+        /// Binds a texture for the named sampler, recording through <paramref name="commandList"/> when one
+        /// is present and falling back to OpenGL when it is not.
+        /// </summary>
+        /// <param name="commandList">The command list to record into, or <see langword="null"/> to bind directly.</param>
+        /// <param name="name">The sampler uniform name.</param>
+        /// <param name="texture">The texture to bind.</param>
+        /// <returns><see langword="true"/> when the texture was bound.</returns>
+        /// <remarks>
+        /// <para>
+        /// The single call that replaces the <c>SetTexture</c> plus <c>BindTexture</c> pair. The caller
+        /// supplies no texture unit and writes no sampler uniform: <see cref="SamplerBindings"/> knows
+        /// which descriptor binding the sampler has, and aims it at the matching unit itself, diffed so a
+        /// batch pays only for the first draw.
+        /// </para>
+        /// <para>
+        /// A sampler the descriptor scheme does not cover keeps the old behaviour, because its unit is
+        /// whatever its caller chose rather than anything derivable from the program. The particle
+        /// renderers' <c>uTexture</c> and <c>post_processing</c>'s <c>g_tColorBuffer</c> are both of this
+        /// kind, which is why they must keep passing a unit explicitly.
+        /// </para>
+        /// </remarks>
+        public bool BindTexture(RHI.ICommandList? commandList, string name, RenderTexture? texture)
+        {
+            if (texture == null)
+            {
+                return false;
+            }
+
+            if (!SamplerBindings.TryGetBinding(name, out var binding))
+            {
+                return false;
+            }
+
+            SamplerBindings.EnsurePointedAt(binding.UniformLocation, binding.TextureUnit);
+
+            if (commandList != null)
+            {
+                commandList.BindTexture(binding.DescriptorSet, binding.Binding, texture.RhiTexture);
+                return true;
+            }
+
+            GL.BindTextureUnit(binding.TextureUnit, texture.Handle);
+            return true;
         }
 
 #if DEBUG
@@ -806,6 +874,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             // The replacement is a different program, so both the cached locations and the diff baseline
             // belong to a program that no longer exists.
             pushConstants = null;
+            samplerBindings = null;
         }
 #endif
     }

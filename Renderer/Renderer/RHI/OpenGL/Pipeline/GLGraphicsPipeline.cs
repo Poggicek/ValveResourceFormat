@@ -43,6 +43,14 @@ public sealed class GLGraphicsPipeline : IGraphicsPipeline
     /// over one program share a block and its diff baseline.</remarks>
     public GLPushConstantBlock PushConstants => Program.PushConstants;
 
+    /// <summary>Gets where this pipeline's sampler uniforms bind, in descriptor terms.</summary>
+    /// <remarks>
+    /// The sampler reflection that lets <see cref="ICommandList.BindTexture"/> stand alone. Cached on the
+    /// shader for the same reason <see cref="PushConstants"/> is: it describes the program, so pipelines
+    /// over one program share it.
+    /// </remarks>
+    public GLSamplerBindings SamplerBindings => Program.SamplerBindings;
+
     /// <summary>Gets the key this pipeline would be cached under.</summary>
     public PipelineCacheKey CacheKey { get; }
 
