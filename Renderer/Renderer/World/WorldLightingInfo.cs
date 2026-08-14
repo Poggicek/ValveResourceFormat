@@ -580,6 +580,8 @@ namespace ValveResourceFormat.Renderer.World
 
             if (cookieTextures.Count > 0)
             {
+                // The atlas clear obeys the color write mask, so apply the baseline first.
+                using var _ = scene.RendererContext.RenderState.Scope();
                 BarnLightCookieAtlas = BuildCookieAtlas(cookieTextures);
             }
         }

@@ -567,6 +567,9 @@ public class Renderer
         ViewBuffer.Data.ViewportSize = new Vector2(w, h);
         ViewBuffer.Data.InvViewportSize = Vector2.One / ViewBuffer.Data.ViewportSize;
 
+        // A frame at the baseline. Entry applies it, so the clear (which obeys the write masks)
+        // does not see state latched by the previous frame.
+        using var frameScope = RendererContext.RenderState.Scope();
         renderContext.Framebuffer.BindAndClear();
 
         var isMainFramebuffer = ReferenceEquals(renderContext.Framebuffer, MainFramebuffer);

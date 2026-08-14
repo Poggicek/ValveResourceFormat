@@ -227,8 +227,11 @@ namespace ValveResourceFormat.Renderer
     /// <summary>
     /// Tracks and applies render state for one GL context. Owns the pass baseline
     /// (<see cref="CurrentPass"/>) and a shadow of the last applied state, so <see cref="Apply"/>
-    /// only emits GL calls for fields that changed. GL state is per context, so each
-    /// <see cref="RendererContext"/> owns one tracker.
+    /// only emits GL calls for fields that changed. State is applied when a scope opens and when a
+    /// draw applies its state; scope dispose only restores the baseline value. Between scopes GL
+    /// holds whatever was applied last, so anything that reads GL state without applying its own
+    /// (framebuffer clears obey the write masks) must run inside an open scope.
+    /// GL state is per context, so each <see cref="RendererContext"/> owns one tracker.
     /// </summary>
     public class RenderStateTracker
     {
@@ -257,7 +260,7 @@ namespace ValveResourceFormat.Renderer
         /// <param name="srcBlend">Source blend factor.</param>
         /// <param name="dstBlend">Destination blend factor.</param>
         /// <param name="colorWriteMask">Color channel write mask, RGBA in bits 0-3.</param>
-        /// <returns>The guard that restores the previous baseline on dispose.</returns>
+        /// <returns>The guard that restores the previous baseline value on dispose.</returns>
         public RenderPassScope Scope(
             FillMode? fillMode = null,
             CullMode? cullMode = null,
@@ -297,6 +300,10 @@ namespace ValveResourceFormat.Renderer
             CurrentPass = state;
             Apply(in state);
         }
+
+        /// <summary>Restores the pass baseline value without touching GL. The latched state stays
+        /// until the next apply diffs from it.</summary>
+        internal void RestoreCurrentPass(in RenderState state) => CurrentPass = state;
 
         /// <summary>Applies a state to GL. Diffs at two levels: one compare per descriptor, then
         /// only the calls whose fields changed within a changed descriptor.</summary>
@@ -541,9 +548,11 @@ namespace ValveResourceFormat.Renderer
     }
 
     /// <summary>
-    /// Sets a render pass baseline for its scope and restores the previous one on dispose.
-    /// Nesting-safe: compose the new baseline from <see cref="RenderStateTracker.CurrentPass"/>
-    /// so outer overrides (e.g. global wireframe) survive into sub-passes.
+    /// Sets a render pass baseline for its scope. Opening the scope applies the state; disposing
+    /// restores the previous baseline value only, leaving GL latched until the next scope opens or
+    /// draw applies state. Nesting-safe: compose the new baseline from
+    /// <see cref="RenderStateTracker.CurrentPass"/> so outer overrides (e.g. global wireframe)
+    /// survive into sub-passes.
     /// </summary>
     public readonly ref struct RenderPassScope
     {
@@ -560,8 +569,9 @@ namespace ValveResourceFormat.Renderer
             tracker.ApplyAsPassBaseline(in state);
         }
 
-        /// <summary>Restores the previous pass baseline. A <see langword="default"/> scope does
+        /// <summary>Restores the previous pass baseline value. GL is not touched: the next scope
+        /// open or draw diffs away this scope's state. A <see langword="default"/> scope does
         /// nothing, so a scope can be conditional.</summary>
-        public void Dispose() => tracker?.ApplyAsPassBaseline(in previous);
+        public void Dispose() => tracker?.RestoreCurrentPass(in previous);
     }
 }

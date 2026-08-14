@@ -77,6 +77,12 @@ namespace ValveResourceFormat.Renderer
         /// <param name="context">Render context describing the current pass and scene state.</param>
         public static void Render(List<Request> requests, Scene.RenderContext context)
         {
+            // Material-ignoring replacement shaders draw without applying render state, so a scope
+            // latches the pass baseline for them. Regular materials apply full state per draw.
+            using var batchScope = context.ReplacementShader?.IgnoreMaterialData == true
+                ? context.Scene.RendererContext.RenderState.Scope()
+                : default;
+
             if (context.RenderPass is RenderPass.Opaque or RenderPass.OpaqueRefract)
             {
                 requests.Sort(CompareCustomPipeline);
@@ -173,6 +179,14 @@ namespace ValveResourceFormat.Renderer
 
                         // Custom nodes bind over the reserved units, so restore them.
                         BindReservedTextures(context);
+
+                        if (context.ReplacementShader?.IgnoreMaterialData == true)
+                        {
+                            // The stateless draws that follow cannot re-apply state, so restore the
+                            // pass baseline the node's scope left latched.
+                            var renderState = context.Scene.RendererContext.RenderState;
+                            renderState.Apply(renderState.CurrentPass);
+                        }
 
                         shader = null;
                         material = null;

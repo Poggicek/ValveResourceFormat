@@ -77,6 +77,9 @@ namespace GUI.Types.GLViewers
 
             var (w, h) = (MainFramebuffer.Width, MainFramebuffer.Height);
 
+            // The clear obeys the write masks, so open a scope to apply the baseline first.
+            using var _ = RendererContext.RenderState.Scope();
+
             MainFramebuffer.Bind(FramebufferTarget.Framebuffer);
             GL.ClearColor(new OpenTK.Mathematics.Color4(0, 0, 0, 0));
             GL.Clear(MainFramebuffer.ClearMask);
@@ -86,6 +89,7 @@ namespace GUI.Types.GLViewers
             if (SaveAsFbo is null)
             {
                 SaveAsFbo = Framebuffer.Prepare(nameof(SaveAsFbo), w, h, 0, new(PixelInternalFormat.Rgba8, PixelFormat.Bgra, PixelType.UnsignedByte), null);
+                SaveAsFbo.ClearMask = ClearBufferMask.ColorBufferBit;
                 SaveAsFbo.ClearColor = new OpenTK.Mathematics.Color4(0, 0, 0, 0);
                 SaveAsFbo.Initialize();
             }

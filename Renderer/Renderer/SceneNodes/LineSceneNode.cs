@@ -59,6 +59,10 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             }
 
             var renderShader = context.ReplacementShader ?? lineBuffer.Shader;
+
+            // A pass-baseline scope so the lines do not inherit state latched by earlier draws.
+            using var _ = Scene.RendererContext.RenderState.Scope();
+
             renderShader.Use();
             renderShader.SetUniform3x4("transform", Transform);
             renderShader.SetBoneAnimationData(false);
