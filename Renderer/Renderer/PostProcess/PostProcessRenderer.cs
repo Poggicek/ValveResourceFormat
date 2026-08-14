@@ -23,7 +23,12 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
         /// <summary>Gets or sets the blue noise texture used for dithering in the tonemap pass.</summary>
         public RenderTexture? BlueNoise { get; set; }
-        private readonly Random random = new();
+
+        // Seeded, so the dither sequence is the same from one run to the next. The offset still
+        // changes every frame, which is what breaks up the banding; what the seed buys is a frame
+        // that reproduces. Unseeded, the tonemap pass put a floor of 2/255 under every comparison,
+        // which is the dither amplitude itself, and the golden image budgets all had to clear it.
+        private readonly Random random = new(Seed: 0x5EED);
 
         /// <summary>Gets or sets the scene average luminance used for auto-exposure calculations.</summary>
         public float AverageLuminance { get; set; }
