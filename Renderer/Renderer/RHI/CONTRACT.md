@@ -42,18 +42,30 @@ sets 0 and 1 preserves both numbering schemes and makes the collision impossible
 
 ## Push constants
 
-The per-draw block is **92 bytes**, inside the 128-byte floor every Vulkan implementation guarantees:
+The per-draw block is **92 bytes**, inside the 128-byte floor every Vulkan implementation
+guarantees. These are today's `glProgramUniform` call sites in `MeshBatchRenderer.cs`.
 
-| Member | Type | Bytes |
-|---|---|---|
-| `Transform` | `mat3x4` | 48 |
-| `AnimationData` | `uvec3` | 12 |
-| `MorphCompositeTextureSize` | `vec2` | 8 |
-| `MeshId`, `ShaderId`, `ShaderProgramId`, `Tint`, `IsInstancing`, `MorphVertexIdOffset` | scalars | 24 |
-| | | **92** |
+**Member order is load-bearing, and this table is not the authority.** The single source of truth is
+`ShaderParser.PushConstantMembers`, which generates the GLSL block and throws if the total ever
+leaves 92. Derive `PushConstantRange` from SPIR-V reflection rather than hardcoding a size.
 
-These are today's `glProgramUniform` call sites in `MeshBatchRenderer.cs`. Query
-`IDeviceLimits.MaxPushConstantSize` before growing the block.
+The order matters because `uvec3 uAnimationData` ends at offset 60 and a `vec2` aligns to 8. Placing
+the `vec2` next wastes four bytes and the block becomes **96**. Slotting a scalar into that hole
+first keeps it at 92:
+
+| Order | Member | Type | Offset |
+|---|---|---|---|
+| 1 | `transform` | `mat3x4` | 0 |
+| 2 | `uAnimationData` | `uvec3` | 48 |
+| 3 | `morphVertexIdOffset` | `int` | 60 ← fills the hole |
+| 4 | `morphCompositeTextureSize` | `vec2` | 64 |
+| 5 | `meshId`, `shaderId`, `shaderProgramId`, `vTint`, `bIsInstancing` | scalars | 72–92 |
+
+An earlier revision of this table listed the members in declaration order, which packs to 96. Two
+agents caught it independently from opposite sides — one generating the block, one reflecting the
+compiled SPIR-V. Read the order above as normative.
+
+`bIsInstancing` is carried as `uint` with a macro, because GLSL block members cannot be `bool`.
 
 ## Pipeline caching
 
