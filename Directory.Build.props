@@ -50,4 +50,15 @@
     <Using Include="System.Numerics" />
     <Using Include="System.Collections.Generic" />
   </ItemGroup>
+
+  <!--
+    Renderer is a library published with PublishAot. Without an explicit root, ILC compiles
+    it as a native lib with no entrypoints, emits a ~1 MB stub and reports zero warnings -
+    the AOT gate would pass while analysing none of our code. Rooting the assembly makes
+    `dotnet publish Renderer.csproj` an actual AOT check. Publish-only: does not affect
+    build, pack or the shipped nupkg.
+  -->
+  <ItemGroup Condition="'$(MSBuildProjectName)' == 'Renderer'">
+    <TrimmerRootAssembly Include="Renderer" />
+  </ItemGroup>
 </Project>

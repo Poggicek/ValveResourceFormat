@@ -11,6 +11,12 @@
     <PublishAot Condition="'$(Configuration)' != 'Debug'">true</PublishAot>
     <IsAotCompatible Condition="'$(Configuration)' != 'Debug'">true</IsAotCompatible>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Silk.NET.Core's DefaultPathResolver reads Assembly.Location and DependencyContext.Default,
+         which are unavailable in a single-file bundle. Its deps.json native lookup is therefore dead
+         there and the plain OS library search finds vulkan-1.dll instead, which is why every runtime
+         probe passes. Only these two single-file diagnostics are exempted; the trim (IL2xxx) and AOT
+         (IL3050/IL3051) gates stay armed. -->
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);IL3000;IL3002</WarningsNotAsErrors>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
 

@@ -1,0 +1,615 @@
+name: Publish gate
+
+# Surfaces publish-time failures of the Vulkan migration at commit time instead of at
+# release time. Three independent gates:
+#
+#   publish   - the two shapes we actually ship: GUI as a compressed single file, and
+#               Renderer through ILC. Any trim/AOT/single-file warning fails the job.
+#   probe     - does Silk.NET's loader and extension resolution, and a native RID asset,
+#               still work after single-file extraction and after NativeAOT? Publishing
+#               cleanly is not the same as running.
+#   golden    - agent A2's golden image suite under the Vulkan validation layers.
+#               Dormant until Tests/Renderer/Golden/ exists; see the job comment.
+#
+# build.yml stays the general CI. This file is deliberately separate so the migration
+# gates can be tightened without destabilising the release pipeline.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    paths-ignore:
+    - '.github/*_TEMPLATE/**'
+    - 'docs/**'
+    - '*.md'
+  pull_request:
+    paths-ignore:
+    - '.github/*_TEMPLATE/**'
+    - 'docs/**'
+    - '*.md'
+  workflow_dispatch:
+
+env:
+  NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+
+jobs:
+  publish:
+    name: Release publish (win-x64)
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Cache NuGet
+      uses: actions/cache@v6
+      with:
+        path: ${{ env.NUGET_PACKAGES }}
+        key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+        restore-keys: |
+          nuget-${{ runner.os }}-
+          nuget-
+
+    # GUI.csproj turns on PublishSingleFile for every configuration except Debug and sets
+    # EnableCompressionInSingleFile + IncludeNativeLibrariesForSelfExtract unconditionally,
+    # so -c Release is all it takes to reach the shipping shape. RuntimeIdentifier is
+    # win-x64 in the csproj; it is repeated here so a csproj change cannot silently move it.
+    - name: Publish GUI (single file, compressed, win-x64)
+      run: >
+        dotnet publish GUI/GUI.csproj
+        --configuration Release
+        --runtime win-x64
+        --self-contained
+        -warnaserror
+        -p:TrimmerSingleWarn=false
+        -fileLogger "-flp:LogFile=gui-publish.log;Verbosity=minimal"
+
+    - name: Assert the GUI really is one self-contained file
+      shell: pwsh
+      run: |
+        $dir = 'GUI/bin/Release/win-x64/publish'
+        $stray = Get-ChildItem $dir -File | Where-Object { $_.Extension -notin '.exe', '.pdb' }
+        if ($stray) {
+          Write-Host '::error::single-file publish left loose files beside the exe:'
+          $stray | ForEach-Object { Write-Host "::error::  $($_.Name)" }
+          exit 1
+        }
+        $exe = Get-Item "$dir/Source2Viewer.exe"
+        Write-Host "Source2Viewer.exe = $([math]::Round($exe.Length / 1MB, 1)) MB"
+
+    # Renderer.csproj sets PublishAot for every configuration except Debug. It is a library,
+    # so ILC needs an explicit root - Directory.Build.props supplies TrimmerRootAssembly for
+    # this project. Without it ILC emits a ~1 MB stub with zero warnings and this gate is
+    # theatre; the size assertion below is what keeps that honest.
+    - name: Publish Renderer (NativeAOT, win-x64)
+      run: >
+        dotnet publish Renderer/Renderer.csproj
+        --configuration Release
+        --runtime win-x64
+        -warnaserror
+        -p:TrimmerSingleWarn=false
+        -fileLogger "-flp:LogFile=renderer-publish.log;Verbosity=minimal"
+
+    - name: Assert ILC compiled the Renderer rather than a stub
+      shell: pwsh
+      run: |
+        $dll = Get-Item 'Renderer/bin/Release/win-x64/native/Renderer.dll'
+        $mb = [math]::Round($dll.Length / 1MB, 1)
+        Write-Host "native Renderer.dll = $mb MB"
+        if ($dll.Length -lt 4MB) {
+          Write-Host "::error::native Renderer.dll is only $mb MB - ILC found no roots, so the AOT gate analysed nothing. Check TrimmerRootAssembly in Directory.Build.props."
+          exit 1
+        }
+
+    # -warnaserror already fails the build, but ILC and ILLink can also report through
+    # channels MSBuild does not promote. Scanning the logs closes that gap.
+    - name: Fail on any trim, AOT or single-file diagnostic
+      shell: pwsh
+      run: |
+        # Anchored on the diagnostic prefix so that a compiler command line carrying
+        # /nowarn:IL2121 is not mistaken for a report.
+        $hits = Select-String -Path 'gui-publish.log', 'renderer-publish.log' -Pattern '(warning|error) IL\d{4}' -ErrorAction SilentlyContinue
+        if ($hits) {
+          Write-Host '::error::trim/AOT/single-file diagnostics were reported:'
+          $hits | ForEach-Object { Write-Host "::error::  $($_.Line.Trim())" }
+          exit 1
+        }
+        Write-Host 'No IL1xxx/IL2xxx/IL3xxx diagnostics.'
+
+    - name: Upload publish logs
+      uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: publish-gate-logs
+        path: '*-publish.log'
+        if-no-files-found: ignore
+
+  probe:
+    name: Vulkan loader survives publish (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: 10.0.x
+
+    # lavapipe is Mesa's software Vulkan implementation. GitHub runners have no GPU, so it
+    # is the only way to get a real VkDevice in CI - and it is also what the golden job
+    # renders against, which is why validation coverage lives on the Linux runner.
+    - name: Install Vulkan runtime (lavapipe + validation layers)
+      if: runner.os == 'Linux'
+      run: |
+        set -eux
+        sudo apt-get update
+        sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan1 vulkan-validationlayers
+
+    - name: Prepare the native RID asset sources
+      shell: bash
+      run: |
+        set -eux
+        cd "${RUNNER_TEMP}"
+        mkdir -p probe/native probe/nativepkg probe/feed probe/harness
+        cat > probe/native/vrfvma_stub.c <<'EOF'
+        // Stand-in for a native VMA wrapper. Only the shape matters: a C ABI export that
+        // receives vkGetInstanceProcAddr from managed code, exactly as VmaVulkanFunctions
+        // is populated in a real binding. Whether VMA ships native at all is agent A4's
+        // call - this harness answers the packaging question either way.
+        #include <stdint.h>
+        #if defined(_WIN32)
+        #define VRFVMA_API __declspec(dllexport)
+        #else
+        #define VRFVMA_API __attribute__((visibility("default")))
+        #endif
+        typedef void* (*PFN_gipa)(void*, const char*);
+        VRFVMA_API uint32_t vrfvma_version(void) { return 0x00030200u; }
+        VRFVMA_API uint32_t vrfvma_probe_entrypoints(PFN_gipa gipa, void* instance)
+        {
+            static const char* names[] = {
+                "vkGetPhysicalDeviceMemoryProperties", "vkAllocateMemory", "vkFreeMemory",
+                "vkMapMemory", "vkBindBufferMemory", "vkCreateBuffer" };
+            uint32_t resolved = 0;
+            if (!gipa) { return 0; }
+            for (uint32_t i = 0; i < 6; i++) { if (gipa(instance, names[i])) { resolved++; } }
+            return resolved;
+        }
+        EOF
+        if [ "${RUNNER_OS}" = "Windows" ]; then
+          RID=win-x64
+          EXE_SUFFIX=.exe
+        else
+          RID=linux-x64
+          EXE_SUFFIX=
+        fi
+        mkdir -p "probe/nativepkg/runtimes/${RID}/native"
+        echo "RID=${RID}" >> "$GITHUB_ENV"
+        echo "EXE_SUFFIX=${EXE_SUFFIX}" >> "$GITHUB_ENV"
+
+    - name: Compile the native library (MSVC)
+      if: runner.os == 'Windows'
+      shell: cmd
+      run: |
+        call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" || call "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+        cd /d "%RUNNER_TEMP%\probe\native"
+        cl /nologo /O2 /LD vrfvma_stub.c /Fe:..\nativepkg\runtimes\win-x64\native\vrfvma.dll
+        rem the import library and exports file must not end up inside the nupkg
+        del /q ..\nativepkg\runtimes\win-x64\native\vrfvma.lib ..\nativepkg\runtimes\win-x64\native\vrfvma.exp
+
+    - name: Compile the native library (gcc)
+      if: runner.os == 'Linux'
+      run: |
+        set -eux
+        cd "${RUNNER_TEMP}/probe/native"
+        gcc -O2 -shared -fPIC vrfvma_stub.c -o ../nativepkg/runtimes/linux-x64/native/libvrfvma.so
+
+    - name: Author the probe project
+      shell: bash
+      run: |
+        set -eux
+        cd "${RUNNER_TEMP}/probe"
+        : > nativepkg/_._
+        cat > nativepkg/VrfSpike.Vma.Native.csproj <<EOF
+        <Project Sdk="Microsoft.NET.Sdk">
+          <PropertyGroup>
+            <TargetFramework>net10.0</TargetFramework>
+            <PackageId>VrfSpike.Vma.Native</PackageId>
+            <Version>0.1.0</Version>
+            <Description>RID-native asset shape probe.</Description>
+            <IncludeBuildOutput>false</IncludeBuildOutput>
+            <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+            <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+            <NoWarn>\$(NoWarn);NU5128</NoWarn>
+          </PropertyGroup>
+          <ItemGroup>
+            <None Include="runtimes/${RID}/native/*" Pack="true" PackagePath="runtimes/${RID}/native/" />
+            <None Include="_._" Pack="true" PackagePath="lib/net10.0/_._" />
+          </ItemGroup>
+        </Project>
+        EOF
+        cat > NuGet.config <<'EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <configuration>
+          <packageSources>
+            <clear />
+            <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+            <add key="probe-local" value="./feed" />
+          </packageSources>
+        </configuration>
+        EOF
+        cat > harness/Harness.csproj <<EOF
+        <Project Sdk="Microsoft.NET.Sdk">
+          <PropertyGroup>
+            <OutputType>Exe</OutputType>
+            <TargetFramework>net10.0</TargetFramework>
+            <Nullable>enable</Nullable>
+            <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+            <RuntimeIdentifier>${RID}</RuntimeIdentifier>
+            <SelfContained>true</SelfContained>
+            <InvariantGlobalization>true</InvariantGlobalization>
+            <AssemblyName>VkPublishHarness</AssemblyName>
+            <!-- Mirrors Directory.Build.props: Release turns ILC warnings into errors. -->
+            <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+            <!--
+              Silk.NET.Core's DefaultPathResolver reads Assembly.Location, Assembly.CodeBase
+              and DependencyContext.Default to find native assets from deps.json. All three
+              are inert in a single-file or AOT app, so ILC reports six IL3000/IL3002. They
+              are diagnostics, not breakage - the probe below proves the fallback path still
+              loads everything. Downgrading only these two codes keeps the trim (IL2xxx) and
+              AOT (IL3050/IL3051) gates armed; the log scan afterwards checks that these six
+              are still the only ones, and that they still come only from Silk.NET.
+            -->
+            <WarningsNotAsErrors>IL3000;IL3002</WarningsNotAsErrors>
+            <TrimmerSingleWarn>false</TrimmerSingleWarn>
+            <IsAotCompatible>true</IsAotCompatible>
+            <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+            <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+          </PropertyGroup>
+          <ItemGroup>
+            <PackageReference Include="Silk.NET.Vulkan" Version="\$(SilkVersion)" />
+            <PackageReference Include="Silk.NET.Vulkan.Extensions.EXT" Version="\$(SilkVersion)" />
+            <PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="\$(SilkVersion)" />
+            <PackageReference Include="VrfSpike.Vma.Native" Version="0.1.0" />
+          </ItemGroup>
+        </Project>
+        EOF
+        cat > harness/Program.cs <<'EOF'
+        using System;
+        using System.Collections.Generic;
+        using System.Reflection;
+        using System.Runtime.InteropServices;
+        using Silk.NET.Core.Native;
+        using Silk.NET.Vulkan;
+        using Silk.NET.Vulkan.Extensions.EXT;
+        using Silk.NET.Vulkan.Extensions.KHR;
+
+        internal static unsafe partial class Program
+        {
+            private static int failures;
+
+            [LibraryImport("vrfvma", EntryPoint = "vrfvma_version")]
+            [UnmanagedCallConv(CallConvs = [typeof(System.Runtime.CompilerServices.CallConvCdecl)])]
+            private static partial uint VmaVersion();
+
+            [DllImport("vrfvma", EntryPoint = "vrfvma_probe_entrypoints", CallingConvention = CallingConvention.Cdecl)]
+            private static extern uint VmaProbe(IntPtr gipa, IntPtr instance);
+
+            private static void Ok(string s, string d) => Console.WriteLine($"PASS  {s,-42} {d}");
+            private static void Info(string s, string d) => Console.WriteLine($"INFO  {s,-42} {d}");
+            private static void Fail(string s, string d) { failures++; Console.WriteLine($"FAIL  {s,-42} {d}"); }
+
+            [System.Diagnostics.CodeAnalysis.UnconditionalSuppressMessage("SingleFile", "IL3000",
+                Justification = "An empty string is the signal that we are inside a bundle.")]
+            private static string Location() => Assembly.GetExecutingAssembly().Location;
+
+            public static int Main()
+            {
+                var requireDevice = Environment.GetEnvironmentVariable("PROBE_REQUIRE_DEVICE") == "1";
+                Info("BaseDirectory", AppContext.BaseDirectory);
+                Info("inside single-file bundle", (Location().Length == 0).ToString());
+                Info("dynamic code compiled", System.Runtime.CompilerServices.RuntimeFeature.IsDynamicCodeCompiled.ToString());
+
+                try { Ok("native RID asset (LibraryImport)", $"vrfvma_version = 0x{VmaVersion():X8}"); }
+                catch (Exception ex) { Fail("native RID asset (LibraryImport)", ex.Message); }
+
+                Vk? vk = null;
+                try { vk = Vk.GetApi(); Ok("Vk.GetApi", "loader constructed"); }
+                catch (Exception ex) { Fail("Vk.GetApi", $"{ex.GetType().Name}: {ex.Message}"); }
+                if (vk is null) { Console.WriteLine($"RESULT failures={failures}"); return failures; }
+
+                var available = new List<string>();
+                try
+                {
+                    uint n = 0;
+                    vk.EnumerateInstanceExtensionProperties((byte*)null, ref n, null);
+                    var props = new ExtensionProperties[n];
+                    fixed (ExtensionProperties* p = props) { vk.EnumerateInstanceExtensionProperties((byte*)null, ref n, p); }
+                    foreach (var p in props) { available.Add(SilkMarshal.PtrToString((nint)p.ExtensionName) ?? "?"); }
+                    Ok("vkEnumerateInstanceExtensionProperties", $"{n} extensions");
+                }
+                catch (Exception ex) { Fail("vkEnumerateInstanceExtensionProperties", $"{ex.GetType().Name}: {ex.Message}"); }
+
+                var wanted = available.FindAll(e => e is "VK_KHR_surface" or "VK_EXT_debug_utils");
+                Instance instance = default;
+                try
+                {
+                    var name = (byte*)SilkMarshal.StringToPtr("probe");
+                    var app = new ApplicationInfo { SType = StructureType.ApplicationInfo, PApplicationName = name, PEngineName = name, ApiVersion = Vk.Version13 };
+                    var ci = new InstanceCreateInfo
+                    {
+                        SType = StructureType.InstanceCreateInfo,
+                        PApplicationInfo = &app,
+                        EnabledExtensionCount = (uint)wanted.Count,
+                        PpEnabledExtensionNames = (byte**)SilkMarshal.StringArrayToPtr(wanted),
+                    };
+                    var r = vk.CreateInstance(in ci, null, out instance);
+                    if (r != Result.Success)
+                    {
+                        if (requireDevice) { Fail("vkCreateInstance", $"result={r}"); }
+                        else { Info("vkCreateInstance", $"result={r} - no ICD on this runner, extension stages skipped"); }
+                    }
+                    else { Ok("vkCreateInstance", string.Join(",", wanted)); }
+                }
+                catch (Exception ex) { Fail("vkCreateInstance", $"{ex.GetType().Name}: {ex.Message}"); }
+
+                if (instance.Handle == 0) { Console.WriteLine($"RESULT failures={failures}"); return failures; }
+
+                // The stage most at risk from trimming and AOT: Silk.NET resolving an
+                // extension object from a generic type argument.
+                try
+                {
+                    if (vk.TryGetInstanceExtension<KhrSurface>(instance, out _)) { Ok("TryGetInstanceExtension<KhrSurface>", "resolved"); }
+                    else { Fail("TryGetInstanceExtension<KhrSurface>", "returned false"); }
+                }
+                catch (Exception ex) { Fail("TryGetInstanceExtension<KhrSurface>", $"{ex.GetType().Name}: {ex.Message}"); }
+
+                try
+                {
+                    if (vk.TryGetInstanceExtension<ExtDebugUtils>(instance, out var du))
+                    {
+                        // Resolution returning an object is not proof the function pointers bound.
+                        var mi = new DebugUtilsMessengerCreateInfoEXT
+                        {
+                            SType = StructureType.DebugUtilsMessengerCreateInfoExt,
+                            MessageSeverity = DebugUtilsMessageSeverityFlagsEXT.WarningBitExt | DebugUtilsMessageSeverityFlagsEXT.ErrorBitExt,
+                            MessageType = DebugUtilsMessageTypeFlagsEXT.ValidationBitExt,
+                            PfnUserCallback = new PfnDebugUtilsMessengerCallbackEXT(Callback),
+                        };
+                        var r = du.CreateDebugUtilsMessenger(instance, in mi, null, out _);
+                        if (r == Result.Success) { Ok("ExtDebugUtils call-through", "messenger created"); }
+                        else { Fail("ExtDebugUtils call-through", $"result={r}"); }
+                    }
+                    else { Fail("TryGetInstanceExtension<ExtDebugUtils>", "returned false"); }
+                }
+                catch (Exception ex) { Fail("TryGetInstanceExtension<ExtDebugUtils>", $"{ex.GetType().Name}: {ex.Message}"); }
+
+                try
+                {
+                    uint n = 0;
+                    vk.EnumeratePhysicalDevices(instance, ref n, null);
+                    var devices = new PhysicalDevice[n];
+                    fixed (PhysicalDevice* p = devices) { vk.EnumeratePhysicalDevices(instance, ref n, p); }
+                    if (n == 0 && requireDevice) { Fail("vkEnumeratePhysicalDevices", "no physical devices"); }
+                    else { Ok("vkEnumeratePhysicalDevices", $"{n}"); }
+
+                    if (n > 0)
+                    {
+                        var prio = 1.0f;
+                        var q = new DeviceQueueCreateInfo { SType = StructureType.DeviceQueueCreateInfo, QueueCount = 1, PQueuePriorities = &prio };
+                        var swap = (byte*)SilkMarshal.StringToPtr(KhrSwapchain.ExtensionName);
+                        var ext = stackalloc byte*[1]; ext[0] = swap;
+                        var dci = new DeviceCreateInfo
+                        {
+                            SType = StructureType.DeviceCreateInfo,
+                            QueueCreateInfoCount = 1,
+                            PQueueCreateInfos = &q,
+                            EnabledExtensionCount = 1,
+                            PpEnabledExtensionNames = ext,
+                        };
+                        if (vk.CreateDevice(devices[0], in dci, null, out var device) == Result.Success)
+                        {
+                            if (vk.TryGetDeviceExtension<KhrSwapchain>(instance, device, out _)) { Ok("TryGetDeviceExtension<KhrSwapchain>", "resolved"); }
+                            else { Fail("TryGetDeviceExtension<KhrSwapchain>", "returned false"); }
+                            vk.DestroyDevice(device, null);
+                        }
+                    }
+                }
+                catch (Exception ex) { Fail("device stage", $"{ex.GetType().Name}: {ex.Message}"); }
+
+                try
+                {
+                    var lib = OperatingSystem.IsWindows() ? "vulkan-1" : "libvulkan.so.1";
+                    var gipa = NativeLibrary.GetExport(NativeLibrary.Load(lib), "vkGetInstanceProcAddr");
+                    var resolved = VmaProbe(gipa, (IntPtr)instance.Handle);
+                    if (resolved == 6) { Ok("native asset + vkGetInstanceProcAddr", "6/6 entrypoints"); }
+                    else { Fail("native asset + vkGetInstanceProcAddr", $"{resolved}/6"); }
+                }
+                catch (Exception ex) { Fail("native asset + vkGetInstanceProcAddr", $"{ex.GetType().Name}: {ex.Message}"); }
+
+                vk.DestroyInstance(instance, null);
+                Console.WriteLine($"RESULT failures={failures}");
+                return failures;
+            }
+
+            private static uint Callback(DebugUtilsMessageSeverityFlagsEXT s, DebugUtilsMessageTypeFlagsEXT t, DebugUtilsMessengerCallbackDataEXT* d, void* u)
+                => Vk.False;
+        }
+        EOF
+
+    - name: Pack the native asset into a local feed
+      shell: bash
+      env:
+        NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
+      run: dotnet pack "${RUNNER_TEMP}/probe/nativepkg/VrfSpike.Vma.Native.csproj" -c Release -o "${RUNNER_TEMP}/probe/feed"
+
+    # Keep this pinned to whatever Renderer.csproj ends up referencing (agent A4 owns that
+    # reference). A mismatch here makes the probe answer a question about the wrong version.
+    - name: Publish the probe as a compressed single file
+      shell: bash
+      run: >
+        dotnet publish "${RUNNER_TEMP}/probe/harness/Harness.csproj"
+        -c Release -r "${RID}" --self-contained
+        -p:SilkVersion=2.23.0
+        -p:PublishSingleFile=true
+        -p:EnableCompressionInSingleFile=true
+        -o "${RUNNER_TEMP}/probe/out-singlefile"
+
+    - name: Run the single-file probe
+      shell: bash
+      env:
+        PROBE_REQUIRE_DEVICE: ${{ runner.os == 'Linux' && '1' || '0' }}
+      run: |
+        set -eux
+        # Only the native RID asset should be extracted from the bundle; everything else
+        # stays inside the exe. Listing the extraction directory proves it.
+        export DOTNET_BUNDLE_EXTRACT_BASE_DIR="${RUNNER_TEMP}/probe/extract"
+        rm -rf "$DOTNET_BUNDLE_EXTRACT_BASE_DIR"
+        "${RUNNER_TEMP}/probe/out-singlefile/VkPublishHarness${EXE_SUFFIX}"
+        find "$DOTNET_BUNDLE_EXTRACT_BASE_DIR" -type f -exec basename {} \;
+
+    # NativeAOT is where Silk.NET's ILC diagnostics show up. TreatWarningsAsErrors is on in
+    # the harness csproj exactly as Directory.Build.props sets it for the repo, so this step
+    # fails on the same diagnostics a real Renderer AOT publish would hit.
+    - name: Publish the probe with NativeAOT
+      shell: bash
+      run: >
+        dotnet publish "${RUNNER_TEMP}/probe/harness/Harness.csproj"
+        -c Release -r "${RID}"
+        -p:SilkVersion=2.23.0
+        -p:PublishAot=true
+        -p:PublishSingleFile=false
+        -p:PublishReadyToRun=false
+        -o "${RUNNER_TEMP}/probe/out-aot"
+        -fileLogger "-flp:LogFile=${RUNNER_TEMP}/probe-aot.log;Verbosity=minimal"
+
+    - name: Fail on any ILC diagnostic beyond the known Silk.NET six
+      shell: bash
+      run: |
+        set -uo pipefail
+        log="${RUNNER_TEMP}/probe-aot.log"
+        # Match on the diagnostic prefix, so a compiler command line carrying
+        # /nowarn:IL2121 is not mistaken for a report.
+        reported=$(grep -oE '(warning|error) IL[0-9]{4}' "$log" | grep -oE 'IL[0-9]{4}' | sort -u)
+        echo "codes reported: ${reported:-none}"
+        bad=0
+        for code in $reported; do
+          case "$code" in
+            # The two known Silk.NET single-file diagnostics. Everything else - every trim
+            # warning, every real AOT warning - is a new problem and fails the job.
+            IL3000|IL3002) ;;
+            *) echo "::error::unexpected ILC diagnostic $code"; bad=1 ;;
+          esac
+        done
+        # And those two are tolerated only from Silk.NET's loader and DependencyModel.
+        if grep -E '(warning|error) IL300[02]' "$log" \
+           | grep -vE 'Silk\.NET\.Core\.Loader|Microsoft\.Extensions\.DependencyModel'; then
+          echo '::error::IL3000/IL3002 reported from an assembly other than Silk.NET.Core or DependencyModel.'
+          bad=1
+        fi
+        exit $bad
+
+    - name: Run the NativeAOT probe
+      shell: bash
+      env:
+        PROBE_REQUIRE_DEVICE: ${{ runner.os == 'Linux' && '1' || '0' }}
+      run: "${RUNNER_TEMP}/probe/out-aot/VkPublishHarness${EXE_SUFFIX}"
+
+  golden:
+    name: Golden images under Vulkan validation
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7
+
+    # Agent A2 is building the suite at Tests/Renderer/Golden/. Until that lands this job
+    # reports a notice and stops; every step below activates on its own once the directory
+    # exists, with no edit to this file.
+    - name: Detect the golden image suite
+      id: detect
+      run: |
+        if [ -d Tests/Renderer/Golden ]; then
+          echo 'present=true' >> "$GITHUB_OUTPUT"
+        else
+          echo 'present=false' >> "$GITHUB_OUTPUT"
+          echo '::notice::Tests/Renderer/Golden/ does not exist yet - golden validation job is dormant.'
+        fi
+
+    - name: Setup .NET
+      if: steps.detect.outputs.present == 'true'
+      uses: actions/setup-dotnet@v6
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Cache NuGet
+      if: steps.detect.outputs.present == 'true'
+      uses: actions/cache@v6
+      with:
+        path: ${{ env.NUGET_PACKAGES }}
+        key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+        restore-keys: |
+          nuget-${{ runner.os }}-
+          nuget-
+
+    # GitHub runners have no GPU. lavapipe is Mesa's software Vulkan device and is what
+    # makes golden images reproducible here in the first place - a hardware driver would
+    # not give bit-identical output across runner generations anyway.
+    - name: Install lavapipe and the Khronos validation layers
+      if: steps.detect.outputs.present == 'true'
+      run: |
+        set -eux
+        sudo apt-get update
+        sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan1 vulkan-validationlayers
+        vulkaninfo --summary | head -40
+
+    - name: Run the golden image suite with validation enabled
+      if: steps.detect.outputs.present == 'true'
+      env:
+        # Both spellings: VK_INSTANCE_LAYERS for older loaders, VK_LOADER_LAYERS_ENABLE for
+        # 1.3.234+. Setting the layer here means the suite does not have to opt in.
+        VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+        VK_LOADER_LAYERS_ENABLE: VK_LAYER_KHRONOS_validation
+        # Report through the layer's own logger as well, so a run still produces evidence
+        # even if the suite has not installed a VK_EXT_debug_utils messenger.
+        VK_LAYER_KHRONOS_VALIDATION_DEBUG_ACTION: VK_DBG_LAYER_ACTION_LOG_MSG
+        VK_LAYER_KHRONOS_VALIDATION_REPORT_FLAGS: error,warn,perf
+        VK_LAYER_KHRONOS_VALIDATION_LOG_FILENAME: stdout
+        # VK_DRIVER_FILES is the current spelling; VK_ICD_FILENAMES covers older loaders.
+        VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        # The suite reads this to know it may assert on validation output.
+        VRF_VULKAN_VALIDATION: '1'
+      run: |
+        set -o pipefail
+        dotnet test --project ./Tests/Tests.csproj --configuration Release 2>&1 | tee golden-validation.log
+
+    # Belt and braces. The suite's own debug-utils callback should be the primary gate;
+    # this catches validation messages that reached stdout without failing a test.
+    - name: Fail on any validation output
+      if: steps.detect.outputs.present == 'true'
+      run: |
+        if grep -nE 'VUID-|Validation Error|Validation Warning|UNASSIGNED-' golden-validation.log; then
+          echo '::error::Vulkan validation layer reported messages during the golden image suite.'
+          exit 1
+        fi
+        echo 'No validation output.'
+
+    - name: Upload golden validation log
+      if: always() && steps.detect.outputs.present == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: golden-validation-log
+        path: golden-validation.log
+        if-no-files-found: ignore
