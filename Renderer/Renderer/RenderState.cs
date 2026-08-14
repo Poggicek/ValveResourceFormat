@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 
 namespace ValveResourceFormat.Renderer
@@ -102,10 +103,15 @@ namespace ValveResourceFormat.Renderer
         Decrement,
     }
 
+    // The state descriptors are packed plain-old-data (byte enums, Pack = 1, no padding), so a
+    // descriptor's raw bytes are its exact bit image: RenderStateTracker diffs them with plain
+    // memory compares, and they can later serve directly as hash keys for state-object dedup.
+
     /// <summary>Stencil test state. Mirrors <see href="https://s2v.app/SchemaExplorer/cs2/rendersystemdx11/RsStencilStateDesc_t"><c>RsStencilStateDesc_t</c></see>; one set of ops serves both
     /// faces until a consumer needs Valve's front/back split. The reference value is
     /// <see cref="DepthStencilStateDesc.StencilRef"/> - D3D and Vulkan treat it as bind-time dynamic
     /// state, and it stays out of this descriptor to match.</summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public record struct StencilStateDesc
     {
         /// <summary>Whether stencil testing is enabled.</summary>
@@ -125,6 +131,7 @@ namespace ValveResourceFormat.Renderer
     }
 
     /// <summary>Rasterizer state. Mirrors <see href="https://s2v.app/SchemaExplorer/cs2/rendersystemdx11/RsRasterizerStateDesc_t"><c>RsRasterizerStateDesc_t</c></see>.</summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public record struct RasterizerStateDesc
     {
         /// <summary>Polygon fill mode.</summary>
@@ -140,6 +147,7 @@ namespace ValveResourceFormat.Renderer
     }
 
     /// <summary>Depth and stencil test state. Mirrors <see href="https://s2v.app/SchemaExplorer/cs2/rendersystemdx11/RsDepthStencilStateDesc_t"><c>RsDepthStencilStateDesc_t</c></see>.</summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public record struct DepthStencilStateDesc
     {
         /// <summary>Whether depth testing is enabled.</summary>
@@ -156,6 +164,7 @@ namespace ValveResourceFormat.Renderer
     }
 
     /// <summary>Blend state. Mirrors <see href="https://s2v.app/SchemaExplorer/cs2/rendersystemdx11/RsBlendStateDesc_t"><c>RsBlendStateDesc_t</c></see> for a single render target.</summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public record struct BlendStateDesc
     {
         /// <summary>Whether blending is enabled.</summary>
@@ -176,6 +185,7 @@ namespace ValveResourceFormat.Renderer
     /// state descriptors. Pure data: state is composed, not toggled, and the per-GL-context
     /// <see cref="RenderStateTracker"/> (on <see cref="RendererContext.RenderState"/>) applies it.
     /// </summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public record struct RenderState
     {
         // Fields rather than properties so members can be set directly (state.DepthStencil.DepthFunc = x);
@@ -298,151 +308,269 @@ namespace ValveResourceFormat.Renderer
             Apply(in state);
         }
 
-        /// <summary>Applies a state to GL, emitting calls only for fields that differ from the
-        /// previously applied state.</summary>
+        /// <summary>Re-applies the pass baseline. Draw restores are lazy - a material leaves its
+        /// state latched and the next draw's own apply diffs from it - so call this before raw GL
+        /// work that assumes the baseline: framebuffer clears (they respect the write masks) and
+        /// draws that do not apply state of their own.</summary>
+        public void ReassertCurrentPass() => Apply(CurrentPass);
+
+        /// <summary>Applies a state to GL. The diff is bit logic, Valve-style, at two levels: each
+        /// descriptor's raw bits are compared against the last applied ones in a single memory
+        /// compare, and a changed descriptor then emits only the calls whose fields actually
+        /// differ - an unchanged group costs one compare, a changed one only its changed
+        /// calls.</summary>
         /// <param name="state">The state to apply.</param>
         public void Apply(in RenderState state)
         {
             var force = !appliedValid;
 
-            if (!force && state == applied)
+            PerfStats.Active.Count(Counter.RenderStateApply);
+
+            if (force || !BitwiseEquals(in state.Rasterizer, in applied.Rasterizer))
             {
-                return;
+                PerfStats.Active.Count(Counter.RenderStateGroupEmit);
+                ApplyRasterizer(in state.Rasterizer, in applied.Rasterizer, force);
             }
 
-            if (force || state.Rasterizer.FillMode != applied.Rasterizer.FillMode)
+            if (force || !BitwiseEquals(in state.DepthStencil, in applied.DepthStencil))
             {
-                GL.PolygonMode(TriangleFace.FrontAndBack, state.Rasterizer.FillMode == FillMode.Wireframe ? PolygonMode.Line : PolygonMode.Fill);
+                PerfStats.Active.Count(Counter.RenderStateGroupEmit);
+                ApplyDepthStencil(in state.DepthStencil, in applied.DepthStencil, force);
             }
 
-            if (force || state.Rasterizer.CullMode != applied.Rasterizer.CullMode)
+            if (force || !BitwiseEquals(in state.Blend, in applied.Blend))
             {
-                if (state.Rasterizer.CullMode == CullMode.None)
-                {
-                    GL.Disable(EnableCap.CullFace);
-                }
-                else
-                {
-                    GL.Enable(EnableCap.CullFace);
-                    GL.CullFace(state.Rasterizer.CullMode == CullMode.Front ? TriangleFace.Front : TriangleFace.Back);
-                }
-            }
-
-            if (force
-                || state.Rasterizer.DepthBias != applied.Rasterizer.DepthBias
-                || state.Rasterizer.DepthBiasClamp != applied.Rasterizer.DepthBiasClamp
-                || state.Rasterizer.SlopeScaledDepthBias != applied.Rasterizer.SlopeScaledDepthBias)
-            {
-                // Both polygon modes get the bias, Vulkan-style, so a biased material stays biased in wireframe.
-                if (state.Rasterizer.DepthBias != 0f || state.Rasterizer.SlopeScaledDepthBias != 0f)
-                {
-                    GL.Enable(EnableCap.PolygonOffsetFill);
-                    GL.Enable(EnableCap.PolygonOffsetLine);
-                    GL.PolygonOffsetClamp(state.Rasterizer.SlopeScaledDepthBias, state.Rasterizer.DepthBias, state.Rasterizer.DepthBiasClamp);
-                }
-                else
-                {
-                    GL.Disable(EnableCap.PolygonOffsetFill);
-                    GL.Disable(EnableCap.PolygonOffsetLine);
-                    GL.PolygonOffsetClamp(0f, 0f, 0f);
-                }
-            }
-
-            if (force || state.DepthStencil.DepthTestEnable != applied.DepthStencil.DepthTestEnable)
-            {
-                if (state.DepthStencil.DepthTestEnable)
-                {
-                    GL.Enable(EnableCap.DepthTest);
-                }
-                else
-                {
-                    GL.Disable(EnableCap.DepthTest);
-                }
-            }
-
-            if (force || state.DepthStencil.DepthWriteEnable != applied.DepthStencil.DepthWriteEnable)
-            {
-                GL.DepthMask(state.DepthStencil.DepthWriteEnable);
-            }
-
-            if (force || state.DepthStencil.DepthFunc != applied.DepthStencil.DepthFunc)
-            {
-                GL.DepthFunc(ToGL(state.DepthStencil.DepthFunc));
-            }
-
-            var stencil = state.DepthStencil.Stencil;
-            var appliedStencil = applied.DepthStencil.Stencil;
-
-            if (force || stencil.StencilEnable != appliedStencil.StencilEnable)
-            {
-                if (stencil.StencilEnable)
-                {
-                    GL.Enable(EnableCap.StencilTest);
-                }
-                else
-                {
-                    GL.Disable(EnableCap.StencilTest);
-                }
-            }
-
-            if (force
-                || stencil.FailOp != appliedStencil.FailOp
-                || stencil.DepthFailOp != appliedStencil.DepthFailOp
-                || stencil.PassOp != appliedStencil.PassOp)
-            {
-                GL.StencilOp(ToGL(stencil.FailOp), ToGL(stencil.DepthFailOp), ToGL(stencil.PassOp));
-            }
-
-            if (force
-                || stencil.Func != appliedStencil.Func
-                || stencil.ReadMask != appliedStencil.ReadMask
-                || state.DepthStencil.StencilRef != applied.DepthStencil.StencilRef)
-            {
-                GL.StencilFunc(ToGLStencil(stencil.Func), state.DepthStencil.StencilRef, stencil.ReadMask);
-            }
-
-            if (force || stencil.WriteMask != appliedStencil.WriteMask)
-            {
-                GL.StencilMask(stencil.WriteMask);
-            }
-
-            if (force || state.Blend.BlendEnable != applied.Blend.BlendEnable)
-            {
-                if (state.Blend.BlendEnable)
-                {
-                    GL.Enable(EnableCap.Blend);
-                }
-                else
-                {
-                    GL.Disable(EnableCap.Blend);
-                }
-            }
-
-            if (force || state.Blend.SrcBlend != applied.Blend.SrcBlend || state.Blend.DstBlend != applied.Blend.DstBlend)
-            {
-                GL.BlendFunc(ToGLSrc(state.Blend.SrcBlend), ToGLDst(state.Blend.DstBlend));
-            }
-
-            if (force || state.Blend.AlphaToCoverageEnable != applied.Blend.AlphaToCoverageEnable)
-            {
-                if (state.Blend.AlphaToCoverageEnable)
-                {
-                    GL.Enable(EnableCap.SampleAlphaToCoverage);
-                }
-                else
-                {
-                    GL.Disable(EnableCap.SampleAlphaToCoverage);
-                }
-            }
-
-            if (force || state.Blend.RenderTargetWriteMask != applied.Blend.RenderTargetWriteMask)
-            {
-                var mask = state.Blend.RenderTargetWriteMask;
-                GL.ColorMask((mask & 1) != 0, (mask & 2) != 0, (mask & 4) != 0, (mask & 8) != 0);
+                PerfStats.Active.Count(Counter.RenderStateGroupEmit);
+                ApplyBlend(in state.Blend, in applied.Blend, force);
             }
 
             applied = state;
             appliedValid = true;
+        }
+
+        /// <summary>Compares two descriptors as raw bits - packed plain-old-data makes the memory
+        /// image the complete state, so this one compare is the whole diff.</summary>
+        private static bool BitwiseEquals<T>(in T a, in T b) where T : unmanaged
+            => MemoryMarshal.AsBytes(new ReadOnlySpan<T>(in a))
+                .SequenceEqual(MemoryMarshal.AsBytes(new ReadOnlySpan<T>(in b)));
+
+        private static void ApplyRasterizer(in RasterizerStateDesc rasterizer, in RasterizerStateDesc prev, bool force)
+        {
+            if (force || rasterizer.FillMode != prev.FillMode)
+            {
+                CountedGL.PolygonMode(TriangleFace.FrontAndBack, rasterizer.FillMode == FillMode.Wireframe ? PolygonMode.Line : PolygonMode.Fill);
+            }
+
+            if (force || rasterizer.CullMode != prev.CullMode)
+            {
+                if (rasterizer.CullMode == CullMode.None)
+                {
+                    CountedGL.Disable(EnableCap.CullFace);
+                }
+                else
+                {
+                    CountedGL.Enable(EnableCap.CullFace);
+                    CountedGL.CullFace(rasterizer.CullMode == CullMode.Front ? TriangleFace.Front : TriangleFace.Back);
+                }
+            }
+
+            if (force
+                || rasterizer.DepthBias != prev.DepthBias
+                || rasterizer.DepthBiasClamp != prev.DepthBiasClamp
+                || rasterizer.SlopeScaledDepthBias != prev.SlopeScaledDepthBias)
+            {
+                // Both polygon modes get the bias, Vulkan-style, so a biased material stays biased in wireframe.
+                if (rasterizer.DepthBias != 0f || rasterizer.SlopeScaledDepthBias != 0f)
+                {
+                    CountedGL.Enable(EnableCap.PolygonOffsetFill);
+                    CountedGL.Enable(EnableCap.PolygonOffsetLine);
+                    CountedGL.PolygonOffsetClamp(rasterizer.SlopeScaledDepthBias, rasterizer.DepthBias, rasterizer.DepthBiasClamp);
+                }
+                else
+                {
+                    CountedGL.Disable(EnableCap.PolygonOffsetFill);
+                    CountedGL.Disable(EnableCap.PolygonOffsetLine);
+                    CountedGL.PolygonOffsetClamp(0f, 0f, 0f);
+                }
+            }
+        }
+
+        private static void ApplyDepthStencil(in DepthStencilStateDesc depthStencil, in DepthStencilStateDesc prev, bool force)
+        {
+            if (force || depthStencil.DepthTestEnable != prev.DepthTestEnable)
+            {
+                if (depthStencil.DepthTestEnable)
+                {
+                    CountedGL.Enable(EnableCap.DepthTest);
+                }
+                else
+                {
+                    CountedGL.Disable(EnableCap.DepthTest);
+                }
+            }
+
+            if (force || depthStencil.DepthWriteEnable != prev.DepthWriteEnable)
+            {
+                CountedGL.DepthMask(depthStencil.DepthWriteEnable);
+            }
+
+            if (force || depthStencil.DepthFunc != prev.DepthFunc)
+            {
+                CountedGL.DepthFunc(ToGL(depthStencil.DepthFunc));
+            }
+
+            var stencil = depthStencil.Stencil;
+            var prevStencil = prev.Stencil;
+
+            if (force || stencil.StencilEnable != prevStencil.StencilEnable)
+            {
+                if (stencil.StencilEnable)
+                {
+                    CountedGL.Enable(EnableCap.StencilTest);
+                }
+                else
+                {
+                    CountedGL.Disable(EnableCap.StencilTest);
+                }
+            }
+
+            if (force
+                || stencil.FailOp != prevStencil.FailOp
+                || stencil.DepthFailOp != prevStencil.DepthFailOp
+                || stencil.PassOp != prevStencil.PassOp)
+            {
+                CountedGL.StencilOp(ToGL(stencil.FailOp), ToGL(stencil.DepthFailOp), ToGL(stencil.PassOp));
+            }
+
+            if (force
+                || stencil.Func != prevStencil.Func
+                || stencil.ReadMask != prevStencil.ReadMask
+                || depthStencil.StencilRef != prev.StencilRef)
+            {
+                CountedGL.StencilFunc(ToGLStencil(stencil.Func), depthStencil.StencilRef, stencil.ReadMask);
+            }
+
+            if (force || stencil.WriteMask != prevStencil.WriteMask)
+            {
+                CountedGL.StencilMask(stencil.WriteMask);
+            }
+        }
+
+        private static void ApplyBlend(in BlendStateDesc blend, in BlendStateDesc prev, bool force)
+        {
+            if (force || blend.BlendEnable != prev.BlendEnable)
+            {
+                if (blend.BlendEnable)
+                {
+                    CountedGL.Enable(EnableCap.Blend);
+                }
+                else
+                {
+                    CountedGL.Disable(EnableCap.Blend);
+                }
+            }
+
+            if (force || blend.SrcBlend != prev.SrcBlend || blend.DstBlend != prev.DstBlend)
+            {
+                CountedGL.BlendFunc(ToGLSrc(blend.SrcBlend), ToGLDst(blend.DstBlend));
+            }
+
+            if (force || blend.AlphaToCoverageEnable != prev.AlphaToCoverageEnable)
+            {
+                if (blend.AlphaToCoverageEnable)
+                {
+                    CountedGL.Enable(EnableCap.SampleAlphaToCoverage);
+                }
+                else
+                {
+                    CountedGL.Disable(EnableCap.SampleAlphaToCoverage);
+                }
+            }
+
+            if (force || blend.RenderTargetWriteMask != prev.RenderTargetWriteMask)
+            {
+                var mask = blend.RenderTargetWriteMask;
+                CountedGL.ColorMask((mask & 1) != 0, (mask & 2) != 0, (mask & 4) != 0, (mask & 8) != 0);
+            }
+        }
+
+        /// <summary>Forwards each state call to GL while counting it, so the stats overlay reports
+        /// the exact number of state calls issued rather than a hardcoded estimate.</summary>
+        private static class CountedGL
+        {
+            private static void Count() => PerfStats.Active.Count(Counter.RenderStateGlCall);
+
+            public static void Enable(EnableCap cap)
+            {
+                Count();
+                GL.Enable(cap);
+            }
+
+            public static void Disable(EnableCap cap)
+            {
+                Count();
+                GL.Disable(cap);
+            }
+
+            public static void DepthMask(bool flag)
+            {
+                Count();
+                GL.DepthMask(flag);
+            }
+
+            public static void BlendFunc(BlendingFactor sfactor, BlendingFactor dfactor)
+            {
+                Count();
+                GL.BlendFunc(sfactor, dfactor);
+            }
+
+            public static void DepthFunc(DepthFunction func)
+            {
+                Count();
+                GL.DepthFunc(func);
+            }
+
+            public static void PolygonOffsetClamp(float factor, float units, float clamp)
+            {
+                Count();
+                GL.PolygonOffsetClamp(factor, units, clamp);
+            }
+
+            public static void ColorMask(bool red, bool green, bool blue, bool alpha)
+            {
+                Count();
+                GL.ColorMask(red, green, blue, alpha);
+            }
+
+            public static void CullFace(TriangleFace mode)
+            {
+                Count();
+                GL.CullFace(mode);
+            }
+
+            public static void PolygonMode(TriangleFace face, OpenTK.Graphics.OpenGL.PolygonMode mode)
+            {
+                Count();
+                GL.PolygonMode(face, mode);
+            }
+
+            public static void StencilOp(OpenTK.Graphics.OpenGL.StencilOp fail, OpenTK.Graphics.OpenGL.StencilOp zfail, OpenTK.Graphics.OpenGL.StencilOp zpass)
+            {
+                Count();
+                GL.StencilOp(fail, zfail, zpass);
+            }
+
+            public static void StencilFunc(StencilFunction func, int reference, uint mask)
+            {
+                Count();
+                GL.StencilFunc(func, reference, mask);
+            }
+
+            public static void StencilMask(uint mask)
+            {
+                Count();
+                GL.StencilMask(mask);
+            }
         }
 
         // The renderer is reverse-Z: greater depth values are closer to the camera.

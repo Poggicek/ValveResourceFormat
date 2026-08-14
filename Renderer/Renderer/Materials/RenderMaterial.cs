@@ -794,12 +794,12 @@ namespace ValveResourceFormat.Renderer.Materials
             SetMatrix(shader, buffer, "g_mTextureColorAdjust", Matrix4x4.Multiply(tintMatrix, ccMatrix));
         }
 
-        /// <summary>Restores the pass baseline render state after the draw call for this material has completed.</summary>
+        /// <summary>Releases the per-material sampler binds after the draw call for this material.
+        /// Render state is left latched rather than restored: the next draw's own apply diffs from
+        /// it, and pass boundaries reassert their baseline - so runs of same-state materials cost
+        /// no state calls at all.</summary>
         public void PostRender()
         {
-            var renderState = Shader.RendererContext.RenderState;
-            renderState.Apply(renderState.CurrentPass);
-
             foreach (var unit in boundSamplerUnits)
             {
                 GL.BindSampler(unit, 0);

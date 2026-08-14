@@ -568,6 +568,8 @@ public class Renderer
         ViewBuffer.Data.ViewportSize = new Vector2(w, h);
         ViewBuffer.Data.InvViewportSize = Vector2.One / ViewBuffer.Data.ViewportSize;
 
+        // Draw restores are lazy; the clear respects write masks, so reassert the baseline first.
+        RendererContext.RenderState.ReassertCurrentPass();
         renderContext.Framebuffer.BindAndClear();
 
         var isMainFramebuffer = ReferenceEquals(renderContext.Framebuffer, MainFramebuffer);
@@ -800,6 +802,10 @@ public class Renderer
         {
             throw new InvalidOperationException("Initialize() must be called before rendering");
         }
+
+        // Draw restores are lazy; the depth clear respects the write mask, and the depth-only
+        // draws below apply no state of their own, so reassert the baseline first.
+        RendererContext.RenderState.ReassertCurrentPass();
 
         GL.Viewport(0, 0, ShadowDepthBuffer.Width, ShadowDepthBuffer.Height);
         ShadowDepthBuffer.Bind(FramebufferTarget.Framebuffer);
