@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 using ValveResourceFormat.ResourceTypes;
 
 namespace ValveResourceFormat.Renderer.SceneNodes
@@ -38,6 +40,11 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
         /// <summary>Gets the vertex array state for this shape.</summary>
         protected int vao { get; private set; }
+
+        // Non-owning RHI views of the buffers built in Init, so the draw can be recorded through a
+        // command list before buffer allocation itself moves onto IDevice.
+        private GLBuffer? vertexRhiBuffer;
+        private GLBuffer? indexRhiBuffer;
 
         /// <summary>Gets whether this shape uses normal-based shading.</summary>
         protected virtual bool Shaded { get; } = true;
@@ -112,8 +119,16 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             GL.CreateBuffers(1, out int vboHandle);
             GL.CreateBuffers(1, out int iboHandle);
 
-            GL.NamedBufferData(vboHandle, verts.Count * SimpleVertexNormal.InputLayout.Stride, ListAccessors<SimpleVertexNormal>.GetBackingArray(verts), BufferUsageHint.StaticDraw);
-            GL.NamedBufferData(iboHandle, inds.Count * sizeof(int), ListAccessors<int>.GetBackingArray(inds), BufferUsageHint.StaticDraw);
+            var vertexSizeBytes = verts.Count * SimpleVertexNormal.InputLayout.Stride;
+            var indexSizeBytes = inds.Count * sizeof(int);
+
+            GL.NamedBufferData(vboHandle, vertexSizeBytes, ListAccessors<SimpleVertexNormal>.GetBackingArray(verts), BufferUsageHint.StaticDraw);
+            GL.NamedBufferData(iboHandle, indexSizeBytes, ListAccessors<int>.GetBackingArray(inds), BufferUsageHint.StaticDraw);
+
+            // Static geometry, uploaded once here and never rewritten, so these views stay valid for the
+            // lifetime of the node and none of the per-frame streaming concerns apply to this renderer.
+            vertexRhiBuffer = GLBuffer.Wrap(vboHandle, vertexSizeBytes, BufferUsage.Vertex, BufferMemory.DeviceLocal, nameof(ShapeSceneNode));
+            indexRhiBuffer = GLBuffer.Wrap(iboHandle, indexSizeBytes, BufferUsage.Index, BufferMemory.DeviceLocal, nameof(ShapeSceneNode));
 
             vao = SimpleVertexNormal.InputLayout.CreateVertexArray(nameof(ShapeSceneNode), vboHandle, iboHandle);
 
@@ -365,7 +380,22 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 renderShader.SetTexture(0, "g_tColor", ToolTexture);
             }
 
-            VertexArray.Bind(vao, renderShader);
+            var commandList = context.CommandList;
+
+            if (commandList == null)
+            {
+                VertexArray.Bind(vao, renderShader);
+            }
+            else
+            {
+                commandList.BindVertexBuffer(0, vertexRhiBuffer!);
+                commandList.BindIndexBuffer(indexRhiBuffer!, IndexType.UInt32);
+
+                if (ToolTexture != null)
+                {
+                    commandList.BindTexture(DescriptorSets.MaterialTextures, 0, ToolTexture.RhiTexture);
+                }
+            }
 
             var renderState = Scene.RendererContext.RenderState;
             var state = renderState.CurrentPass;
@@ -385,7 +415,15 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 lineState.Rasterizer.FillMode = FillMode.Wireframe;
                 lineState.Blend.BlendEnable = false;
                 renderState.Apply(in lineState);
-                GL.DrawElements(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0);
+
+                if (commandList != null)
+                {
+                    commandList.DrawIndexed(indexCount);
+                }
+                else
+                {
+                    GL.DrawElements(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0);
+                }
 
                 // Triangles
                 var fillState = state;
@@ -396,12 +434,24 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 fillState.Rasterizer.DepthBias = 100f;
                 fillState.Rasterizer.DepthBiasClamp = 0.05f;
                 renderState.Apply(in fillState);
-                GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
+                DrawPicking(commandList);
             }
             else
             {
-                GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
+                DrawPicking(commandList);
             }
+        }
+
+        // The scene node id rides in the base instance, which is what the picking buffer reads back.
+        private void DrawPicking(ICommandList? commandList)
+        {
+            if (commandList != null)
+            {
+                commandList.DrawIndexed(indexCount, instanceCount: 1, firstIndex: 0, baseVertex: 0, firstInstance: (int)Id);
+                return;
+            }
+
+            GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
         }
 
         /// <inheritdoc/>

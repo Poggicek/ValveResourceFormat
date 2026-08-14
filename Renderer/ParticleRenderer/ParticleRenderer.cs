@@ -262,7 +262,14 @@ namespace ValveResourceFormat.Renderer.Particles
         /// <summary>
         /// Draws the renderers belonging to <paramref name="pass"/>.
         /// </summary>
-        public void Render(Camera camera, RenderPass pass)
+        /// <param name="camera">The camera being drawn from.</param>
+        /// <param name="pass">The pass to draw.</param>
+        /// <param name="context">
+        /// The pass being drawn, when the caller has one. Supplying it lets a ported renderer record
+        /// through <see cref="Scene.RenderContext.CommandList"/>; without it every renderer takes its
+        /// camera-only overload and draws through OpenGL.
+        /// </param>
+        public void Render(Camera camera, RenderPass pass, Scene.RenderContext? context = null)
         {
             var wantedPass = pass == RenderPass.DepthOnly ? RenderPass.Opaque : pass;
 
@@ -273,7 +280,7 @@ namespace ValveResourceFormat.Renderer.Particles
                     continue;
                 }
 
-                childParticleRenderer.Render(camera, pass);
+                childParticleRenderer.Render(camera, pass, context);
             }
 
             if (particleCollection.Count > 0)
@@ -292,7 +299,15 @@ namespace ValveResourceFormat.Renderer.Particles
                         continue;
                     }
 
-                    renderer.Render(particleCollection, systemRenderState, camera);
+                    if (context.HasValue)
+                    {
+                        renderer.Render(particleCollection, systemRenderState, context.Value);
+                    }
+                    else
+                    {
+                        renderer.Render(particleCollection, systemRenderState, camera);
+                    }
+
                     rendered = true;
                 }
 
@@ -343,6 +358,8 @@ namespace ValveResourceFormat.Renderer.Particles
                     continue;
                 }
 
+                // Camera-only on purpose: prewarm is driven from the viewer, before and outside any pass,
+                // so there is no render context in this chain to carry a command list.
                 renderer.Render(particleCollection, systemRenderState, camera);
             }
 

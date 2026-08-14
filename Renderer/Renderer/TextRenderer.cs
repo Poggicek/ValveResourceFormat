@@ -4,6 +4,8 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 using SkiaSharp;
+using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 
 namespace ValveResourceFormat.Renderer
 {
@@ -228,6 +230,15 @@ namespace ValveResourceFormat.Renderer
         private int bufferHandle;
         private int vao;
 
+        // Non-owning RHI views of the two OpenGL buffers this renderer draws from, so the draw can be
+        // recorded through a command list before buffer allocation itself moves onto IDevice. The vertex
+        // view is rebuilt whenever the frame's glyph count changes the buffer's size.
+        private GLBuffer? vertexRhiBuffer;
+        private GLBuffer? quadIndexRhiBuffer;
+
+        // :SharedQuadIndexCount - the shared index buffer GPUMeshBufferCache allocates, in indices.
+        private const int SharedQuadIndexCount = 65532;
+
         /// <summary>Initializes the text renderer.</summary>
         /// <param name="rendererContext">Renderer context for loading shaders.</param>
         /// <param name="camera">Camera (unused at construction; required at render time).</param>
@@ -347,7 +358,11 @@ namespace ValveResourceFormat.Renderer
         /// Resolved scene depth texture used to occlude world-space text behind geometry. When
         /// <see langword="null"/>, depth masking is skipped (world-space text always renders on top).
         /// </param>
-        public void Render(Camera camera, RenderTexture? sceneDepth = null)
+        /// <param name="context">
+        /// The pass being drawn, when the caller has one. Supplying it records the binds and the draw
+        /// through <see cref="Scene.RenderContext.CommandList"/>; omitting it keeps the OpenGL path.
+        /// </param>
+        public void Render(Camera camera, RenderTexture? sceneDepth = null, Scene.RenderContext? context = null)
         {
             var letters = 0;
             var verticesSize = 0;
@@ -486,14 +501,50 @@ namespace ValveResourceFormat.Renderer
 
                 shader.SetUniform("g_fRange", TextureRange);
 
-                VertexArray.Bind(vao, shader);
-                GL.DrawElements(PrimitiveType.Triangles, letters * 6, DrawElementsType.UnsignedShort, 0);
+                var commandList = context?.CommandList;
+
+                if (commandList == null)
+                {
+                    VertexArray.Bind(vao, shader);
+                    GL.DrawElements(PrimitiveType.Triangles, letters * 6, DrawElementsType.UnsignedShort, 0);
+                }
+                else
+                {
+                    commandList.BindVertexBuffer(0, VertexRhiBuffer(verticesSize));
+                    commandList.BindIndexBuffer(QuadIndexRhiBuffer(), IndexType.UInt16);
+                    commandList.BindTexture(DescriptorSets.MaterialTextures, 0, fontTexture.RhiTexture);
+
+                    if (sceneDepth != null)
+                    {
+                        commandList.BindTexture(DescriptorSets.ReservedTextures, (int)ReservedTextureSlots.SceneDepth, sceneDepth.RhiTexture);
+                    }
+
+                    commandList.DrawIndexed(letters * 6);
+                }
             }
 
             PerfStats.Active.ResumeTriangleCounter();
 
             TextRenderRequests.Clear();
         }
+
+        private GLBuffer VertexRhiBuffer(int sizeInBytes)
+        {
+            if (vertexRhiBuffer is null || vertexRhiBuffer.SizeInBytes != sizeInBytes)
+            {
+                vertexRhiBuffer = GLBuffer.Wrap(bufferHandle, sizeInBytes, BufferUsage.Vertex, BufferMemory.DeviceLocal, nameof(TextRenderer));
+            }
+
+            return vertexRhiBuffer;
+        }
+
+        private GLBuffer QuadIndexRhiBuffer()
+            => quadIndexRhiBuffer ??= GLBuffer.Wrap(
+                RendererContext.MeshBufferCache.QuadIndices.GLHandle,
+                SharedQuadIndexCount * sizeof(ushort),
+                BufferUsage.Index,
+                BufferMemory.DeviceLocal,
+                nameof(QuadIndexBuffer));
 
         // Font metrics for JetBrainsMono-Regular.ttf generated using msdf-atlas-gen (use Misc/FontMsdfGen)
         private const float AtlasSize = 512f;

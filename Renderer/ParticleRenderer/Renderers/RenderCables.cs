@@ -1,6 +1,8 @@
 using System.Buffers;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Renderer.Particles.Utils;
+using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.World;
 using ValveResourceFormat.Serialization.KeyValues;
@@ -24,6 +26,22 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         private readonly int vaoHandle;
         private int vertexBufferHandle;
         private int indexBufferHandle;
+
+        // Non-owning RHI views of the two OpenGL buffers this renderer draws from, so the draw can be
+        // recorded through a command list before buffer allocation itself moves onto IDevice.
+        //
+        // :CableGeometryPersistence - both survive across frames on purpose. When the tube has not
+        // changed, Render skips the upload entirely and redraws whatever these hold, which may have been
+        // written an arbitrary number of frames ago. That is safe only because the buffers are persistent
+        // and privately owned; a per-frame ring allocation would hand this draw a slot another cable
+        // wrote, so this renderer must keep a persistent allocation rather than stream.
+        private GLBuffer? vertexRhiBuffer;
+        private GLBuffer? indexRhiBuffer;
+        private int vertexBufferSizeBytes;
+        private int indexBufferSizeBytes;
+
+        // Reused across draws so a settled cable allocates nothing to bind its material.
+        private readonly List<RenderMaterial.TextureBinding> textureBindings = [];
 
         // The probe volume the cable's scene node is bound to, resolved on first draw because the
         // scene computes the bindings after all nodes are loaded.
@@ -117,7 +135,17 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             return CableVertex.InputLayout.CreateVertexArray(nameof(RenderCables), vertexBufferHandle, indexBufferHandle);
         }
 
+        /// <inheritdoc/>
+        public override void Render(ParticleCollection particles, ParticleSystemRenderState systemRenderState, Scene.RenderContext context)
+            => Render(particles, systemRenderState, context.Camera, context.CommandList);
+
+        /// <inheritdoc/>
+        /// <remarks>Still overridden because the prewarm path reaches this renderer with only a camera:
+        /// it starts in the viewer, which has no render context to thread through.</remarks>
         public override void Render(ParticleCollection particles, ParticleSystemRenderState systemRenderState, Camera camera)
+            => Render(particles, systemRenderState, camera, commandList: null);
+
+        private void Render(ParticleCollection particles, ParticleSystemRenderState systemRenderState, Camera camera, ICommandList? commandList)
         {
             if (particles.Count < 2)
             {
@@ -160,7 +188,8 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
             if (!GeometryChanged(positions, levels, radii, colors))
             {
-                DrawTube();
+                // :CableGeometryPersistence - redraws buffers written on an earlier frame.
+                DrawTube(commandList);
                 return;
             }
 
@@ -215,8 +244,10 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 }
 
                 var stride = CableVertex.InputLayout.Stride;
-                GL.NamedBufferData(vertexBufferHandle, vertexCount * stride, vertexArray, BufferUsageHint.DynamicDraw);
-                GL.NamedBufferData(indexBufferHandle, tubeIndexCount * sizeof(uint), indexArray, BufferUsageHint.DynamicDraw);
+                vertexBufferSizeBytes = vertexCount * stride;
+                indexBufferSizeBytes = tubeIndexCount * sizeof(uint);
+                GL.NamedBufferData(vertexBufferHandle, vertexBufferSizeBytes, vertexArray, BufferUsageHint.DynamicDraw);
+                GL.NamedBufferData(indexBufferHandle, indexBufferSizeBytes, indexArray, BufferUsageHint.DynamicDraw);
                 indexCount = tubeIndexCount;
             }
             finally
@@ -227,7 +258,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 IndexArrayPool.Return(indexArray);
             }
 
-            DrawTube();
+            DrawTube(commandList);
         }
 
         /// <summary>
@@ -390,7 +421,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         // Grow-only: reused buffers are sliced to the live count, so shrinking never reallocates.
         private static T[] EnsureCapacity<T>(T[] buffer, int size) => buffer.Length >= size ? buffer : new T[size];
 
-        private void DrawTube()
+        private void DrawTube(ICommandList? commandList)
         {
             if (indexCount == 0)
             {
@@ -398,8 +429,30 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             }
 
             shader.Use();
-            VertexArray.Bind(vaoHandle, shader);
+
+            if (commandList == null)
+            {
+                VertexArray.Bind(vaoHandle, shader);
+            }
+            else
+            {
+                commandList.BindVertexBuffer(0, VertexRhiBuffer());
+                commandList.BindIndexBuffer(IndexRhiBuffer(), IndexType.UInt32);
+            }
+
+            // Sets the material's uniforms and render state on both paths; the texture binds it also does
+            // are what CollectTextureBindings restates below for a backend that binds by descriptor set.
             material.Render(shader);
+
+            if (commandList != null)
+            {
+                material.CollectTextureBindings(shader, textureBindings);
+
+                foreach (var binding in textureBindings)
+                {
+                    commandList.BindTexture(binding.DescriptorSet, binding.Binding, binding.Texture.RhiTexture);
+                }
+            }
 
             // todo: batch tube draws and call this less often
             scene.LightingInfo.BindLightmapTextures();
@@ -411,9 +464,37 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             }
 
             PerfStats.Active.Count(Counter.ParticleDraw);
-            GL.DrawElements(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0);
+
+            if (commandList != null)
+            {
+                commandList.DrawIndexed(indexCount);
+            }
+            else
+            {
+                GL.DrawElements(PrimitiveType.Triangles, indexCount, DrawElementsType.UnsignedInt, 0);
+            }
 
             material.PostRender();
+        }
+
+        private GLBuffer VertexRhiBuffer()
+        {
+            if (vertexRhiBuffer is null || vertexRhiBuffer.SizeInBytes != vertexBufferSizeBytes)
+            {
+                vertexRhiBuffer = GLBuffer.Wrap(vertexBufferHandle, vertexBufferSizeBytes, BufferUsage.Vertex, BufferMemory.DeviceLocal, nameof(RenderCables));
+            }
+
+            return vertexRhiBuffer;
+        }
+
+        private GLBuffer IndexRhiBuffer()
+        {
+            if (indexRhiBuffer is null || indexRhiBuffer.SizeInBytes != indexBufferSizeBytes)
+            {
+                indexRhiBuffer = GLBuffer.Wrap(indexBufferHandle, indexBufferSizeBytes, BufferUsage.Index, BufferMemory.DeviceLocal, nameof(RenderCables));
+            }
+
+            return indexRhiBuffer;
         }
 
         public override IEnumerable<string> GetSupportedRenderModes() => shader.RenderModes;

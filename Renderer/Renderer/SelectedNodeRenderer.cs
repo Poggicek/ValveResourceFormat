@@ -338,6 +338,14 @@ namespace ValveResourceFormat.Renderer
         }
 
         /// <summary>Renders the wireframe selection overlay for the current frame.</summary>
+        /// <remarks>
+        /// :SelectedNodeLineBufferPersistence - the vertices this draws were uploaded by <see cref="Update"/>
+        /// earlier in the frame, and are redrawn unchanged on any frame where <see cref="Update"/> does not
+        /// run. The upload and the draw therefore sit in different phases, which a per-frame ring
+        /// allocation would break; the line buffer has to stay a persistent allocation.
+        /// The draw itself still goes through OpenGL because it lives in <c>LineBuffer</c>, behind
+        /// <c>LineDebugRenderer.RenderLines</c>, and neither of those is this renderer's to change.
+        /// </remarks>
         public void Render()
         {
             RenderLines(disableDepth);

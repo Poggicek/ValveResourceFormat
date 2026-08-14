@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Renderer.RHI;
 
 namespace ValveResourceFormat.Renderer;
 
@@ -60,7 +61,11 @@ public class QuadOverdraw(RendererContext rendererContext)
     /// </summary>
     /// <param name="width">Framebuffer width in pixels.</param>
     /// <param name="height">Framebuffer height in pixels.</param>
-    public void Prepare(int width, int height)
+    /// <param name="context">
+    /// The pass being drawn, when one is available. Supplying it records the counter resets through
+    /// <see cref="Scene.RenderContext.CommandList"/>; omitting it keeps the OpenGL path.
+    /// </param>
+    public void Prepare(int width, int height, Scene.RenderContext? context = null)
     {
         SceneShader.SetUniform1("bCountQuads", false);
 
@@ -70,21 +75,39 @@ public class QuadOverdraw(RendererContext rendererContext)
 
         if (quadLock == null || quadLock.Width != quadWidth || quadLock.Height != quadHeight)
         {
+            // :QuadOverdrawResizeLifetime - these free their OpenGL objects immediately, while a frame
+            // that sampled them may still be in flight. Deferring needs IDevice.DeferredDestroy, which
+            // needs the textures to be owned by the device rather than wrapped non-owningly by
+            // RenderTexture, so it has to wait for texture allocation to move onto IDevice.CreateTexture.
             quadLock?.Delete();
             quadCount?.Delete();
 
-            quadLock = RenderTexture.Create(quadWidth, quadHeight, SizedInternalFormat.R32ui);
+            // The RHI format overload records the format on the texture, which is what lets RhiTexture
+            // describe it completely enough to be cleared and bound through the command list.
+            quadLock = RenderTexture.Create(quadWidth, quadHeight, RhiFormat.R32_UInt);
             quadLock.SetLabel("QuadOverdrawLock");
 
-            quadCount = RenderTexture.Create(quadWidth, quadHeight, SizedInternalFormat.R32ui);
+            quadCount = RenderTexture.Create(quadWidth, quadHeight, RhiFormat.R32_UInt);
             quadCount.SetLabel("QuadOverdrawCount");
             quadCount.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
         }
 
-        var unlocked = uint.MaxValue;
-        var zero = 0u;
-        GL.ClearTexImage(quadLock.Handle, 0, PixelFormat.RedInteger, PixelType.UnsignedInt, ref unlocked);
-        GL.ClearTexImage(quadCount!.Handle, 0, PixelFormat.RedInteger, PixelType.UnsignedInt, ref zero);
+        var commandList = context?.CommandList;
+
+        if (commandList != null)
+        {
+            // uint.MaxValue is the unlocked sentinel; no float clear colour can represent it, which is
+            // why this is a raw-integer texture clear rather than a LoadOp.Clear attachment.
+            commandList.ClearTexture(quadLock.RhiTexture, 0, uint.MaxValue);
+            commandList.ClearTexture(quadCount!.RhiTexture, 0, 0u);
+        }
+        else
+        {
+            var unlocked = uint.MaxValue;
+            var zero = 0u;
+            GL.ClearTexImage(quadLock.Handle, 0, PixelFormat.RedInteger, PixelType.UnsignedInt, ref unlocked);
+            GL.ClearTexImage(quadCount!.Handle, 0, PixelFormat.RedInteger, PixelType.UnsignedInt, ref zero);
+        }
 
         GL.BindImageTexture(LockImageUnit, quadLock.Handle, 0, false, 0, TextureAccess.ReadWrite, SizedInternalFormat.R32ui);
         GL.BindImageTexture(CountImageUnit, quadCount.Handle, 0, false, 0, TextureAccess.ReadWrite, SizedInternalFormat.R32ui);
@@ -119,7 +142,11 @@ public class QuadOverdraw(RendererContext rendererContext)
     /// Replaces the bound framebuffer contents with the overdraw heat map and legend.
     /// Call after the scene rendered with <see cref="SceneShader"/> as the replacement shader.
     /// </summary>
-    public void Render()
+    /// <param name="context">
+    /// The pass being drawn, when one is available. Supplying it records the barrier that publishes the
+    /// counter image to the sampling pass; omitting it keeps the OpenGL path.
+    /// </param>
+    public void Render(Scene.RenderContext? context = null)
     {
         Debug.Assert(quadCount != null, $"{nameof(Prepare)} must be called before {nameof(Render)}");
 
@@ -127,16 +154,34 @@ public class QuadOverdraw(RendererContext rendererContext)
 
         using var _ = new GLDebugGroup("Quad Overdraw Visualization");
 
+        var commandList = context?.CommandList;
+
         // The counts were written as image stores, the fullscreen pass samples them.
-        GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+        if (commandList != null)
+        {
+            commandList.Barrier(new TextureBarrier(quadCount.RhiTexture, ResourceState.ShaderWrite, ResourceState.ShaderRead));
+        }
+        else
+        {
+            GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+        }
 
         visualizeShader.Use();
         visualizeShader.SetTexture(0, "g_tQuadOverdraw", quadCount);
 
         using (rendererContext.RenderState.Scope(depthTest: false, depthWrite: false))
         {
-            GL.BindVertexArray(rendererContext.MeshBufferCache.EmptyVAO);
-            GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+            // A fullscreen triangle generated from the vertex index: no vertex buffer, so a pipeline
+            // built for this draw takes VertexInputDesc.Empty.
+            if (commandList != null)
+            {
+                commandList.Draw(3);
+            }
+            else
+            {
+                GL.BindVertexArray(rendererContext.MeshBufferCache.EmptyVAO);
+                GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+            }
         }
     }
 

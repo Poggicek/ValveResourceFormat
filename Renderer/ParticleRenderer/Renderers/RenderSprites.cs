@@ -1,6 +1,8 @@
 using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Renderer.Particles.Utils;
+using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 using ValveResourceFormat.Serialization.KeyValues;
 
 namespace ValveResourceFormat.Renderer.Particles.Renderers
@@ -109,6 +111,13 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         // Start0, End0, Start1, End1 -- the order the shader's two-sided ramp wants them in.
         private readonly Vector4 outlineRanges = new(0.5f, 0.7f, 0.6f, 0.8f);
         private int vertexBufferHandle;
+
+        // Non-owning RHI views of the two OpenGL buffers this renderer draws from, so the draw can be
+        // recorded through a command list before buffer allocation itself moves onto IDevice. Rebuilt
+        // when the vertex buffer is reallocated to a different size, which glNamedBufferData does every
+        // frame the quad count changes.
+        private GLBuffer? vertexRhiBuffer;
+        private GLBuffer? quadIndexRhiBuffer;
 
 
         public RenderSprites(ParticleDefinitionParser parse, RendererContext rendererContext) : base(parse)
@@ -572,7 +581,17 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             }
         }
 
+        /// <inheritdoc/>
+        public override void Render(ParticleCollection particleBag, ParticleSystemRenderState systemRenderState, Scene.RenderContext context)
+            => Render(particleBag, systemRenderState, context.Camera, context.CommandList);
+
+        /// <inheritdoc/>
+        /// <remarks>Still overridden because the prewarm path reaches this renderer with only a camera:
+        /// it starts in the viewer, which has no render context to thread through.</remarks>
         public override void Render(ParticleCollection particleBag, ParticleSystemRenderState systemRenderState, Camera camera)
+            => Render(particleBag, systemRenderState, camera, commandList: null);
+
+        private void Render(ParticleCollection particleBag, ParticleSystemRenderState systemRenderState, Camera camera, ICommandList? commandList)
         {
             if (particleBag.Count == 0)
             {
@@ -598,14 +617,31 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 dstBlend: mod2x ? BlendFactor.SrcColor : BlendFactor.OneMinusSrcAlpha);
 
             shader.Use();
-            VertexArray.Bind(vaoHandle, shader);
+
+            if (commandList == null)
+            {
+                VertexArray.Bind(vaoHandle, shader);
+            }
+            else
+            {
+                commandList.BindVertexBuffer(0, VertexRhiBuffer(quadCount * 4 * Vertex.InputLayout.Stride));
+                commandList.BindIndexBuffer(QuadIndexRhiBuffer(), IndexType.UInt16);
+            }
 
             // Layer 0 keeps the plain uTexture name; the rest take a sampler each. Units past the layer
             // count are never sampled, but they get layer 0's texture so no sampler is left unbound.
             for (var layer = 0; layer < MaxTextureLayers; layer++)
             {
                 var source = layer < layers.Length ? layers[layer] : layers[0];
+
+                // Set on both paths: this also points the sampler uniform at its texture unit, which
+                // BindTexture cannot do because it carries no uniform name. That mapping belongs to the
+                // pipeline layer, so the two calls stop overlapping once pipelines carry reflection.
                 shader.SetTexture(RenderMaterial.TextureUnitStart + layer, LayerTextureUniforms[layer], source.Texture);
+
+                // Per-material textures are set 3 counting from zero, matching RenderMaterial's own
+                // numbering, so layer N here is the texture unit TextureUnitStart + N above.
+                commandList?.BindTexture(DescriptorSets.MaterialTextures, layer, source.Texture.RhiTexture);
             }
 
             shader.SetUniform1("uLayerCount", layers.Length);
@@ -629,8 +665,37 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
             // DRAW
             PerfStats.Active.Count(Counter.ParticleDraw);
-            GL.DrawElements(PrimitiveType.Triangles, quadCount * 6, DrawElementsType.UnsignedShort, 0);
+
+            if (commandList != null)
+            {
+                commandList.DrawIndexed(quadCount * 6);
+            }
+            else
+            {
+                GL.DrawElements(PrimitiveType.Triangles, quadCount * 6, DrawElementsType.UnsignedShort, 0);
+            }
         }
+
+        // :SharedQuadIndexCount - the shared index buffer GPUMeshBufferCache allocates, in indices.
+        private const int SharedQuadIndexCount = 65532;
+
+        private GLBuffer VertexRhiBuffer(int sizeInBytes)
+        {
+            if (vertexRhiBuffer is null || vertexRhiBuffer.SizeInBytes != sizeInBytes)
+            {
+                vertexRhiBuffer = GLBuffer.Wrap(vertexBufferHandle, sizeInBytes, BufferUsage.Vertex, BufferMemory.DeviceLocal, nameof(RenderSprites));
+            }
+
+            return vertexRhiBuffer;
+        }
+
+        private GLBuffer QuadIndexRhiBuffer()
+            => quadIndexRhiBuffer ??= GLBuffer.Wrap(
+                rendererContext.MeshBufferCache.QuadIndices.GLHandle,
+                SharedQuadIndexCount * sizeof(ushort),
+                BufferUsage.Index,
+                BufferMemory.DeviceLocal,
+                nameof(QuadIndexBuffer));
 
         public override IEnumerable<string> GetSupportedRenderModes() => shader.RenderModes;
 

@@ -3,6 +3,8 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 using ValveKeyValue;
+using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
 
@@ -27,6 +29,15 @@ namespace ValveResourceFormat.Renderer
         private readonly HashSet<int> usedRects = [];
         private int morphCount;
         private bool renderTargetInitialized;
+        private int quadIndicesHandle;
+
+        // Non-owning RHI views of the two OpenGL buffers this pass draws from, so the draw can be
+        // recorded through a command list before buffer allocation itself moves onto IDevice.
+        private GLBuffer? vertexRhiBuffer;
+        private GLBuffer? quadIndexRhiBuffer;
+
+        // :SharedQuadIndexCount - the shared index buffer GPUMeshBufferCache allocates, in indices.
+        private const int SharedQuadIndexCount = 65532;
 
         struct MorphCompositeRectData
         {
@@ -83,16 +94,28 @@ namespace ValveResourceFormat.Renderer
             CompositeTexture.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
             CompositeTexture.SetWrapMode(TextureWrapMode.ClampToEdge);
 
+            // :MorphCompositeFormat - Rgb16f deliberately has no RhiFormat member: three-component half
+            // float is optional in Vulkan and unsupported as a render target on most implementations, so
+            // the RHI equivalent would have to be R16G16B16A16_SFloat. Widening it changes what the morph
+            // shader path samples, so the allocation stays on the OpenGL format until that is decided
+            // together with the shader. Until then CompositeTexture.RhiFormat stays Undefined, which is
+            // what stops this pass from being expressed as a RenderPassDesc colour attachment.
             GL.TextureStorage2D(CompositeTexture.Handle, 1, SizedInternalFormat.Rgb16f, TextureSize, TextureSize);
             GL.NamedFramebufferTexture(frameBuffer, FramebufferAttachment.ColorAttachment0, CompositeTexture.Handle, 0);
         }
 
         /// <summary>Composites all active morph targets into <see cref="CompositeTexture"/>.</summary>
-        public void Render()
+        /// <param name="context">
+        /// The pass being drawn, when the caller has one. Supplying it records the draw and the barrier
+        /// that publishes <see cref="CompositeTexture"/> to the morph shader path; omitting it keeps the
+        /// OpenGL path.
+        /// </param>
+        public void Render(Scene.RenderContext? context = null)
         {
             var usedVertexCount = usedRects.Count * 4;
+            var vertexSizeBytes = usedVertexCount * MorphRectVertex.InputLayout.Stride;
 
-            GL.NamedBufferData(bufferHandle, usedVertexCount * MorphRectVertex.InputLayout.Stride, allVertices, BufferUsageHint.DynamicDraw);
+            GL.NamedBufferData(bufferHandle, vertexSizeBytes, allVertices, BufferUsageHint.DynamicDraw);
 
             if (!renderTargetInitialized)
             {
@@ -111,10 +134,43 @@ namespace ValveResourceFormat.Renderer
             GL.ClearColor(0, 0, 0, 0);
             GL.Clear(ClearBufferMask.ColorBufferBit);
 
-            VertexArray.Bind(vao, shader);
+            var commandList = context?.CommandList;
 
-            GL.DrawElements(PrimitiveType.Triangles, usedRects.Count * 6, DrawElementsType.UnsignedShort, 0);
+            if (commandList == null)
+            {
+                VertexArray.Bind(vao, shader);
+                GL.DrawElements(PrimitiveType.Triangles, usedRects.Count * 6, DrawElementsType.UnsignedShort, 0);
+            }
+            else
+            {
+                commandList.BindVertexBuffer(0, VertexRhiBuffer(vertexSizeBytes));
+                commandList.BindIndexBuffer(QuadIndexRhiBuffer(), IndexType.UInt16);
+                commandList.BindTexture(DescriptorSets.MaterialTextures, 0, morphAtlas.RhiTexture);
+                commandList.DrawIndexed(usedRects.Count * 6);
+
+                // The composite is sampled by the morph shader path in a later pass, so the colour writes
+                // have to be made visible to that read.
+                commandList.Barrier(new TextureBarrier(CompositeTexture.RhiTexture, ResourceState.ColorTarget, ResourceState.ShaderRead));
+            }
         }
+
+        private GLBuffer VertexRhiBuffer(int sizeInBytes)
+        {
+            if (vertexRhiBuffer is null || vertexRhiBuffer.SizeInBytes != sizeInBytes)
+            {
+                vertexRhiBuffer = GLBuffer.Wrap(bufferHandle, sizeInBytes, BufferUsage.Vertex, BufferMemory.DeviceLocal, nameof(MorphComposite));
+            }
+
+            return vertexRhiBuffer;
+        }
+
+        private GLBuffer QuadIndexRhiBuffer()
+            => quadIndexRhiBuffer ??= GLBuffer.Wrap(
+                quadIndicesHandle,
+                SharedQuadIndexCount * sizeof(ushort),
+                BufferUsage.Index,
+                BufferMemory.DeviceLocal,
+                nameof(QuadIndexBuffer));
 
         // Mutable because SetVertexMorphValue pokes the current weight into PositionWeights in place.
         [StructLayout(LayoutKind.Sequential)]
@@ -133,7 +189,8 @@ namespace ValveResourceFormat.Renderer
         {
             GL.CreateBuffers(1, out bufferHandle);
 
-            vao = MorphRectVertex.InputLayout.CreateVertexArray(nameof(MorphComposite), bufferHandle, renderContext.MeshBufferCache.QuadIndices.GLHandle);
+            quadIndicesHandle = renderContext.MeshBufferCache.QuadIndices.GLHandle;
+            vao = MorphRectVertex.InputLayout.CreateVertexArray(nameof(MorphComposite), bufferHandle, quadIndicesHandle);
         }
 
         [MemberNotNull(nameof(allVertices), nameof(morphRects))]

@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Renderer.Buffers;
+using ValveResourceFormat.Renderer.RHI;
 
 namespace ValveResourceFormat.Renderer
 {
@@ -38,7 +39,12 @@ namespace ValveResourceFormat.Renderer
         }
 
         /// <summary>Allocates (if needed) and clears the GPU buffer that receives occluded bounds from the culling shader.</summary>
-        public void BindAndClearBuffer()
+        /// <param name="context">
+        /// The pass being drawn, when one is available. Supplying it records the clear and the barrier
+        /// that publishes it to the culling shader through <see cref="Scene.RenderContext.CommandList"/>;
+        /// omitting it keeps the OpenGL path.
+        /// </param>
+        public void BindAndClearBuffer(Scene.RenderContext? context = null)
         {
             if (OccludedBoundsDebugGpu == null)
             {
@@ -47,9 +53,23 @@ namespace ValveResourceFormat.Renderer
                 GL.NamedBufferData(OccludedBoundsDebugGpu.Handle, totalSize, IntPtr.Zero, BufferUsageHint.StreamRead);
             }
 
-            // Clear the atomic counter before dispatching
-            var zero = 0u;
-            GL.ClearNamedBufferSubData(OccludedBoundsDebugGpu.Handle, PixelInternalFormat.R32ui, IntPtr.Zero, sizeof(uint), PixelFormat.RedInteger, PixelType.UnsignedInt, ref zero);
+            var commandList = context?.CommandList;
+
+            if (commandList != null)
+            {
+                // Clear the atomic counter, then publish it: the culling shader's atomic increments are
+                // shader writes, and without this they can be ordered before the clear that resets them.
+                var buffer = OccludedBoundsDebugGpu.RhiBuffer;
+                commandList.FillBuffer(buffer, 0, sizeof(uint), 0u);
+                commandList.Barrier(new BufferBarrier(buffer, ResourceState.CopyDestination, ResourceState.ShaderWrite));
+            }
+            else
+            {
+                // Clear the atomic counter before dispatching
+                var zero = 0u;
+                GL.ClearNamedBufferSubData(OccludedBoundsDebugGpu.Handle, PixelInternalFormat.R32ui, IntPtr.Zero, sizeof(uint), PixelFormat.RedInteger, PixelType.UnsignedInt, ref zero);
+            }
+
             OccludedBoundsDebugGpu.BindBufferBase();
         }
 
@@ -57,9 +77,18 @@ namespace ValveResourceFormat.Renderer
         /// Dispatches a single-invocation compute shader that turns the occluded-object
         /// atomic counter into a <c>DrawArraysIndirectCommand</c>, entirely on the GPU.
         /// </summary>
-        public void DispatchFinalize()
+        /// <param name="context">
+        /// The pass being drawn, when one is available. Supplying it records the barrier that makes the
+        /// culling shader's atomic counter visible to this dispatch; omitting it keeps the OpenGL path.
+        /// </param>
+        public void DispatchFinalize(Scene.RenderContext? context = null)
         {
             Debug.Assert(OccludedBoundsDebugGpu is not null);
+
+            // This dispatch reads the counter the culling shader incremented and writes the indirect
+            // arguments back into the same buffer, so it both waits on those writes and joins them.
+            context?.CommandList?.Barrier(
+                new BufferBarrier(OccludedBoundsDebugGpu.RhiBuffer, ResourceState.ShaderWrite, ResourceState.ShaderReadWrite));
 
             finalizeShader.Use();
             OccludedBoundsDebugGpu.BindBufferBase();
@@ -67,11 +96,34 @@ namespace ValveResourceFormat.Renderer
         }
 
         /// <summary>Renders wireframe bounding boxes for all occluded meshlets, color-coded by whether occlusion was correct.</summary>
-        public void Render()
+        /// <param name="context">
+        /// The pass being drawn, when one is available. Supplying it records the indirect draws and the
+        /// barrier they depend on through <see cref="Scene.RenderContext.CommandList"/>; omitting it
+        /// keeps the OpenGL path.
+        /// </param>
+        public void Render(Scene.RenderContext? context = null)
         {
             if (!scene.DrawMeshletsIndirect || !scene.EnableOcclusionCulling || OccludedBoundsDebugGpu == null)
             {
                 return;
+            }
+
+            var commandList = context?.CommandList;
+
+            if (commandList != null)
+            {
+                // One buffer consumed two ways at the same point: the vertex shader reads the bounds the
+                // culling pass wrote, and the indirect fetch reads the arguments the finalize pass wrote.
+                // Both transitions go in one call so a backend can merge them into a single barrier
+                // rather than paying for two pipeline stalls.
+                var buffer = OccludedBoundsDebugGpu.RhiBuffer;
+                ReadOnlySpan<BufferBarrier> barriers =
+                [
+                    new(buffer, ResourceState.ShaderWrite, ResourceState.ShaderRead),
+                    new(buffer, ResourceState.ShaderWrite, ResourceState.IndirectArgument),
+                ];
+
+                commandList.Barrier(barriers, []);
             }
 
             var renderState = renderContext.RenderState;
@@ -89,23 +141,43 @@ namespace ValveResourceFormat.Renderer
             OccludedBoundsDebugGpu.BindBufferBase();
 
             GL.BindVertexArray(renderContext.MeshBufferCache.EmptyVAO);
-            GL.BindBuffer(BufferTarget.DrawIndirectBuffer, OccludedBoundsDebugGpu.Handle);
 
-            var indirectArgs = (IntPtr)IndirectArgsByteOffset;
+            if (commandList == null)
+            {
+                GL.BindBuffer(BufferTarget.DrawIndirectBuffer, OccludedBoundsDebugGpu.Handle);
+            }
 
             // First pass: behind depth buffer (correctly occluded) - GREEN
             state.DepthStencil.DepthFunc = Comparison.Farther;
             renderState.Apply(in state);
             shader.SetUniform("g_vColor", new Vector4(0.0f, 1.0f, 0.0f, 0.9f));
-            GL.DrawArraysIndirect(PrimitiveType.Lines, indirectArgs);
+            DrawOccludedBounds(commandList);
 
             // Second pass: in front/at depth buffer (incorrectly visible) - RED
             state.DepthStencil.DepthFunc = Comparison.CloserEqual;
             renderState.Apply(in state);
             shader.SetUniform("g_vColor", new Vector4(1.0f, 0.0f, 0.0f, 0.9f));
-            GL.DrawArraysIndirect(PrimitiveType.Lines, indirectArgs);
+            DrawOccludedBounds(commandList);
 
-            GL.BindBuffer(BufferTarget.DrawIndirectBuffer, 0);
+            if (commandList == null)
+            {
+                GL.BindBuffer(BufferTarget.DrawIndirectBuffer, 0);
+            }
+        }
+
+        // The vertex count and instance count both come from the GPU-written header, so this is a
+        // non-indexed indirect draw: the arguments are a DrawArraysIndirectCommand, not the indexed form.
+        private void DrawOccludedBounds(ICommandList? commandList)
+        {
+            Debug.Assert(OccludedBoundsDebugGpu is not null);
+
+            if (commandList != null)
+            {
+                commandList.DrawIndirect(OccludedBoundsDebugGpu.RhiBuffer, IndirectArgsByteOffset, drawCount: 1);
+                return;
+            }
+
+            GL.DrawArraysIndirect(PrimitiveType.Lines, (IntPtr)IndirectArgsByteOffset);
         }
     }
 }
