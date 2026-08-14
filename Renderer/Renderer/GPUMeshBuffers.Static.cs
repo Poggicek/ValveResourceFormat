@@ -50,8 +50,19 @@ public partial class GPUMeshBufferCache
         {
             if (vectorOneVertexBuffer == -1)
             {
+                const int SizeInBytes = 4 * sizeof(float);
+
                 GL.CreateBuffers(1, out vectorOneVertexBuffer);
-                GL.NamedBufferData(vectorOneVertexBuffer, 4 * sizeof(float), [1f, 1f, 1f, 1f], BufferUsageHint.StaticDraw);
+                GL.NamedBufferData(vectorOneVertexBuffer, SizeInBytes, [1f, 1f, 1f, 1f], BufferUsageHint.StaticDraw);
+
+                // Registered so GetRhiBuffer can resolve it: AddMissingAttributes hands this buffer out as
+                // a VertexDrawBuffer, and a size stated here is a real size rather than a fabricated one.
+                standaloneRhiBuffers[vectorOneVertexBuffer] = RHI.OpenGL.GLBuffer.Wrap(
+                    vectorOneVertexBuffer,
+                    SizeInBytes,
+                    RHI.BufferUsage.Vertex,
+                    RHI.BufferMemory.DeviceLocal,
+                    nameof(VectorOneVertexBuffer));
 
 #if DEBUG
                 var bufferLabel = nameof(VectorOneVertexBuffer);

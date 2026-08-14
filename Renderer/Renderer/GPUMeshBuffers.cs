@@ -87,8 +87,28 @@ namespace ValveResourceFormat.Renderer
         }
 
         /// <summary>Deletes all GPU vertex and index buffers.</summary>
+        /// <remarks>
+        /// Any wrapper handed out by <see cref="RhiVertexBuffer"/> or <see cref="RhiIndexBuffer"/> is
+        /// disposed too. Disposing a non-owning wrapper deletes nothing but zeroes its handle, so a
+        /// reference that outlived this call reads as plainly invalid rather than silently addressing
+        /// whatever unrelated buffer OpenGL later assigns that handle to. Same reasoning as
+        /// <see cref="GPUMeshBufferCache.InvalidateVertexArrayObjectsForFreedBuffers"/>.
+        /// </remarks>
         public void Delete()
         {
+            foreach (var buffer in rhiVertexBuffers)
+            {
+                buffer?.Dispose();
+            }
+
+            foreach (var buffer in rhiIndexBuffers)
+            {
+                buffer?.Dispose();
+            }
+
+            Array.Clear(rhiVertexBuffers);
+            Array.Clear(rhiIndexBuffers);
+
             GL.DeleteBuffers(VertexBuffers.Length, VertexBuffers);
             GL.DeleteBuffers(IndexBuffers.Length, IndexBuffers);
         }

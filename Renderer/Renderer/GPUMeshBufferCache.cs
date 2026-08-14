@@ -19,6 +19,25 @@ namespace ValveResourceFormat.Renderer
         private readonly Dictionary<string, GPUMeshBuffers> gpuBuffers = [];
         private readonly Dictionary<VAOKey, int> vertexArrayObjects = [];
 
+        /// <summary>
+        /// Where each live mesh buffer handle came from, so a bare handle out of a <see cref="DrawCall"/>
+        /// can be resolved back to a correctly sized <see cref="RHI.IBuffer"/>.
+        /// </summary>
+        /// <remarks>
+        /// Locators rather than wrappers: building the wrapper is deferred to
+        /// <see cref="GPUMeshBuffers.RhiVertexBuffer"/>, which memoizes, so a scene that never records
+        /// through the RHI pays only a dictionary entry per buffer and allocates no wrappers at all.
+        /// </remarks>
+        private readonly Dictionary<int, BufferLocator> rhiBufferLocators = [];
+
+        private readonly record struct BufferLocator(GPUMeshBuffers Owner, bool IsIndex, int Index);
+
+        /// <summary>
+        /// Sized wrappers for buffers this cache owns directly rather than through a
+        /// <see cref="GPUMeshBuffers"/>, which today is only <see cref="VectorOneVertexBuffer"/>.
+        /// </summary>
+        private readonly Dictionary<int, RHI.IBuffer> standaloneRhiBuffers = [];
+
         /// <summary>Gets the number of distinct vertex array objects currently cached.</summary>
         public int VertexArrayObjectCount => vertexArrayObjects.Count;
 
@@ -69,6 +88,7 @@ namespace ValveResourceFormat.Renderer
             {
                 gpuVbib = new GPUMeshBuffers(vbib);
                 gpuBuffers.Add(meshName, gpuVbib);
+                RegisterRhiBuffers(gpuVbib);
 
 #if DEBUG
                 for (var i = 0; i < gpuVbib.VertexBuffers.Length; i++)
@@ -110,6 +130,129 @@ namespace ValveResourceFormat.Renderer
             ], inputSignature, vbib.IndexBuffers.Count > 0 ? gpuVbib.IndexBuffers[0] : 0, meshName);
         }
 
+        private void RegisterRhiBuffers(GPUMeshBuffers gpuVbib)
+        {
+            for (var i = 0; i < gpuVbib.VertexBuffers.Length; i++)
+            {
+                rhiBufferLocators[gpuVbib.VertexBuffers[i]] = new BufferLocator(gpuVbib, false, i);
+            }
+
+            for (var i = 0; i < gpuVbib.IndexBuffers.Length; i++)
+            {
+                rhiBufferLocators[gpuVbib.IndexBuffers[i]] = new BufferLocator(gpuVbib, true, i);
+            }
+        }
+
+        private void UnregisterRhiBuffers(GPUMeshBuffers gpuVbib)
+        {
+            foreach (var handle in gpuVbib.VertexBuffers)
+            {
+                rhiBufferLocators.Remove(handle);
+            }
+
+            foreach (var handle in gpuVbib.IndexBuffers)
+            {
+                rhiBufferLocators.Remove(handle);
+            }
+        }
+
+        /// <summary>
+        /// Resolves a mesh buffer handle to a correctly sized <see cref="RHI.IBuffer"/>.
+        /// </summary>
+        /// <param name="handle">The OpenGL buffer handle, as carried by <see cref="VertexDrawBuffer.Handle"/>
+        /// or <see cref="IndexDrawBuffer.Handle"/>.</param>
+        /// <returns>A non-owning view of the same OpenGL object. This cache still owns it, and
+        /// <see cref="DeleteVertexIndexBuffers"/> is still what frees it.</returns>
+        /// <exception cref="ArgumentException">The handle was not uploaded through this cache, so its size
+        /// is unknown.</exception>
+        /// <remarks>
+        /// <para>
+        /// The size comes from the <see cref="VBIB"/> the buffer was uploaded from, which is the only thing
+        /// that knows it: an OpenGL buffer handle carries no length, and a draw call carries only the
+        /// handle. This is why the bridge lives here rather than on <see cref="DrawCall"/>.
+        /// </para>
+        /// <para>
+        /// An unknown handle throws rather than returning a zero-sized or guessed buffer. A fabricated size
+        /// would turn a genuine out-of-range draw into silently wrong geometry on OpenGL and a device loss
+        /// on Vulkan, which is exactly the class of bug the RHI's sized buffers exist to catch.
+        /// </para>
+        /// </remarks>
+        public RHI.IBuffer GetRhiBuffer(int handle)
+        {
+            if (!rhiBufferLocators.TryGetValue(handle, out var locator))
+            {
+                if (standaloneRhiBuffers.TryGetValue(handle, out var standalone))
+                {
+                    return standalone;
+                }
+
+                throw new ArgumentException(
+                    $"Buffer handle {handle} was not uploaded through this {nameof(GPUMeshBufferCache)}, so its size is unknown. Only mesh buffers created by {nameof(CreateVertexIndexBuffers)} can be resolved; anything else has to carry its own size to {nameof(RHI.OpenGL.GLBuffer)}.{nameof(RHI.OpenGL.GLBuffer.Wrap)}.",
+                    nameof(handle));
+            }
+
+            return locator.IsIndex
+                ? locator.Owner.RhiIndexBuffer(locator.Index)
+                : locator.Owner.RhiVertexBuffer(locator.Index);
+        }
+
+        /// <summary>Resolves a draw call's vertex buffer binding to a correctly sized <see cref="RHI.IBuffer"/>.</summary>
+        /// <param name="buffer">The binding to resolve.</param>
+        /// <returns>A non-owning view of the same OpenGL object.</returns>
+        /// <exception cref="ArgumentException">The handle was not uploaded through this cache.</exception>
+        public RHI.IBuffer GetRhiBuffer(in VertexDrawBuffer buffer) => GetRhiBuffer(buffer.Handle);
+
+        /// <summary>Resolves a draw call's index buffer binding to a correctly sized <see cref="RHI.IBuffer"/>.</summary>
+        /// <param name="buffer">The binding to resolve.</param>
+        /// <returns>A non-owning view of the same OpenGL object.</returns>
+        /// <exception cref="ArgumentException">The handle was not uploaded through this cache.</exception>
+        public RHI.IBuffer GetRhiBuffer(in IndexDrawBuffer buffer) => GetRhiBuffer(buffer.Handle);
+
+        /// <summary>
+        /// Translates an OpenGL index element type to the RHI's, and converts a draw call's byte-offset
+        /// <see cref="DrawCall.StartIndex"/> into the index count <see cref="RHI.ICommandList.DrawIndexed"/>
+        /// takes.
+        /// </summary>
+        /// <param name="drawCall">The draw call to describe.</param>
+        /// <returns>The index element width and the first index, as an element count.</returns>
+        /// <exception cref="NotSupportedException">The draw call uses 8 bit indices, which the RHI has no
+        /// member for. See the remarks.</exception>
+        /// <remarks>
+        /// <para>
+        /// Both conversions are returned together on purpose. <see cref="DrawCall.StartIndex"/> is a
+        /// <b>byte</b> offset, because that is the pointer <c>glDrawElements</c> takes, whereas
+        /// <see cref="RHI.ICommandList.DrawIndexed"/> takes <c>firstIndex</c> as an element <b>count</b>.
+        /// Passing one where the other belongs is silently wrong for 16 bit indices and wrong by a factor
+        /// of four for 32 bit ones, and it is the natural mistake to make. Taking both from one call means
+        /// a caller cannot convert the type and forget the offset.
+        /// </para>
+        /// <para>
+        /// 8 bit indices are refused rather than widened. <see cref="DrawElementsType.UnsignedByte"/> is
+        /// representable in <see cref="DrawCall.IndexType"/> and priced by
+        /// <see cref="DrawCall.IndexSizeInBytes"/>, but no Source 2 mesh produces one: the only place index
+        /// width is decided reads it from the <see cref="VBIB"/> and already rejects anything but 2 or 4
+        /// bytes. Vulkan's <c>VK_INDEX_TYPE_UINT8</c> needs an extension that is not universally available,
+        /// so widening here would mean silently reallocating and rewriting the buffer at draw time. If a
+        /// mesh format ever does arrive with 8 bit indices, the conversion belongs at upload, where the
+        /// buffer is built, not here.
+        /// </para>
+        /// </remarks>
+        public static (RHI.IndexType IndexType, int FirstIndex) DescribeIndexedDraw(DrawCall drawCall)
+        {
+            ArgumentNullException.ThrowIfNull(drawCall);
+
+            var indexType = drawCall.IndexType switch
+            {
+                DrawElementsType.UnsignedShort => RHI.IndexType.UInt16,
+                DrawElementsType.UnsignedInt => RHI.IndexType.UInt32,
+                DrawElementsType.UnsignedByte => throw new NotSupportedException(
+                    $"8 bit indices have no {nameof(RHI.IndexType)} member. No Source 2 mesh produces them, and widening the buffer at draw time is not something this layer may do; convert at upload instead."),
+                _ => throw new ArgumentOutOfRangeException(nameof(drawCall), drawCall.IndexType, "Unknown index element type."),
+            };
+
+            return (indexType, (int)(drawCall.StartIndex / drawCall.IndexSizeInBytes));
+        }
+
         /// <summary>
         /// Disposes any cached gpu buffers and frees gpu vertex arrays.
         /// </summary>
@@ -121,6 +264,7 @@ namespace ValveResourceFormat.Renderer
             }
 
             gpuBuffers.Clear();
+            rhiBufferLocators.Clear();
 
             foreach (var item in vertexArrayObjects)
             {
@@ -137,6 +281,7 @@ namespace ValveResourceFormat.Renderer
             if (gpuBuffers.TryGetValue(meshName, out var gpuVbib))
             {
                 gpuVbib.Delete();
+                UnregisterRhiBuffers(gpuVbib);
                 gpuBuffers.Remove(meshName);
                 InvalidateVertexArrayObjectsForFreedBuffers([.. gpuVbib.VertexBuffers, .. gpuVbib.IndexBuffers]);
             }
