@@ -24,10 +24,9 @@ namespace ValveResourceFormat.Renderer
     }
 
     /// <summary>
-    /// Comparison function for depth testing. Mirrors <see href="https://s2v.app/SchemaExplorer/cs2/rendersystemdx11/RsComparison_t"><c>RsComparison_t</c></see>, including its
-    /// depth-direction-agnostic values: this renderer uses reverse-Z, so prefer
-    /// <see cref="Closer"/>/<see cref="Farther"/> to state intent - they resolve to the correct
-    /// GL comparison for the depth convention in one place.
+    /// Comparison function for depth and stencil tests. Mirrors <see href="https://s2v.app/SchemaExplorer/cs2/rendersystemdx11/RsComparison_t"><c>RsComparison_t</c></see>.
+    /// The renderer is reverse-Z. Prefer <see cref="Closer"/>/<see cref="Farther"/>: they are
+    /// independent of the depth direction.
     /// </summary>
     public enum Comparison : byte
     {
@@ -103,14 +102,13 @@ namespace ValveResourceFormat.Renderer
         Decrement,
     }
 
-    // The state descriptors are packed plain-old-data (byte enums, Pack = 1, no padding), so a
-    // descriptor's raw bytes are its exact bit image: RenderStateTracker diffs them with plain
-    // memory compares, and they can later serve directly as hash keys for state-object dedup.
+    // The descriptors are packed plain-old-data with no padding. Their raw bytes are their exact
+    // bit image: RenderStateTracker diffs them with memory compares, and they can serve as hash
+    // keys for state-object dedup later.
 
-    /// <summary>Stencil test state. Mirrors <see href="https://s2v.app/SchemaExplorer/cs2/rendersystemdx11/RsStencilStateDesc_t"><c>RsStencilStateDesc_t</c></see>; one set of ops serves both
-    /// faces until a consumer needs Valve's front/back split. The reference value is
-    /// <see cref="DepthStencilStateDesc.StencilRef"/> - D3D and Vulkan treat it as bind-time dynamic
-    /// state, and it stays out of this descriptor to match.</summary>
+    /// <summary>Stencil test state. Mirrors <see href="https://s2v.app/SchemaExplorer/cs2/rendersystemdx11/RsStencilStateDesc_t"><c>RsStencilStateDesc_t</c></see>.
+    /// One set of ops serves both faces until a consumer needs the front/back split. The reference
+    /// value is <see cref="DepthStencilStateDesc.StencilRef"/>.</summary>
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public record struct StencilStateDesc
     {
@@ -126,7 +124,7 @@ namespace ValveResourceFormat.Renderer
         public StencilOperation PassOp { get; set; }
         /// <summary>Mask applied to stored and reference values before comparison.</summary>
         public byte ReadMask { get; set; }
-        /// <summary>Mask of stencil bits writes (and stencil clears) can touch.</summary>
+        /// <summary>Mask of stencil bits that writes and stencil clears can touch.</summary>
         public byte WriteMask { get; set; }
     }
 
@@ -158,8 +156,8 @@ namespace ValveResourceFormat.Renderer
         public Comparison DepthFunc { get; set; }
         /// <summary>Stencil test state.</summary>
         public StencilStateDesc Stencil { get; set; }
-        /// <summary>Stencil reference value. Dynamic bind-time state in D3D and Vulkan; GL couples it
-        /// to the comparison, so it rides along here.</summary>
+        /// <summary>Stencil reference value. D3D and Vulkan set it at bind time; GL couples it to
+        /// the comparison, so it lives here.</summary>
         public byte StencilRef { get; set; }
     }
 
@@ -180,16 +178,15 @@ namespace ValveResourceFormat.Renderer
     }
 
     /// <summary>
-    /// The complete declarative render state for a draw, mirroring the
+    /// The complete render state for a draw. Mirrors the
     /// <see href="https://s2v.app/SchemaExplorer/cs2/rendersystemdx11"><c>rendersystemdx11</c></see>
-    /// state descriptors. Pure data: state is composed, not toggled, and the per-GL-context
-    /// <see cref="RenderStateTracker"/> (on <see cref="RendererContext.RenderState"/>) applies it.
+    /// descriptors. Pure data: <see cref="RendererContext.RenderState"/> applies it.
     /// </summary>
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public record struct RenderState
     {
-        // Fields rather than properties so members can be set directly (state.DepthStencil.DepthFunc = x);
-        // a property getter would return a copy of the sub-state.
+        // Fields, not properties: a property getter returns a copy, which would break
+        // state.DepthStencil.DepthFunc = x.
 #pragma warning disable CA1051 // Do not declare visible instance fields
         /// <summary>Rasterizer state.</summary>
         public RasterizerStateDesc Rasterizer;
@@ -199,9 +196,8 @@ namespace ValveResourceFormat.Renderer
         public BlendStateDesc Blend;
 #pragma warning restore CA1051
 
-        /// <summary>Gets the renderer's ambient default: solid fill, backface culling, depth test
-        /// and write on with the closer-wins comparison, blending off with standard alpha factors,
-        /// all color channels written.</summary>
+        /// <summary>Gets the renderer default: solid fill, backface culling, depth test and write
+        /// on, blending off with alpha factors, all color channels written.</summary>
         public static RenderState Default => new()
         {
             Rasterizer = new()
@@ -218,7 +214,7 @@ namespace ValveResourceFormat.Renderer
                 {
                     Func = Comparison.Always,
                     ReadMask = 0xFF,
-                    WriteMask = 0xFF, // stencil clears respect the write mask even with the test disabled
+                    WriteMask = 0xFF, // stencil clears obey this mask even with the test disabled
                 },
             },
             Blend = new()
@@ -228,31 +224,28 @@ namespace ValveResourceFormat.Renderer
                 RenderTargetWriteMask = 0xF,
             },
         };
-
     }
 
     /// <summary>
-    /// Tracks and applies render state for one GL context: owns the pass baseline
-    /// (<see cref="CurrentPass"/>) and a shadow of the state last applied to the context, so
-    /// <see cref="Apply"/> only emits GL calls for fields that actually changed - redundant applies
-    /// (the common case for baseline restores) cost no driver work. GL state is per context, so
-    /// each <see cref="RendererContext"/> owns its own tracker.
+    /// Tracks and applies render state for one GL context. Owns the pass baseline
+    /// (<see cref="CurrentPass"/>) and a shadow of the last applied state, so <see cref="Apply"/>
+    /// only emits GL calls for fields that changed. GL state is per context, so each
+    /// <see cref="RendererContext"/> owns one tracker.
     /// </summary>
     public class RenderStateTracker
     {
-        /// <summary>Gets the state established by the innermost enclosing pass. Per-draw state is
-        /// composed by copying this and overriding fields.</summary>
+        /// <summary>Gets the state of the innermost enclosing pass. Compose per-draw state by
+        /// copying this and overriding fields.</summary>
         public RenderState CurrentPass { get; private set; } = RenderState.Default;
 
-        // Shadow of the state last applied to the GL context, the diffing baseline for Apply().
-        // Only meaningful once the first Apply has run (appliedValid).
+        // Shadow of the last applied state, the diff baseline for Apply().
+        // Valid only after the first Apply.
         private RenderState applied;
         private bool appliedValid;
 
-        /// <summary>Composes a state over <see cref="CurrentPass"/> and applies it for the lifetime of
-        /// the returned <see langword="using"/> guard, which restores the previous baseline on dispose.
-        /// Omitted arguments inherit the enclosing pass. For state the arguments do not cover (e.g.
-        /// stencil), compose a <see cref="RenderState"/> by hand and open a
+        /// <summary>Composes a state over <see cref="CurrentPass"/> and applies it for the scope of
+        /// the returned <see langword="using"/> guard. Omitted arguments keep the pass value. For
+        /// state not covered here (e.g. stencil), build a <see cref="RenderState"/> and open a
         /// <see cref="RenderPassScope"/> directly.</summary>
         /// <param name="fillMode">Polygon fill mode.</param>
         /// <param name="cullMode">Face culling mode.</param>
@@ -266,7 +259,7 @@ namespace ValveResourceFormat.Renderer
         /// <param name="srcBlend">Source blend factor.</param>
         /// <param name="dstBlend">Destination blend factor.</param>
         /// <param name="colorWriteMask">Color channel write mask, RGBA in bits 0-3.</param>
-        /// <returns>The scope guard restoring the previous baseline on dispose.</returns>
+        /// <returns>The guard that restores the previous baseline on dispose.</returns>
         public RenderPassScope Scope(
             FillMode? fillMode = null,
             CullMode? cullMode = null,
@@ -299,8 +292,7 @@ namespace ValveResourceFormat.Renderer
             return new RenderPassScope(this, in state);
         }
 
-        /// <summary>Applies a state and makes it the baseline that composed per-draw states and
-        /// restores derive from, until the enclosing pass re-establishes its own.</summary>
+        /// <summary>Applies a state and makes it <see cref="CurrentPass"/>.</summary>
         /// <param name="state">The pass baseline state.</param>
         public void ApplyAsPassBaseline(in RenderState state)
         {
@@ -308,17 +300,13 @@ namespace ValveResourceFormat.Renderer
             Apply(in state);
         }
 
-        /// <summary>Re-applies the pass baseline. Draw restores are lazy - a material leaves its
-        /// state latched and the next draw's own apply diffs from it - so call this before raw GL
-        /// work that assumes the baseline: framebuffer clears (they respect the write masks) and
-        /// draws that do not apply state of their own.</summary>
+        /// <summary>Re-applies the pass baseline. Draws do not restore state; they leave it
+        /// latched. Call this before raw GL work that assumes the baseline: framebuffer clears
+        /// (they obey the write masks) and draws that do not apply state.</summary>
         public void ReassertCurrentPass() => Apply(CurrentPass);
 
-        /// <summary>Applies a state to GL. The diff is bit logic, Valve-style, at two levels: each
-        /// descriptor's raw bits are compared against the last applied ones in a single memory
-        /// compare, and a changed descriptor then emits only the calls whose fields actually
-        /// differ - an unchanged group costs one compare, a changed one only its changed
-        /// calls.</summary>
+        /// <summary>Applies a state to GL. Diffs at two levels: one memory compare per descriptor,
+        /// then only the calls whose fields changed within a changed descriptor.</summary>
         /// <param name="state">The state to apply.</param>
         public void Apply(in RenderState state)
         {
@@ -348,8 +336,8 @@ namespace ValveResourceFormat.Renderer
             appliedValid = true;
         }
 
-        /// <summary>Compares two descriptors as raw bits - packed plain-old-data makes the memory
-        /// image the complete state, so this one compare is the whole diff.</summary>
+        /// <summary>Compares two descriptors as raw bits. The descriptors have no padding, so the
+        /// memory image is the complete state.</summary>
         private static bool BitwiseEquals<T>(in T a, in T b) where T : unmanaged
             => MemoryMarshal.AsBytes(new ReadOnlySpan<T>(in a))
                 .SequenceEqual(MemoryMarshal.AsBytes(new ReadOnlySpan<T>(in b)));
@@ -379,7 +367,7 @@ namespace ValveResourceFormat.Renderer
                 || rasterizer.DepthBiasClamp != prev.DepthBiasClamp
                 || rasterizer.SlopeScaledDepthBias != prev.SlopeScaledDepthBias)
             {
-                // Both polygon modes get the bias, Vulkan-style, so a biased material stays biased in wireframe.
+                // Bias both polygon modes, Vulkan-style, so a biased material stays biased in wireframe.
                 if (rasterizer.DepthBias != 0f || rasterizer.SlopeScaledDepthBias != 0f)
                 {
                     CountedGL.Enable(EnableCap.PolygonOffsetFill);
@@ -472,7 +460,7 @@ namespace ValveResourceFormat.Renderer
 
             if (force || blend.SrcBlend != prev.SrcBlend || blend.DstBlend != prev.DstBlend)
             {
-                CountedGL.BlendFunc(ToGLSrc(blend.SrcBlend), ToGLDst(blend.DstBlend));
+                CountedGL.BlendFunc(ToGL(blend.SrcBlend), ToGL(blend.DstBlend));
             }
 
             if (force || blend.AlphaToCoverageEnable != prev.AlphaToCoverageEnable)
@@ -494,8 +482,7 @@ namespace ValveResourceFormat.Renderer
             }
         }
 
-        /// <summary>Forwards each state call to GL while counting it, so the stats overlay reports
-        /// the exact number of state calls issued rather than a hardcoded estimate.</summary>
+        /// <summary>Forwards each state call to GL and counts it for the stats overlay.</summary>
         private static class CountedGL
         {
             private static void Count() => PerfStats.Active.Count(Counter.RenderStateGlCall);
@@ -573,7 +560,7 @@ namespace ValveResourceFormat.Renderer
             }
         }
 
-        // The renderer is reverse-Z: greater depth values are closer to the camera.
+        // The renderer is reverse-Z: greater depth is closer to the camera.
         private static DepthFunction ToGL(Comparison comparison) => comparison switch
         {
             Comparison.Never => DepthFunction.Never,
@@ -606,9 +593,7 @@ namespace ValveResourceFormat.Renderer
             _ => throw new NotImplementedException($"Unknown stencil operation {operation}"),
         };
 
-        private static BlendingFactor ToGLSrc(BlendFactor factor) => (BlendingFactor)ToGLDst(factor);
-
-        private static BlendingFactor ToGLDst(BlendFactor factor) => factor switch
+        private static BlendingFactor ToGL(BlendFactor factor) => factor switch
         {
             BlendFactor.Zero => BlendingFactor.Zero,
             BlendFactor.One => BlendingFactor.One,
@@ -625,10 +610,9 @@ namespace ValveResourceFormat.Renderer
     }
 
     /// <summary>
-    /// Establishes a render pass baseline for its scope and restores the previous baseline on
-    /// dispose. Nesting-safe: the new baseline is typically composed from
-    /// <see cref="RenderStateTracker.CurrentPass"/>, so an outer pass's overrides (e.g. global
-    /// wireframe) survive into sub-passes.
+    /// Sets a render pass baseline for its scope and restores the previous one on dispose.
+    /// Nesting-safe: compose the new baseline from <see cref="RenderStateTracker.CurrentPass"/>
+    /// so outer overrides (e.g. global wireframe) survive into sub-passes.
     /// </summary>
     public readonly ref struct RenderPassScope
     {
@@ -636,7 +620,7 @@ namespace ValveResourceFormat.Renderer
         private readonly RenderState previous;
 
         /// <summary>Applies <paramref name="state"/> as the pass baseline.</summary>
-        /// <param name="tracker">The state tracker of the GL context being rendered to.</param>
+        /// <param name="tracker">The state tracker of the target GL context.</param>
         /// <param name="state">The baseline state for this pass.</param>
         public RenderPassScope(RenderStateTracker tracker, scoped in RenderState state)
         {

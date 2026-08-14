@@ -588,10 +588,10 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 return;
             }
 
-            // Draw it. The translucent pass leaves blend/depth state to each custom draw, so enable blending and
-            // stop depth writes here; otherwise sprites are opaque. The cable renderer instead draws opaque with depth writes.
-            // Modulate-2x scales what is behind it, so it needs its own factors; everything else composites
-            // premultiplied, with the additive path having zeroed its own alpha in the shader.
+            // The translucent pass leaves blend/depth state to each draw. Enable blending and stop
+            // depth writes, or sprites render opaque. Cables instead draw opaque with depth writes.
+            // Modulate-2x scales what is behind it, so it needs its own factors. Everything else
+            // composites premultiplied; the additive path zeroes its own alpha in the shader.
             var mod2x = blendMode == ParticleBlendMode.PARTICLE_OUTPUT_BLEND_MODE_MOD2X;
             using (rendererContext.RenderState.Scope(blend: true, depthWrite: false, cullMode: CullMode.None,
                 srcBlend: mod2x ? BlendFactor.DstColor : BlendFactor.One,

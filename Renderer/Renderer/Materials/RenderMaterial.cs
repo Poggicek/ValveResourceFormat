@@ -794,10 +794,9 @@ namespace ValveResourceFormat.Renderer.Materials
             SetMatrix(shader, buffer, "g_mTextureColorAdjust", Matrix4x4.Multiply(tintMatrix, ccMatrix));
         }
 
-        /// <summary>Releases the per-material sampler binds after the draw call for this material.
-        /// Render state is left latched rather than restored: the next draw's own apply diffs from
-        /// it, and pass boundaries reassert their baseline - so runs of same-state materials cost
-        /// no state calls at all.</summary>
+        /// <summary>Releases the per-material sampler binds after the draw. Render state stays
+        /// latched: the next apply diffs from it, so runs of same-state materials cost no state
+        /// calls.</summary>
         public void PostRender()
         {
             foreach (var unit in boundSamplerUnits)

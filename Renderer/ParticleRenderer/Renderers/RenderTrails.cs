@@ -397,8 +397,8 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 return;
             }
 
-            // The translucent pass leaves blend/depth state to each custom draw; enable blending and stop depth
-            // writes here or trails render opaque (matching the sprite renderer; cables draw opaque with depth writes instead).
+            // The translucent pass leaves blend/depth state to each draw. Enable blending and stop
+            // depth writes, or trails render opaque. Cables instead draw opaque with depth writes.
             // Modulate-2x scales what is behind it, so it needs its own factors; see RenderSprites.
             // Trail quads are oriented by motion direction, so either side can face the camera.
             var mod2x = blendMode == ParticleBlendMode.PARTICLE_OUTPUT_BLEND_MODE_MOD2X;

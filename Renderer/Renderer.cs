@@ -568,7 +568,7 @@ public class Renderer
         ViewBuffer.Data.ViewportSize = new Vector2(w, h);
         ViewBuffer.Data.InvViewportSize = Vector2.One / ViewBuffer.Data.ViewportSize;
 
-        // Draw restores are lazy; the clear respects write masks, so reassert the baseline first.
+        // Draws leave state latched and the clear obeys the write masks, so reassert the baseline.
         RendererContext.RenderState.ReassertCurrentPass();
         renderContext.Framebuffer.BindAndClear();
 
@@ -588,8 +588,8 @@ public class Renderer
         // TODO+: replace wireframe shaders with solid color
         if (isWireframe)
         {
-            // A baseline rather than a raw toggle, so sub-passes and materials compose over it
-            // and wireframe survives the whole frame.
+            // Set as a baseline so sub-passes and materials compose over it and wireframe
+            // survives the whole frame.
             var wireframeState = RendererContext.RenderState.CurrentPass;
             wireframeState.Rasterizer.FillMode = FillMode.Wireframe;
             RendererContext.RenderState.ApplyAsPassBaseline(in wireframeState);
@@ -803,8 +803,8 @@ public class Renderer
             throw new InvalidOperationException("Initialize() must be called before rendering");
         }
 
-        // Draw restores are lazy; the depth clear respects the write mask, and the depth-only
-        // draws below apply no state of their own, so reassert the baseline first.
+        // Draws leave state latched. The depth clear obeys the write mask and the depth-only draws
+        // below apply no state, so reassert the baseline.
         RendererContext.RenderState.ReassertCurrentPass();
 
         GL.Viewport(0, 0, ShadowDepthBuffer.Width, ShadowDepthBuffer.Height);
