@@ -156,6 +156,16 @@ public interface ICommandList : IDisposable
     /// <param name="firstInstance">First instance. The renderer passes the scene node id here.</param>
     void DrawIndexed(int indexCount, int instanceCount = 1, int firstIndex = 0, int baseVertex = 0, int firstInstance = 0);
 
+    /// <summary>Draws non-indexed primitives from an argument buffer.</summary>
+    /// <param name="argumentBuffer">The buffer holding the draw arguments, as four-uint
+    /// <c>DrawArraysIndirectCommand</c> structures.</param>
+    /// <param name="offsetInBytes">Byte offset of the first argument structure.</param>
+    /// <param name="drawCount">Number of draws.</param>
+    /// <param name="strideInBytes">Bytes between argument structures, or 0 for tightly packed.</param>
+    /// <remarks>Distinct from <see cref="DrawIndexedIndirect"/>: the argument layout differs, and
+    /// <see cref="OcclusionDebugRenderer"/> has a compute pass writing the non-indexed form.</remarks>
+    void DrawIndirect(IBuffer argumentBuffer, int offsetInBytes, int drawCount, int strideInBytes = 0);
+
     /// <summary>Draws indexed primitives from an argument buffer.</summary>
     /// <param name="argumentBuffer">The buffer holding the draw arguments.</param>
     /// <param name="offsetInBytes">Byte offset of the first argument structure.</param>
@@ -250,6 +260,17 @@ public interface ICommandList : IDisposable
     /// <param name="sizeInBytes">Bytes to fill.</param>
     /// <param name="value">The 32 bit value to repeat.</param>
     void FillBuffer(IBuffer buffer, int offsetInBytes, int sizeInBytes, uint value);
+
+    /// <summary>Fills one mip level of a texture with a raw 32 bit value, outside a render pass.
+    /// Replaces <c>glClearTexImage</c>.</summary>
+    /// <param name="texture">The texture to fill.</param>
+    /// <param name="mipLevel">Mip level to fill.</param>
+    /// <param name="value">The raw 32 bit value, reinterpreted according to the texture's format.</param>
+    /// <remarks>Distinct from a <see cref="LoadOp.Clear"/> attachment: this targets storage images,
+    /// which are not attachments, and takes a raw integer rather than a
+    /// <see cref="ColorAttachmentDesc.ClearColor"/>. The overdraw counters are cleared to
+    /// <see cref="uint.MaxValue"/>, which no float clear colour can represent.</remarks>
+    void ClearTexture(ITexture texture, int mipLevel, uint value);
 
     // ---- debugging ----
 
