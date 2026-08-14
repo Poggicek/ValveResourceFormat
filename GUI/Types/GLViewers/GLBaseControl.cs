@@ -10,7 +10,9 @@ using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.Input;
+using ValveResourceFormat.Renderer.RHI;
 using Windows.Win32;
+using GLDevice = ValveResourceFormat.Renderer.RHI.OpenGL.GLDevice;
 
 namespace GUI.Types.GLViewers;
 
@@ -92,6 +94,13 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
     protected Framebuffer? GLDefaultFramebuffer;
     protected Framebuffer? MainFramebuffer;
+
+    /// <summary>
+    /// The graphics device this viewer renders through. Created in <see cref="InitializeLoad"/> once the
+    /// GL context is current, and published on <see cref="RendererContext"/> so the renderer can reach it.
+    /// Null until then.
+    /// </summary>
+    protected IDevice? Device { get; private set; }
 
     public GLBaseControl(RendererContext rendererContext)
     {
@@ -427,6 +436,12 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 #endif
 
         FullScreenForm?.Dispose();
+
+        // Before the native window, which owns the GL context the device's resources live in.
+        RendererContext.Device = null;
+        Device?.Dispose();
+        Device = null;
+
         NativeWindowFactory.Destroy(GLNativeWindow);
         RendererContext.Dispose();
     }
@@ -747,10 +762,8 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
             loadedBindings = true;
         }
 
-        GL.Enable(EnableCap.DebugOutput);
-        GL.DebugMessageCallback(OpenGLDebugMessageDelegate, IntPtr.Zero);
-
 #if DEBUG
+        // Synchronous, so the debugger break in OnRhiMessage lands on the call that caused the error.
         GL.Enable(EnableCap.DebugOutputSynchronous);
 
         // Filter out performance warnings
@@ -764,10 +777,16 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         GL.DebugMessageControl(DebugSourceControl.DontCare, DebugTypeControl.DontCare, DebugSeverityControl.DebugSeverityHigh, 0, Array.Empty<int>(), true);
 #endif
 
+        // Constructing the device enables debug output and installs the message callback, so the
+        // severity filtering above is configured first. The device reads the current context's limits,
+        // which is why this cannot move out of the MakeCurrent scope.
+        Device = new GLDevice(OnRhiMessage);
+        RendererContext.Device = Device;
+
         GLEnvironment.Initialize(VrfGuiContext.Logger);
         GLEnvironment.SetDefaultRenderState(RendererContext);
 
-        MaxSamples = GL.GetInteger(GetPName.MaxSamples);
+        MaxSamples = Device.Limits.MaxSampleCount;
         GLDefaultFramebuffer = Framebuffer.GLDefaultFramebuffer;
 
         // Framebuffer used to draw geometry
@@ -802,51 +821,27 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
     protected void SetMoveSpeedOrZoomLabel(string text) => UiControl?.SetMoveSpeed(text);
 
-    private static void OnDebugMessage(DebugSource source, DebugType type, int id, DebugSeverity severity, int length, IntPtr pMessage, IntPtr pUserParam)
+    /// <summary>
+    /// Routes backend diagnostics into the log, and breaks into the debugger on errors so the offending
+    /// call is on the stack. Handed to the device at construction, which is the only point Vulkan can
+    /// install its messenger.
+    /// </summary>
+    private static void OnRhiMessage(RhiMessageSeverity severity, string message)
     {
-        var severityStr = severity.ToString().Replace("DebugSeverity", string.Empty, StringComparison.Ordinal);
-        var sourceStr = source.ToString().Replace("DebugSource", string.Empty, StringComparison.Ordinal);
-        var typeStr = type.ToString().Replace("DebugType", string.Empty, StringComparison.Ordinal);
-        var message = System.Runtime.InteropServices.Marshal.PtrToStringUTF8(pMessage, length);
-        var error = $"[{severityStr} {sourceStr} {typeStr}] {message}";
-
-#if DEBUG
-        if (type is DebugType.DebugTypePerformance or DebugType.DebugTypeUndefinedBehavior)
+        switch (severity)
         {
-            error += $" ({DescribeObject(ObjectLabelIdentifier.Program, GL.GetInteger(GetPName.CurrentProgram))}, {DescribeObject(ObjectLabelIdentifier.Framebuffer, GL.GetInteger(GetPName.DrawFramebufferBinding))})";
-        }
-#endif
-
-        switch (type)
-        {
-            case DebugType.DebugTypeError: Log.Error("OpenGL", error); break;
-            default: Log.Debug("OpenGL", error); break;
+            case RhiMessageSeverity.Error: Log.Error("RHI", message); break;
+            case RhiMessageSeverity.Warning: Log.Warn("RHI", message); break;
+            default: Log.Debug("RHI", message); break;
         }
 
 #if DEBUG
-        if (type == DebugType.DebugTypeError && source != DebugSource.DebugSourceShaderCompiler)
+        if (severity == RhiMessageSeverity.Error)
         {
             Debugger.Break();
         }
 #endif
     }
-
-#if DEBUG
-    private static string DescribeObject(ObjectLabelIdentifier identifier, int name)
-    {
-        var kind = identifier == ObjectLabelIdentifier.Program ? "program" : "framebuffer";
-
-        if (name == 0)
-        {
-            return $"{kind} 0";
-        }
-
-        GL.GetObjectLabel(identifier, name, 256, out _, out string label);
-        return string.IsNullOrEmpty(label) ? $"{kind} {name}" : $"{kind} {name} '{label}'";
-    }
-#endif
-
-    protected static readonly DebugProc OpenGLDebugMessageDelegate = OnDebugMessage;
 
     public void Draw(bool isPaused)
     {

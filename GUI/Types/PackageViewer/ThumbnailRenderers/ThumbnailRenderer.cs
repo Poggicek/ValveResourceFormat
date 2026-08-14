@@ -10,7 +10,9 @@ using SteamDatabase.ValvePak;
 using ValveResourceFormat;
 using ValveResourceFormat.IO;
 using ValveResourceFormat.Renderer;
+using ValveResourceFormat.Renderer.RHI;
 using ValveResourceFormat.Renderer.SceneEnvironment;
+using GLDevice = ValveResourceFormat.Renderer.RHI.OpenGL.GLDevice;
 
 namespace GUI.Types.PackageViewer.ThumbnailRenderers;
 
@@ -31,6 +33,12 @@ internal abstract class ThumbnailRenderer : IDisposable
     private RendererContext? RendererContext;
     private NativeWindow? NativeWindow;
     private bool disposed;
+
+    /// <summary>
+    /// The graphics device thumbnails render through, created in <see cref="Load"/> once the GL context
+    /// is current and published on the renderer context. Null until then.
+    /// </summary>
+    protected IDevice? Device { get; private set; }
 
     public bool Loaded { get; private set; }
 
@@ -60,6 +68,10 @@ internal abstract class ThumbnailRenderer : IDisposable
         RendererContext = new RendererContext(context, VrfGuiContext.Logger);
 
         NativeWindow.MakeCurrent();
+
+        // Thumbnails render on a background thread, so diagnostics are logged rather than broken on.
+        Device = new GLDevice(OnRhiMessage);
+        RendererContext.Device = Device;
 
         GLEnvironment.Initialize(RendererContext.Logger);
         GLEnvironment.SetDefaultRenderState(RendererContext);
@@ -112,6 +124,16 @@ internal abstract class ThumbnailRenderer : IDisposable
         };
 
         SceneRenderer.Scene.PostProcessInfo.AddPostProcessVolume(post);
+    }
+
+    private static void OnRhiMessage(RhiMessageSeverity severity, string message)
+    {
+        switch (severity)
+        {
+            case RhiMessageSeverity.Error: Log.Error(nameof(ThumbnailRenderer), message); break;
+            case RhiMessageSeverity.Warning: Log.Warn(nameof(ThumbnailRenderer), message); break;
+            default: Log.Debug(nameof(ThumbnailRenderer), message); break;
+        }
     }
 
     public Bitmap? ReadPixelsToBitmap()
@@ -210,7 +232,9 @@ internal abstract class ThumbnailRenderer : IDisposable
         // no need for this since we just want the pixels into bitmap
         //NativeWindow.Context.SwapBuffers();
 
-        GL.Flush();
+        // The contract's sanctioned use of WaitIdle: drain before reading back.
+        Debug.Assert(Device is not null, "Device is not created.");
+        Device.WaitIdle();
 
         return ReadPixelsToBitmap();
     }
@@ -230,6 +254,15 @@ internal abstract class ThumbnailRenderer : IDisposable
 
         if (disposing)
         {
+            // Before the native window, which owns the GL context the device's resources live in.
+            if (RendererContext is not null)
+            {
+                RendererContext.Device = null;
+            }
+
+            Device?.Dispose();
+            Device = null;
+
             RendererContext?.Dispose();
             SceneRenderer?.Dispose();
             GLViewers.NativeWindowFactory.Destroy(NativeWindow);

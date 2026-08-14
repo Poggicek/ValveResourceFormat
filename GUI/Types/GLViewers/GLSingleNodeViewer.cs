@@ -101,8 +101,9 @@ namespace GUI.Types.GLViewers
             SaveAsFbo.BindAndClear();
             Renderer.PostprocessRender(MainFramebuffer, SaveAsFbo, flipY: true);
 
-            GL.Flush();
-            GL.Finish();
+            // The contract's sanctioned use of WaitIdle: drain before reading back.
+            Debug.Assert(Device is not null);
+            Device.WaitIdle();
 
             SaveAsFbo.Bind(FramebufferTarget.ReadFramebuffer);
             GL.ReadBuffer(ReadBufferMode.ColorAttachment0);

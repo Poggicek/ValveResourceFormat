@@ -145,6 +145,20 @@ Still open, needing a decision rather than an addition:
   through an otherwise handle-free interface. Likeliest answer is Skia CPU raster plus a texture
   upload, but it needs deciding before anything touches that file.
 
+## `GLDebugGroup` is not a debug marker — do not port it to `DebugScope`
+
+`IDevice.DebugScope` and `ICommandList.DebugScope` exist for *marker* usage. `GLDebugGroup` is not
+marker usage, despite the name.
+
+Read `GLDebugGroup.cs:19`: `TimeQueryId = PerfStats.Active.BeginTimingQuery(name)` sits **outside**
+the `#if DEBUG`. It is the renderer's timing-scope primitive that also pushes a marker, and the
+timing half runs in Release. Substituting `DebugScope` compiles, renders identically, and silently
+deletes the instrumentation feeding the Timings overlay.
+
+`GLDebugGroup` should keep its timing role and gain a `DebugScope` *inside* it. Timestamps are
+outside this contract by design, so the two surfaces have to be reconciled deliberately rather than
+by mechanical substitution.
+
 ## Not in this contract, by design
 
 - **Queries and timestamps** — `PerfStats` / `Timings` keep their own surface (agent `E2`).

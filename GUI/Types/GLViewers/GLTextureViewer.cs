@@ -798,8 +798,9 @@ namespace GUI.Types.GLViewers
 
                 Draw(SaveAsFbo, captureFullSizeImage: true, removeFlags);
 
-                GL.Flush();
-                GL.Finish();
+                // The contract's sanctioned use of WaitIdle: drain before reading back.
+                Debug.Assert(Device is not null);
+                Device.WaitIdle();
 
                 SaveAsFbo.Bind(FramebufferTarget.ReadFramebuffer);
                 GL.ReadBuffer(ReadBufferMode.ColorAttachment0);
