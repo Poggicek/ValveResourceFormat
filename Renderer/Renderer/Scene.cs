@@ -53,6 +53,32 @@ namespace ValveResourceFormat.Renderer
             /// <summary>Gets or sets the framebuffer that is the render target.</summary>
             public required Framebuffer Framebuffer { get; set; }
 
+            /// <summary>
+            /// Gets or sets the RHI command list this pass records into, or <see langword="null"/> when
+            /// the pass is still drawing through OpenGL directly.
+            /// </summary>
+            /// <remarks>
+            /// Optional rather than <see langword="required"/> on purpose. Every render path already
+            /// threads this context down to <see cref="SceneNode.Render"/>, so setting this once beside
+            /// <see cref="Framebuffer"/> reaches every node and renderer with no further plumbing, while
+            /// call sites that have not been ported yet keep working unchanged on the OpenGL path.
+            /// </remarks>
+            public RHI.ICommandList? CommandList { get; set; }
+
+            /// <summary>
+            /// Gets the graphics device this pass renders with: the one that produced
+            /// <see cref="CommandList"/>, or failing that <see cref="RendererContext.Device"/>.
+            /// </summary>
+            public readonly RHI.IDevice? Device => CommandList?.Device ?? Scene.RendererContext.Device;
+
+            /// <summary>Gets <see cref="CommandList"/>, throwing when this pass was not given one.</summary>
+            /// <returns>The command list to record into.</returns>
+            /// <exception cref="InvalidOperationException">The pass has no command list.</exception>
+            public readonly RHI.ICommandList RequireCommandList() => CommandList
+                ?? throw new InvalidOperationException(
+                    $"The {RenderPass} pass has no RHI command list. Whoever builds the render context must "
+                    + $"set {nameof(Scene)}.{nameof(RenderContext)}.{nameof(CommandList)} before anything records through it.");
+
             /// <summary>Gets or sets the current render pass being executed.</summary>
             public RenderPass RenderPass { get; set; }
 

@@ -66,6 +66,20 @@ public class Renderer
     public RendererContext RendererContext { get; }
 
     /// <summary>
+    /// The RHI command list this renderer records into, or <see langword="null"/> to keep drawing
+    /// through OpenGL directly. Set it once per frame, before <see cref="DrawMainScene"/> or
+    /// <see cref="Render(Framebuffer)"/>; both put it on the <see cref="Scene.RenderContext"/> they
+    /// build, which is what carries it to every scene node and renderer.
+    /// </summary>
+    public RHI.ICommandList? CommandList { get; set; }
+
+    /// <summary>
+    /// The graphics device this renderer draws with, assigned by the presentation layer on
+    /// <see cref="RendererContext"/>. <see langword="null"/> until a backend has been brought up.
+    /// </summary>
+    public RHI.IDevice? Device => RendererContext.Device;
+
+    /// <summary>
     /// Active camera used for view and projection transforms.
     /// </summary>
     public Camera Camera { get; set; }
@@ -503,6 +517,7 @@ public class Renderer
         {
             Camera = Camera,
             Framebuffer = MainFramebuffer,
+            CommandList = CommandList,
             Scene = Scene,
             Textures = Textures,
         };
@@ -525,6 +540,7 @@ public class Renderer
         {
             Camera = Camera,
             Framebuffer = framebuffer,
+            CommandList = CommandList,
             Scene = Scene,
             Textures = Textures,
         };

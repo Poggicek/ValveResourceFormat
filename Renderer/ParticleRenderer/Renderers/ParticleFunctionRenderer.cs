@@ -124,7 +124,40 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         {
         }
 
-        public abstract void Render(ParticleCollection particles, ParticleSystemRenderState systemRenderState, Camera camera);
+        /// <summary>
+        /// Draws this renderer's particles through the RHI.
+        /// </summary>
+        /// <param name="particles">The particles to draw.</param>
+        /// <param name="systemRenderState">The owning system's render state.</param>
+        /// <param name="context">
+        /// The pass being drawn. <see cref="Scene.RenderContext.CommandList"/> is the command list to
+        /// record into and <see cref="Scene.RenderContext.Camera"/> replaces the camera argument of the
+        /// older overload.
+        /// </param>
+        /// <remarks>
+        /// This is the overload to implement. The default body forwards to the camera-only
+        /// <see cref="Render(ParticleCollection, ParticleSystemRenderState, Camera)"/> so renderers that
+        /// have not been ported yet keep drawing through OpenGL untouched; a renderer that overrides this
+        /// one no longer needs to implement that one at all.
+        /// </remarks>
+        public virtual void Render(ParticleCollection particles, ParticleSystemRenderState systemRenderState, Scene.RenderContext context)
+            => Render(particles, systemRenderState, context.Camera);
+
+        /// <summary>
+        /// Draws this renderer's particles through OpenGL, with no access to a command list.
+        /// </summary>
+        /// <param name="particles">The particles to draw.</param>
+        /// <param name="systemRenderState">The owning system's render state.</param>
+        /// <param name="camera">The camera being drawn from.</param>
+        /// <remarks>
+        /// Superseded by <see cref="Render(ParticleCollection, ParticleSystemRenderState, Scene.RenderContext)"/>,
+        /// which carries the RHI command list as well as the camera. Virtual rather than abstract only so
+        /// that ported renderers can drop it; every renderer must still override one of the two.
+        /// </remarks>
+        /// <exception cref="NotSupportedException">Neither overload was overridden.</exception>
+        public virtual void Render(ParticleCollection particles, ParticleSystemRenderState systemRenderState, Camera camera)
+            => throw new NotSupportedException(
+                $"{GetType().Name} overrides neither {nameof(Render)} overload, so it cannot draw anything.");
 
         /// <summary>
         /// The two sheet frames a particle sits between and how far it has crossed from the first to

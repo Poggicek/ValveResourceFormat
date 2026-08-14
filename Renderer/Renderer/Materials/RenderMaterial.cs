@@ -601,6 +601,93 @@ namespace ValveResourceFormat.Renderer.Materials
             renderState.Apply(GetRenderState(renderState.CurrentPass));
         }
 
+        /// <summary>
+        /// One texture this material contributes to a draw, in RHI descriptor terms.
+        /// </summary>
+        /// <param name="DescriptorSet">
+        /// Always <see cref="RHI.DescriptorSets.MaterialTextures"/>. Carried explicitly so a caller can
+        /// pass it straight to <see cref="RHI.ICommandList.BindTexture"/> without restating the mapping.
+        /// </param>
+        /// <param name="Binding">
+        /// The slot within that set, assigned by this material. Equal to the OpenGL texture unit the same
+        /// texture gets in <see cref="Render"/>, less <see cref="TextureUnitStart"/>.
+        /// </param>
+        /// <param name="Name">The sampler uniform name this texture satisfies.</param>
+        /// <param name="Texture">The texture to bind.</param>
+        /// <param name="UsesUserConfigSampler">
+        /// Whether this binding takes the sampler built from <see cref="UserConfigAddressModes"/> rather
+        /// than the device default.
+        /// </param>
+        public readonly record struct TextureBinding(
+            int DescriptorSet,
+            int Binding,
+            string Name,
+            RenderTexture Texture,
+            bool UsesUserConfigSampler);
+
+        /// <summary>
+        /// Gets the texture address modes this material's user-config samplers are built from, as the raw
+        /// Source 2 values of <c>g_nTextureAddressModeU</c> and <c>g_nTextureAddressModeV</c>. Applies to
+        /// the bindings <see cref="TextureBinding.UsesUserConfigSampler"/> marks.
+        /// </summary>
+        public (int AddressModeU, int AddressModeV) UserConfigAddressModes => (
+            (int)IntParams.GetValueOrDefault("g_nTextureAddressModeU"),
+            (int)IntParams.GetValueOrDefault("g_nTextureAddressModeV"));
+
+        /// <summary>
+        /// Collects this material's texture bindings for a draw, in the RHI descriptor terms of
+        /// <see cref="RHI.DescriptorSets.MaterialTextures"/>.
+        /// </summary>
+        /// <param name="shader">The shader being drawn with, or <see langword="null"/> to use <see cref="Shader"/>.</param>
+        /// <param name="bindings">Receives the bindings. Cleared first, so one list can be reused per draw.</param>
+        /// <remarks>
+        /// <para>
+        /// This walks the shader's textures in the same order and skips the same entries as
+        /// <see cref="Render"/>, so binding <c>N</c> here is the texture that path puts on OpenGL texture
+        /// unit <c>TextureUnitStart + N</c>. That correspondence is what lets the two backends stay a
+        /// parity oracle for each other, so the two loops must be changed together.
+        /// </para>
+        /// <para>
+        /// Slot numbering is the material's own, per the contract's descriptor set table: the reserved
+        /// global textures of <see cref="ReservedTextureSlots"/> are set 2 at their enum value, and these
+        /// per-material ones are set 3 counting from zero. Shader-side <c>layout(set=, binding=)</c>
+        /// decorations must agree with what this assigns, or the wrong texture binds silently.
+        /// </para>
+        /// </remarks>
+        public void CollectTextureBindings(Shader? shader, List<TextureBinding> bindings)
+        {
+            ArgumentNullException.ThrowIfNull(bindings);
+
+            bindings.Clear();
+
+            shader ??= Shader;
+
+            if (shader.IgnoreMaterialData)
+            {
+                return;
+            }
+
+            var hasUserConfigSampler = shader.SamplerUserConfigUniforms.Count > 0 && Loader != null;
+            var binding = 0;
+
+            foreach (var (name, defaultTexture) in shader.Default.Textures)
+            {
+                // Mirrors Shader.SetTexture returning false: a texture the shader never declared is
+                // skipped without consuming a slot.
+                if (shader.GetUniformLocation(name) < 0)
+                {
+                    continue;
+                }
+
+                bindings.Add(new TextureBinding(
+                    RHI.DescriptorSets.MaterialTextures,
+                    binding++,
+                    name,
+                    Textures.GetValueOrDefault(name, defaultTexture),
+                    hasUserConfigSampler && shader.SamplerUserConfigUniforms.Contains(name)));
+            }
+        }
+
         private static void SetMatrix(Shader shader, Globals buffer, string name, Matrix4x4 value)
         {
             if (shader.GlobalsLayout.Members.TryGetValue(name, out var constant))

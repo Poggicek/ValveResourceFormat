@@ -175,9 +175,20 @@ namespace ValveResourceFormat.Renderer
         }
 
         /// <summary>
+        /// Gets the graphics device this node's scene renders with, or <see langword="null"/> before the
+        /// presentation layer has brought a backend up. For resource creation outside a draw; during one,
+        /// prefer <see cref="Scene.RenderContext.Device"/>, which agrees with the command list in hand.
+        /// </summary>
+        protected RHI.IDevice? Device => Scene.RendererContext.Device;
+
+        /// <summary>
         /// Called each frame to render this node.
         /// </summary>
-        /// <param name="context">The current render context.</param>
+        /// <param name="context">
+        /// The current render context. <see cref="Scene.RenderContext.CommandList"/> is the RHI command
+        /// list to record into, and is <see langword="null"/> while the pass still draws through OpenGL
+        /// directly; <see cref="Scene.RenderContext.RequireCommandList"/> asserts one is present.
+        /// </param>
         public virtual void Render(Scene.RenderContext context)
         {
         }
