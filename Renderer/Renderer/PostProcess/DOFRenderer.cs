@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Renderer.RHI;
 
 namespace ValveResourceFormat.Renderer.PostProcess;
 
@@ -103,7 +104,9 @@ public class DOFRenderer
     /// <summary>
     /// Applies depth-of-field blur. Returns the blurred color texture.
     /// </summary>
-    public RenderTexture Render(RenderTexture input)
+    /// <param name="input">The resolved scene colour, with circle-of-confusion in its alpha channel.</param>
+    /// <param name="commandList">The list to record into, or <see langword="null"/> to run through OpenGL.</param>
+    public RenderTexture Render(RenderTexture input, ICommandList? commandList = null)
     {
         if (DOF == null)
         {
@@ -120,14 +123,19 @@ public class DOFRenderer
             DOF.Use();
 
             BlurredResult.Resize(input.Width, input.Height);
-            BlurredResult.BindAndClear(FramebufferTarget.DrawFramebuffer);
+
+            if (commandList == null)
+            {
+                BlurredResult.BindAndClear(FramebufferTarget.DrawFramebuffer);
+            }
+
+            using var pass = PostProcessRenderer.BeginPass(commandList, BlurredResult, "Depth Of Field", clear: true);
 
             SetShaderParams();
 
-            DOF.SetTexture(0, "g_tInputColor_CoC", input);
+            PostProcessRenderer.BindTexture(commandList, DOF, 0, "g_tInputColor_CoC", input);
 
-            GL.BindVertexArray(RendererContext.MeshBufferCache.EmptyVAO);
-            GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+            PostProcessRenderer.DrawFullscreenTriangle(commandList, RendererContext, DOF, BlurredResult);
         }
 
         return BlurredResult.Color!;
@@ -139,10 +147,13 @@ public class DOFRenderer
     /// <param name="shader">The MSAA resolve shader to configure.</param>
     /// <param name="camera">The active camera providing view/projection matrices and position.</param>
     /// <param name="msaaDepth">The MSAA depth texture used to reconstruct world-space depth.</param>
-    public void SetDofResolveShaderUniforms(Shader shader, Camera camera, RenderTexture msaaDepth)
+    /// <param name="commandList">The list to record the texture bind into, or <see langword="null"/> to bind directly.</param>
+    public void SetDofResolveShaderUniforms(Shader shader, Camera camera, RenderTexture msaaDepth,
+        ICommandList? commandList = null)
     {
         // Not the scene's resolved depth, so it goes above the reserved slots like any other per draw texture.
-        shader.SetTexture(RenderMaterial.TextureUnitStart, "g_tSceneDepthMsaa", msaaDepth);
+        PostProcessRenderer.BindTexture(commandList, shader, RenderMaterial.TextureUnitStart, "g_tSceneDepthMsaa",
+            msaaDepth, DescriptorSets.MaterialTextures);
 
         if (!Matrix4x4.Invert(camera.ViewProjectionMatrix, out var invViewProjMatrix))
         {

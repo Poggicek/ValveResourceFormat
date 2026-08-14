@@ -306,11 +306,14 @@ public class Renderer
         histogramBuffers[0] = StorageBuffer.Allocate<uint>(ReservedBufferSlots.Histogram, 256, BufferUsageHint.DynamicDraw);
         histogramBuffers[1] = StorageBuffer.Allocate<uint>(ReservedBufferSlots.AverageLuminance, 4, BufferUsageHint.DynamicRead);
 
-        ResolvedSceneColor = RenderTexture.Create(4, 4, SizedInternalFormat.Rgba16f);
+        // Created through the RhiFormat overloads so the textures describe themselves completely: the MSAA
+        // resolve binds both as storage images through the command list, which takes the image format from
+        // the texture rather than from the call site.
+        ResolvedSceneColor = RenderTexture.Create(4, 4, RHI.RhiFormat.R16G16B16A16_SFloat);
         ResolvedSceneColor.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
         ResolvedSceneColor.SetWrapMode(TextureWrapMode.ClampToEdge);
 
-        ResolvedSceneDepth = RenderTexture.Create(4, 4, SizedInternalFormat.R32f);
+        ResolvedSceneDepth = RenderTexture.Create(4, 4, RHI.RhiFormat.R32_SFloat);
 
         Textures.Add(new(ReservedTextureSlots.SceneColor, "g_tSceneColor", ResolvedSceneColor));
         Textures.Add(new(ReservedTextureSlots.SceneDepth, "g_tSceneDepth", ResolvedSceneDepth));
@@ -434,7 +437,7 @@ public class Renderer
         }
     }
 
-    void UpdatePerViewGpuBuffers(Scene scene, Camera camera, float deltaTime)
+    void UpdatePerViewGpuBuffers(Scene scene, Camera camera, float deltaTime, RHI.ICommandList? commandList = null)
     {
         Debug.Assert(ViewBuffer != null);
 
@@ -499,7 +502,7 @@ public class Renderer
         if (Postprocess != null)
         {
             Postprocess.State = scene.PostProcessInfo.CurrentState;
-            Postprocess.ResolveColorCorrection(scene.PostProcessInfo.ActiveLuts);
+            Postprocess.ResolveColorCorrection(scene.PostProcessInfo.ActiveLuts, commandList);
             Postprocess.CalculateTonemapScalar(deltaTime);
         }
     }
@@ -545,7 +548,8 @@ public class Renderer
     /// and is the only thing that knows where a frame really begins: the renderer draws one part of one,
     /// with post-processing and overlays still to come after it returns.
     /// </remarks>
-    private RHI.ICommandList? AcquireCommandList()
+    /// <param name="name">Debug label for the recorded work.</param>
+    private RHI.ICommandList? AcquireCommandList(string name = "Scene")
     {
         if (!EnableRhiRecording)
         {
@@ -561,7 +565,7 @@ public class Renderer
 
         try
         {
-            return device.BeginCommandList("Scene");
+            return device.BeginCommandList(name);
         }
         catch (NotSupportedException e)
         {
@@ -697,7 +701,7 @@ public class Renderer
         };
 
         LoadShaderTextures();
-        UpdatePerViewGpuBuffers(Scene, Camera, DeltaTime);
+        UpdatePerViewGpuBuffers(Scene, Camera, DeltaTime, renderContext.CommandList);
         Scene.SetSceneBuffers();
 
         Scene.RenderOpaqueLayer(renderContext);
@@ -804,7 +808,7 @@ public class Renderer
             ? RendererContext.RenderState.Scope(fillMode: FillMode.Wireframe)
             : default;
 
-        UpdatePerViewGpuBuffers(Scene, renderContext.Camera, DeltaTime);
+        UpdatePerViewGpuBuffers(Scene, renderContext.Camera, DeltaTime, renderContext.CommandList);
 
         // The opaque half. Ends before the framebuffer grab, which copies and dispatches compute, and
         // neither is valid inside a pass.
@@ -907,7 +911,7 @@ public class Renderer
                 copyDepth |= generateDepthPyramid;
                 Scene.DepthPyramidValid = !DisableAllCulling && (generateDepthPyramid || LockedCullFrustum != null);
 
-                GrabFramebufferCopy(renderContext.Framebuffer, copyColor, copyDepth);
+                GrabFramebufferCopy(renderContext.Framebuffer, copyColor, copyDepth, renderContext.CommandList);
 
                 if (generateDepthPyramid)
                 {
@@ -1142,42 +1146,87 @@ public class Renderer
 
         using var _ = new GLDebugGroup("Compute Average Luminance");
 
+        var commandList = renderContext.CommandList;
+
         var width = ResolvedSceneColor.Width;
         var height = ResolvedSceneColor.Height;
 
-        static void Dispatch(Shader shader, RenderTexture texture, int x, int y)
+        static void Dispatch(RHI.ICommandList? commandList, Shader shader, RenderTexture texture, int x, int y)
         {
             var logMin = -8f;
             var logRange = 13f;
 
             shader.Use();
-            shader.SetTexture(0, "inputImage", texture);
+            PostProcess.PostProcessRenderer.BindComputePipeline(commandList, shader);
+            PostProcess.PostProcessRenderer.BindTexture(commandList, shader, 0, "inputImage", texture);
             shader.SetUniform1("logMinLuminance", logMin);
             shader.SetUniform1("logLuminanceRange", logRange);
 
-            GL.DispatchCompute(x, y, 1);
+            PostProcess.PostProcessRenderer.Dispatch(commandList, x, y);
         }
 
         histogramBuffers[0].Clear();
-        histogramBuffers[0].BindBufferBase();
-        histogramBuffers[1].BindBufferBase();
+        BindStorageBuffer(commandList, histogramBuffers[0]);
+        BindStorageBuffer(commandList, histogramBuffers[1]);
 
         var inputTex = ResolvedSceneColor;
 
         // Build histogram
         var groupsX = Math.Max(1, (width + 15) / 16);
         var groupsY = Math.Max(1, (height + 15) / 16);
-        Dispatch(histogramShaders[0], inputTex, groupsX, groupsY);
-        GL.MemoryBarrier(MemoryBarrierFlags.ShaderStorageBarrierBit);
+        Dispatch(commandList, histogramShaders[0], inputTex, groupsX, groupsY);
+        HistogramBarrier(commandList, histogramBuffers[0], readBack: false);
 
         // Reduce histogram
-        Dispatch(histogramShaders[1], inputTex, 1, 1); // local_size_x = 256
+        Dispatch(commandList, histogramShaders[1], inputTex, 1, 1); // local_size_x = 256
 
-        GL.MemoryBarrier(MemoryBarrierFlags.ShaderStorageBarrierBit | MemoryBarrierFlags.BufferUpdateBarrierBit);
+        // The reduction's result is read by the client through a persistent mapping, which is the second
+        // half of what the OpenGL path's buffer update bit orders.
+        HistogramBarrier(commandList, histogramBuffers[1], readBack: true);
 
         var output = Vector4.Zero;
         histogramBuffers[1].Read(ref output);
         Postprocess.AverageLuminance = output.X;
+    }
+
+    /// <summary>Binds a storage buffer to its reserved slot, through the command list when recording.</summary>
+    private static void BindStorageBuffer(RHI.ICommandList? commandList, StorageBuffer buffer)
+    {
+        if (commandList is null)
+        {
+            buffer.BindBufferBase();
+            return;
+        }
+
+        commandList.BindStorageBuffer(buffer.BindingPoint, buffer.RhiBuffer);
+    }
+
+    /// <summary>Orders a histogram pass's storage writes against whatever reads them next.</summary>
+    private static void HistogramBarrier(RHI.ICommandList? commandList, StorageBuffer buffer, bool readBack)
+    {
+        if (commandList is null)
+        {
+            var flags = MemoryBarrierFlags.ShaderStorageBarrierBit;
+
+            if (readBack)
+            {
+                flags |= MemoryBarrierFlags.BufferUpdateBarrierBit;
+            }
+
+            GL.MemoryBarrier(flags);
+            return;
+        }
+
+        // Two transitions rather than one, batched into a single call: the reduction's output is both read
+        // by the next shader and mapped for the client, and the OpenGL backend unions their barrier bits.
+        RHI.BufferBarrier[] barriers = readBack
+            ? [
+                new(buffer.RhiBuffer, RHI.ResourceState.ShaderWrite, RHI.ResourceState.ShaderRead),
+                new(buffer.RhiBuffer, RHI.ResourceState.ShaderWrite, RHI.ResourceState.CopySource),
+            ]
+            : [new(buffer.RhiBuffer, RHI.ResourceState.ShaderWrite, RHI.ResourceState.ShaderRead)];
+
+        commandList.Barrier(barriers, []);
     }
 
     private void RenderOutlineLayer(Scene.RenderContext renderContext)
@@ -1209,12 +1258,12 @@ public class Renderer
             ResolvedSceneColor.Height != height)
         {
             ResolvedSceneColor.Delete();
-            ResolvedSceneColor = RenderTexture.Create(width, height, SizedInternalFormat.Rgba16f);
+            ResolvedSceneColor = RenderTexture.Create(width, height, RHI.RhiFormat.R16G16B16A16_SFloat);
             ResolvedSceneColor.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
             ResolvedSceneColor.SetWrapMode(TextureWrapMode.ClampToEdge);
 
             ResolvedSceneDepth!.Delete();
-            ResolvedSceneDepth = RenderTexture.Create(width, height, SizedInternalFormat.R32f);
+            ResolvedSceneDepth = RenderTexture.Create(width, height, RHI.RhiFormat.R32_SFloat);
 
             Textures.RemoveAll(static t => t.Slot == ReservedTextureSlots.SceneColor || t.Slot == ReservedTextureSlots.SceneDepth);
             Textures.Add(new(ReservedTextureSlots.SceneColor, "g_tSceneColor", ResolvedSceneColor));
@@ -1225,7 +1274,13 @@ public class Renderer
     /// <summary>
     /// Resolves MSAA and copies color and/or depth from the framebuffer into <see cref="ResolvedSceneColor"/> and <see cref="ResolvedSceneDepth"/>.
     /// </summary>
-    public void GrabFramebufferCopy(Framebuffer framebuffer, bool copyColor, bool copyDepth)
+    /// <param name="framebuffer">The multisampled framebuffer to resolve.</param>
+    /// <param name="copyColor">Whether to resolve colour.</param>
+    /// <param name="copyDepth">Whether to resolve depth.</param>
+    /// <param name="commandList">The list to record into, or <see langword="null"/> to run through OpenGL.
+    /// The resolve dispatches compute, so no render pass may be open on it.</param>
+    public void GrabFramebufferCopy(Framebuffer framebuffer, bool copyColor, bool copyDepth,
+        RHI.ICommandList? commandList = null)
     {
         if (!copyColor && !copyDepth)
         {
@@ -1236,7 +1291,7 @@ public class Renderer
 
         EnsureResolvedTextureSize(framebuffer.Width, framebuffer.Height);
 
-        Postprocess.ResolveMsaa(framebuffer, ResolvedSceneColor!, ResolvedSceneDepth!, copyColor, copyDepth);
+        Postprocess.ResolveMsaa(framebuffer, ResolvedSceneColor!, ResolvedSceneDepth!, copyColor, copyDepth, commandList);
 
         framebuffer.Bind(FramebufferTarget.Framebuffer);
     }
@@ -1244,6 +1299,24 @@ public class Renderer
     /// <summary>
     /// Multisampling resolve, postprocess the image, and convert to gamma.
     /// </summary>
+    /// <param name="inputFramebuffer">The multisampled scene framebuffer to read.</param>
+    /// <param name="outputFramebuffer">Where the tonemapped image is written.</param>
+    /// <param name="flipY">Whether the image is flipped vertically on the way out.</param>
+    /// <remarks>
+    /// <para>
+    /// This takes a command list of its own rather than the scene's. Post-processing runs after
+    /// <see cref="Render(Scene.RenderContext)"/> has already submitted, and on the OpenGL backend
+    /// acquiring a list is what rewinds it, so reusing the scene's would replay into a list whose work
+    /// has been handed over.
+    /// </para>
+    /// <para>
+    /// The chain only records when <paramref name="outputFramebuffer"/> is texture backed. A render pass
+    /// can never name the presented surface &#8212; framebuffer 0 has no texture handle for an attachment
+    /// to name &#8212; so a viewer that tonemaps straight onto the screen keeps the OpenGL path until the
+    /// presentation layer splits that draw in two: the chain into an offscreen colour target, and a
+    /// backend-specific blit from it to the screen.
+    /// </para>
+    /// </remarks>
     public void PostprocessRender(Framebuffer inputFramebuffer, Framebuffer outputFramebuffer, bool flipY = false)
     {
         using var _ = new GLDebugGroup("Post Processing");
@@ -1256,7 +1329,14 @@ public class Renderer
 
         EnsureResolvedTextureSize(inputFramebuffer.Width, inputFramebuffer.Height);
 
-        Postprocess.Render(inputFramebuffer, outputFramebuffer, ResolvedSceneColor!, Camera, flipY);
+        var commandList = outputFramebuffer.Color is null ? null : AcquireCommandList("Post Process");
+
+        Postprocess.Render(inputFramebuffer, outputFramebuffer, ResolvedSceneColor!, Camera, flipY, commandList);
+
+        if (commandList is not null)
+        {
+            RendererContext.Device?.Submit(commandList);
+        }
     }
 
     /// <summary>

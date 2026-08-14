@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Renderer.RHI;
 using Vector2i = OpenTK.Mathematics.Vector2i;
 
 namespace ValveResourceFormat.Renderer.PostProcess;
@@ -66,7 +67,9 @@ public class BloomRenderer
     /// <summary>
     /// Renders multi-pass bloom from the resolved scene color into <see cref="AccumulationResult"/>.
     /// </summary>
-    public void Render(RenderTexture input)
+    /// <param name="input">The resolved scene colour the threshold pass reads.</param>
+    /// <param name="commandList">The list to record into, or <see langword="null"/> to run through OpenGL.</param>
+    public void Render(RenderTexture input, ICommandList? commandList = null)
     {
         Debug.Assert(firstDownsampleBloomThreshold != null);
         Debug.Assert(downsample != null);
@@ -89,7 +92,16 @@ public class BloomRenderer
         // skip bloom if the resolution is too small
         if (InvalidSize(maxBloomRes))
         {
-            Accumulation.BindAndClear();
+            if (commandList == null)
+            {
+                Accumulation.BindAndClear();
+            }
+            else
+            {
+                // A pass that only clears: nothing is drawn, but the tonemap still samples the result.
+                using var clearPass = PostProcessRenderer.BeginPass(commandList, Accumulation, "Bloom Clear", clear: true);
+            }
+
             return;
         }
 
@@ -119,18 +131,22 @@ public class BloomRenderer
             Debug.Assert(input.Target == TextureTarget.Texture2D);
 
             firstDownsampleBloomThreshold.Use();
-            firstDownsampleBloomThreshold.SetTexture(0, "inputTexture", input);
+            PostProcessRenderer.BindTexture(commandList, firstDownsampleBloomThreshold, 0, "inputTexture", input);
 
-            Ping.Bind(FramebufferTarget.DrawFramebuffer);
-            GL.Viewport(0, 0, Ping.Width, Ping.Height);
+            if (commandList == null)
+            {
+                Ping.Bind(FramebufferTarget.DrawFramebuffer);
+                GL.Viewport(0, 0, Ping.Width, Ping.Height);
+            }
+
+            using var pass = PostProcessRenderer.BeginPass(commandList, Ping, "Bloom Downsample Threshold Pass");
 
             var thresholdParams = new Vector2(settings.BloomThreshold / settings.BloomThresholdWidth * -1, 1 / settings.BloomThresholdWidth);
             firstDownsampleBloomThreshold.SetUniform("g_flBloomScale", settings.BloomStrength);
             firstDownsampleBloomThreshold.SetUniform("g_flToneMapScalarLinear", tonemapScalar);
             firstDownsampleBloomThreshold.SetUniform("g_flThresholdParams", thresholdParams);
 
-            GL.BindVertexArray(RendererContext.MeshBufferCache.EmptyVAO);
-            GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+            PostProcessRenderer.DrawFullscreenTriangle(commandList, RendererContext, firstDownsampleBloomThreshold, Ping);
         }
 
         var lastWrittenMip = 0;
@@ -147,23 +163,30 @@ public class BloomRenderer
 
             if (i != 0)
             {
-                Ping.BindAndClear();
-                Pong.BindAndClear();
+                if (commandList == null)
+                {
+                    Ping.BindAndClear();
+                    Pong.BindAndClear();
+                }
 
                 // cheap downsample from previous mip
                 // Accumulation.AttachColorMipLevel(i - 1);
-                RenderTexture(downsample, Accumulation, Ping, downsampledSize, i - 1);
+                //
+                // The clear is load bearing on this one: the downsample draws into a viewport smaller than
+                // Ping, and the horizontal blur below reads all of it. Pong's clear folds into its own pass,
+                // which does cover every texel.
+                RenderTexture(commandList, downsample, Accumulation, Ping, downsampledSize, i - 1, clear: true);
             }
 
             // blur horizontal
-            RenderTexture(horizontalBlur, Ping, Pong, maxBloomRes);
+            RenderTexture(commandList, horizontalBlur, Ping, Pong, maxBloomRes, clear: i != 0);
 
             // blur vertical
-            RenderTexture(verticalBlur, Pong, Ping, maxBloomRes);
+            RenderTexture(commandList, verticalBlur, Pong, Ping, maxBloomRes);
 
             // write to bloom accumulation buffer
             Accumulation.AttachColorMipLevel(i);
-            RenderTexture(downsample, Ping, Accumulation, maxBloomRes, i);
+            RenderTexture(commandList, downsample, Ping, Accumulation, maxBloomRes, i, destMipLevel: i);
 
             lastWrittenMip = i;
             downsampledSize /= 2;
@@ -179,11 +202,13 @@ public class BloomRenderer
             var currentMipSize = Accumulation.GetMipSize(i - 1);
             var invTexSize = Vector2.One / new Vector2(currentMipSize.X, currentMipSize.Y);
 
-            Accumulation.Bind(FramebufferTarget.DrawFramebuffer);
+            if (commandList == null)
+            {
+                Accumulation.Bind(FramebufferTarget.DrawFramebuffer);
+            }
 
             // render into next higher res mip
             Accumulation.AttachColorMipLevel(i - 1);
-            GL.Viewport(0, 0, currentMipSize.X, currentMipSize.Y);
 
             // first combine needs two blur+tint values, for first and second mip
             // subsequent combines only need one, for current mip
@@ -192,7 +217,14 @@ public class BloomRenderer
                 : upsample;
 
             upsampleShader.Use();
-            upsampleShader.SetTexture(0, "g_tSource", Accumulation.Color);
+
+            // The pass renders into one mip of the same texture it samples, which is why it loads rather
+            // than clears: the merge composites the coarser level onto what is already in the finer one.
+            using var upsamplePass = PostProcessRenderer.BeginPass(commandList, Accumulation, "Bloom Upsample", i - 1);
+
+            PostProcessRenderer.SetViewport(commandList, currentMipSize.X, currentMipSize.Y);
+
+            PostProcessRenderer.BindTexture(commandList, upsampleShader, 0, "g_tSource", Accumulation.Color);
             upsampleShader.SetUniform("g_vTexelSize", invTexSize);
             upsampleShader.SetUniform("g_nCurrentMip", (float)i);
 
@@ -215,8 +247,7 @@ public class BloomRenderer
 
             upsampleShader.SetUniform("g_vCurMipBlurTint", blurTint);
 
-            GL.BindVertexArray(RendererContext.MeshBufferCache.EmptyVAO);
-            GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+            PostProcessRenderer.DrawFullscreenTriangle(commandList, RendererContext, upsampleShader, Accumulation);
         }
 
         Accumulation.AttachColorMipLevel(0);
@@ -225,24 +256,40 @@ public class BloomRenderer
     /// <summary>
     /// Render a texture from <paramref name="ping"/> to <paramref name="pong"/> using the provided screenspace shader.
     /// </summary>
-    private void RenderTexture(Shader shader, Framebuffer ping, Framebuffer pong, Vector2i size, int mip = 0)
+    /// <param name="commandList">The list to record into, or <see langword="null"/> to run through OpenGL.</param>
+    /// <param name="shader">The screen-space shader to draw with.</param>
+    /// <param name="ping">The framebuffer whose colour attachment is sampled.</param>
+    /// <param name="pong">The framebuffer being rendered into.</param>
+    /// <param name="size">The viewport to draw into, which is not always the whole attachment.</param>
+    /// <param name="mip">Which mip level of the source the shader samples.</param>
+    /// <param name="clear">Whether the destination is cleared first.</param>
+    /// <param name="destMipLevel">Which mip level of <paramref name="pong"/> is rendered into. The RHI
+    /// equivalent of the <see cref="Framebuffer.AttachColorMipLevel"/> the caller makes for the OpenGL
+    /// path, and separate from <paramref name="mip"/>, which names a level of the source.</param>
+    private void RenderTexture(ICommandList? commandList, Shader shader, Framebuffer ping, Framebuffer pong,
+        Vector2i size, int mip = 0, bool clear = false, int destMipLevel = 0)
     {
         var texSize = new Vector2(size.X, size.Y);
         var invTexSize = Vector2.One / new Vector2(size.X, size.Y);
 
-        pong.Bind(FramebufferTarget.DrawFramebuffer);
-
         Debug.Assert(ping.Color != null);
-        GL.Viewport(0, 0, size.X, size.Y);
+
+        if (commandList == null)
+        {
+            pong.Bind(FramebufferTarget.DrawFramebuffer);
+        }
 
         shader.Use();
+
+        using var pass = PostProcessRenderer.BeginPass(commandList, pong, "Bloom Blit", destMipLevel, clear);
+
+        PostProcessRenderer.SetViewport(commandList, size.X, size.Y);
 
         shader.SetUniform("g_vTexelSize", invTexSize);
         shader.SetUniform("g_vTextureSize", texSize);
         shader.SetUniform("g_nCurrentMip", (float)mip);
-        shader.SetTexture(0, "g_tSource", ping.Color);
+        PostProcessRenderer.BindTexture(commandList, shader, 0, "g_tSource", ping.Color);
 
-        GL.BindVertexArray(RendererContext.MeshBufferCache.EmptyVAO);
-        GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+        PostProcessRenderer.DrawFullscreenTriangle(commandList, RendererContext, shader, pong);
     }
 }

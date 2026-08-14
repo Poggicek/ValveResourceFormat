@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.World;
 
@@ -109,13 +111,262 @@ namespace ValveResourceFormat.Renderer.PostProcess
             Outline.Load();
         }
 
+        #region RHI helpers shared by the post-process chain
+
+        // The chain is a sequence of fullscreen triangles and compute dispatches over textures the
+        // renderer allocates itself, so every helper below is the same shape: record through the command
+        // list when there is one, and issue the OpenGL call the chain has always issued when there is not.
+        // Nothing here decides what is drawn; the two paths must stay pixel identical.
+
+        /// <summary>
+        /// Draws the fullscreen triangle every post-process pass is built on, binding a pipeline first
+        /// when recording.
+        /// </summary>
+        /// <param name="commandList">The list to record into, or <see langword="null"/> to draw through OpenGL.</param>
+        /// <param name="rendererContext">The context supplying the empty vertex array and the render state.</param>
+        /// <param name="shader">The program to draw with, which must already be in use.</param>
+        /// <param name="target">The framebuffer being rendered into, whose attachment format the pipeline
+        /// needs. Only read when recording; the OpenGL path draws into whatever is bound.</param>
+        /// <remarks>
+        /// The pipeline takes its state from <see cref="RenderStateTracker.CurrentPass"/>, which is the
+        /// state the enclosing scope has already applied, so binding it re-applies nothing. Its vertex
+        /// input is <see cref="VertexInputDesc.Empty"/>: the triangle is generated from the vertex index
+        /// and fetches nothing, which is what the empty vertex array stands for on the OpenGL path.
+        /// </remarks>
+        internal static void DrawFullscreenTriangle(ICommandList? commandList, RendererContext rendererContext,
+            Shader shader, Framebuffer? target)
+        {
+            if (commandList == null)
+            {
+                GL.BindVertexArray(rendererContext.MeshBufferCache.EmptyVAO);
+                GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+                return;
+            }
+
+            var device = (GLRendererDevice)commandList.Device;
+            var state = rendererContext.RenderState.CurrentPass;
+
+            commandList.BindPipeline(device.GetOrCreatePipeline(
+                shader,
+                in state,
+                VertexInputDesc.Empty,
+                PrimitiveTopology.TriangleList,
+                target?.Color is { } color ? [color.RhiFormat] : [],
+                RhiFormat.Undefined,
+                Math.Max(1, target?.NumSamples ?? 0)));
+
+            commandList.Draw(3);
+        }
+
+        /// <summary>Binds a compute program as a pipeline, when recording.</summary>
+        /// <param name="commandList">The list to record into, or <see langword="null"/> to do nothing.</param>
+        /// <param name="shader">The compute program, which must already be in use.</param>
+        /// <remarks>Cached on the program's identity by the device, so this costs a dictionary lookup
+        /// after the first call.</remarks>
+        internal static void BindComputePipeline(ICommandList? commandList, Shader shader)
+        {
+            if (commandList == null)
+            {
+                return;
+            }
+
+            // Disposed straight away: the module only names an already linked program, the pipeline does
+            // not keep it, and releasing it releases nothing.
+            using var module = GLRendererDevice.ModuleFor(shader, ShaderStage.Compute);
+
+            commandList.BindPipeline(commandList.Device.CreateComputePipeline(new ComputePipelineDesc(module, shader.Name)));
+        }
+
+        /// <summary>Points a sampler uniform at a texture unit and binds the texture there.</summary>
+        /// <param name="commandList">The list to record the bind into, or <see langword="null"/> to bind directly.</param>
+        /// <param name="shader">The program whose sampler uniform is being set.</param>
+        /// <param name="slot">The texture unit, which is also the binding within the descriptor set.</param>
+        /// <param name="name">The sampler uniform name.</param>
+        /// <param name="texture">The texture to bind, or <see langword="null"/> to do nothing.</param>
+        /// <param name="descriptorSet">Which set the binding belongs to. Defaults to the reserved globals.</param>
+        /// <remarks>
+        /// Only the bind moves onto the command list. Which unit a sampler reads is program state rather
+        /// than a binding, so it stays a <c>glProgramUniform</c> on both paths &#8212; and a program that
+        /// does not declare the sampler binds nothing at all, exactly as <c>Shader.SetTexture</c> does.
+        /// </remarks>
+        internal static void BindTexture(ICommandList? commandList, Shader shader, int slot, string name,
+            RenderTexture? texture, int descriptorSet = DescriptorSets.ReservedTextures)
+        {
+            if (texture == null)
+            {
+                return;
+            }
+
+            if (commandList == null)
+            {
+                shader.SetTexture(slot, name, texture);
+                return;
+            }
+
+            if (shader.GetUniformLocation(name) < 0)
+            {
+                return;
+            }
+
+            shader.SetUniform1(name, slot);
+
+            var binding = descriptorSet == DescriptorSets.MaterialTextures
+                ? slot - RenderMaterial.TextureUnitStart
+                : slot;
+
+            commandList.BindTexture(descriptorSet, binding, texture.RhiTexture);
+        }
+
+        /// <summary>Binds a texture as the storage image a compute pass writes through.</summary>
+        /// <param name="commandList">The list to record the bind into, or <see langword="null"/> to bind directly.</param>
+        /// <param name="binding">The image unit.</param>
+        /// <param name="texture">The texture to bind.</param>
+        /// <param name="format">The format the OpenGL path declares the image with.</param>
+        /// <param name="layered">Whether every layer of a volume or array texture is bound at once.</param>
+        internal static void BindStorageImage(ICommandList? commandList, int binding, RenderTexture texture,
+            SizedInternalFormat format, bool layered = false)
+        {
+            if (commandList == null)
+            {
+                GL.BindImageTexture(binding, texture.Handle, 0, layered, 0, TextureAccess.WriteOnly, format);
+                return;
+            }
+
+            commandList.BindStorageTexture(binding, texture.RhiTexture);
+        }
+
+        /// <summary>Dispatches a compute workload.</summary>
+        /// <param name="commandList">The list to record into, or <see langword="null"/> to dispatch directly.</param>
+        /// <param name="groupsX">Workgroups on X.</param>
+        /// <param name="groupsY">Workgroups on Y.</param>
+        /// <param name="groupsZ">Workgroups on Z.</param>
+        internal static void Dispatch(ICommandList? commandList, int groupsX, int groupsY = 1, int groupsZ = 1)
+        {
+            if (commandList == null)
+            {
+                GL.DispatchCompute(groupsX, groupsY, groupsZ);
+                return;
+            }
+
+            commandList.Dispatch(groupsX, groupsY, groupsZ);
+        }
+
+        /// <summary>
+        /// Makes the image stores of a finished compute pass visible to the sampling and image loads that
+        /// read them next.
+        /// </summary>
+        /// <param name="commandList">The list to record into, or <see langword="null"/> to issue the barrier directly.</param>
+        /// <param name="first">The texture that was written.</param>
+        /// <param name="second">A second texture written by the same batch, or <see langword="null"/>.</param>
+        /// <remarks>Batched into one call, as the contract asks: separate calls cost separate pipeline
+        /// stalls, and on OpenGL they collapse to the union of their barrier bits anyway.</remarks>
+        internal static void ShaderWriteBarrier(ICommandList? commandList, RenderTexture first, RenderTexture? second = null)
+        {
+            if (commandList == null)
+            {
+                GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+                return;
+            }
+
+            TextureBarrier[] barriers = second == null
+                ? [new(first.RhiTexture, ResourceState.ShaderWrite, ResourceState.ShaderRead)]
+                : [
+                    new(first.RhiTexture, ResourceState.ShaderWrite, ResourceState.ShaderRead),
+                    new(second.RhiTexture, ResourceState.ShaderWrite, ResourceState.ShaderRead),
+                ];
+
+            commandList.Barrier([], barriers);
+        }
+
+        /// <summary>
+        /// Describes a framebuffer as a render pass that keeps what its attachments already hold.
+        /// </summary>
+        /// <param name="framebuffer">The framebuffer to render into.</param>
+        /// <param name="name">Debug label for the pass.</param>
+        /// <param name="colorMipLevel">Mip level of the colour attachment to render into.</param>
+        /// <returns>The pass descriptor.</returns>
+        /// <remarks>Most of the chain composites onto or fully overwrites its target rather than starting
+        /// from a clear, and the two are only interchangeable when a pass covers every texel &#8212; which
+        /// the bloom chain's partial-viewport downsamples do not.</remarks>
+        internal static RenderPassDesc LoadPass(Framebuffer framebuffer, string name, int colorMipLevel = 0)
+        {
+            var desc = framebuffer.RenderPass(name, colorMipLevel);
+            var colors = new ColorAttachmentDesc[desc.ColorAttachments.Length];
+
+            for (var i = 0; i < colors.Length; i++)
+            {
+                colors[i] = desc.ColorAttachments[i] with { LoadOp = LoadOp.Load };
+            }
+
+            return desc with { ColorAttachments = colors };
+        }
+
+        /// <summary>Holds an open render pass so it can be closed with <c>using</c>. The default value
+        /// holds nothing and closes nothing, which is what the OpenGL path gets.</summary>
+        /// <param name="commandList">The list the pass was opened on, or <see langword="null"/>.</param>
+        internal readonly struct PostPass(ICommandList? commandList) : IDisposable
+        {
+            /// <summary>Ends the pass, if one was opened.</summary>
+            public void Dispose() => commandList?.EndRenderPass();
+        }
+
+        /// <summary>Opens a render pass over a framebuffer, or does nothing when not recording.</summary>
+        /// <param name="commandList">The list to record into, or <see langword="null"/> to do nothing.</param>
+        /// <param name="framebuffer">The framebuffer whose attachments the pass renders into.</param>
+        /// <param name="name">Debug label for the pass.</param>
+        /// <param name="colorMipLevel">Mip level of the colour attachment to render into.</param>
+        /// <param name="clear">Whether the attachments are cleared rather than loaded, matching what
+        /// <see cref="Framebuffer.BindAndClear"/> would do at the same point on the OpenGL path.</param>
+        /// <returns>A guard that ends the pass.</returns>
+        internal static PostPass BeginPass(ICommandList? commandList, Framebuffer framebuffer, string name,
+            int colorMipLevel = 0, bool clear = false)
+        {
+            if (commandList == null)
+            {
+                return default;
+            }
+
+            commandList.BeginRenderPass(clear
+                ? framebuffer.RenderPass(name, colorMipLevel)
+                : LoadPass(framebuffer, name, colorMipLevel));
+
+            return new PostPass(commandList);
+        }
+
+        /// <summary>Sets the viewport to a rectangle anchored at the origin.</summary>
+        /// <param name="commandList">The list to record into, or <see langword="null"/> to set it directly.</param>
+        /// <param name="width">Viewport width in pixels.</param>
+        /// <param name="height">Viewport height in pixels.</param>
+        /// <remarks>A pass opens covering its whole attachment, so this is only needed where the chain
+        /// draws into part of one &#8212; which the bloom downsamples and the tonemap both do.</remarks>
+        internal static void SetViewport(ICommandList? commandList, int width, int height)
+        {
+            if (commandList == null)
+            {
+                GL.Viewport(0, 0, width, height);
+                return;
+            }
+
+            commandList.SetViewport(0, 0, width, height);
+        }
+
+        #endregion
+
         /// <summary>
         /// Resolves MSAA color and/or depth from <paramref name="source"/> using compute shaders.
         /// Color and depth are written to standalone <see cref="RenderTexture"/> targets.
         /// Uses Karis average for HDR-aware color resolve, min filter for depth (conservative for reverse-Z).
         /// </summary>
+        /// <param name="source">The multisampled framebuffer to resolve.</param>
+        /// <param name="destColor">Where resolved colour is written.</param>
+        /// <param name="destDepth">Where resolved depth is written.</param>
+        /// <param name="resolveColor">Whether to resolve colour.</param>
+        /// <param name="resolveDepth">Whether to resolve depth.</param>
+        /// <param name="commandList">The list to record into, or <see langword="null"/> to run through OpenGL.</param>
+        /// <remarks>A compute resolve rather than an attachment one, because the colour filter is a Karis
+        /// average rather than the box filter a hardware resolve applies.</remarks>
         public void ResolveMsaa(Framebuffer source, RenderTexture destColor, RenderTexture destDepth,
-            bool resolveColor, bool resolveDepth)
+            bool resolveColor, bool resolveDepth, ICommandList? commandList = null)
         {
             Debug.Assert(shaderMsaaResolve != null && shaderDepthResolve != null);
 
@@ -125,22 +376,30 @@ namespace ValveResourceFormat.Renderer.PostProcess
             if (resolveColor)
             {
                 shaderMsaaResolve.Use();
-                shaderMsaaResolve.SetTexture(0, "g_tSourceMsaa", source.Color);
-                GL.BindImageTexture(1, destColor.Handle, 0, false, 0,
-                    TextureAccess.WriteOnly, SizedInternalFormat.Rgba16f);
-                GL.DispatchCompute(groupsX, groupsY, 1);
+                BindComputePipeline(commandList, shaderMsaaResolve);
+                BindTexture(commandList, shaderMsaaResolve, 0, "g_tSourceMsaa", source.Color);
+                BindStorageImage(commandList, 1, destColor, SizedInternalFormat.Rgba16f);
+                Dispatch(commandList, groupsX, groupsY);
             }
 
             if (resolveDepth)
             {
                 shaderDepthResolve.Use();
-                shaderDepthResolve.SetTexture(0, "g_tSourceDepthMsaa", source.Depth);
-                GL.BindImageTexture(1, destDepth.Handle, 0, false, 0,
-                    TextureAccess.WriteOnly, SizedInternalFormat.R32f);
-                GL.DispatchCompute(groupsX, groupsY, 1);
+                BindComputePipeline(commandList, shaderDepthResolve);
+                BindTexture(commandList, shaderDepthResolve, 0, "g_tSourceDepthMsaa", source.Depth);
+                BindStorageImage(commandList, 1, destDepth, SizedInternalFormat.R32f);
+                Dispatch(commandList, groupsX, groupsY);
             }
 
-            GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+            if (resolveColor || resolveDepth)
+            {
+                // Only what was actually written is transitioned. OpenGL would not notice the difference,
+                // since its barrier is global, but a transition out of a state a texture was never in is
+                // a validation error on Vulkan.
+                ShaderWriteBarrier(commandList,
+                    resolveColor ? destColor : destDepth,
+                    resolveColor && resolveDepth ? destDepth : null);
+            }
         }
 
         /// <summary>
@@ -149,7 +408,8 @@ namespace ValveResourceFormat.Renderer.PostProcess
         /// weighs up to four LUTs and fills the remainder with the neutral LUT.
         /// </summary>
         /// <param name="luts">The LUTs contributing this frame with their blend weights.</param>
-        public void ResolveColorCorrection(List<WeightedLut> luts)
+        /// <param name="commandList">The list to record into, or <see langword="null"/> to run through OpenGL.</param>
+        public void ResolveColorCorrection(List<WeightedLut> luts, ICommandList? commandList = null)
         {
             if (luts.Count == 0)
             {
@@ -180,12 +440,17 @@ namespace ValveResourceFormat.Renderer.PostProcess
                 combinedLut.SetWrapMode(TextureWrapMode.ClampToEdge);
                 combinedLut.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
                 GL.TextureStorage3D(combinedLut.Handle, 1, SizedInternalFormat.Rgba8, dimensions, dimensions, dimensions);
+
+                // Recorded so RhiTexture can describe the volume completely, which is what the storage
+                // image binding below needs to declare its format.
+                combinedLut.RhiFormat = RhiFormat.R8G8B8A8_UNorm;
             }
 
             var weights = Vector4.Zero;
             var totalWeight = 0f;
 
             shaderCombineLuts.Use();
+            BindComputePipeline(commandList, shaderCombineLuts);
 
             for (var i = 0; i < WorldPostProcessInfo.MaxBlendedLuts; i++)
             {
@@ -197,17 +462,17 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
                 weights[i] = weight;
                 totalWeight += weight;
-                shaderCombineLuts.SetTexture(i, LutSamplerNames[i], entry.Lut);
+                BindTexture(commandList, shaderCombineLuts, i, LutSamplerNames[i], entry.Lut);
             }
 
             shaderCombineLuts.SetUniform("g_vColorCorrectionWeights0", weights);
             shaderCombineLuts.SetUniform("g_flIdentityWeight", MathF.Max(0f, 1f - totalWeight));
 
-            GL.BindImageTexture(0, combinedLut.Handle, 0, true, 0, TextureAccess.WriteOnly, SizedInternalFormat.Rgba8);
+            BindStorageImage(commandList, 0, combinedLut, SizedInternalFormat.Rgba8, layered: true);
 
             var groups = (dimensions + 3) / 4;
-            GL.DispatchCompute(groups, groups, groups);
-            GL.MemoryBarrier(MemoryBarrierFlags.TextureFetchBarrierBit);
+            Dispatch(commandList, groups, groups, groups);
+            ShaderWriteBarrier(commandList, combinedLut);
 
             State = State with
             {
@@ -243,8 +508,19 @@ namespace ValveResourceFormat.Renderer.PostProcess
         /// <summary>
         /// Resolves MSAA, applies DOF/bloom, tonemaps, and writes the final LDR image to <paramref name="colorBufferDraw"/>.
         /// </summary>
+        /// <param name="colorBufferRead">The multisampled scene framebuffer to read.</param>
+        /// <param name="colorBufferDraw">Where the tonemapped image is written.</param>
+        /// <param name="resolveTarget">The single-sampled texture the MSAA resolve writes into.</param>
+        /// <param name="camera">The active camera, used by the depth-of-field circle-of-confusion pass.</param>
+        /// <param name="flipY">Whether the image is flipped vertically on the way out.</param>
+        /// <param name="commandList">The list to record into, or <see langword="null"/> to run through OpenGL.</param>
+        /// <remarks>
+        /// A render pass never names the presented surface, so <paramref name="colorBufferDraw"/> has to be
+        /// a texture-backed target for <paramref name="commandList"/> to be usable. <see cref="Renderer"/>
+        /// is what decides that and passes <see langword="null"/> when it does not hold.
+        /// </remarks>
         public void Render(Framebuffer colorBufferRead, Framebuffer colorBufferDraw,
-            RenderTexture resolveTarget, Camera camera, bool flipY)
+            RenderTexture resolveTarget, Camera camera, bool flipY, ICommandList? commandList = null)
         {
             Debug.Assert(shaderMsaaResolve != null);
             Debug.Assert(shaderPostProcess != null && shaderPostProcessBloom != null);
@@ -258,54 +534,60 @@ namespace ValveResourceFormat.Renderer.PostProcess
                 var msaaResolveShader = DOF.Enabled ? DOF.MsaaResolveDof : shaderMsaaResolve;
 
                 msaaResolveShader.Use();
-                msaaResolveShader.SetTexture(0, "g_tSourceMsaa", colorBufferRead.Color);
-                GL.BindImageTexture(1, resolveTarget.Handle, 0, false, 0,
-                    TextureAccess.WriteOnly, SizedInternalFormat.Rgba16f);
+                BindComputePipeline(commandList, msaaResolveShader);
+                BindTexture(commandList, msaaResolveShader, 0, "g_tSourceMsaa", colorBufferRead.Color);
+                BindStorageImage(commandList, 1, resolveTarget, SizedInternalFormat.Rgba16f);
                 msaaResolveShader.SetUniform("g_bFlipY", flipY);
 
                 if (DOF.Enabled)
                 {
-                    DOF.SetDofResolveShaderUniforms(msaaResolveShader, camera, colorBufferRead.Depth!);
+                    DOF.SetDofResolveShaderUniforms(msaaResolveShader, camera, colorBufferRead.Depth!, commandList);
                 }
 
                 var groupsX = (resolveTarget.Width + 7) / 8;
                 var groupsY = (resolveTarget.Height + 7) / 8;
-                GL.DispatchCompute(groupsX, groupsY, 1);
-                GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+                Dispatch(commandList, groupsX, groupsY);
+                ShaderWriteBarrier(commandList, resolveTarget);
             }
 
             RenderTexture resolvedScene = resolveTarget;
 
             if (DOF.Enabled)
             {
-                resolvedScene = DOF.Render(resolveTarget);
+                resolvedScene = DOF.Render(resolveTarget, commandList);
             }
 
             using (new GLDebugGroup("Tonemapping, Color Correction, Bloom"))
             {
-                colorBufferDraw.Bind(FramebufferTarget.DrawFramebuffer);
-
                 var postProcessShader = State.HasBloom == true ? shaderPostProcessBloom : shaderPostProcess;
 
+                // Bloom opens passes of its own over the ping-pong chain, so the tonemap target is only
+                // bound once it is finished.
                 if (State.HasBloom)
                 {
-                    Bloom.Render(resolvedScene);
+                    Bloom.Render(resolvedScene, commandList);
                 }
 
                 colorBufferDraw.Bind(FramebufferTarget.DrawFramebuffer);
                 postProcessShader.Use();
-                GL.Viewport(0, 0, colorBufferRead.Width, colorBufferRead.Height);
 
-                postProcessShader.SetTexture(0, "g_tColorBuffer", resolvedScene);
-                postProcessShader.SetTexture(2, "g_tColorCorrectionLUT",
+                // Loaded rather than cleared: the tonemap covers every texel of its own viewport, but that
+                // viewport is the scene's size rather than the target's, so a clear would wipe whatever
+                // sits outside it.
+                using var pass = BeginPass(commandList, colorBufferDraw, "Tonemap");
+
+                SetViewport(commandList, colorBufferRead.Width, colorBufferRead.Height);
+
+                BindTexture(commandList, postProcessShader, 0, "g_tColorBuffer", resolvedScene);
+                BindTexture(commandList, postProcessShader, 2, "g_tColorCorrectionLUT",
                     State.ColorCorrectionLUT ?? RendererContext.MaterialLoader.GetDefaultVolume());
 
                 // Bound here too, in case post processing runs before the scene binds it.
-                postProcessShader.SetTexture((int)ReservedTextureSlots.BlueNoise, "g_tBlueNoise", BlueNoise);
+                BindTexture(commandList, postProcessShader, (int)ReservedTextureSlots.BlueNoise, "g_tBlueNoise", BlueNoise);
 
                 if (State.HasBloom)
                 {
-                    postProcessShader.SetTexture(4, "g_tBloom", Bloom.AccumulationResult);
+                    BindTexture(commandList, postProcessShader, 4, "g_tBloom", Bloom.AccumulationResult);
                     // these seem to all be needed at once due to transitions between post process volumes, we don't do that yet
                     // NormalizedBloomStrengths seems to act as a blending factor "how much of each bloom mode do we have right now"
                     var bloomStrengths = new Vector3(State.BloomSettings.AddBloomStrength, State.BloomSettings.ScreenBloomStrength, State.BloomSettings.BlurBloomStrength);
@@ -325,15 +607,14 @@ namespace ValveResourceFormat.Renderer.PostProcess
                 postProcessShader.SetUniform("g_vColorCorrectionColorRange", invRange);
                 postProcessShader.SetUniform("g_flColorCorrectionDefaultWeight", (State.NumLutsActive > 0 && ColorCorrectionEnabled) ? State.ColorCorrectionWeight : 0f);
 
-                GL.BindVertexArray(RendererContext.MeshBufferCache.EmptyVAO);
-                GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+                DrawFullscreenTriangle(commandList, RendererContext, postProcessShader, colorBufferDraw);
             }
 
             if (HasOutlineObjects)
             {
                 using var outlineGroup = new GLDebugGroup("Outline Edge");
                 Debug.Assert(colorBufferRead.Stencil != null);
-                Outline.Render(colorBufferRead.Stencil, colorBufferRead.NumSamples, flipY);
+                Outline.Render(colorBufferRead.Stencil, colorBufferRead.NumSamples, flipY, colorBufferDraw, commandList);
             }
         }
 
