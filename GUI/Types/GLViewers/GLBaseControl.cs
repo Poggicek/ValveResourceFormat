@@ -299,8 +299,31 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
     /// </summary>
     public bool PreFilterMessage(ref Message m)
     {
-        if (GLControl is not { IsHandleCreated: true } || m.HWnd != GLControl.Handle)
+        if (GLControl is not { IsHandleCreated: true })
         {
+            return false;
+        }
+
+        if (m.HWnd != GLControl.Handle)
+        {
+            // The one message the Vulkan surface still swallows. Every other input message reaches the
+            // GL control underneath because VulkanControl answers WM_NCHITTEST with HTTRANSPARENT, but
+            // the wheel is not delivered by hit testing at all: Windows sends it to the focused window,
+            // or, with "scroll inactive windows when I hover over them" on, to the window the cursor is
+            // over as WindowFromPoint reports it -- and that function skips hidden and disabled windows
+            // without consulting WM_NCHITTEST, so it names the Vulkan surface regardless.
+            //
+            // Accepting it from there is safe in a way accepting a mouse move would not be:
+            // WM_MOUSEWHEEL carries screen coordinates, not the receiving window's client coordinates,
+            // so the position below is converted through GLControl exactly as it already was and cannot
+            // pick up an origin offset from the window that happened to receive the message.
+            if (m.Msg == WM_MOUSEWHEEL && IsVulkanSurfaceWindow(m.HWnd))
+            {
+                var wheelPosition = new Point((short)m.LParam, (short)((nint)m.LParam >> 16));
+                OnMouseWheel((short)((nint)m.WParam >> 16), GLControl.PointToClient(wheelPosition));
+                return true;
+            }
+
             return false;
         }
 
@@ -330,6 +353,16 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
                 return false;
         }
     }
+
+    /// <summary>
+    /// Whether <paramref name="handle"/> is the Vulkan presentation surface this viewer stacks in front
+    /// of its GL control. Always false on OpenGL, where there is no such control.
+    /// </summary>
+    /// <remarks>Only the <see cref="VulkanControl"/>'s own window is tested. The plain Win32 child it
+    /// creates is <c>WS_DISABLED</c>, and a disabled window is never what <c>WindowFromPoint</c> returns
+    /// and never what a mouse message is delivered to, so it cannot be the source of one.</remarks>
+    private bool IsVulkanSurfaceWindow(nint handle)
+        => VulkanSurface is { IsHandleCreated: true } surface && handle == surface.Handle;
 
     protected virtual void OnKeyDown(Keys keyData)
     {

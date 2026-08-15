@@ -372,7 +372,55 @@ public sealed partial class VulkanControl : Control
         SetStyle(ControlStyles.Opaque, true);
         SetStyle(ControlStyles.UserPaint, true);
         SetStyle(ControlStyles.AllPaintingInWmPaint, true);
+
+        // Keyboard messages go to the focused window, and this control must never be it. Hit testing
+        // (see WndProc) already stops a click from focusing it, but tab navigation does not go through
+        // hit testing, so the control is taken out of the tab order as well. A Vulkan surface that held
+        // the focus would send every keystroke somewhere the viewer's input filter does not look.
+        SetStyle(ControlStyles.Selectable, false);
+
         DoubleBuffered = false;
+    }
+
+    private const int WM_NCHITTEST = 0x0084;
+
+    /// <summary>Hit-test result meaning "not me, keep looking underneath".</summary>
+    private const int HTTRANSPARENT = -1;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// <para>
+    /// <b>This control is invisible to the mouse on purpose.</b> A Vulkan viewer stacks this control in
+    /// front of the <see cref="GLControl"/> that the viewer's input plumbing is built around: the raw
+    /// message filter keys on <c>GLControl.Handle</c>, and mouse down, mouse up, mouse enter, mouse leave
+    /// and lost focus are wired as WinForms events on that control. Being in front made this control the
+    /// window every mouse message was delivered to, so the filter rejected all of them and none of those
+    /// events ever fired &#8212; a Vulkan viewer whose camera could not be moved at all.
+    /// </para>
+    /// <para>
+    /// Answering <c>HTTRANSPARENT</c> makes the window manager skip this window and carry on hit testing
+    /// the siblings underneath it in the same thread, which is the GL control. So the messages arrive at
+    /// exactly the window they arrive at on OpenGL, carrying that window's client coordinates, and the
+    /// whole input path &#8212; filter, events, focus, capture, hover tracking, picking &#8212; is the one
+    /// OpenGL already uses. Nothing about it is backend specific, which is the point: routing input
+    /// through a second window would have meant a second coordinate space and a second focus story, and
+    /// an origin offset there would move the camera <i>wrongly</i> rather than not at all.
+    /// </para>
+    /// <para>
+    /// The plain Win32 child window this control owns is already <c>WS_DISABLED</c> and is skipped by hit
+    /// testing for the same reason, so the two windows this control puts on screen are both transparent
+    /// to input. Nothing here is interactive; it is a surface the swapchain presents into.
+    /// </para>
+    /// </remarks>
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_NCHITTEST)
+        {
+            m.Result = HTTRANSPARENT;
+            return;
+        }
+
+        base.WndProc(ref m);
     }
 
     /// <summary>
