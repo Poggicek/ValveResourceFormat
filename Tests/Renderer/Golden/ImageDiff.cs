@@ -31,40 +31,58 @@ namespace Tests.Renderer.Golden
         double DeviantPixelThreshold = 4.0 / 255.0)
     {
         /// <summary>
-        /// The reproducibility floor of the renderer itself, in channel levels.
+        /// The reproducibility floor of the renderer, in channel levels. It is now zero.
         ///
-        /// <para><b>The frame is not bit-reproducible, and cannot be made so from here.</b>
-        /// <c>PostProcessRenderer.SetPostProcessUniforms</c> re-randomises the blue-noise dither offset on
-        /// every frame from an unseeded <see cref="Random"/>, with an amplitude of <c>2.0f / 255.0f</c>.
-        /// Two runs of the same scene therefore differ by up to two levels per channel no matter what the
-        /// harness pins. Measured over this catalog the difference is at most 2.00/255 per channel with a
-        /// mean of about 0.5/255, which matches that amplitude exactly.</para>
+        /// <para>It was not always. <c>PostProcessRenderer</c> used to re-randomise the blue-noise dither
+        /// offset every frame from an unseeded <see cref="Random"/>, with an amplitude of
+        /// <c>2.0f / 255.0f</c>, and every budget below had to clear that. The generator is now seeded, and
+        /// re-recording the whole catalog twice produces byte-identical PNGs, so the budgets below are
+        /// sized for genuine difference rather than for noise.</para>
         ///
-        /// <para>Every budget below sits above this floor, which is what makes the suite stable. Seeding
-        /// that generator would let the floor drop to zero and every budget tighten with it; that is a
-        /// change to <c>Renderer/</c> and so is not made here.</para>
+        /// <para>Kept as a named constant, at zero, because it is the assumption the tight budgets rest on:
+        /// anything that reintroduces per-frame randomness into the frame will show up as most of the suite
+        /// going red at once, and this is where the explanation lives.</para>
         /// </summary>
-        public const double DitherFloor = 2.0 / 255.0;
+        public const double DitherFloor = 0.0;
 
         /// <summary>
         /// The budget for a scene whose output should be reproduced almost exactly: flat colour, unlit
-        /// geometry, a directly read back depth buffer, or anything else with no accumulation in it. Only
-        /// far enough above <see cref="DitherFloor"/> to clear it.
+        /// geometry, a directly read back depth buffer, or anything else with no accumulation in it.
+        ///
+        /// <para>A single channel level on a single pixel. Not zero, only because a driver update that
+        /// changes a rounding mode somewhere should read as a baseline to review rather than as the suite
+        /// collapsing; anything a change in the renderer does is larger than this.</para>
         /// </summary>
-        public static ImageTolerance Strict { get; } = new(5.0 / 255.0, 1.2 / 255.0, 0.0005, 5.0 / 255.0);
+        public static ImageTolerance Strict { get; } = new(1.0 / 255.0, 0.05 / 255.0, 0.0002, 1.0 / 255.0);
 
         /// <summary>
-        /// The budget for lit geometry. Wide enough to absorb the last bit of floating point drift in a
-        /// lighting or shadow term, narrow enough that a wrong light, a flipped normal or a missing shadow
-        /// still lands well outside it.
+        /// The budget for lit geometry. Enough to absorb the last bit of floating point drift in a lighting
+        /// or shadow term across driver revisions, and nothing beyond that.
         /// </summary>
-        public static ImageTolerance Lit { get; } = new(16.0 / 255.0, 2.5 / 255.0, 0.004, 6.0 / 255.0);
+        public static ImageTolerance Lit { get; } = new(4.0 / 255.0, 0.2 / 255.0, 0.0005, 2.0 / 255.0);
+
+        /// <summary>
+        /// The budget for the quad overdraw heat map, which is not reproducible and cannot be made so.
+        ///
+        /// <para>The counting pass accumulates per-quad shading cost through unordered image stores from
+        /// concurrent fragment shader invocations. How many invocations a silhouette edge produces depends
+        /// on helper-lane scheduling, so counts at edges vary by one between runs -- and because the heat
+        /// map quantises counts into colour bands, a count that moves by one across a band boundary moves
+        /// that pixel by over half the colour range. Measured across runs in both the OpenGL and the RHI
+        /// path: max channel deviation pinned at 135/255, between 48 and 132 pixels affected out of 76800,
+        /// mean deviation never above 0.10/255.</para>
+        ///
+        /// <para>So the maximum is deliberately not the instrument here; the mean and the affected fraction
+        /// are, and both are held tight. A regression that actually broke the counter, the legend or the
+        /// pass ordering moves a large share of the image and fails on those two immediately.</para>
+        /// </summary>
+        public static ImageTolerance CountingRace { get; } = new(160.0 / 255.0, 0.5 / 255.0, 0.005, 8.0 / 255.0);
 
         /// <summary>
         /// The budget for the parts of the frame that accumulate over many texels: bloom, depth of field
         /// and anything else where a blur kernel spreads small differences across the image.
         /// </summary>
-        public static ImageTolerance Accumulating { get; } = new(28.0 / 255.0, 4.0 / 255.0, 0.02, 8.0 / 255.0);
+        public static ImageTolerance Accumulating { get; } = new(8.0 / 255.0, 0.5 / 255.0, 0.002, 4.0 / 255.0);
     }
 
     /// <summary>Measured difference between a rendered image and its baseline.</summary>

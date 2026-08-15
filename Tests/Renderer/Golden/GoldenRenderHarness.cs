@@ -7,6 +7,7 @@ using ValveResourceFormat;
 using ValveResourceFormat.IO;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.Materials;
+using ValveResourceFormat.Renderer.RHI;
 using ValveResourceFormat.Renderer.RHI.OpenGL;
 
 namespace Tests.Renderer.Golden
@@ -41,8 +42,9 @@ namespace Tests.Renderer.Golden
         private const int SampleCount = 1;
 
         private readonly RendererContext rendererContext;
-        private readonly GameFileLoader fileLoader;
+        private readonly FixtureFileLoader fileLoader;
         private readonly GLDevice device;
+        private readonly QuadOverdraw quadOverdraw;
         private readonly Framebuffer sceneFramebuffer;
         private readonly Framebuffer captureFramebuffer;
         private readonly byte[] readbackBuffer = new byte[Width * Height * 4];
@@ -59,7 +61,7 @@ namespace Tests.Renderer.Golden
             // references never resolve and materials fall back to the renderer's own error material. That
             // fallback is deterministic, which is all the harness needs. See the coverage note in the
             // scene catalog for what it costs.
-            fileLoader = new GameFileLoader(null, null);
+            fileLoader = new FixtureFileLoader();
 
             rendererContext = new RendererContext(fileLoader, NullLogger.Instance)
             {
@@ -72,7 +74,12 @@ namespace Tests.Renderer.Golden
             // to the context is what the presentation layer does in the real application, so the renderer
             // sees the same shape here. It also installs the driver's debug message callback, which is how
             // a golden run reports a GL error today and a Vulkan validation error once that backend lands.
-            device = new GLRecordingDevice(rendererContext, ValidationGate.OnMessage);
+            // VRF_RHI_CENSUS swaps in a device whose command list notes which renderer type issued each
+            // draw, so "which RHI call sites does the suite reach?" is answered by measurement.
+            device = RhiCallSiteCensus.IsEnabled
+                ? new CensusRecordingDevice(rendererContext, ValidationGate.OnMessage)
+                : new GLRecordingDevice(rendererContext, ValidationGate.OnMessage);
+
             rendererContext.Device = device;
 
             // Set VRF_RHI_RECORDING=1 to run the scenes through the RHI instead of straight OpenGL.
@@ -108,6 +115,9 @@ namespace Tests.Renderer.Golden
                 null);
 
             ThrowIfIncomplete(captureFramebuffer.Initialize(), nameof(captureFramebuffer));
+
+            quadOverdraw = new QuadOverdraw(rendererContext);
+            quadOverdraw.Load();
         }
 
         /// <summary>Which RHI backend this harness renders through.</summary>
@@ -126,6 +136,8 @@ namespace Tests.Renderer.Golden
         {
             ObjectDisposedException.ThrowIf(disposed, this);
 
+            RhiCallSiteCensus.CurrentScene = scene.Name;
+
             var renderer = new ValveResourceFormat.Renderer.Renderer(rendererContext);
             GoldenSceneSetup? setup = null;
 
@@ -140,6 +152,11 @@ namespace Tests.Renderer.Golden
                 for (var frame = 0; frame < scene.Frames; frame++)
                 {
                     RenderFrame(renderer, setup);
+                }
+
+                if (setup.MorphComposite is { } morphComposite)
+                {
+                    return RenderAndReadMorphComposite(renderer, morphComposite);
                 }
 
                 return setup.CaptureShadowAtlas
@@ -197,7 +214,21 @@ namespace Tests.Renderer.Golden
             };
 
             setup.TextRenderer = textRenderer;
+            setup.FileLoader = fileLoader;
             scene.Build(setup);
+
+            if (setup.EnableOcclusionDebug)
+            {
+                // Opted back in for this scene only, and paid for with a pinned frame count long enough to
+                // clear the renderer's occlusion warmup.
+                renderer.Scene.EnableOcclusionCulling = true;
+                renderer.Scene.OcclusionDebugEnabled = true;
+            }
+
+            if (setup.EnableQuadOverdraw)
+            {
+                quadOverdraw.SetRenderMode("Overdraw");
+            }
 
             // One-time GPU setup for the populated scene: octrees, lighting and instancing buffers, env map
             // and light probe bindings. The viewers do this in their post-load step, after the scene's nodes
@@ -256,7 +287,30 @@ namespace Tests.Renderer.Golden
                 Textures = renderer.Textures,
             };
 
+            if (setup.EnableQuadOverdraw)
+            {
+                quadOverdraw.Prepare(Width, Height);
+                renderContext.ReplacementShader = quadOverdraw.SceneShader;
+            }
+
             renderer.Render(renderContext);
+
+            if (setup.EnableQuadOverdraw)
+            {
+                // A second pass over the same geometry with counting enabled, then the heat map resolve.
+                // The order mirrors the viewer exactly: the first render leaves a depth buffer so the
+                // counting pass shades only what is actually visible.
+                quadOverdraw.BeginCountingPass(sceneFramebuffer);
+                renderer.RenderScenesWithView(renderContext);
+                quadOverdraw.EndCountingPass(sceneFramebuffer);
+
+                RecordOverPass(sceneFramebuffer, "GoldenQuadOverdraw", renderer, context => quadOverdraw.Render(context));
+            }
+
+            if (setup.EnableOcclusionDebug && renderer.Scene.OcclusionDebug is { } occlusionDebug)
+            {
+                RecordOverPass(sceneFramebuffer, "GoldenOcclusionDebug", renderer, context => occlusionDebug.Render(context));
+            }
 
             if (setup.EnableBloomAfterRender)
             {
@@ -269,7 +323,211 @@ namespace Tests.Renderer.Golden
             // viewer draws it over the presented framebuffer.
             captureFramebuffer.Bind(FramebufferTarget.Framebuffer);
             GL.Viewport(0, 0, Width, Height);
-            textRenderer.Render(renderer.Camera, renderer.ResolvedSceneDepth);
+            RenderOverlayText(renderer, textRenderer);
+        }
+
+        /// <summary>
+        /// Draws the queued overlay text over the tonemapped frame.
+        ///
+        /// <para>The overlay is the one pass the renderer does not own: it runs after
+        /// <see cref="ValveResourceFormat.Renderer.Renderer.PostprocessRender"/> has finished, so the
+        /// renderer's own command list has already been closed. That leaves opening a list for it to the
+        /// presentation layer, which offscreen is this harness. Doing so is also the only way the suite
+        /// reaches <see cref="TextRenderer"/>'s RHI path at all: handed no render context, the text renderer
+        /// takes its direct OpenGL route and the recorded path goes unchecked however many text scenes
+        /// exist.</para>
+        /// </summary>
+        private void RenderOverlayText(ValveResourceFormat.Renderer.Renderer renderer, TextRenderer textRenderer)
+        {
+            var commandList = ValveResourceFormat.Renderer.Renderer.EnableRhiRecording
+                ? device.BeginCommandList("GoldenOverlay")
+                : null;
+
+            if (commandList == null)
+            {
+                textRenderer.Render(renderer.Camera, renderer.ResolvedSceneDepth);
+                return;
+            }
+
+            // Loaded rather than cleared: the tonemapped frame is already in this target and the overlay
+            // draws on top of it.
+            var pass = KeepContents(captureFramebuffer.RenderPass("GoldenOverlay"));
+
+            commandList.BeginRenderPass(pass);
+
+            try
+            {
+                textRenderer.Render(renderer.Camera, renderer.ResolvedSceneDepth, new Scene.RenderContext
+                {
+                    Camera = renderer.Camera,
+                    Framebuffer = captureFramebuffer,
+                    Scene = renderer.Scene,
+                    Textures = renderer.Textures,
+                    CommandList = commandList,
+                });
+            }
+            finally
+            {
+                commandList.EndRenderPass();
+            }
+        }
+
+        /// <summary>
+        /// Runs an overlay step over an already-drawn framebuffer, inside its own recorded pass when the
+        /// RHI path is on and directly through OpenGL when it is not.
+        ///
+        /// <para>These steps run after <see cref="ValveResourceFormat.Renderer.Renderer.Render"/> has
+        /// closed its command list, so each needs a list of its own. Handing them one is what puts their
+        /// RHI paths under test; called with no context they silently take the OpenGL route and the
+        /// recorded path is never executed however many scenes select the mode.</para>
+        /// </summary>
+        private void RecordOverPass(Framebuffer framebuffer, string name,
+            ValveResourceFormat.Renderer.Renderer renderer, Action<Scene.RenderContext?> draw)
+        {
+            if (!ValveResourceFormat.Renderer.Renderer.EnableRhiRecording)
+            {
+                draw(null);
+                return;
+            }
+
+            var commandList = device.BeginCommandList(name);
+            var pass = KeepContents(framebuffer.RenderPass(name));
+
+            commandList.BeginRenderPass(pass);
+
+            try
+            {
+                draw(new Scene.RenderContext
+                {
+                    Camera = renderer.Camera,
+                    Framebuffer = framebuffer,
+                    Scene = renderer.Scene,
+                    Textures = renderer.Textures,
+                    CommandList = commandList,
+                });
+            }
+            finally
+            {
+                commandList.EndRenderPass();
+            }
+        }
+
+        /// <summary>
+        /// Rewrites a pass descriptor to load its attachments instead of clearing them.
+        /// </summary>
+        /// <remarks>
+        /// A stencil aspect already marked <see cref="LoadOp.DontCare"/> stays that way: the framebuffer
+        /// marks it so when its depth format carries no stencil, and asking to load an aspect that does not
+        /// exist is an error rather than a no-op.
+        /// </remarks>
+        private static RenderPassDesc KeepContents(RenderPassDesc desc)
+        {
+            var colors = new ColorAttachmentDesc[desc.ColorAttachments.Length];
+
+            for (var i = 0; i < colors.Length; i++)
+            {
+                colors[i] = desc.ColorAttachments[i] with { LoadOp = LoadOp.Load };
+            }
+
+            var depth = desc.DepthAttachment is { } attachment
+                ? attachment with
+                {
+                    DepthLoadOp = LoadOp.Load,
+                    StencilLoadOp = attachment.StencilLoadOp == LoadOp.DontCare ? LoadOp.DontCare : LoadOp.Load,
+                }
+                : desc.DepthAttachment;
+
+            return desc with { ColorAttachments = colors, DepthAttachment = depth };
+        }
+
+        /// <summary>
+        /// The square of the morph composite atlas that gets captured, in texels.
+        /// </summary>
+        /// <remarks>
+        /// The composite target is allocated at 2048 square whatever the morph needs, and where within it a
+        /// rectangle lands is derived from the atlas dimensions, so a corner crop can miss the drawn
+        /// rectangles entirely -- it did, and produced a uniform image that would have passed forever
+        /// without testing anything. The whole target is read and reduced instead.
+        /// </remarks>
+        private const int MorphCaptureTexels = 2048;
+
+        /// <summary>
+        /// Composites the morph targets and reads the result back, magnified so the atlas rectangles are
+        /// large enough in the image to be compared.
+        ///
+        /// <para>Signed values, mapped about mid grey rather than clamped at zero. The composite holds
+        /// per-vertex deltas which are as often negative as positive, and clamping would throw away half of
+        /// what distinguishes one atlas rectangle from another -- which is the whole subject of this
+        /// scene.</para>
+        /// </summary>
+        private SKBitmap RenderAndReadMorphComposite(ValveResourceFormat.Renderer.Renderer renderer, MorphComposite morphComposite)
+        {
+            RecordOverPass(captureFramebuffer, "GoldenMorphComposite", renderer, context => morphComposite.Render(context));
+
+            var texels = new float[MorphCaptureTexels * MorphCaptureTexels * 3];
+
+            GL.GetTextureSubImage(morphComposite.CompositeTexture.Handle, 0,
+                0, 0, 0, MorphCaptureTexels, MorphCaptureTexels, 1,
+                PixelFormat.Rgb, PixelType.Float, texels.Length * sizeof(float), texels);
+
+            var bitmap = new SKBitmap(Width, Height, SKColorType.Bgra8888, SKAlphaType.Opaque);
+            var pixels = bitmap.GetPixelSpan();
+
+            static byte Encode(float value)
+                => (byte)Math.Clamp((int)((0.5f + 0.5f * value) * 255f + 0.5f), 0, 255);
+
+            // Square aspect, so the atlas is not stretched and the boundary between one rectangle and the
+            // next stays where it is.
+            var offsetX = (Width - Height) / 2;
+
+            for (var y = 0; y < Height; y++)
+            {
+                var startY = y * MorphCaptureTexels / Height;
+                var endY = Math.Max(startY + 1, (y + 1) * MorphCaptureTexels / Height);
+
+                for (var x = 0; x < Width; x++)
+                {
+                    var destination = (y * Width + x) * 4;
+                    pixels[destination + 3] = 255;
+
+                    if (x < offsetX || x >= offsetX + Height)
+                    {
+                        continue;
+                    }
+
+                    var startX = (x - offsetX) * MorphCaptureTexels / Height;
+                    var endX = Math.Max(startX + 1, (x - offsetX + 1) * MorphCaptureTexels / Height);
+
+                    // The largest magnitude in the block rather than its average. A morph rectangle covers
+                    // a small part of a large atlas, and averaging would dilute it back into the zeroes
+                    // around it until the image said nothing.
+                    var peak = new float[3];
+
+                    for (var sourceY = startY; sourceY < endY; sourceY++)
+                    {
+                        for (var sourceX = startX; sourceX < endX; sourceX++)
+                        {
+                            var source = (sourceY * MorphCaptureTexels + sourceX) * 3;
+
+                            for (var channel = 0; channel < 3; channel++)
+                            {
+                                var value = texels[source + channel];
+
+                                if (MathF.Abs(value) > MathF.Abs(peak[channel]))
+                                {
+                                    peak[channel] = value;
+                                }
+                            }
+                        }
+                    }
+
+                    pixels[destination + 2] = Encode(peak[0]);
+                    pixels[destination + 1] = Encode(peak[1]);
+                    pixels[destination + 0] = Encode(peak[2]);
+                }
+            }
+
+            return bitmap;
         }
 
         /// <summary>
@@ -371,6 +629,7 @@ namespace Tests.Renderer.Golden
 
             sceneFramebuffer.Delete();
             captureFramebuffer.Delete();
+            quadOverdraw.Dispose();
             device.Dispose();
             rendererContext.Dispose();
             fileLoader.Dispose();

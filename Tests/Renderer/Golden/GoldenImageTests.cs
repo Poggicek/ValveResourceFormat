@@ -43,7 +43,15 @@ namespace Tests.Renderer.Golden
         }
 
         [OneTimeTearDown]
-        public void DestroyDevice() => HeadlessGL.Shutdown();
+        public void DestroyDevice()
+        {
+            if (RhiCallSiteCensus.IsEnabled)
+            {
+                TestContext.Progress.WriteLine(RhiCallSiteCensus.Report());
+            }
+
+            HeadlessGL.Shutdown();
+        }
 
         [Test]
         [TestCaseSource(nameof(Cases))]

@@ -73,6 +73,12 @@ namespace Tests.Renderer.Golden
         public TextRenderer? TextRenderer { get; set; }
 
         /// <summary>
+        /// The file loader backing this scene, exposed so a scene can register a stand-in for an external
+        /// reference that would otherwise stop it from being built at all.
+        /// </summary>
+        public FixtureFileLoader? FileLoader { get; set; }
+
+        /// <summary>
         /// Captures the sun shadow atlas instead of the shaded frame.
         ///
         /// The shadow term is not visible in the colour output of any scene this catalog can build, because
@@ -81,6 +87,39 @@ namespace Tests.Renderer.Golden
         /// pass wrote through it -- rather than a shaded image that would not move if either were wrong.
         /// </summary>
         public bool CaptureShadowAtlas { get; set; }
+
+        /// <summary>
+        /// A morph composite to render and capture instead of the shaded frame.
+        ///
+        /// <para>Captured directly because the composite is an intermediate the scene never shows: it is a
+        /// texture of per-vertex deltas that the morph shader path samples, and no fixture here has a model
+        /// that samples it. Reading it back is what turns the composite into something a baseline can
+        /// hold.</para>
+        /// </summary>
+        public MorphComposite? MorphComposite { get; set; }
+
+        /// <summary>
+        /// Drives the quad overdraw visualisation the way the viewer's Overdraw render mode does: a depth
+        /// prime pass, a counting pass that accumulates per-quad shading cost through image stores, and a
+        /// fullscreen resolve into a heat map.
+        ///
+        /// <para>Setting the render mode alone does not do this. The scene shader is only a replacement
+        /// shader; the counting passes are driven by the viewer around the render call, so a scene that
+        /// merely selects the mode leaves <c>QuadOverdraw</c> untouched -- which is exactly what the call
+        /// site census showed was happening.</para>
+        /// </summary>
+        public bool EnableQuadOverdraw { get; set; }
+
+        /// <summary>
+        /// Turns occlusion culling back on and draws the occluded-bounds debug overlay.
+        ///
+        /// <para>The harness disables occlusion culling everywhere else, because it culls against the
+        /// previous frame's depth pyramid and so makes the image a function of how many frames were
+        /// rendered. That is only a problem when the frame count varies; it is fixed per scene, so a scene
+        /// that opts in and pins its frame count is still reproducible. It must render past the renderer's
+        /// one-second occlusion warmup for the pyramid to be built at all.</para>
+        /// </summary>
+        public bool EnableOcclusionDebug { get; set; }
 
         /// <summary>
         /// Forces the bloom stage on for this scene.

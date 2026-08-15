@@ -5,6 +5,7 @@ using ValveResourceFormat.Renderer.Materials;
 using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.Renderer.Utils;
 using ValveResourceFormat.ResourceTypes;
+using ValveResourceFormat.Serialization.KeyValues;
 
 namespace Tests.Renderer.Golden
 {
@@ -138,6 +139,8 @@ namespace Tests.Renderer.Golden
             AddModelScenes(scenes);
             AddPhysicsScenes(scenes);
             AddWorldScene(scenes);
+            AddParticleScenes(scenes);
+            AddMorphScene(scenes);
             AddTextureScenes(scenes);
             AddPostProcessScenes(scenes);
             AddDebugModeScenes(scenes);
@@ -241,6 +244,164 @@ namespace Tests.Renderer.Golden
             });
         }
 
+        /// <summary>
+        /// The one particle fixture in the repository that can emit anything.
+        /// </summary>
+        /// <remarks>
+        /// Measured, not assumed: <c>explosion_barrel_kv0_lz4.vpcf_c</c> parses with one
+        /// <c>C_OP_RenderSprites</c> renderer and <b>zero emitters</b>, so it never spawns a particle and
+        /// no amount of simulation makes it draw. This one has a <c>C_OP_ContinuousEmitter</c>.
+        /// </remarks>
+        private const string ParticleSystemFixture = "frostivus_throne_wraith_king_ambient_c_b.vpcf_c";
+
+        private static void AddParticleScenes(List<GoldenScene> scenes)
+        {
+            scenes.Add(new GoldenScene
+            {
+                // Continuous sprite emitter, simulated on the fixed timestep, then captured. This is the
+                // only route to RenderSprites, one of the three particle draw sites the RHI migration had
+                // no coverage for at all.
+                //
+                // One of only two scenes in the catalog that is not byte-reproducible: re-recording the
+                // whole set twice leaves every other baseline identical and moves this one. The particle
+                // simulation carries randomness that the harness cannot pin from outside, the way the
+                // post-process dither did before it was seeded. Measured across runs the movement is small
+                // and steady -- at most 6/255 on any channel, under 0.02% of pixels, mean below 0.01/255 --
+                // so the budget clears it with room while still being far tighter than the effect a real
+                // change to emission, simulation or the sprite path would have. Seeding that generator
+                // would let this scene go to Strict like the rest.
+                Name = "particle_sprites",
+                Tolerance = ImageTolerance.Accumulating,
+                Frames = 40,
+                RequiredFixtures = [ParticleSystemFixture],
+                Build = static setup =>
+                {
+                    var resource = setup.LoadFixture(ParticleSystemFixture);
+
+                    if (resource.DataBlock is not ParticleSystem particleSystem)
+                    {
+                        throw new GoldenRenderException($"'{ParticleSystemFixture}' did not parse as a particle system.");
+                    }
+
+                    var node = new ParticleSceneNode(setup.Scene, particleSystem, particleSnapshot: null, preview: true)
+                    {
+                        Transform = Matrix4x4.Identity,
+                    };
+
+                    // The system's material does not resolve in this repository, and a sprite renderer with
+                    // no texture draws nothing. Overriding it with the renderer's own flat white is what the
+                    // particle viewer does for snapshots, and it makes the geometry the subject of the test
+                    // rather than the texture.
+                    node.SetTextureOverride(setup.RendererContext.MaterialLoader.GetDefaultColor());
+
+                    setup.Scene.Add(node, dynamic: true);
+                    setup.Scene.LightingInfo.UseSceneBoundsForSunLightFrustum = false;
+
+                    setup.PlaceCamera(new Vector3(0, -160, 40), new Vector3(0, 0, 30));
+
+                    // Runs the system forward so the captured frame has a populated bag rather than the
+                    // handful of particles a cold start would have emitted.
+                    node.Prewarm(setup.Camera);
+                },
+            });
+        }
+
+        private const string MorphFixture = "gsg9_helmet001.vmorf_c";
+
+        /// <summary>
+        /// A texture with strong, position-dependent structure, standing in for the morph atlas this
+        /// repository does not ship. What it contains does not matter to the composite's logic, but that it
+        /// varies sharply from place to place does: it is what makes "which atlas rectangle was read"
+        /// visible in the composited image.
+        /// </summary>
+        private const string MorphAtlasStandIn = "Textures/BC7_testgrid_color_tga_2d6cc34.vtex_c";
+
+        private static void AddMorphScene(List<GoldenScene> scenes)
+        {
+            scenes.Add(new GoldenScene
+            {
+                // The morph composite, rendered and read straight back.
+                //
+                // WHAT THIS SCENE DOES AND DOES NOT CHECK. It reaches MorphComposite -- construction,
+                // Render, and the recorded RHI draw -- and it is the only thing in the suite that does. It
+                // is NOT yet an oracle for the BuildVertexBuffer bug, and the captured image is uniform.
+                //
+                // Measured, not assumed: gsg9_helmet001.vmorf_c parses to exactly one morph with one morph
+                // data entry, and that entry carries zero entries in m_morphRectDatas. With no rectangles,
+                // allVertices is empty, usedRects stays empty, and Render issues a draw of zero indices
+                // into a cleared atlas. There is nothing to composite, so no arrangement of weights or
+                // capture windows can make this fixture produce an image.
+                //
+                // WHAT A FIXTURE WOULD NEED, to turn this into the oracle the morph bug is waiting for:
+                //   - a .vmorf_c whose m_morphRectDatas holds at least three rectangles, since the bug is
+                //     invisible whenever the active rectangles are already the lowest-numbered ones;
+                //   - its m_pTextureAtlas .vtex_c alongside it, or the stand-in registered below;
+                //   - ideally a morph whose rectangles can be driven independently, so a weighting that
+                //     activates only the higher-numbered rectangles can be composited. That is the case
+                //     that separates correct behaviour from the current behaviour, because Render uploads
+                //     from the front of allVertices rather than from the rectangles in use.
+                // With that in place this scene needs no code change: raise the weights, record, and the
+                // baseline pins which rectangles were uploaded.
+                //
+                // Not a shaded scene, because no fixture here has a model that samples a morph composite.
+                // The composite is captured on its own instead, which is what makes any coverage possible.
+                Name = "morph_composite_atlas",
+                Tolerance = ImageTolerance.Strict,
+                RequiredFixtures = [MorphFixture, MorphAtlasStandIn],
+                Build = static setup =>
+                {
+                    var resource = setup.LoadFixture(MorphFixture);
+
+                    if (resource.DataBlock is not Morph morph)
+                    {
+                        throw new GoldenRenderException($"'{MorphFixture}' did not parse as morph data.");
+                    }
+
+                    var atlasPath = morph.Data.GetStringProperty("m_pTextureAtlas");
+                    setup.FileLoader!.Substitute(atlasPath, MorphAtlasStandIn);
+
+                    try
+                    {
+                        morph.LoadFlexData(setup.RendererContext.FileLoader);
+                    }
+                    catch (NotImplementedException)
+                    {
+                        // VRF cannot parse this fixture's flex rules -- it rejects the "jawOpen" flex
+                        // controller type outright. The texture atlas is resolved before the rules are
+                        // walked, so the morph is still usable for compositing, which is all this scene
+                        // needs. Swallowed narrowly and deliberately: the alternative is no morph coverage
+                        // at all until that parser gains a case.
+                    }
+
+                    if (morph.TextureResource == null)
+                    {
+                        throw new GoldenRenderException(
+                            $"The morph atlas stand-in was not picked up for '{atlasPath}'.");
+                    }
+
+                    var composite = new MorphComposite(setup.RendererContext, morph);
+
+                    // Every morph driven to full, so the composite is built from all the rectangles rather
+                    // than from whichever subset a partial weighting would leave active.
+                    //
+                    // Set twice, and that is not redundant. MorphComposite.SetMorphValue decides whether a
+                    // rectangle is in use from GetMorphValue(morphId) -- the value already stored -- before
+                    // writing the new one, so the first call to raise a morph off zero writes the weight and
+                    // then *removes* its rectangles from usedRects. One call therefore composites nothing at
+                    // all; the second sees the weight the first wrote and adds them back. Found here, by
+                    // this scene rendering a completely empty atlas.
+                    for (var morphId = 0; morphId < morph.GetMorphCount(); morphId++)
+                    {
+                        composite.SetMorphValue(morphId, 1f);
+                        composite.SetMorphValue(morphId, 1f);
+                    }
+
+                    setup.MorphComposite = composite;
+                    setup.PlaceCamera(new Vector3(0, -100, 0), Vector3.Zero);
+                },
+            });
+        }
+
         private static void AddWorldScene(List<GoldenScene> scenes)
         {
             scenes.Add(new GoldenScene
@@ -289,9 +450,18 @@ namespace Tests.Renderer.Golden
         /// </summary>
         private static void AddTextureScenes(List<GoldenScene> scenes)
         {
+            // DXT1 is missing from this list on purpose, and the reason is a finding rather than an
+            // omission. The only DXT1 fixture in the repository is
+            // DXT1_dota_default_cube_tga_c95513b9.vtex_c, and on this quad the two backends disagree about
+            // it completely: the OpenGL path samples flat grey, while the RHI path samples the texture
+            // correctly. 88% of pixels differ, mean deviation 35.7/255 -- not a tolerance question.
+            //
+            // Whatever the cause, a baseline recorded from the OpenGL path would enshrine the wrong image,
+            // and one recorded from the RHI path would fail the default mode. The scene was therefore
+            // withdrawn rather than left encoding either. Restoring DXT1 coverage needs a plain 2D DXT1
+            // fixture, and the divergence on this one needs explaining first.
             var textures = new[]
             {
-                ("texture_dxt1", "DXT1_dota_default_cube_tga_c95513b9.vtex_c"),
                 ("texture_dxt5", "DXT5_mod_dire_lava_000b_vmat_g_tnormal1_5a28bd86.vtex_c"),
                 ("texture_bc7", "BC7_testgrid_color_tga_2d6cc34.vtex_c"),
                 ("texture_bc6h_hdr", "BC6H.vtex_c"),
@@ -417,6 +587,68 @@ namespace Tests.Renderer.Golden
                     },
                 });
             }
+
+            scenes.Add(new GoldenScene
+            {
+                // The Overdraw mode actually driven, rather than merely selected. The census showed that
+                // debug_mode_overdraw above never touches QuadOverdraw at all: selecting the mode only
+                // swaps the scene's replacement shader, while the depth prime, counting and resolve passes
+                // are driven by the caller around the render. This scene drives them.
+                //
+                // Deliberately overlapping geometry, since a heat map of a scene with no overdraw in it is
+                // a uniform image that would not notice the counter being wrong.
+                Name = "overdraw_heatmap",
+                Tolerance = ImageTolerance.CountingRace,
+                RequiredFixtures = [PhysicsAggregate],
+                Build = static setup =>
+                {
+                    AddPhysics(setup, PhysicsAggregate, Matrix4x4.Identity);
+                    AddPhysics(setup, PhysicsAggregate, Matrix4x4.CreateRotationZ(0.9f) * Matrix4x4.CreateTranslation(0f, 0f, 12f));
+                    AddLitGroundPlane(setup, 300f);
+
+                    setup.PlaceCamera(new Vector3(70, -110, 55), new Vector3(0, 0, 15));
+                    setup.EnableQuadOverdraw = true;
+                },
+            });
+
+            scenes.Add(new GoldenScene
+            {
+                // Occlusion culling on, with the occluded-bounds overlay requested, and enough frames to
+                // clear the renderer's one-second warmup. Geometry is a wall of instances with more behind
+                // it, so there is something for a depth pyramid to occlude.
+                //
+                // It does not currently reach OcclusionDebugRenderer, and cannot from this repository.
+                // Measured rather than assumed: SceneMeshletCount is 0 in every scene in this catalog.
+                // Meshlets are built only from SceneAggregate nodes, which only the world loader creates
+                // from world node aggregate geometry, and no fixture here resolves any. With no meshlets
+                // DrawMeshletsIndirect stays false, and the overlay's first line returns on it -- as do the
+                // GPU meshlet cull, the indirect draw path, draw compaction and the depth pyramid.
+                //
+                // Kept because it is still a real multi-instance culling scene over 70 frames, and because
+                // it starts covering all of the above the moment aggregate geometry is available.
+                Name = "occlusion_debug_overlay",
+                Tolerance = ImageTolerance.Lit,
+                Frames = 70,
+                RequiredFixtures = [StaticModel],
+                Build = static setup =>
+                {
+                    var model = LoadModel(setup, StaticModel);
+
+                    for (var row = 0; row < 4; row++)
+                    {
+                        for (var column = -2; column <= 2; column++)
+                        {
+                            setup.Scene.Add(new ModelSceneNode(setup.Scene, model)
+                            {
+                                Transform = Matrix4x4.CreateTranslation(column * 70f, row * 120f, 0f),
+                            }, dynamic: false);
+                        }
+                    }
+
+                    setup.PlaceCamera(new Vector3(0, -260, 60), new Vector3(0, 200, 40));
+                    setup.EnableOcclusionDebug = true;
+                },
+            });
         }
 
         // ---- Shared scene building blocks ---------------------------------------------------------------
