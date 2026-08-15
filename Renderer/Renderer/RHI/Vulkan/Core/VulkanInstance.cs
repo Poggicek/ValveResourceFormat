@@ -84,6 +84,15 @@ public sealed unsafe class VulkanInstance : IDisposable
         var wantValidation = options.EnableValidation && availableLayers.Contains(ValidationLayerName);
         ValidationEnabled = wantValidation;
 
+        // Extensions owned by an explicit layer are invisible to the null-layer query above, and
+        // VK_EXT_validation_features belongs to the validation layer. Without this the sync
+        // validation request silently resolved to false and every smoke test that asked for it ran
+        // without it -- passing while proving nothing about the barriers it was written to check.
+        if (wantValidation)
+        {
+            availableExtensions.UnionWith(EnumerateExtensions(ValidationLayerName));
+        }
+
         var extensions = new List<string>(options.InstanceExtensions);
 
         var hasDebugUtils = availableExtensions.Contains(DebugUtilsExtensionName);
@@ -351,10 +360,30 @@ public sealed unsafe class VulkanInstance : IDisposable
         return result;
     }
 
-    private HashSet<string> EnumerateExtensions()
+    /// <param name="layerName">The layer whose extensions to list, or <see langword="null"/> for the
+    /// implicit ones. A layer's own extensions are reported only when it is named here, which is why
+    /// the validation layer has to be asked separately.</param>
+    private HashSet<string> EnumerateExtensions(string? layerName = null)
+    {
+        var layerPtr = layerName is null ? 0 : SilkMarshal.StringToPtr(layerName);
+
+        try
+        {
+            return EnumerateExtensionsCore((byte*)layerPtr);
+        }
+        finally
+        {
+            if (layerPtr != 0)
+            {
+                SilkMarshal.Free(layerPtr);
+            }
+        }
+    }
+
+    private HashSet<string> EnumerateExtensionsCore(byte* layerName)
     {
         uint count = 0;
-        Api.EnumerateInstanceExtensionProperties((byte*)null, ref count, null)
+        Api.EnumerateInstanceExtensionProperties(layerName, ref count, null)
             .Check("vkEnumerateInstanceExtensionProperties");
 
         var properties = new ExtensionProperties[count];
@@ -362,7 +391,7 @@ public sealed unsafe class VulkanInstance : IDisposable
 
         fixed (ExtensionProperties* p = properties)
         {
-            Api.EnumerateInstanceExtensionProperties((byte*)null, ref count, p)
+            Api.EnumerateInstanceExtensionProperties(layerName, ref count, p)
                 .Check("vkEnumerateInstanceExtensionProperties");
 
             for (var i = 0; i < count; i++)

@@ -4,60 +4,190 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 using GUI.Utils;
-using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
-using Silk.NET.Vulkan.Extensions.EXT;
 using Silk.NET.Vulkan.Extensions.KHR;
+using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.Vulkan.Core;
+using ValveResourceFormat.Renderer.RHI.Vulkan.Present;
 using Windows.Win32;
 using Windows.Win32.Foundation;
 using Windows.Win32.UI.WindowsAndMessaging;
 using ImageLayout = Silk.NET.Vulkan.ImageLayout;
+using VkDevice = Silk.NET.Vulkan.Device;
 using VkSemaphore = Silk.NET.Vulkan.Semaphore;
 
 namespace GUI.Controls;
 
 /// <summary>
-/// The Vulkan objects a <see cref="VulkanControl"/> needs in order to own a swapchain.
+/// The shared Vulkan device every <see cref="VulkanControl"/> presents through, plus the
+/// <c>VK_KHR_*</c> surface and swapchain entry points that only the presentation layer needs.
 /// </summary>
 /// <remarks>
-/// This is the seam the real device is injected through. <see cref="TemporaryVulkanDevice"/> implements
-/// it today; the renderer's own Vulkan device implements it later without this control changing.
-/// Everything here is shared between controls, so several tabs can each own a swapchain on one device.
+/// <para>
+/// The device itself is <see cref="VulkanPresentDevice"/>, which lives in the renderer next to the rest
+/// of the backend. This class exists only because the swapchain extensions do not: <c>Renderer</c>
+/// references <c>Silk.NET.Vulkan</c> and its <c>Extensions.EXT</c>, while <c>KhrSurface</c>,
+/// <c>KhrWin32Surface</c> and <c>KhrSwapchain</c> come from <c>Extensions.KHR</c>, which only this
+/// project references. Everything platform- and swapchain-specific therefore stays on this side of the
+/// boundary, which is also what the contract asks for: swapchain creation is owned by the presentation
+/// layer and is no part of the RHI.
+/// </para>
+/// <para>
+/// Reference counted, so every tab shares one instance, device and queue. Nothing is destroyed when the
+/// last tab closes: the extension wrappers and the <see cref="Vk"/> under them share the loaded
+/// <c>vulkan-1</c> module, and disposing them unloads it, which makes the next device this process
+/// creates access-violate inside the loader. <see cref="Shutdown"/> is the one place it all goes away.
+/// </para>
 /// </remarks>
-public interface IVulkanPresentDevice
+public sealed class VulkanPresentSession
 {
-    /// <summary>Core Vulkan entry points.</summary>
-    Vk Api { get; }
+    private static readonly Lock SharedLock = new();
+    private static VulkanPresentSession? shared;
 
-    /// <summary>Instance the presentation surfaces are created from.</summary>
-    Instance Instance { get; }
+    /// <summary>Gets the device rendering and presentation go through.</summary>
+    public VulkanPresentDevice PresentDevice { get; }
 
-    /// <summary>Physical device backing <see cref="Device"/>.</summary>
-    PhysicalDevice PhysicalDevice { get; }
+    /// <summary>Gets the core Vulkan entry points.</summary>
+    public Vk Api => PresentDevice.Core.Api;
 
-    /// <summary>Logical device the swapchains belong to.</summary>
-    Device Device { get; }
+    /// <summary>Gets the instance the presentation surfaces are created from.</summary>
+    public Instance Instance => PresentDevice.Core.Instance.Handle;
 
-    /// <summary>Index of the queue family used for both rendering and presentation.</summary>
-    uint PresentQueueFamily { get; }
+    /// <summary>Gets the physical device that was selected.</summary>
+    public PhysicalDevice PhysicalDevice => PresentDevice.Core.Adapter.Handle;
 
-    /// <summary>Queue used for both rendering and presentation.</summary>
-    Queue PresentQueue { get; }
+    /// <summary>Gets the logical device the swapchains belong to.</summary>
+    public VkDevice LogicalDevice => PresentDevice.Core.Handle;
+
+    /// <summary>Gets the index of the queue family used for both rendering and presentation.</summary>
+    public uint PresentQueueFamily => PresentDevice.Core.GraphicsQueueFamily;
+
+    /// <summary>Gets the queue used for both rendering and presentation.</summary>
+    public Queue PresentQueue => PresentDevice.Core.GraphicsQueue;
+
+    /// <summary>Gets the lock guarding the queue, presentation and the frame ring. Reentrant.</summary>
+    public Lock QueueLock => PresentDevice.SubmissionLock;
+
+    /// <summary>Gets the object naming helper, so swapchain images show up named in a capture.</summary>
+    public VulkanDebugNames DebugNames => PresentDevice.Core.DebugNames;
+
+    /// <summary>Gets the <c>VK_KHR_surface</c> entry points.</summary>
+    public KhrSurface SurfaceApi { get; }
+
+    /// <summary>Gets the <c>VK_KHR_win32_surface</c> entry points.</summary>
+    public KhrWin32Surface Win32SurfaceApi { get; }
+
+    /// <summary>Gets the <c>VK_KHR_swapchain</c> entry points.</summary>
+    public KhrSwapchain SwapchainApi { get; }
+
+    private VulkanPresentSession(VulkanPresentDevice device)
+    {
+        PresentDevice = device;
+
+        if (!device.Core.Api.TryGetInstanceExtension(Instance, out KhrSurface surfaceApi))
+        {
+            throw new VulkanException($"{VulkanPresentDevice.SurfaceExtensionName} is unavailable.");
+        }
+
+        if (!device.Core.Api.TryGetInstanceExtension(Instance, out KhrWin32Surface win32SurfaceApi))
+        {
+            throw new VulkanException($"{VulkanPresentDevice.Win32SurfaceExtensionName} is unavailable.");
+        }
+
+        if (!device.Core.Api.TryGetDeviceExtension(Instance, LogicalDevice, out KhrSwapchain swapchainApi))
+        {
+            throw new VulkanException($"{VulkanPresentDevice.SwapchainExtensionName} is unavailable.");
+        }
+
+        SurfaceApi = surfaceApi;
+        Win32SurfaceApi = win32SurfaceApi;
+        SwapchainApi = swapchainApi;
+    }
+
+    /// <summary>Returns the shared session, creating the device on first use.</summary>
+    /// <returns>The shared session.</returns>
+    /// <exception cref="VulkanException">No suitable device exists, or creation failed.</exception>
+    public static VulkanPresentSession Acquire()
+    {
+        using var _ = SharedLock.EnterScope();
+
+        if (shared is null)
+        {
+            var options = new VulkanCoreOptions
+            {
+                ApplicationName = "Source 2 Viewer",
+                EnableValidation = ShouldUseValidation(),
+                EnableSynchronizationValidation = ShouldUseValidation(),
+            };
+
+            var device = VulkanPresentDevice.Acquire(OnRhiMessage, options);
+
+            try
+            {
+                shared = new VulkanPresentSession(device);
+            }
+            catch
+            {
+                VulkanPresentDevice.Release();
+                throw;
+            }
+
+            Log.Info(nameof(VulkanPresentSession),
+                $"Vulkan device: {device.Core.Adapter.Name}, validation {(device.ValidationEnabled ? "on" : "off")}.");
+
+            return shared;
+        }
+
+        VulkanPresentDevice.Acquire();
+
+        return shared;
+    }
+
+    /// <summary>Drops a control's reference. Destroys nothing; see the remarks on the class.</summary>
+    public static void Release() => VulkanPresentDevice.Release();
 
     /// <summary>
-    /// Guards <see cref="PresentQueue"/> and device-wide waits. Vulkan queues are not internally
-    /// synchronized and every control shares this one queue.
+    /// Destroys the shared instance and device. Call once while shutting the application down, after
+    /// every <see cref="VulkanControl"/> is disposed; the validation layer reports anything still alive
+    /// at this point as a leak.
     /// </summary>
-    Lock QueueLock { get; }
+    public static void Shutdown()
+    {
+        using var _ = SharedLock.EnterScope();
 
-    /// <summary><c>VK_KHR_surface</c> entry points.</summary>
-    KhrSurface SurfaceApi { get; }
+        if (shared is null)
+        {
+            return;
+        }
 
-    /// <summary><c>VK_KHR_win32_surface</c> entry points.</summary>
-    KhrWin32Surface Win32SurfaceApi { get; }
+        var outstanding = VulkanPresentDevice.Shutdown();
 
-    /// <summary><c>VK_KHR_swapchain</c> entry points.</summary>
-    KhrSwapchain SwapchainApi { get; }
+        if (outstanding != 0)
+        {
+            Log.Warn(nameof(VulkanPresentSession), $"Shutting down with {outstanding} live controls.");
+        }
+
+        shared = null;
+    }
+
+    private static bool ShouldUseValidation()
+    {
+#if DEBUG
+        return true;
+#else
+        return !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("VRF_VULKAN_VALIDATION"));
+#endif
+    }
+
+    private static void OnRhiMessage(RhiMessageSeverity severity, string message)
+    {
+        switch (severity)
+        {
+            case RhiMessageSeverity.Error: Log.Error("Vulkan", message); break;
+            case RhiMessageSeverity.Warning: Log.Warn("Vulkan", message); break;
+            default: Log.Debug("Vulkan", message); break;
+        }
+    }
 }
 
 /// <summary>
@@ -67,6 +197,8 @@ public interface IVulkanPresentDevice
 /// <remarks>
 /// Vulkan has no current-context concept, so this only takes the control's render lock. The shape is
 /// deliberately identical to the OpenGL one so the shared render thread's call sites are unchanged.
+/// Simplifying it away is tempting and wrong: changing the threading model and the graphics API in the
+/// same step is how a port like this goes wrong.
 /// </remarks>
 public readonly ref struct VulkanLockScope
 {
@@ -102,40 +234,41 @@ public readonly ref struct VulkanLockScope
 /// destroys the child window. Vulkan needs no current context, but the lock and its scope are kept so
 /// that swapping backends does not also swap threading models.
 /// </para>
+/// <para>
+/// <b>Frame pacing is the device's, not this control's.</b> The swapchain contributes the acquire and
+/// the present; everything between them &#8212; how far the CPU may run ahead, which command pool a frame
+/// records into, when a retired frame's resources are recycled &#8212; belongs to
+/// <see cref="VulkanPresentDevice"/> and its frame ring. So a frame here is
+/// <c>BeginFrame, acquire, record, submit, present, EndFrame</c>, and this control owns no fences and
+/// no command pool of its own. Keeping a second, parallel notion of "frames in flight" next to the
+/// device's is how the two drift apart.
+/// </para>
 /// </remarks>
 public sealed partial class VulkanControl : Control
 {
-    /// <summary>Frames the CPU may run ahead of the GPU.</summary>
-    private const int MaxFramesInFlight = 2;
-
     private const string ChildWindowClassName = "Source2ViewerVulkanSurface";
 
     private static readonly Lock WindowClassLock = new();
     private static bool windowClassRegistered;
 
     private readonly Lock renderLock;
-    private readonly IVulkanPresentDevice? injectedDevice;
+    private readonly VulkanPresentSession? injectedSession;
 
-    private IVulkanPresentDevice? device;
-    private bool ownsTemporaryDevice;
+    private VulkanPresentSession? session;
+    private bool ownsSessionReference;
 
     private HWND childWindow;
     private SurfaceKHR surface;
     private SwapchainKHR swapchain;
 
-    private Image[] swapchainImages = [];
+    private VulkanSwapchainTexture[] swapchainTextures = [];
     private VkSemaphore[] renderFinishedSemaphores = [];
-    private Fence[] imagesInFlight = [];
+    private ulong[] imageFrameSerials = [];
 
-    private readonly VkSemaphore[] imageAvailableSemaphores = new VkSemaphore[MaxFramesInFlight];
-    private readonly Fence[] inFlightFences = new Fence[MaxFramesInFlight];
-    private readonly CommandBuffer[] commandBuffers = new CommandBuffer[MaxFramesInFlight];
-    private CommandPool commandPool;
+    private VkSemaphore[] imageAvailableSemaphores = [];
 
     private Extent2D swapchainExtent;
-    private int frameIndex;
     private bool swapchainDirty;
-    private bool perFrameObjectsCreated;
     private bool torndown;
 
     // Written by the UI thread on resize, read by the render thread. Only a fallback: the surface's
@@ -144,10 +277,19 @@ public sealed partial class VulkanControl : Control
     private volatile int lastClientHeight;
 
     /// <summary>
-    /// Colour the swapchain image is cleared to each frame. Distinct values make it obvious which tab
-    /// a presented image belongs to.
+    /// Colour the swapchain image is cleared to when no <see cref="RenderFrame"/> callback is set.
+    /// Distinct values make it obvious which tab a presented image belongs to.
     /// </summary>
     public ClearColorValue ClearColor { get; set; } = new(0.1f, 0.1f, 0.12f, 1f);
+
+    /// <summary>
+    /// Draws the frame into the acquired swapchain image, or <see langword="null"/> to clear it to
+    /// <see cref="ClearColor"/>.
+    /// </summary>
+    /// <remarks>This is the seam the renderer attaches to. The callback receives the backbuffer as an
+    /// <see cref="ITexture"/> it may name as a render pass colour attachment, because on Vulkan a
+    /// swapchain image is a real <c>VkImage</c> and the frame renders straight into it.</remarks>
+    public VulkanPresentFrameCallback? RenderFrame { get; set; }
 
     /// <summary>
     /// Whether presentation waits for vertical blank. <see langword="true"/> selects FIFO, which every
@@ -166,26 +308,39 @@ public sealed partial class VulkanControl : Control
         }
     } = true;
 
-    /// <summary>Whether a swapchain currently exists and can be presented to.</summary>
+    /// <summary>Gets a value indicating whether a swapchain currently exists and can be presented to.</summary>
     public bool HasSwapchain => swapchain.Handle != 0;
 
-    /// <summary>Format of the current swapchain images; whatever renders into them must match it.</summary>
+    /// <summary>Gets the format of the current swapchain images; whatever renders into them must match it.</summary>
     public Format SwapchainFormat { get; private set; }
 
-    /// <summary>Size of the current swapchain images, in pixels.</summary>
+    /// <summary>Gets the contract format of the current swapchain images.</summary>
+    public RhiFormat SwapchainRhiFormat { get; private set; }
+
+    /// <summary>Gets the size of the current swapchain images, in pixels.</summary>
     public Extent2D SwapchainExtent => swapchainExtent;
 
-    /// <summary>Number of frames successfully presented, for tests and diagnostics.</summary>
+    /// <summary>Gets the device this control presents through, or <see langword="null"/> before the
+    /// surface exists or after teardown.</summary>
+    public VulkanPresentDevice? PresentDevice => session?.PresentDevice;
+
+    /// <summary>Gets the number of frames successfully presented, for tests and diagnostics.</summary>
     public long PresentedFrameCount { get; private set; }
 
-    /// <summary>Number of times the swapchain was rebuilt, for tests and diagnostics.</summary>
+    /// <summary>Gets the number of times the swapchain was rebuilt, for tests and diagnostics.</summary>
     public long SwapchainRecreateCount { get; private set; }
 
     /// <summary>
-    /// Number of times acquire or present reported the swapchain out of date or suboptimal, for tests
-    /// and diagnostics.
+    /// Gets the number of times acquire or present reported the swapchain out of date or suboptimal,
+    /// for tests and diagnostics.
     /// </summary>
     public long OutOfDateCount { get; private set; }
+
+    /// <summary>
+    /// Gets the number of frames skipped because the surface had no pixels, for tests and diagnostics.
+    /// Minimising a window drives this and nothing else does.
+    /// </summary>
+    public long ZeroExtentSkipCount { get; private set; }
 
     /// <summary>
     /// Constructs a control that presents onto its own child window.
@@ -194,15 +349,14 @@ public sealed partial class VulkanControl : Control
     /// Lock serialising this control's Vulkan work, held by the shared render thread while drawing and
     /// by the UI thread while creating or destroying the surface.
     /// </param>
-    /// <param name="device">
-    /// Device to present with. When <see langword="null"/> the temporary process-wide device is used;
-    /// pass the renderer's device once it exists.
+    /// <param name="session">
+    /// Session to present with, or <see langword="null"/> to take a reference on the shared one.
     /// </param>
-    public VulkanControl(Lock renderLock, IVulkanPresentDevice? device = null)
+    public VulkanControl(Lock renderLock, VulkanPresentSession? session = null)
     {
         // Not ArgumentNullException.ThrowIfNull: passing a Lock as object trips CS9216.
         this.renderLock = renderLock ?? throw new ArgumentNullException(nameof(renderLock));
-        injectedDevice = device;
+        injectedSession = session;
 
         SetStyle(ControlStyles.Opaque, true);
         SetStyle(ControlStyles.UserPaint, true);
@@ -350,8 +504,26 @@ public sealed partial class VulkanControl : Control
             return;
         }
 
-        device = injectedDevice ?? TemporaryVulkanDevice.Acquire();
-        ownsTemporaryDevice = injectedDevice is null;
+        if (injectedSession is not null)
+        {
+            session = injectedSession;
+        }
+        else
+        {
+            try
+            {
+                session = VulkanPresentSession.Acquire();
+                ownsSessionReference = true;
+            }
+            catch (VulkanException exception)
+            {
+                // Not fatal. Both backends ship, and OpenGL is the one that always works.
+                Log.Error(nameof(VulkanControl), $"Vulkan is unavailable: {exception.Message}");
+                RhiBackendSelection.FallBackToOpenGL(exception.Message);
+                DestroyChildWindow();
+                return;
+            }
+        }
 
         var createInfo = new Win32SurfaceCreateInfoKHR
         {
@@ -360,7 +532,7 @@ public sealed partial class VulkanControl : Control
             Hwnd = childWindow,
         };
 
-        var result = device.Win32SurfaceApi.CreateWin32Surface(device.Instance, in createInfo, null, out surface);
+        var result = session.Win32SurfaceApi.CreateWin32Surface(session.Instance, in createInfo, null, out surface);
 
         if (result != Result.Success)
         {
@@ -369,16 +541,20 @@ public sealed partial class VulkanControl : Control
             return;
         }
 
-        var supportResult = device.SurfaceApi.GetPhysicalDeviceSurfaceSupport(
-            device.PhysicalDevice, device.PresentQueueFamily, surface, out var supported);
+        var supportResult = session.SurfaceApi.GetPhysicalDeviceSurfaceSupport(
+            session.PhysicalDevice, session.PresentQueueFamily, surface, out var supported);
 
         if (supportResult != Result.Success || !supported)
         {
+            // The authoritative "can this adapter present here" answer, which cannot be asked before a
+            // surface exists and therefore cannot gate physical device selection.
             Log.Error(nameof(VulkanControl), "The present queue family cannot present to this surface.");
+            RhiBackendSelection.FallBackToOpenGL("the selected adapter cannot present to a window surface");
             DestroySurface();
             return;
         }
 
+        RhiBackendSelection.MarkActive(RhiBackend.Vulkan);
         swapchainDirty = true;
     }
 
@@ -425,14 +601,15 @@ public sealed partial class VulkanControl : Control
         => PInvoke.DefWindowProc(hwnd, message, wParam, lParam);
 
     /// <summary>
-    /// Acquires, clears and presents one swapchain image. Called by the shared render thread.
+    /// Runs one frame: acquire, render into the acquired image, present. Called by the shared render
+    /// thread.
     /// </summary>
     /// <returns><see langword="true"/> when an image was presented this call.</returns>
-    public unsafe bool DrawFrame()
+    public bool DrawFrame()
     {
         using var _ = renderLock.EnterScope();
 
-        if (torndown || device is null || surface.Handle == 0)
+        if (torndown || session is null || surface.Handle == 0)
         {
             return false;
         }
@@ -443,20 +620,42 @@ public sealed partial class VulkanControl : Control
             return false;
         }
 
-        var vk = device.Api;
-        var logicalDevice = device.Device;
-        var fence = inFlightFences[frameIndex];
+        var device = session.PresentDevice;
 
-        vk.WaitForFences(logicalDevice, 1, in fence, true, ulong.MaxValue);
+        // Held across the whole frame. The frame ring is device-wide and every window shares one
+        // queue, so a frame is not a thing two windows may be inside at once.
+        using var submission = device.SubmissionLock.EnterScope();
+
+        device.BeginFrame();
+
+        try
+        {
+            return AcquireRenderPresent(device);
+        }
+        finally
+        {
+            // Unconditional. A frame that opened and did not signal the timeline leaves the ring
+            // waiting on a serial nothing will ever reach; EndFrame submits the empty signalling
+            // command buffer for exactly the case where the acquire failed and nothing else did.
+            device.EndFrame();
+        }
+    }
+
+    private unsafe bool AcquireRenderPresent(VulkanPresentDevice device)
+    {
+        Debug.Assert(session is not null);
+
+        var frameIndex = device.FrameIndex;
+        var acquireSemaphore = imageAvailableSemaphores[frameIndex];
 
         uint imageIndex;
-        var acquire = device.SwapchainApi.AcquireNextImage(
-            logicalDevice, swapchain, ulong.MaxValue, imageAvailableSemaphores[frameIndex], default, &imageIndex);
+        var acquire = session.SwapchainApi.AcquireNextImage(
+            session.LogicalDevice, swapchain, ulong.MaxValue, acquireSemaphore, default, &imageIndex);
 
         if (acquire is Result.ErrorOutOfDateKhr)
         {
-            // The fence is still signalled and the semaphore was not touched, so the next frame is
-            // free to start over on a rebuilt swapchain.
+            // The semaphore was not touched, so the next frame is free to start over on a rebuilt
+            // swapchain without an already-signalled semaphore handed to vkAcquireNextImageKHR.
             swapchainDirty = true;
             OutOfDateCount++;
             return false;
@@ -476,95 +675,93 @@ public sealed partial class VulkanControl : Control
             return false;
         }
 
-        // The previous user of this image may still be in flight in another frame slot.
-        var previousFence = imagesInFlight[imageIndex];
+        // With more swapchain images than frames in flight, the slot the ring just recycled says
+        // nothing about whether *this image* is still being rendered into by an older frame.
+        device.WaitForFrameSerial(imageFrameSerials[imageIndex]);
 
-        if (previousFence.Handle != 0 && previousFence.Handle != fence.Handle)
+        var backbuffer = swapchainTextures[imageIndex];
+
+        // Acquiring guarantees nothing about the image's layout or its contents, so the frame starts
+        // from Undefined and the first barrier discards whatever the presentation engine left.
+        backbuffer.OverrideTrackedState(ResourceState.Undefined);
+
+        var commandBuffer = device.BeginFrameCommands($"{nameof(VulkanControl)} frame {device.CurrentFrameSerial}");
+
+        var callback = RenderFrame;
+
+        if (callback is not null)
         {
-            vk.WaitForFences(logicalDevice, 1, in previousFence, true, ulong.MaxValue);
+            var frame = new VulkanPresentFrame(backbuffer, commandBuffer, frameIndex);
+
+            // A throwing callback must not take the frame with it. The acquire semaphore has already
+            // been signalled by the presentation engine, and the only thing that can unsignal it is a
+            // submission waiting on it; abandoning the frame here would hand an already-signalled
+            // semaphore to the next vkAcquireNextImageKHR on this slot. So whatever the callback
+            // managed to record is transitioned, submitted and presented anyway, and the failure is
+            // reported rather than compounded.
+            try
+            {
+                callback(in frame);
+            }
+            catch (Exception exception)
+            {
+                Log.Error(nameof(VulkanControl), $"The frame callback threw, presenting the partial frame: {exception}");
+            }
+        }
+        else
+        {
+            RecordClear(commandBuffer, backbuffer);
         }
 
-        imagesInFlight[imageIndex] = fence;
+        backbuffer.TransitionTo(commandBuffer, ResourceState.Present);
 
-        RecordClear(commandBuffers[frameIndex], swapchainImages[imageIndex]);
-
-        vk.ResetFences(logicalDevice, 1, in fence);
-
-        var waitSemaphore = imageAvailableSemaphores[frameIndex];
         var signalSemaphore = renderFinishedSemaphores[imageIndex];
-        var waitStage = PipelineStageFlags.TransferBit;
-        var commandBuffer = commandBuffers[frameIndex];
 
-        var submit = new SubmitInfo
-        {
-            SType = StructureType.SubmitInfo,
-            WaitSemaphoreCount = 1,
-            PWaitSemaphores = &waitSemaphore,
-            PWaitDstStageMask = &waitStage,
-            CommandBufferCount = 1,
-            PCommandBuffers = &commandBuffer,
-            SignalSemaphoreCount = 1,
-            PSignalSemaphores = &signalSemaphore,
-        };
+        device.SubmitFrameCommands(commandBuffer, acquireSemaphore, signalSemaphore);
+        imageFrameSerials[imageIndex] = device.CurrentFrameSerial;
 
-        Result present;
         var localSwapchain = swapchain;
 
-        using (device.QueueLock.EnterScope())
+        var presentInfo = new PresentInfoKHR
         {
-            var submitted = vk.QueueSubmit(device.PresentQueue, 1, in submit, fence);
+            SType = StructureType.PresentInfoKhr,
+            WaitSemaphoreCount = 1,
+            PWaitSemaphores = &signalSemaphore,
+            SwapchainCount = 1,
+            PSwapchains = &localSwapchain,
+            PImageIndices = &imageIndex,
+        };
 
-            if (submitted != Result.Success)
-            {
-                Log.Error(nameof(VulkanControl), $"vkQueueSubmit failed: {submitted}");
-                return false;
-            }
+        var present = session.SwapchainApi.QueuePresent(session.PresentQueue, in presentInfo);
 
-            var presentInfo = new PresentInfoKHR
-            {
-                SType = StructureType.PresentInfoKhr,
-                WaitSemaphoreCount = 1,
-                PWaitSemaphores = &signalSemaphore,
-                SwapchainCount = 1,
-                PSwapchains = &localSwapchain,
-                PImageIndices = &imageIndex,
-            };
-
-            present = device.SwapchainApi.QueuePresent(device.PresentQueue, in presentInfo);
-        }
-
-        if (present is Result.ErrorOutOfDateKhr or Result.SuboptimalKhr)
+        if (present is Result.SuboptimalKhr)
         {
             swapchainDirty = true;
             OutOfDateCount++;
+        }
+        else if (present is Result.ErrorOutOfDateKhr)
+        {
+            swapchainDirty = true;
+            OutOfDateCount++;
+            return false;
         }
         else if (present is not Result.Success)
         {
             Log.Error(nameof(VulkanControl), $"vkQueuePresentKHR failed: {present}");
             swapchainDirty = true;
+            return false;
         }
 
-        frameIndex = (frameIndex + 1) % MaxFramesInFlight;
         PresentedFrameCount++;
 
         return true;
     }
 
-    private unsafe void RecordClear(CommandBuffer commandBuffer, Image image)
+    private unsafe void RecordClear(CommandBuffer commandBuffer, VulkanSwapchainTexture backbuffer)
     {
-        Debug.Assert(device is not null);
+        Debug.Assert(session is not null);
 
-        var vk = device.Api;
-
-        vk.ResetCommandBuffer(commandBuffer, CommandBufferResetFlags.None);
-
-        var begin = new CommandBufferBeginInfo
-        {
-            SType = StructureType.CommandBufferBeginInfo,
-            Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
-        };
-
-        vk.BeginCommandBuffer(commandBuffer, in begin);
+        backbuffer.TransitionTo(commandBuffer, ResourceState.CopyDestination);
 
         var range = new ImageSubresourceRange
         {
@@ -575,46 +772,10 @@ public sealed partial class VulkanControl : Control
             LayerCount = 1,
         };
 
-        // Undefined -> TransferDst. The transition is placed in the transfer stage, which is the stage
-        // the acquire semaphore is waited at, so it cannot run ahead of the presentation engine.
-        var toTransferDst = new ImageMemoryBarrier
-        {
-            SType = StructureType.ImageMemoryBarrier,
-            OldLayout = ImageLayout.Undefined,
-            NewLayout = ImageLayout.TransferDstOptimal,
-            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            Image = image,
-            SubresourceRange = range,
-            SrcAccessMask = AccessFlags.None,
-            DstAccessMask = AccessFlags.TransferWriteBit,
-        };
-
-        vk.CmdPipelineBarrier(commandBuffer,
-            PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit,
-            DependencyFlags.None, 0, null, 0, null, 1, in toTransferDst);
-
         var clearColor = ClearColor;
-        vk.CmdClearColorImage(commandBuffer, image, ImageLayout.TransferDstOptimal, in clearColor, 1, in range);
 
-        var toPresent = new ImageMemoryBarrier
-        {
-            SType = StructureType.ImageMemoryBarrier,
-            OldLayout = ImageLayout.TransferDstOptimal,
-            NewLayout = ImageLayout.PresentSrcKhr,
-            SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-            Image = image,
-            SubresourceRange = range,
-            SrcAccessMask = AccessFlags.TransferWriteBit,
-            DstAccessMask = AccessFlags.None,
-        };
-
-        vk.CmdPipelineBarrier(commandBuffer,
-            PipelineStageFlags.TransferBit, PipelineStageFlags.BottomOfPipeBit,
-            DependencyFlags.None, 0, null, 0, null, 1, in toPresent);
-
-        vk.EndCommandBuffer(commandBuffer);
+        session.Api.CmdClearColorImage(
+            commandBuffer, backbuffer.Handle, ImageLayout.TransferDstOptimal, in clearColor, 1, in range);
     }
 
     /// <summary>
@@ -624,7 +785,7 @@ public sealed partial class VulkanControl : Control
     /// <returns><see langword="false"/> when there is nothing to draw into.</returns>
     private bool EnsureSwapchain()
     {
-        Debug.Assert(device is not null);
+        Debug.Assert(session is not null);
 
         var caps = QuerySurfaceCapabilities();
 
@@ -639,6 +800,7 @@ public sealed partial class VulkanControl : Control
         // hold on to whatever exists and simply do not draw until there are pixels again.
         if (extent.Width == 0 || extent.Height == 0)
         {
+            ZeroExtentSkipCount++;
             return false;
         }
 
@@ -652,9 +814,9 @@ public sealed partial class VulkanControl : Control
 
     private SurfaceCapabilitiesKHR? QuerySurfaceCapabilities()
     {
-        Debug.Assert(device is not null);
+        Debug.Assert(session is not null);
 
-        var result = device.SurfaceApi.GetPhysicalDeviceSurfaceCapabilities(device.PhysicalDevice, surface, out var caps);
+        var result = session.SurfaceApi.GetPhysicalDeviceSurfaceCapabilities(session.PhysicalDevice, surface, out var caps);
 
         if (result != Result.Success)
         {
@@ -687,20 +849,26 @@ public sealed partial class VulkanControl : Control
 
     private unsafe bool RecreateSwapchain(SurfaceCapabilitiesKHR caps, Extent2D extent)
     {
-        Debug.Assert(device is not null);
+        Debug.Assert(session is not null);
 
-        var vk = device.Api;
-        var logicalDevice = device.Device;
+        var logicalDevice = session.LogicalDevice;
 
-        const ImageUsageFlags requiredUsage = ImageUsageFlags.TransferDstBit;
+        // The frame renders straight into the swapchain image, so it must be a colour attachment; the
+        // fallback clear path also needs it as a transfer destination.
+        const ImageUsageFlags RequiredUsage = ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferDstBit;
 
-        if ((caps.SupportedUsageFlags & requiredUsage) != requiredUsage)
+        if ((caps.SupportedUsageFlags & RequiredUsage) != RequiredUsage)
         {
-            Log.Error(nameof(VulkanControl), "The surface does not support being a transfer destination.");
+            Log.Error(nameof(VulkanControl), $"The surface supports {caps.SupportedUsageFlags}, which does not cover {RequiredUsage}.");
             return false;
         }
 
-        var format = ChooseSurfaceFormat();
+        if (!TryChooseSurfaceFormat(out var format, out var rhiFormat))
+        {
+            Log.Error(nameof(VulkanControl), "The surface reports no format the renderer can describe a render pass against.");
+            return false;
+        }
+
         var presentMode = ChoosePresentMode();
 
         var imageCount = caps.MinImageCount + 1;
@@ -711,8 +879,8 @@ public sealed partial class VulkanControl : Control
         }
 
         // Everything still referencing the old swapchain has to finish first. A device-wide wait is
-        // heavier than waiting on this control's fences, but fences do not cover queued presents and
-        // this only happens on resize.
+        // heavier than waiting on the frame timeline, but the timeline does not cover queued presents
+        // and this only happens on resize.
         WaitDeviceIdle();
 
         var oldSwapchain = swapchain;
@@ -726,7 +894,7 @@ public sealed partial class VulkanControl : Control
             ImageColorSpace = format.ColorSpace,
             ImageExtent = extent,
             ImageArrayLayers = 1,
-            ImageUsage = ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferDstBit,
+            ImageUsage = RequiredUsage,
             ImageSharingMode = SharingMode.Exclusive,
             PreTransform = caps.CurrentTransform,
             CompositeAlpha = CompositeAlphaFlagsKHR.OpaqueBitKhr,
@@ -735,7 +903,7 @@ public sealed partial class VulkanControl : Control
             OldSwapchain = oldSwapchain,
         };
 
-        var result = device.SwapchainApi.CreateSwapchain(logicalDevice, in createInfo, null, out var newSwapchain);
+        var result = session.SwapchainApi.CreateSwapchain(logicalDevice, in createInfo, null, out var newSwapchain);
 
         // The old swapchain is retired whether or not creation succeeded, so it is destroyed either
         // way, and only after the new one is built so the driver can hand over its resources.
@@ -751,17 +919,34 @@ public sealed partial class VulkanControl : Control
         swapchain = newSwapchain;
         swapchainExtent = extent;
         SwapchainFormat = format.Format;
+        SwapchainRhiFormat = rhiFormat;
         swapchainDirty = false;
         SwapchainRecreateCount++;
 
         uint actualImageCount = 0;
-        device.SwapchainApi.GetSwapchainImages(logicalDevice, swapchain, ref actualImageCount, null);
+        session.SwapchainApi.GetSwapchainImages(logicalDevice, swapchain, ref actualImageCount, null);
 
-        swapchainImages = new Image[actualImageCount];
+        var images = new Image[actualImageCount];
 
-        fixed (Image* images = swapchainImages)
+        fixed (Image* pointer = images)
         {
-            device.SwapchainApi.GetSwapchainImages(logicalDevice, swapchain, ref actualImageCount, images);
+            session.SwapchainApi.GetSwapchainImages(logicalDevice, swapchain, ref actualImageCount, pointer);
+        }
+
+        swapchainTextures = new VulkanSwapchainTexture[actualImageCount];
+
+        for (var i = 0; i < actualImageCount; i++)
+        {
+            swapchainTextures[i] = new VulkanSwapchainTexture(
+                session.Api,
+                logicalDevice,
+                session.DebugNames,
+                images[i],
+                rhiFormat,
+                (int)extent.Width,
+                (int)extent.Height,
+                TextureUsage.ColorTarget | TextureUsage.CopyDestination,
+                $"Swapchain image {i}");
         }
 
         // One signalling semaphore per image, not per frame in flight: present waits on it and there
@@ -772,59 +957,67 @@ public sealed partial class VulkanControl : Control
 
         for (var i = 0; i < actualImageCount; i++)
         {
-            vk.CreateSemaphore(logicalDevice, in semaphoreInfo, null, out renderFinishedSemaphores[i]);
+            session.Api.CreateSemaphore(logicalDevice, in semaphoreInfo, null, out renderFinishedSemaphores[i]);
+            session.DebugNames.SetName(renderFinishedSemaphores[i], $"Render finished {i}");
         }
 
-        imagesInFlight = new Fence[actualImageCount];
-        frameIndex = 0;
+        imageFrameSerials = new ulong[actualImageCount];
 
         EnsurePerFrameObjects();
 
         return true;
     }
 
-    private SurfaceFormatKHR ChooseSurfaceFormat()
+    private bool TryChooseSurfaceFormat(out SurfaceFormatKHR format, out RhiFormat rhiFormat)
     {
-        Debug.Assert(device is not null);
+        Debug.Assert(session is not null);
 
         var formats = GetSurfaceFormats();
 
-        if (formats.Length == 0)
+        // A single entry of VK_FORMAT_UNDEFINED is the legacy "anything goes" answer.
+        if (formats.Length == 0 || (formats.Length == 1 && formats[0].Format is Format.Undefined))
         {
-            return new SurfaceFormatKHR(Format.B8G8R8A8Unorm, ColorSpaceKHR.SpaceSrgbNonlinearKhr);
+            format = new SurfaceFormatKHR(Format.B8G8R8A8Unorm, ColorSpaceKHR.SpaceSrgbNonlinearKhr);
+            rhiFormat = RhiFormat.B8G8R8A8_UNorm;
+            return true;
         }
 
-        foreach (var candidate in formats)
+        foreach (var preferred in (ReadOnlySpan<Format>)[Format.B8G8R8A8Unorm, Format.R8G8B8A8Unorm])
         {
-            if (candidate.Format is Format.B8G8R8A8Unorm && candidate.ColorSpace is ColorSpaceKHR.SpaceSrgbNonlinearKhr)
+            foreach (var candidate in formats)
             {
-                return candidate;
+                if (candidate.Format == preferred
+                    && candidate.ColorSpace is ColorSpaceKHR.SpaceSrgbNonlinearKhr
+                    && VulkanSwapchainTexture.TryToRhiFormat(candidate.Format, out rhiFormat))
+                {
+                    format = candidate;
+                    return true;
+                }
             }
         }
 
+        // Anything else the contract can name. A surface format with no RhiFormat could never be a
+        // render pass attachment, so it is rejected here rather than at the first draw.
         foreach (var candidate in formats)
         {
-            if (candidate.Format is Format.R8G8B8A8Unorm && candidate.ColorSpace is ColorSpaceKHR.SpaceSrgbNonlinearKhr)
+            if (VulkanSwapchainTexture.TryToRhiFormat(candidate.Format, out rhiFormat))
             {
-                return candidate;
+                format = candidate;
+                return true;
             }
         }
 
-        // A single entry of VK_FORMAT_UNDEFINED means anything goes.
-        if (formats.Length == 1 && formats[0].Format is Format.Undefined)
-        {
-            return new SurfaceFormatKHR(Format.B8G8R8A8Unorm, ColorSpaceKHR.SpaceSrgbNonlinearKhr);
-        }
-
-        return formats[0];
+        format = default;
+        rhiFormat = RhiFormat.Undefined;
+        return false;
     }
 
     private unsafe SurfaceFormatKHR[] GetSurfaceFormats()
     {
-        Debug.Assert(device is not null);
+        Debug.Assert(session is not null);
 
         uint count = 0;
-        device.SurfaceApi.GetPhysicalDeviceSurfaceFormats(device.PhysicalDevice, surface, ref count, null);
+        session.SurfaceApi.GetPhysicalDeviceSurfaceFormats(session.PhysicalDevice, surface, ref count, null);
 
         if (count == 0)
         {
@@ -835,7 +1028,7 @@ public sealed partial class VulkanControl : Control
 
         fixed (SurfaceFormatKHR* pointer = formats)
         {
-            device.SurfaceApi.GetPhysicalDeviceSurfaceFormats(device.PhysicalDevice, surface, ref count, pointer);
+            session.SurfaceApi.GetPhysicalDeviceSurfaceFormats(session.PhysicalDevice, surface, ref count, pointer);
         }
 
         return formats;
@@ -843,7 +1036,7 @@ public sealed partial class VulkanControl : Control
 
     private unsafe PresentModeKHR ChoosePresentMode()
     {
-        Debug.Assert(device is not null);
+        Debug.Assert(session is not null);
 
         // FIFO is the only mode guaranteed to exist, and is what vsync means here.
         if (Vsync)
@@ -852,7 +1045,7 @@ public sealed partial class VulkanControl : Control
         }
 
         uint count = 0;
-        device.SurfaceApi.GetPhysicalDeviceSurfacePresentModes(device.PhysicalDevice, surface, ref count, null);
+        session.SurfaceApi.GetPhysicalDeviceSurfacePresentModes(session.PhysicalDevice, surface, ref count, null);
 
         if (count == 0)
         {
@@ -863,7 +1056,7 @@ public sealed partial class VulkanControl : Control
 
         fixed (PresentModeKHR* pointer = modes)
         {
-            device.SurfaceApi.GetPhysicalDeviceSurfacePresentModes(device.PhysicalDevice, surface, ref count, pointer);
+            session.SurfaceApi.GetPhysicalDeviceSurfacePresentModes(session.PhysicalDevice, surface, ref count, pointer);
         }
 
         if (Array.IndexOf(modes, PresentModeKHR.MailboxKhr) >= 0)
@@ -881,74 +1074,51 @@ public sealed partial class VulkanControl : Control
 
     private unsafe void EnsurePerFrameObjects()
     {
-        Debug.Assert(device is not null);
+        Debug.Assert(session is not null);
 
-        if (perFrameObjectsCreated)
+        var framesInFlight = session.PresentDevice.FramesInFlight;
+
+        if (imageAvailableSemaphores.Length == framesInFlight)
         {
             return;
         }
 
-        var vk = device.Api;
-        var logicalDevice = device.Device;
-
-        var poolInfo = new CommandPoolCreateInfo
-        {
-            SType = StructureType.CommandPoolCreateInfo,
-            QueueFamilyIndex = device.PresentQueueFamily,
-            Flags = CommandPoolCreateFlags.ResetCommandBufferBit,
-        };
-
-        vk.CreateCommandPool(logicalDevice, in poolInfo, null, out commandPool);
-
-        var allocateInfo = new CommandBufferAllocateInfo
-        {
-            SType = StructureType.CommandBufferAllocateInfo,
-            CommandPool = commandPool,
-            Level = CommandBufferLevel.Primary,
-            CommandBufferCount = MaxFramesInFlight,
-        };
-
-        fixed (CommandBuffer* buffers = commandBuffers)
-        {
-            vk.AllocateCommandBuffers(logicalDevice, in allocateInfo, buffers);
-        }
-
         var semaphoreInfo = new SemaphoreCreateInfo { SType = StructureType.SemaphoreCreateInfo };
 
-        // Signalled, so the very first frame does not wait on a fence nothing will ever signal.
-        var fenceInfo = new FenceCreateInfo
-        {
-            SType = StructureType.FenceCreateInfo,
-            Flags = FenceCreateFlags.SignaledBit,
-        };
+        imageAvailableSemaphores = new VkSemaphore[framesInFlight];
 
-        for (var i = 0; i < MaxFramesInFlight; i++)
+        for (var i = 0; i < framesInFlight; i++)
         {
-            vk.CreateSemaphore(logicalDevice, in semaphoreInfo, null, out imageAvailableSemaphores[i]);
-            vk.CreateFence(logicalDevice, in fenceInfo, null, out inFlightFences[i]);
+            session.Api.CreateSemaphore(session.LogicalDevice, in semaphoreInfo, null, out imageAvailableSemaphores[i]);
+            session.DebugNames.SetName(imageAvailableSemaphores[i], $"Image available {i}");
         }
-
-        perFrameObjectsCreated = true;
     }
 
     private void WaitDeviceIdle()
     {
-        Debug.Assert(device is not null);
+        Debug.Assert(session is not null);
 
-        using var _ = device.QueueLock.EnterScope();
-        device.Api.DeviceWaitIdle(device.Device);
+        using var _ = session.QueueLock.EnterScope();
+        session.PresentDevice.WaitIdle();
     }
 
     private unsafe void DestroySwapchainObjects(SwapchainKHR target)
     {
-        Debug.Assert(device is not null);
+        Debug.Assert(session is not null);
 
-        var vk = device.Api;
-        var logicalDevice = device.Device;
+        var logicalDevice = session.LogicalDevice;
+
+        foreach (var texture in swapchainTextures)
+        {
+            // Only the view; the images belong to the swapchain and go with it.
+            texture.Dispose();
+        }
+
+        swapchainTextures = [];
 
         if (target.Handle != 0)
         {
-            device.SwapchainApi.DestroySwapchain(logicalDevice, target, null);
+            session.SwapchainApi.DestroySwapchain(logicalDevice, target, null);
         }
 
         // Destroyed only after the swapchain that presented with them, so no present is left waiting.
@@ -956,13 +1126,12 @@ public sealed partial class VulkanControl : Control
         {
             if (semaphore.Handle != 0)
             {
-                vk.DestroySemaphore(logicalDevice, semaphore, null);
+                session.Api.DestroySemaphore(logicalDevice, semaphore, null);
             }
         }
 
         renderFinishedSemaphores = [];
-        imagesInFlight = [];
-        swapchainImages = [];
+        imageFrameSerials = [];
     }
 
     private unsafe void Teardown()
@@ -976,68 +1145,54 @@ public sealed partial class VulkanControl : Control
 
         torndown = true;
 
-        if (device is not null)
+        if (session is not null)
         {
-            var vk = device.Api;
-            var logicalDevice = device.Device;
-
             WaitDeviceIdle();
 
             DestroySwapchainObjects(swapchain);
             swapchain = default;
 
-            if (perFrameObjectsCreated)
+            foreach (var semaphore in imageAvailableSemaphores)
             {
-                for (var i = 0; i < MaxFramesInFlight; i++)
+                if (semaphore.Handle != 0)
                 {
-                    if (imageAvailableSemaphores[i].Handle != 0)
-                    {
-                        vk.DestroySemaphore(logicalDevice, imageAvailableSemaphores[i], null);
-                        imageAvailableSemaphores[i] = default;
-                    }
-
-                    if (inFlightFences[i].Handle != 0)
-                    {
-                        vk.DestroyFence(logicalDevice, inFlightFences[i], null);
-                        inFlightFences[i] = default;
-                    }
+                    session.Api.DestroySemaphore(session.LogicalDevice, semaphore, null);
                 }
-
-                if (commandPool.Handle != 0)
-                {
-                    vk.DestroyCommandPool(logicalDevice, commandPool, null);
-                    commandPool = default;
-                }
-
-                perFrameObjectsCreated = false;
             }
+
+            imageAvailableSemaphores = [];
 
             DestroySurface();
 
-            device = null;
+            session = null;
         }
 
+        DestroyChildWindow();
+
+        if (ownsSessionReference)
+        {
+            ownsSessionReference = false;
+            VulkanPresentSession.Release();
+        }
+    }
+
+    private void DestroyChildWindow()
+    {
         if (!childWindow.IsNull)
         {
             PInvoke.DestroyWindow(childWindow);
             childWindow = HWND.Null;
         }
-
-        if (ownsTemporaryDevice)
-        {
-            ownsTemporaryDevice = false;
-            TemporaryVulkanDevice.Release();
-        }
     }
 
     private unsafe void DestroySurface()
     {
-        if (device is null || surface.Handle == 0)
+        if (session is null || surface.Handle == 0)
         {
             return;
         }
 
-        device.SurfaceApi.DestroySurface(device.Instance, surface, null);
+        session.SurfaceApi.DestroySurface(session.Instance, surface, null);
         surface = default;
     }
 
@@ -1046,515 +1201,4 @@ public sealed partial class VulkanControl : Control
     [LibraryImport("user32.dll", SetLastError = true)]
     [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     private static partial int SetWindowPos(nint hWnd, nint hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
-}
-
-/// <summary>
-/// TEMPORARY. A minimal shared <c>VkInstance</c> and <c>VkDevice</c> that exists only so the swapchain
-/// has something to be created from.
-/// </summary>
-/// <remarks>
-/// <para>
-/// This is scaffolding, not the renderer's device. It picks one queue family that can both render and
-/// present, enables nothing beyond <c>VK_KHR_swapchain</c>, and exposes no resource creation at all.
-/// Delete it once the real device implements <see cref="IVulkanPresentDevice"/>: pass that device to
-/// the <see cref="VulkanControl"/> constructor and every reference here disappears with it.
-/// </para>
-/// <para>
-/// Reference counted, so all tabs share one instance and device, and the last tab to close tears them
-/// down.
-/// </para>
-/// </remarks>
-internal sealed class TemporaryVulkanDevice : IVulkanPresentDevice, IDisposable
-{
-    private const string ValidationLayerName = "VK_LAYER_KHRONOS_validation";
-
-    private static readonly Lock SharedLock = new();
-    private static TemporaryVulkanDevice? shared;
-    private static int referenceCount;
-
-    // The Vk object owns the loaded vulkan-1 module and is shared by every device this process
-    // creates. Disposing it unloads that module, which breaks any device created afterwards, so it is
-    // created once and deliberately never disposed.
-    private static Vk? sharedApi;
-
-    /// <summary>Validation messages seen since process start, for tests to assert on.</summary>
-    internal static int ValidationMessageCount;
-
-    /// <summary>
-    /// Whether the validation layer was found and enabled on the most recently created device. Without
-    /// this, a run reporting no validation messages proves nothing.
-    /// </summary>
-    internal static bool ValidationLayerActive;
-
-    private DebugUtilsMessengerEXT debugMessenger;
-    private ExtDebugUtils? debugUtils;
-
-    public Vk Api { get; }
-    public Instance Instance { get; private set; }
-    public PhysicalDevice PhysicalDevice { get; private set; }
-    public Device Device { get; private set; }
-    public uint PresentQueueFamily { get; private set; }
-    public Queue PresentQueue { get; private set; }
-    public Lock QueueLock { get; } = new();
-    public KhrSurface SurfaceApi { get; private set; } = null!;
-    public KhrWin32Surface Win32SurfaceApi { get; private set; } = null!;
-    public KhrSwapchain SwapchainApi { get; private set; } = null!;
-
-    private TemporaryVulkanDevice(Vk api)
-    {
-        Api = api;
-    }
-
-    /// <summary>Returns the shared temporary device, creating it on first use.</summary>
-    internal static IVulkanPresentDevice Acquire()
-    {
-        using var _ = SharedLock.EnterScope();
-
-        if (shared is null)
-        {
-            sharedApi ??= Vk.GetApi();
-
-            var created = new TemporaryVulkanDevice(sharedApi);
-            created.Initialize();
-            shared = created;
-        }
-
-        referenceCount++;
-
-        return shared;
-    }
-
-    /// <summary>
-    /// Drops a control's reference. The instance and device deliberately outlive the last control:
-    /// Silk.NET's <see cref="Vk"/> caches instance-level entry points, so destroying and recreating the
-    /// instance underneath it hands out physical devices the loader then rejects. A real device is
-    /// process-lifetime anyway; <see cref="Shutdown"/> is the one place it goes away.
-    /// </summary>
-    internal static void Release()
-    {
-        using var _ = SharedLock.EnterScope();
-
-        if (referenceCount > 0)
-        {
-            referenceCount--;
-        }
-    }
-
-    /// <summary>
-    /// Destroys the temporary instance and device. Call once while shutting the application down, after
-    /// every <see cref="VulkanControl"/> is disposed; the validation layer reports anything still alive
-    /// as a leak at this point.
-    /// </summary>
-    internal static void Shutdown()
-    {
-        using var _ = SharedLock.EnterScope();
-
-        if (shared is null)
-        {
-            return;
-        }
-
-        if (referenceCount != 0)
-        {
-            Log.Warn(nameof(TemporaryVulkanDevice), $"Shutting down with {referenceCount} live controls.");
-        }
-
-        shared.Dispose();
-        shared = null;
-        referenceCount = 0;
-
-        // A new Vk is needed for any future instance, for the caching reason described in Release.
-        sharedApi = null;
-    }
-
-    private unsafe void Initialize()
-    {
-        var useValidation = ShouldUseValidation() && HasValidationLayer();
-        var hasDebugUtils = HasInstanceExtension(ExtDebugUtils.ExtensionName);
-
-        var extensions = new List<string>
-        {
-            KhrSurface.ExtensionName,
-            KhrWin32Surface.ExtensionName,
-        };
-
-        if (useValidation && hasDebugUtils)
-        {
-            extensions.Add(ExtDebugUtils.ExtensionName);
-        }
-
-        var applicationName = SilkMarshal.StringToPtr("Source 2 Viewer");
-        var engineName = SilkMarshal.StringToPtr("Source 2 Viewer");
-        var extensionNames = SilkMarshal.StringArrayToPtr(extensions);
-        var layerNames = useValidation ? SilkMarshal.StringArrayToPtr(new[] { ValidationLayerName }) : 0;
-
-        try
-        {
-            var applicationInfo = new ApplicationInfo
-            {
-                SType = StructureType.ApplicationInfo,
-                PApplicationName = (byte*)applicationName,
-                ApplicationVersion = Vk.MakeVersion(1, 0, 0),
-                PEngineName = (byte*)engineName,
-                EngineVersion = Vk.MakeVersion(1, 0, 0),
-                ApiVersion = Vk.Version13,
-            };
-
-            var instanceInfo = new InstanceCreateInfo
-            {
-                SType = StructureType.InstanceCreateInfo,
-                PApplicationInfo = &applicationInfo,
-                EnabledExtensionCount = (uint)extensions.Count,
-                PpEnabledExtensionNames = (byte**)extensionNames,
-                EnabledLayerCount = useValidation ? 1u : 0u,
-                PpEnabledLayerNames = useValidation ? (byte**)layerNames : null,
-            };
-
-            var result = Api.CreateInstance(in instanceInfo, null, out var instance);
-
-            if (result != Result.Success)
-            {
-                throw new InvalidOperationException($"vkCreateInstance failed: {result}");
-            }
-
-            Instance = instance;
-            ValidationLayerActive = useValidation;
-        }
-        finally
-        {
-            SilkMarshal.Free(applicationName);
-            SilkMarshal.Free(engineName);
-            SilkMarshal.Free(extensionNames);
-
-            if (layerNames != 0)
-            {
-                SilkMarshal.Free(layerNames);
-            }
-        }
-
-        if (!Api.TryGetInstanceExtension(Instance, out KhrSurface surfaceApi))
-        {
-            throw new InvalidOperationException("VK_KHR_surface is unavailable.");
-        }
-
-        SurfaceApi = surfaceApi;
-
-        if (!Api.TryGetInstanceExtension(Instance, out KhrWin32Surface win32SurfaceApi))
-        {
-            throw new InvalidOperationException("VK_KHR_win32_surface is unavailable.");
-        }
-
-        Win32SurfaceApi = win32SurfaceApi;
-
-        if (useValidation && hasDebugUtils && Api.TryGetInstanceExtension(Instance, out ExtDebugUtils utils))
-        {
-            debugUtils = utils;
-            CreateDebugMessenger();
-        }
-
-        SelectPhysicalDevice();
-        CreateLogicalDevice();
-    }
-
-    private static bool ShouldUseValidation()
-    {
-#if DEBUG
-        return true;
-#else
-        return !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("VRF_VULKAN_VALIDATION"));
-#endif
-    }
-
-    private unsafe bool HasValidationLayer()
-    {
-        uint count = 0;
-        Api.EnumerateInstanceLayerProperties(ref count, null);
-
-        if (count == 0)
-        {
-            return false;
-        }
-
-        var layers = new LayerProperties[count];
-
-        fixed (LayerProperties* pointer = layers)
-        {
-            Api.EnumerateInstanceLayerProperties(ref count, pointer);
-
-            for (var i = 0; i < count; i++)
-            {
-                if (SilkMarshal.PtrToString((nint)pointer[i].LayerName) == ValidationLayerName)
-                {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private unsafe bool HasInstanceExtension(string name)
-    {
-        uint count = 0;
-        Api.EnumerateInstanceExtensionProperties((byte*)null, ref count, null);
-
-        if (count == 0)
-        {
-            return false;
-        }
-
-        var extensions = new ExtensionProperties[count];
-
-        fixed (ExtensionProperties* pointer = extensions)
-        {
-            Api.EnumerateInstanceExtensionProperties((byte*)null, ref count, pointer);
-
-            for (var i = 0; i < count; i++)
-            {
-                if (SilkMarshal.PtrToString((nint)pointer[i].ExtensionName) == name)
-                {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private unsafe void CreateDebugMessenger()
-    {
-        Debug.Assert(debugUtils is not null);
-
-        var info = new DebugUtilsMessengerCreateInfoEXT
-        {
-            SType = StructureType.DebugUtilsMessengerCreateInfoExt,
-            MessageSeverity = DebugUtilsMessageSeverityFlagsEXT.WarningBitExt
-                | DebugUtilsMessageSeverityFlagsEXT.ErrorBitExt,
-            MessageType = DebugUtilsMessageTypeFlagsEXT.GeneralBitExt
-                | DebugUtilsMessageTypeFlagsEXT.ValidationBitExt
-                | DebugUtilsMessageTypeFlagsEXT.PerformanceBitExt,
-            PfnUserCallback = new PfnDebugUtilsMessengerCallbackEXT(DebugCallback),
-        };
-
-        debugUtils.CreateDebugUtilsMessenger(Instance, in info, null, out debugMessenger);
-    }
-
-    private static unsafe uint DebugCallback(
-        DebugUtilsMessageSeverityFlagsEXT severity,
-        DebugUtilsMessageTypeFlagsEXT messageType,
-        DebugUtilsMessengerCallbackDataEXT* callbackData,
-        void* userData)
-    {
-        var message = SilkMarshal.PtrToString((nint)callbackData->PMessage) ?? string.Empty;
-
-        Interlocked.Increment(ref ValidationMessageCount);
-
-        if ((severity & DebugUtilsMessageSeverityFlagsEXT.ErrorBitExt) != 0)
-        {
-            Log.Error("Vulkan", message);
-        }
-        else
-        {
-            Log.Warn("Vulkan", message);
-        }
-
-        return Vk.False;
-    }
-
-    private unsafe void SelectPhysicalDevice()
-    {
-        var devices = Api.GetPhysicalDevices(Instance);
-        PhysicalDevice best = default;
-        uint bestFamily = 0;
-        var bestScore = -1;
-
-        foreach (var candidate in devices)
-        {
-            if (!TryFindPresentQueueFamily(candidate, out var family))
-            {
-                continue;
-            }
-
-            if (!HasSwapchainExtension(candidate))
-            {
-                continue;
-            }
-
-            Api.GetPhysicalDeviceProperties(candidate, out var properties);
-
-            var score = properties.DeviceType switch
-            {
-                PhysicalDeviceType.DiscreteGpu => 3,
-                PhysicalDeviceType.IntegratedGpu => 2,
-                PhysicalDeviceType.VirtualGpu => 1,
-                _ => 0,
-            };
-
-            if (score > bestScore)
-            {
-                bestScore = score;
-                best = candidate;
-                bestFamily = family;
-            }
-        }
-
-        if (bestScore < 0)
-        {
-            throw new InvalidOperationException("No Vulkan device that can present to a window was found.");
-        }
-
-        PhysicalDevice = best;
-        PresentQueueFamily = bestFamily;
-    }
-
-    private unsafe bool TryFindPresentQueueFamily(PhysicalDevice candidate, out uint family)
-    {
-        uint count = 0;
-        Api.GetPhysicalDeviceQueueFamilyProperties(candidate, ref count, null);
-
-        var families = new QueueFamilyProperties[count];
-
-        fixed (QueueFamilyProperties* pointer = families)
-        {
-            Api.GetPhysicalDeviceQueueFamilyProperties(candidate, ref count, pointer);
-        }
-
-        for (var i = 0u; i < count; i++)
-        {
-            if ((families[i].QueueFlags & QueueFlags.GraphicsBit) == 0)
-            {
-                continue;
-            }
-
-            // Checked without a surface, which is exactly why this can run before any control exists.
-            if (Win32SurfaceApi.GetPhysicalDeviceWin32PresentationSupport(candidate, i))
-            {
-                family = i;
-                return true;
-            }
-        }
-
-        family = 0;
-        return false;
-    }
-
-    private unsafe bool HasSwapchainExtension(PhysicalDevice candidate)
-    {
-        uint count = 0;
-        Api.EnumerateDeviceExtensionProperties(candidate, (byte*)null, ref count, null);
-
-        if (count == 0)
-        {
-            return false;
-        }
-
-        var extensions = new ExtensionProperties[count];
-
-        fixed (ExtensionProperties* pointer = extensions)
-        {
-            Api.EnumerateDeviceExtensionProperties(candidate, (byte*)null, ref count, pointer);
-
-            for (var i = 0; i < count; i++)
-            {
-                if (SilkMarshal.PtrToString((nint)pointer[i].ExtensionName) == KhrSwapchain.ExtensionName)
-                {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private unsafe void CreateLogicalDevice()
-    {
-        var priority = 1f;
-
-        var queueInfo = new DeviceQueueCreateInfo
-        {
-            SType = StructureType.DeviceQueueCreateInfo,
-            QueueFamilyIndex = PresentQueueFamily,
-            QueueCount = 1,
-            PQueuePriorities = &priority,
-        };
-
-        var extensionNames = SilkMarshal.StringArrayToPtr(new[] { KhrSwapchain.ExtensionName });
-
-        try
-        {
-            Api.GetPhysicalDeviceFeatures(PhysicalDevice, out var supported);
-
-            // Overlay layers (Steam, OBS, RTSS and friends) inject themselves into whatever device the
-            // application creates and render with it. Several of them create anisotropic samplers
-            // without checking, which the validation layer then reports against us. Enabling the
-            // feature when the device has it costs nothing and keeps that output clean.
-            var features = new PhysicalDeviceFeatures
-            {
-                SamplerAnisotropy = supported.SamplerAnisotropy,
-            };
-
-            var deviceInfo = new DeviceCreateInfo
-            {
-                SType = StructureType.DeviceCreateInfo,
-                QueueCreateInfoCount = 1,
-                PQueueCreateInfos = &queueInfo,
-                EnabledExtensionCount = 1,
-                PpEnabledExtensionNames = (byte**)extensionNames,
-                PEnabledFeatures = &features,
-            };
-
-            var result = Api.CreateDevice(PhysicalDevice, in deviceInfo, null, out var logicalDevice);
-
-            if (result != Result.Success)
-            {
-                throw new InvalidOperationException($"vkCreateDevice failed: {result}");
-            }
-
-            Device = logicalDevice;
-        }
-        finally
-        {
-            SilkMarshal.Free(extensionNames);
-        }
-
-        if (!Api.TryGetDeviceExtension(Instance, Device, out KhrSwapchain swapchainApi))
-        {
-            throw new InvalidOperationException("VK_KHR_swapchain is unavailable.");
-        }
-
-        SwapchainApi = swapchainApi;
-
-        Api.GetDeviceQueue(Device, PresentQueueFamily, 0, out var queue);
-        PresentQueue = queue;
-    }
-
-    public unsafe void Dispose()
-    {
-        if (Device.Handle != 0)
-        {
-            Api.DeviceWaitIdle(Device);
-            Api.DestroyDevice(Device, null);
-            Device = default;
-        }
-
-        if (debugMessenger.Handle != 0 && debugUtils is not null)
-        {
-            debugUtils.DestroyDebugUtilsMessenger(Instance, debugMessenger, null);
-            debugMessenger = default;
-        }
-
-        if (Instance.Handle != 0)
-        {
-            // Any object still alive here is reported as a leak by the validation layer.
-            Api.DestroyInstance(Instance, null);
-            Instance = default;
-        }
-
-        // The extension wrappers and the Vk object are not disposed: they all share the loaded
-        // vulkan-1 module, and unloading it makes the next device this process creates crash.
-        debugUtils = null;
-        SwapchainApi = null!;
-        Win32SurfaceApi = null!;
-        SurfaceApi = null!;
-    }
 }

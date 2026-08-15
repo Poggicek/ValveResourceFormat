@@ -33,8 +33,24 @@ public static class DescriptorSets
     /// <summary>Per-material textures, bound at the slot the material assigns.</summary>
     public const int MaterialTextures = 3;
 
+    /// <summary>
+    /// Storage images, bound at the image unit their shader declares.
+    /// </summary>
+    /// <remarks>
+    /// A third index space, and it needs its own set for the same reason uniform and storage buffers
+    /// needed sets 0 and 1. <c>glBindImageTexture</c> addresses image units, which OpenGL keeps
+    /// separate from texture units; Vulkan does not. The numbers genuinely collide — a storage image
+    /// at 0, 1, 2 and 3 lands on <see cref="Materials.ReservedTextureSlots.BRDFLookup"/>,
+    /// <see cref="Materials.ReservedTextureSlots.BlueNoise"/>,
+    /// <see cref="Materials.ReservedTextureSlots.FogCubeTexture"/> and
+    /// <see cref="Materials.ReservedTextureSlots.Lightmap1"/>, typed as combined image samplers.
+    /// <c>depth_pyramid.comp</c> settles it: it declares a sampler at 0 and images at 1 and 2 in one
+    /// shader, so no renumbering within a single set can separate them.
+    /// </remarks>
+    public const int StorageImages = 4;
+
     /// <summary>The number of sets a pipeline layout declares.</summary>
-    public const int Count = 4;
+    public const int Count = 5;
 }
 
 /// <summary>Creation parameters for a buffer.</summary>

@@ -131,7 +131,8 @@ public interface ICommandList : IDisposable
     void BindTransientUniform<T>(int binding, in T data) where T : unmanaged;
 
     /// <summary>Binds a texture as a read/write storage image.</summary>
-    /// <param name="binding">The slot within <see cref="DescriptorSets.ReservedTextures"/>.</param>
+    /// <param name="binding">The image unit within <see cref="DescriptorSets.StorageImages"/>, which
+    /// is a separate index space from sampled textures and must not be confused with one.</param>
     /// <param name="texture">The texture to bind.</param>
     /// <param name="mipLevel">Which mip level to bind.</param>
     void BindStorageTexture(int binding, ITexture texture, int mipLevel = 0);

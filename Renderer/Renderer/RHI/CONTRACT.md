@@ -31,14 +31,23 @@ unchanged — 120 shaders are not being renumbered.
 | 1 | Storage buffers | `ReservedBufferSlots` (SSBO range, 0–15) |
 | 2 | Global textures | `ReservedTextureSlots` |
 | 3 | Per-material textures | assigned by the material |
+| 4 | Storage images | the image unit the shader declares |
 
 **This resolves a real ambiguity, not just a layout preference.** `ReservedBufferSlots` deliberately
 overlaps its UBO and SSBO index spaces — both start at 0, which is why the file suppresses CA1069.
 OpenGL keeps those namespaces separate per binding target; Vulkan does not. Splitting them across
 sets 0 and 1 preserves both numbering schemes and makes the collision impossible to hit.
 
-> Shader-side `layout(set=, binding=)` decorations must match this table exactly. This is what agent
-> `A7` emits and agent `C2` builds layouts from — a mismatch binds the wrong buffer *silently*.
+**Set 4 exists for the same reason as the 0/1 split, one index space further on.** `glBindImageTexture`
+addresses *image units*, which OpenGL keeps separate from texture units and Vulkan does not. The
+numbers really do collide: storage images bound at 0–3 land on `BRDFLookup`, `BlueNoise`,
+`FogCubeTexture` and `Lightmap1`, typed as combined image samplers. `depth_pyramid.comp` settles that
+no renumbering can fix it inside one set — it declares a sampler at 0 *and* images at 1 and 2 in the
+same shader.
+
+> Shader-side `layout(set=, binding=)` decorations must match this table exactly — a mismatch binds
+> the wrong resource *silently*. Note that shader emission currently places storage images in set 2,
+> which predates this row and must be updated to set 4.
 
 ## Push constants
 
