@@ -7,7 +7,8 @@ namespace ValveResourceFormat.Renderer.RHI.Vulkan.Descriptors;
 /// <summary>What the binder has been doing, for a diagnostics overlay or a smoke test.</summary>
 /// <param name="Flushes">How many times <see cref="VulkanDescriptorBinder.Flush"/> was called, which is
 /// once per draw and dispatch.</param>
-/// <param name="NoOpFlushes">How many of those found nothing changed and issued no Vulkan call at all.</param>
+/// <param name="NoOpFlushes">How many of those issued no Vulkan call at all: either nothing changed, or
+/// nothing that changed was declared by the bound pipeline.</param>
 /// <param name="SetsAllocated">Descriptor sets taken from the frame chain.</param>
 /// <param name="DescriptorsWritten">Individual descriptor writes.</param>
 /// <param name="UpdateCalls">Calls to <c>vkUpdateDescriptorSets</c>. The ratio of
@@ -15,6 +16,11 @@ namespace ValveResourceFormat.Renderer.RHI.Vulkan.Descriptors;
 /// <param name="BindCalls">Calls to <c>vkCmdBindDescriptorSets</c>.</param>
 /// <param name="LayoutChanges">How many flushes saw a different pipeline layout than the one before and
 /// had to rebind every set.</param>
+/// <param name="FilteredWrites">Accumulated bindings that were <i>not</i> written, because the set layout
+/// the bound pipeline declares at that index declares no such binding. Never zero for long in a scene
+/// that draws several materials: see the type remarks on why a binding outlives the pipeline it was
+/// recorded under. A count that grows without a material or shader change is the shape of a caller
+/// binding to the wrong slot.</param>
 public readonly record struct VulkanDescriptorBinderStatistics(
     long Flushes,
     long NoOpFlushes,
@@ -22,7 +28,8 @@ public readonly record struct VulkanDescriptorBinderStatistics(
     long DescriptorsWritten,
     long UpdateCalls,
     long BindCalls,
-    long LayoutChanges);
+    long LayoutChanges,
+    long FilteredWrites);
 
 /// <summary>
 /// Turns the contract's immediate-mode binding calls into descriptor sets, and is the piece that joins
@@ -41,11 +48,44 @@ public readonly record struct VulkanDescriptorBinderStatistics(
 /// strategy to assume.
 /// </para>
 /// <para>
-/// <b>Two kinds of staleness, tracked separately, because they cost differently.</b> A set whose
-/// contents changed needs a new set and a write. A set whose contents are unchanged but which is no
-/// longer bound &#8212; because the pipeline layout changed under it &#8212; needs only a rebind of the
-/// set it already has. Collapsing the two would allocate on every pipeline change, which for a scene
-/// sorted by material is most draws.
+/// <b>A recorded binding is sticky command-list state, and it is scoped to nothing.</b> The contract's
+/// binding calls are OpenGL's, where <c>glBindTextureUnit</c> settles a unit until something else
+/// settles it and each program reads only the units it declares a sampler for. Bindings therefore
+/// outlive the pipeline that was bound when they were recorded, deliberately: the renderer binds the
+/// reserved globals once per pass, before any pipeline exists, and every draw in that pass reads them.
+/// Scoping a binding to the pipeline it was recorded under, or clearing the pending set when the
+/// pipeline changes, would discard exactly those pass-wide binds and fail the following draw.
+/// </para>
+/// <para>
+/// <b>What a pipeline reads is decided when the set is materialised, not when the binding is
+/// recorded.</b> A set is written against the set layout the <i>bound</i> pipeline declares at that
+/// index, and only the bindings that layout declares are written; the rest are counted in
+/// <see cref="VulkanDescriptorBinderStatistics.FilteredWrites"/> and dropped. That is not a guess. A
+/// set layout is built by <see cref="VulkanPipelineDescriptorLayouts"/> from the SPIR-V reflection of
+/// that pipeline's own stages, so a binding it does not declare is one no stage of the draw can
+/// address &#8212; unreadable by construction rather than merely unread, and inert on the OpenGL oracle
+/// for the same reason. Writing it anyway is what made a material's set 3 slot blow up on the next
+/// material's draw.
+/// </para>
+/// <para>
+/// <b>The dangerous direction stays loud, and got louder.</b> The failure worth catching is the
+/// opposite one &#8212; a descriptor the shader reads that nothing wrote, which is the undefined read
+/// that hangs a device. At set granularity <see cref="VulkanDescriptorSetUsage.EnsureBound"/> catches
+/// it at the draw. At binding granularity <see cref="EnsureDeclaredBindingsBound"/> catches it here,
+/// for every set whose layout is <i>reflected</i> rather than canonical: a reflected layout is literally
+/// the declaration of the pipeline's stages, so every binding in it is read by the draw and every one
+/// must have been bound. A canonical layout declares a whole reserved range whether a shader reads it
+/// or not, so no such conclusion can be drawn from it and none is.
+/// </para>
+/// <para>
+/// <b>Three kinds of staleness, tracked separately, because they cost differently.</b> A set whose
+/// contents changed needs a new set and a write. A set materialised against a different set layout
+/// needs the same, because the fresh set is allocated from that layout and the filter's answer depends
+/// on it &#8212; and because binding a set allocated from one layout at an index the pipeline layout
+/// declares as another is not legal Vulkan. A set that is merely no longer bound, because the pipeline
+/// layout changed under it while its own set layout did not, needs only a rebind of the set it already
+/// has. Collapsing the last into the first two would allocate on every pipeline change, which for a
+/// scene sorted by material is most draws.
 /// </para>
 /// <para>
 /// <b>A layout change invalidates conservatively.</b> Vulkan invalidates bound sets from the first index
@@ -68,7 +108,7 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
     private readonly bool OwnsAllocator;
 
     private readonly SetState[] Sets = new SetState[DescriptorSets.Count];
-    private readonly Dictionary<ulong, VulkanDescriptorSetLayout?[]> ResolvedLayouts = [];
+    private readonly Dictionary<ulong, LayoutPlan> ResolvedLayouts = [];
 
     private PipelineLayout LastLayout;
     private PipelineBindPoint LastBindPoint;
@@ -82,6 +122,7 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
     private long UpdateCallCount;
     private long BindCallCount;
     private long LayoutChangeCount;
+    private long FilteredWriteCount;
 
     /// <summary>Gets what the binder has been doing.</summary>
     public VulkanDescriptorBinderStatistics Statistics => new(
@@ -91,7 +132,8 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
         DescriptorsWrittenCount,
         UpdateCallCount,
         BindCallCount,
-        LayoutChangeCount);
+        LayoutChangeCount,
+        FilteredWriteCount);
 
     /// <summary>Gets the allocator the per-draw sets come from.</summary>
     public VulkanDescriptorAllocator DescriptorAllocator => Allocator;
@@ -213,7 +255,9 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
 
     /// <inheritdoc/>
     /// <exception cref="InvalidOperationException">The pipeline layout did not come from the pipeline
-    /// layout cache, or a binding does not match what the shader declared.</exception>
+    /// layout cache, a bound binding is typed differently by the shader that declares it, or a reflected
+    /// set layout declares a binding nothing bound. A binding the bound pipeline does not declare at all
+    /// is <i>not</i> an error: it is filtered out, for the reasons on this type.</exception>
     public void Flush(CommandBuffer commandBuffer, PipelineBindPoint bindPoint, PipelineLayout layout)
     {
         ObjectDisposedException.ThrowIf(Disposed, this);
@@ -238,7 +282,7 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
             LastBindPoint = bindPoint;
         }
 
-        var resolved = ResolveFor(layout);
+        var plan = ResolveFor(layout);
         var written = 0;
         var toBind = 0;
         var bound = 0;
@@ -255,31 +299,25 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
                 continue;
             }
 
-            if (state.ContentsDirty)
+            var setLayout = plan.SetLayouts[set]
+                ?? throw new InvalidOperationException(string.Create(CultureInfo.InvariantCulture,
+                    $"A binding was recorded into descriptor set {set}, but the bound pipeline layout declares nothing this layer created there. Its set layout at that index did not come from this binder's layout cache, so what the shader declares there cannot be established and the bindings cannot be filtered against it."));
+
+            // Contents changing and the set layout changing are separate reasons to build a new set, and
+            // the second is not the same as the pipeline layout changing: two pipeline layouts routinely
+            // share a canonical set layout at an index, and then the set already built is still valid
+            // there and only needs rebinding.
+            if (state.ContentsDirty || !ReferenceEquals(state.MaterializedFor, setLayout))
             {
-                var setLayout = resolved[set]
-                    ?? throw new InvalidOperationException(string.Create(CultureInfo.InvariantCulture,
-                        $"A binding was recorded into descriptor set {set}, but the bound pipeline layout declares nothing this layer created there. The shader does not use that set."));
+                written += Materialize(state, setLayout, plan.Reflected[set]);
+            }
 
-                state.Current = Allocator.AllocateForFrame(setLayout);
-                SetsAllocatedCount++;
-
-                foreach (var (binding, pending) in state.Bindings)
-                {
-                    if (pending.IsImage)
-                    {
-                        Writer.WriteImageHandle(state.Current, setLayout, binding, pending.View, pending.Sampler, pending.ImageLayout);
-                    }
-                    else
-                    {
-                        Writer.WriteBufferHandle(state.Current, setLayout, binding, pending.Buffer, pending.Offset, pending.Size);
-                    }
-
-                    written++;
-                }
-
-                state.ContentsDirty = false;
-                state.Bound = false;
+            // Nothing the bound pipeline declares was among the accumulated bindings, so there is no set
+            // to bind and this index stays out of the bound mask. A pipeline that does read the set then
+            // fails the draw-time guard naming it, which is the right error rather than this being one.
+            if (!state.HasSet)
+            {
+                continue;
             }
 
             if (!state.Bound)
@@ -355,6 +393,112 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
         }
     }
 
+    /// <summary>
+    /// Builds a fresh descriptor set for one index and writes the accumulated bindings the given set
+    /// layout actually declares into it.
+    /// </summary>
+    /// <param name="state">The set's accumulated bindings and current materialisation.</param>
+    /// <param name="setLayout">The layout the bound pipeline declares at this index.</param>
+    /// <param name="reflected">Whether that layout is the pipeline's own reflected declaration rather
+    /// than a shared canonical one, which is what makes the completeness check meaningful.</param>
+    /// <returns>How many descriptors were queued on the writer.</returns>
+    /// <remarks>The set is allocated lazily, on the first binding that survives the filter, so a set
+    /// whose accumulated bindings are all foreign to this pipeline costs no allocation at all.</remarks>
+    private int Materialize(SetState state, VulkanDescriptorSetLayout setLayout, bool reflected)
+    {
+        if (reflected)
+        {
+            // Before anything is queued, so a throw does not leave half a set on the writer.
+            EnsureDeclaredBindingsBound(state, setLayout);
+        }
+
+        state.MaterializedFor = setLayout;
+        state.ContentsDirty = false;
+        state.Bound = false;
+        state.HasSet = false;
+        state.Current = default;
+
+        var written = 0;
+
+        foreach (var (binding, pending) in state.Bindings)
+        {
+            if (!setLayout.TryGetBinding(binding, out _))
+            {
+                FilteredWriteCount++;
+                continue;
+            }
+
+            if (!state.HasSet)
+            {
+                state.Current = Allocator.AllocateForFrame(setLayout);
+                state.HasSet = true;
+                SetsAllocatedCount++;
+            }
+
+            if (pending.IsImage)
+            {
+                Writer.WriteImageHandle(state.Current, setLayout, binding, pending.View, pending.Sampler, pending.ImageLayout);
+            }
+            else
+            {
+                Writer.WriteBufferHandle(state.Current, setLayout, binding, pending.Buffer, pending.Offset, pending.Size);
+            }
+
+            written++;
+        }
+
+        return written;
+    }
+
+    /// <summary>
+    /// Refuses to build a set from a reflected layout while a binding that layout declares has nothing
+    /// bound to it.
+    /// </summary>
+    /// <param name="state">The set's accumulated bindings.</param>
+    /// <param name="setLayout">The reflected layout, which is the declaration of the bound pipeline's own
+    /// stages.</param>
+    /// <exception cref="InvalidOperationException">A declared binding was never bound.</exception>
+    /// <remarks>
+    /// <para>
+    /// The companion to the filter, and the reason filtering is not a loosening. A reflected set layout
+    /// is built from nothing but the SPIR-V of the pipeline's stages, so every binding in it is one the
+    /// draw reads. Leaving one unwritten is a descriptor read of undefined contents &#8212; the failure
+    /// class that hangs a device rather than the one that renders a wrong pixel &#8212; and it is exactly
+    /// what a caller binding a material texture to the wrong slot produces once the wrong slot is
+    /// silently filtered away.
+    /// </para>
+    /// <para>
+    /// Only for reflected layouts. A canonical layout declares a whole reserved range whether any shader
+    /// reads it or not, so an unbound binding there says nothing at all; that case is left to the
+    /// set-granularity guard at the draw.
+    /// </para>
+    /// <para>
+    /// Not reached for a set nothing has bound anything into, because the flush skips those before it
+    /// looks at a layout. <see cref="VulkanDescriptorSetUsage.EnsureBound"/> is what names that one.
+    /// </para>
+    /// <para>
+    /// <b>It asks whether a binding is bound, not whether it was bound for this pipeline</b>, and that is
+    /// the one hole left. A slot the previous material set and this one did not would satisfy this check
+    /// while writing the previous material's texture. Closing it needs a binding to carry which pipeline
+    /// recorded it, which is the scoping this type's remarks reject for the pass-wide globals, so it is
+    /// left open deliberately: <c>MeshBatchRenderer.BindMaterialTextures</c> restates every slot the
+    /// shader declares on every material change, so the case does not arise for the path that has one.
+    /// </para>
+    /// </remarks>
+    private static void EnsureDeclaredBindingsBound(SetState state, VulkanDescriptorSetLayout setLayout)
+    {
+        foreach (var declared in setLayout.Bindings)
+        {
+            if (state.Bindings.ContainsKey(declared.Binding))
+            {
+                continue;
+            }
+
+            throw new InvalidOperationException(string.Create(CultureInfo.InvariantCulture,
+                $"Set {setLayout.SetIndex} of '{setLayout.Name}' declares binding {declared.Binding} as a {declared.Type}, and nothing bound anything there on this command list. That layout is the bound pipeline's own reflected declaration, so its shaders do read that binding, and a descriptor left unwritten reads undefined contents on the GPU. Bind it, or check whether the caller meant one of the {state.Bindings.Count} binding(s) it did set on this set."));
+        }
+    }
+
     private void Record(int set, int binding, in Pending pending)
     {
         ObjectDisposedException.ThrowIf(Disposed, this);
@@ -375,7 +519,17 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
         state.ContentsDirty = true;
     }
 
-    private VulkanDescriptorSetLayout?[] ResolveFor(PipelineLayout layout)
+    /// <summary>
+    /// Resolves a bare pipeline layout handle into the set layouts behind it, and which of those are the
+    /// pipeline's own reflected declarations rather than shared canonical layouts.
+    /// </summary>
+    /// <param name="layout">The bound pipeline's layout.</param>
+    /// <returns>The plan, cached per pipeline layout handle.</returns>
+    /// <exception cref="InvalidOperationException">The layout did not come from the pipeline layout cache.</exception>
+    /// <remarks>The canonical comparison is made here, once per pipeline layout, rather than per flush:
+    /// <see cref="VulkanDescriptorLayoutCache.Canonical"/> creates its layout on first use, and a draw
+    /// should not be the thing that discovers it.</remarks>
+    private LayoutPlan ResolveFor(PipelineLayout layout)
     {
         if (ResolvedLayouts.TryGetValue(layout.Handle, out var cached))
         {
@@ -389,14 +543,23 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
         }
 
         var resolved = new VulkanDescriptorSetLayout?[DescriptorSets.Count];
+        var reflected = new bool[DescriptorSets.Count];
 
         for (var set = 0; set < resolved.Length && set < pipelineLayout.SetLayouts.Count; set++)
         {
-            resolved[set] = Layouts.TryResolve(pipelineLayout.SetLayouts[set], out var setLayout) ? setLayout : null;
+            if (!Layouts.TryResolve(pipelineLayout.SetLayouts[set], out var setLayout))
+            {
+                continue;
+            }
+
+            resolved[set] = setLayout;
+            reflected[set] = !ReferenceEquals(setLayout, Layouts.Canonical(set));
         }
 
-        ResolvedLayouts[layout.Handle] = resolved;
-        return resolved;
+        var plan = new LayoutPlan(resolved, reflected);
+
+        ResolvedLayouts[layout.Handle] = plan;
+        return plan;
     }
 
     /// <summary>Releases the allocator, when this binder owns it.</summary>
@@ -436,6 +599,17 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
             => new(true, default, 0, 0, view, sampler, layout);
     }
 
+    /// <summary>
+    /// What one pipeline layout declares at each set index, and which of those declarations came from the
+    /// pipeline's own shaders.
+    /// </summary>
+    /// <param name="SetLayouts">The set layout at each index, or <see langword="null"/> when the pipeline
+    /// layout declares one this binder's cache does not know.</param>
+    /// <param name="Reflected">Whether the entry at that index is a reflected layout rather than the
+    /// shared canonical one. True for every index of set 3, which has no canonical layout because its
+    /// contents are assigned per shader.</param>
+    private sealed record LayoutPlan(VulkanDescriptorSetLayout?[] SetLayouts, bool[] Reflected);
+
     /// <summary>What one descriptor set has accumulated, and whether it is current on the command buffer.</summary>
     private sealed class SetState
     {
@@ -447,6 +621,16 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
         /// <summary>The set is bound at its index for the current pipeline layout and bind point.</summary>
         internal bool Bound;
 
+        /// <summary><see cref="Current"/> holds a set built from <see cref="MaterializedFor"/>. False when
+        /// the last materialisation found nothing that layout declares, which is not the same as the set
+        /// being unbound: there is no set at all.</summary>
+        internal bool HasSet;
+
+        /// <summary>The set layout <see cref="Current"/> was allocated from and filtered against, or
+        /// <see langword="null"/> before the first flush. Compared by reference, which is exact: the
+        /// layout cache hands out one object per distinct binding table.</summary>
+        internal VulkanDescriptorSetLayout? MaterializedFor;
+
         internal DescriptorSet Current;
 
         internal void Clear()
@@ -454,6 +638,8 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
             Bindings.Clear();
             ContentsDirty = false;
             Bound = false;
+            HasSet = false;
+            MaterializedFor = null;
             Current = default;
         }
     }

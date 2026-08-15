@@ -46,8 +46,34 @@ no renumbering can fix it inside one set — it declares a sampler at 0 *and* im
 same shader.
 
 > Shader-side `layout(set=, binding=)` decorations must match this table exactly — a mismatch binds
-> the wrong resource *silently*. Note that shader emission currently places storage images in set 2,
-> which predates this row and must be updated to set 4.
+> the wrong resource *silently*. Emission writes these decorations (`VulkanGlsl.Decorate`), and picks
+> a block's set from its **storage qualifier**, not its packing qualifier: `std140` and `std430`
+> describe memory layout, while `uniform` and `buffer` decide set 0 or set 1. `histogram.comp`
+> declares a `std140`-qualified *storage* buffer, so a packing-keyed rule puts it in set 0 at the
+> `LightProbe` slot while the renderer writes it into set 1 — a collision this table exists to make
+> unrepresentable.
+
+## A binding outlives the pipeline it was recorded under
+
+`BindTexture`, `BindUniformBuffer`, `BindStorageBuffer` and `BindStorageTexture` set command-list
+state that persists until it is overwritten or the list is reset. They are **not** scoped to a
+pipeline or a render pass. This is forced by existing call sites: the reserved globals are bound
+once per pass, before any pipeline is bound, and every draw in the pass reads them.
+
+A draw reads only the bindings its own pipeline declares. **Binding to a slot the bound pipeline
+does not declare is legal and has no effect** — it is what `glBindTextureUnit` on a unit no program
+samples already does, and the Vulkan backend filters such writes against the pipeline's reflected
+set layout rather than failing. Callers must not rely on a bind being rejected for being in the
+wrong slot.
+
+The error case is the reverse: a binding the pipeline **does** declare that nothing bound. That is a
+read of undefined descriptor contents — the fault that hung a display driver and bugchecked a
+machine during this migration — so it is refused at record time, and it is what a wrong slot number
+actually produces.
+
+> This section was written after two agents independently hit the same wall. The contract's silence
+> here let the two backends implement different answers: OpenGL ignored an undeclared bind, Vulkan
+> threw on it.
 
 ## Push constants
 
