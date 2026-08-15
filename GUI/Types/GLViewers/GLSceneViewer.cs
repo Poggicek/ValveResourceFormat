@@ -620,10 +620,7 @@ namespace GUI.Types.GLViewers
         {
             var output = PresentFramebuffer ?? GLDefaultFramebuffer;
 
-            // ReferenceEquals, not the type's own equality, which compares OpenGL framebuffer handles.
-            // On a Vulkan device every framebuffer has handle 0, so == calls the scene target and the
-            // present target the same object and this returns without ever tonemapping.
-            if (ReferenceEquals(MainFramebuffer, output))
+            if (MainFramebuffer == output)
             {
                 return; // already on the presented surface
             }

@@ -411,11 +411,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
         GLDefaultFramebuffer.Resize(w, h);
 
-        // ReferenceEquals, not the type's own equality, which compares OpenGL framebuffer handles. Every
-        // framebuffer on a Vulkan device has handle 0, so == reports all of them equal and this resize
-        // would be skipped -- leaving the scene target at its 4x4 initial size for the whole session.
-        // Identical on OpenGL, where the fallback assigns the same instance rather than an equal one.
-        if (!ReferenceEquals(MainFramebuffer, GLDefaultFramebuffer))
+        if (MainFramebuffer != GLDefaultFramebuffer)
         {
             MainFramebuffer.Resize(w, h, NumSamples);
         }

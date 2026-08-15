@@ -928,7 +928,7 @@ public class Renderer
         using var frameScope = RendererContext.RenderState.Scope();
         renderContext.Framebuffer.BindAndClear();
 
-        var isMainFramebuffer = ReferenceEquals(renderContext.Framebuffer, MainFramebuffer);
+        var isMainFramebuffer = renderContext.Framebuffer == MainFramebuffer;
         var isStandardPass = renderContext.ReplacementShader == null && isMainFramebuffer;
 
         if (!isStandardPass)

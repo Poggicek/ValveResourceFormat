@@ -231,29 +231,53 @@ public class Framebuffer
     /// </summary>
     public static Framebuffer GLDefaultFramebuffer => new(fboHandle: 0);
 
-    /// <inheritdoc/>
-    public override bool Equals(object? obj) => obj is Framebuffer other && other.FboHandle == FboHandle;
+    /// <summary>
+    /// Returns <see langword="true"/> only when <paramref name="obj"/> is this very framebuffer.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Reference identity, deliberately, and not <see cref="FboHandle"/>.</b> The handle is an OpenGL
+    /// implementation detail that only one backend has: on any other device no framebuffer object is
+    /// created and every instance keeps the default handle 0, so a handle comparison degenerates into
+    /// "always equal" and reports every framebuffer in the process as the same one. That is not a
+    /// theoretical hazard. It skipped <c>MainFramebuffer.Resize</c> in <c>GLBaseControl.OnResize</c>,
+    /// leaving the scene target at its 4x4 initial size for a whole session, and it returned from
+    /// <c>GLSceneViewer.PresentToScreen</c> before tonemapping, because in both places the scene target
+    /// and the present target compared equal.
+    /// </para>
+    /// <para>
+    /// <b>Nothing wants handle equality, so there is no named method for it.</b> Every caller in the tree
+    /// asks the identity question — "is the target I am about to render into the one I already have?" —
+    /// and every instance with a non-zero handle owns that handle alone, since the constructor calls
+    /// <c>glCreateFramebuffers</c> and never adopts an existing name. The one way to obtain two distinct
+    /// wrappers over one handle is <see cref="GLDefaultFramebuffer"/>, which mints a fresh handle-0
+    /// wrapper per read; the presentation layer reads it once into a field and compares against that
+    /// field, so those comparisons are identity comparisons already.
+    /// </para>
+    /// <para>
+    /// A framebuffer is also mutable and owns GPU storage: two of them may name one handle yet differ in
+    /// extent, sample count, attachment formats and clear state, and <see cref="Delete"/> makes one of
+    /// them retire storage the other still points at. Value equality over a subset of that state would
+    /// be a claim this type cannot honour.
+    /// </para>
+    /// </remarks>
+    public override bool Equals(object? obj) => ReferenceEquals(this, obj);
 
     /// <inheritdoc/>
-    public override int GetHashCode() => FboHandle.GetHashCode();
+    /// <remarks>The identity hash, to stay consistent with <see cref="Equals(object?)"/>. Hashing
+    /// <see cref="FboHandle"/> would put every framebuffer on a non-OpenGL device in one bucket.</remarks>
+    public override int GetHashCode() => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this);
 
     /// <summary>
-    /// Returns <see langword="true"/> if both framebuffers wrap the same OpenGL handle.
+    /// Returns <see langword="true"/> if both operands are the same framebuffer instance, or both are
+    /// <see langword="null"/>. See <see cref="Equals(object?)"/> for why this is identity.
     /// </summary>
-    public static bool operator ==(Framebuffer? left, Framebuffer? right)
-    {
-        if (left is null)
-        {
-            return right is null;
-        }
-
-        return left.Equals(right);
-    }
+    public static bool operator ==(Framebuffer? left, Framebuffer? right) => ReferenceEquals(left, right);
 
     /// <summary>
-    /// Returns <see langword="true"/> if the framebuffers wrap different OpenGL handles.
+    /// Returns <see langword="true"/> if the operands are different framebuffer instances.
     /// </summary>
-    public static bool operator !=(Framebuffer? left, Framebuffer? right) => !(left == right);
+    public static bool operator !=(Framebuffer? left, Framebuffer? right) => !ReferenceEquals(left, right);
 
     #endregion
 

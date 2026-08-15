@@ -231,10 +231,18 @@ namespace ValveResourceFormat.Renderer
         private int vao;
 
         // Non-owning RHI views of the two OpenGL buffers this renderer draws from, so the draw can be
-        // recorded through a command list before buffer allocation itself moves onto IDevice. The vertex
-        // view is rebuilt whenever the frame's glyph count changes the buffer's size.
+        // recorded through a command list without the OpenGL path losing the buffer name its vertex array
+        // was built from. The vertex view is rebuilt whenever the frame's glyph count changes the size.
+        // OpenGL only; see <see cref="VertexStorage"/> for what stands here on every other backend.
         private GLBuffer? vertexRhiBuffer;
         private GLBuffer? quadIndexRhiBuffer;
+
+        // The same two buffers on a device that has no OpenGL in it, owned rather than wrapped: there is
+        // no glCreateBuffers name to view, so these are created through IDevice and written through
+        // IDevice.UploadBuffer. The vertex buffer is reallocated whenever the glyph count changes, which
+        // is what glNamedBufferData does to its store on the OpenGL path.
+        private IBuffer? deviceVertexBuffer;
+        private IBuffer? deviceQuadIndexBuffer;
 
         // Built once on first RHI draw rather than in a static initializer, so a layout the contract has
         // no format for throws at the draw that needs it instead of as a type initializer failure.
@@ -252,6 +260,11 @@ namespace ValveResourceFormat.Renderer
         }
 
         /// <summary>Loads the MSDF font atlas texture and compiles the font shader.</summary>
+        /// <remarks>
+        /// The atlas is allocated through the device on both backends. Only the vertex buffer name and
+        /// the vertex array below it are OpenGL-specific, and on any other backend neither exists: the
+        /// draw is recorded through a command list, which takes its vertex layout from the pipeline.
+        /// </remarks>
         public void Load()
         {
             using var fontStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("Renderer.Resources.jetbrains_mono_msdf.png");
@@ -259,11 +272,24 @@ namespace ValveResourceFormat.Renderer
 
             shader = RendererContext.ShaderLoader.LoadShader("font_msdf");
 
-            fontTexture = new RenderTexture(TextureTarget.Texture2D, (int)AtlasSize, (int)AtlasSize, 1, 1);
+            var device = RendererDevice.Resolve(RendererContext.Device);
+
+            // Equivalent to the glTextureStorage2D/glTextureSubImage2D pair this replaces, and not only in
+            // effect: a bitmap that decoded to BGRA picks RhiFormat.B8G8R8A8_UNorm, which on OpenGL *is*
+            // Rgba8 storage written through PixelFormat.Bgra. The bytes that reach the texture are the same
+            // ones, in the same order, so the OpenGL oracle is untouched.
+            fontTexture = MaterialLoader.LoadBitmapTexture(bitmap, device);
+            fontTexture.SetLabel(nameof(TextRenderer));
             fontTexture.SetWrapMode(TextureWrapMode.ClampToEdge);
             fontTexture.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
-            GL.TextureStorage2D(fontTexture.Handle, 1, SizedInternalFormat.Rgba8, bitmap.Width, bitmap.Height);
-            GL.TextureSubImage2D(fontTexture.Handle, 0, 0, 0, bitmap.Width, bitmap.Height, PixelFormat.Bgra, PixelType.UnsignedByte, bitmap.GetPixels());
+
+            if (!RendererDevice.IsOpenGL(device))
+            {
+                // Storage is allocated at the first draw instead, once the frame's glyph count says how
+                // much is needed -- a VkBuffer's size is fixed at creation, so there is nothing to create
+                // here that a later frame would not have to replace anyway.
+                return;
+            }
 
             GL.CreateBuffers(1, out bufferHandle);
 
@@ -272,7 +298,6 @@ namespace ValveResourceFormat.Renderer
 #if DEBUG
             var objectLabel = nameof(TextRenderer);
             GL.ObjectLabel(ObjectLabelIdentifier.Buffer, bufferHandle, objectLabel.Length, objectLabel);
-            GL.ObjectLabel(ObjectLabelIdentifier.Texture, fontTexture.Handle, objectLabel.Length, objectLabel);
 #endif
         }
 
@@ -485,30 +510,44 @@ namespace ValveResourceFormat.Renderer
                 }
 
                 verticesSize = i * Vertex.Size * sizeof(float);
-                GL.NamedBufferData(bufferHandle, verticesSize, vertexBuffer.FloatArray, BufferUsageHint.DynamicDraw);
+                UploadVertices(vertexBuffer.FloatArray, verticesSize);
             }
 
             Debug.Assert(shader != null);
             Debug.Assert(fontTexture != null);
 
+            var commandList = context?.CommandList;
+            var device = RendererDevice.Resolve(commandList?.Device ?? RendererContext.Device);
+            var openGL = RendererDevice.IsOpenGL(device);
+
             using (RendererContext.RenderState.Scope(depthTest: false,
                 blend: true, srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha))
             {
-                shader.Use();
+                // Before Use, not after it. These are routed setters: they write into the shader's own
+                // globals material, and Use is what fills the globals buffer from it and binds it. Setting
+                // them afterwards left the buffer holding the values of the frame before, so the transform
+                // reaching the GPU lagged one frame behind every window resize.
+                //
                 // The routed overload, not SetUniform4x4: the numbered setters write by GL location and
                 // do nothing at all when there isn't one, which is exactly what a packed uniform has.
                 // This one goes through the globals buffer, so it works on either backend.
                 shader.SetUniform("g_matTextTransform", Matrix4x4.CreateOrthographicOffCenter(0f, camera.WindowSize.X, camera.WindowSize.Y, 0f, -100f, 100f));
-                shader.SetTexture(0, "msdf", fontTexture);
-
-                if (sceneDepth != null)
-                {
-                    shader.SetTexture((int)ReservedTextureSlots.SceneDepth, "g_tSceneDepth", sceneDepth);
-                }
-
                 shader.SetUniform("g_fRange", TextureRange);
 
-                var commandList = context?.CommandList;
+                shader.Use(commandList);
+
+                if (openGL)
+                {
+                    // Binding by texture unit and writing the sampler uniform, which is what an OpenGL
+                    // program needs whether or not the draw itself is recorded. There is no equivalent on
+                    // a device with no OpenGL in it: the command list binds by descriptor set below.
+                    shader.SetTexture(0, "msdf", fontTexture);
+
+                    if (sceneDepth != null)
+                    {
+                        shader.SetTexture((int)ReservedTextureSlots.SceneDepth, "g_tSceneDepth", sceneDepth);
+                    }
+                }
 
                 if (commandList == null)
                 {
@@ -532,14 +571,21 @@ namespace ValveResourceFormat.Renderer
                         Math.Max(1, framebuffer.NumSamples),
                         GLRendererDevice.DrawConstants);
 
-                    commandList.BindPipeline(pipeline);
-                    commandList.BindVertexBuffer(0, VertexRhiBuffer(verticesSize));
-                    commandList.BindIndexBuffer(QuadIndexRhiBuffer(), IndexType.UInt16);
-                    commandList.BindTexture(DescriptorSets.MaterialTextures, 0, fontTexture.RhiTexture);
+                    // Bound whenever there is one, and on a non-OpenGL device even when there is not: see
+                    // ReservedSceneDepth. Not substituted on OpenGL, where a reserved unit is global state
+                    // that outlives this draw, so putting a placeholder in one would hand it to whatever
+                    // samples that unit next.
+                    var depth = sceneDepth ?? (openGL ? null : ReservedSceneDepth(context.Value));
 
-                    if (sceneDepth != null)
+                    commandList.BindPipeline(pipeline);
+                    commandList.BindVertexBuffer(0, VertexStorage(device, verticesSize));
+                    commandList.BindIndexBuffer(QuadIndexStorage(device), IndexType.UInt16);
+                    commandList.BindTexture(DescriptorSets.MaterialTextures, 0, fontTexture.RhiTexture, fontTexture.SamplerFor(device));
+
+                    if (depth != null)
                     {
-                        commandList.BindTexture(DescriptorSets.ReservedTextures, (int)ReservedTextureSlots.SceneDepth, sceneDepth.RhiTexture);
+                        commandList.BindTexture(DescriptorSets.ReservedTextures, (int)ReservedTextureSlots.SceneDepth,
+                            depth.RhiTexture, depth.SamplerFor(device));
                     }
 
                     commandList.DrawIndexed(letters * 6);
@@ -551,8 +597,97 @@ namespace ValveResourceFormat.Renderer
             TextRenderRequests.Clear();
         }
 
-        private GLBuffer VertexRhiBuffer(int sizeInBytes)
+        /// <summary>
+        /// Finds the scene depth texture to bind when the caller supplied none.
+        /// </summary>
+        /// <param name="context">The pass being drawn, whose reserved textures are searched.</param>
+        /// <returns>The scene's resolved depth, or the font atlas when the scene has none.</returns>
+        /// <remarks>
+        /// <para>
+        /// <b>Something has to be bound here, always.</b> <c>font_msdf.frag</c> declares
+        /// <c>g_tSceneDepth</c> unconditionally, so the pipeline names
+        /// <see cref="DescriptorSets.ReservedTextures"/> whether or not the frame's text is depth masked.
+        /// Leaving it unbound is a no-op on OpenGL, where the unit keeps whatever the last pass left in
+        /// it, and undefined behaviour on Vulkan that reaches the GPU: the draw is refused outright rather
+        /// than rendering a frame that might hang the device.
+        /// </para>
+        /// <para>
+        /// The atlas as the last resort is not a depth texture and is not meant to read as one. Nothing
+        /// samples this binding unless a request set <see cref="TextRenderRequest.SceneDepth"/>, which
+        /// means <see cref="AddTextBillboard"/> was called with <c>depthMask: true</c> by a caller that
+        /// then supplied no depth to mask against &#8212; already undefined on the OpenGL path, for the
+        /// same reason. It keeps the descriptor set complete so that the overlay, which never masks,
+        /// draws.
+        /// </para>
+        /// </remarks>
+        private RenderTexture ReservedSceneDepth(in Scene.RenderContext context)
         {
+            foreach (var (slot, _, texture) in context.Textures)
+            {
+                if (slot == ReservedTextureSlots.SceneDepth)
+                {
+                    return texture;
+                }
+            }
+
+            Debug.Assert(fontTexture != null);
+            return fontTexture;
+        }
+
+        /// <summary>
+        /// Writes this frame's glyph vertices into the buffer the draw reads, allocating storage first
+        /// when the glyph count changed the size it needs.
+        /// </summary>
+        /// <param name="floats">The rented scratch array the vertices were built in. Longer than the
+        /// data, because the pool hands out whole buckets.</param>
+        /// <param name="sizeInBytes">How much of <paramref name="floats"/> is this frame's vertices.</param>
+        private void UploadVertices(float[] floats, int sizeInBytes)
+        {
+            var device = RendererDevice.Resolve(RendererContext.Device);
+
+            if (RendererDevice.IsOpenGL(device))
+            {
+                // Unchanged: a mutable store replaced wholesale every frame, which is what the vertex
+                // array built in Load reads through.
+                GL.NamedBufferData(bufferHandle, sizeInBytes, floats, BufferUsageHint.DynamicDraw);
+                return;
+            }
+
+            EnsureDeviceVertexBuffer(device!, sizeInBytes);
+
+            // Staged by the device. A frame's own uploads are flushed before its command lists execute,
+            // so writing here rather than at load time is correct even though this runs mid-frame.
+            device!.UploadBuffer(deviceVertexBuffer!, 0, MemoryMarshal.AsBytes(floats.AsSpan(0, sizeInBytes / sizeof(float))));
+        }
+
+        private void EnsureDeviceVertexBuffer(IDevice device, int sizeInBytes)
+        {
+            if (deviceVertexBuffer is not null && deviceVertexBuffer.SizeInBytes == sizeInBytes)
+            {
+                return;
+            }
+
+            if (deviceVertexBuffer is not null)
+            {
+                // Deferred, not destroyed: a frame still in flight may be reading the old storage.
+                device.DeferredDestroy(deviceVertexBuffer);
+            }
+
+            deviceVertexBuffer = device.CreateBuffer(new BufferDesc(
+                sizeInBytes, BufferUsage.Vertex | BufferUsage.CopyDestination, BufferMemory.DeviceLocal, nameof(TextRenderer)));
+        }
+
+        /// <summary>Gets the buffer the recorded draw reads its vertices from.</summary>
+        /// <param name="device">The device the draw is recorded on.</param>
+        /// <param name="sizeInBytes">This frame's vertex data size.</param>
+        private IBuffer VertexStorage(IDevice? device, int sizeInBytes)
+        {
+            if (!RendererDevice.IsOpenGL(device))
+            {
+                return deviceVertexBuffer ?? throw new InvalidOperationException(
+                    $"{nameof(TextRenderer)} has no vertex storage, so this frame's glyphs were never uploaded.");
+            }
+
             if (vertexRhiBuffer is null || vertexRhiBuffer.SizeInBytes != sizeInBytes)
             {
                 vertexRhiBuffer = GLBuffer.Wrap(bufferHandle, sizeInBytes, BufferUsage.Vertex, BufferMemory.DeviceLocal, nameof(TextRenderer));
@@ -561,13 +696,57 @@ namespace ValveResourceFormat.Renderer
             return vertexRhiBuffer;
         }
 
-        private GLBuffer QuadIndexRhiBuffer()
-            => quadIndexRhiBuffer ??= GLBuffer.Wrap(
-                RendererContext.MeshBufferCache.QuadIndices.GLHandle,
+        /// <summary>
+        /// Gets the quad index buffer the recorded draw reads, which turns each glyph's four vertices into
+        /// two triangles.
+        /// </summary>
+        /// <param name="device">The device the draw is recorded on.</param>
+        /// <remarks>
+        /// On OpenGL this is a view of the one <see cref="GPUMeshBufferCache.QuadIndices"/> allocates and
+        /// every quad renderer shares. That buffer is a bare <c>glCreateBuffers</c> name with no device
+        /// behind it, so on any other backend this renderer builds and owns an identical one instead. The
+        /// duplication is deliberate and small; folding it away means giving <see cref="QuadIndexBuffer"/>
+        /// a device path, which the particle renderers share and this change does not own.
+        /// </remarks>
+        private IBuffer QuadIndexStorage(IDevice? device)
+        {
+            if (RendererDevice.IsOpenGL(device))
+            {
+                return quadIndexRhiBuffer ??= GLBuffer.Wrap(
+                    RendererContext.MeshBufferCache.QuadIndices.GLHandle,
+                    SharedQuadIndexCount * sizeof(ushort),
+                    BufferUsage.Index,
+                    BufferMemory.DeviceLocal,
+                    nameof(QuadIndexBuffer));
+            }
+
+            if (deviceQuadIndexBuffer is not null)
+            {
+                return deviceQuadIndexBuffer;
+            }
+
+            var indices = new ushort[SharedQuadIndexCount];
+
+            for (var quad = 0; quad < SharedQuadIndexCount / 6; quad++)
+            {
+                indices[(quad * 6) + 0] = (ushort)((quad * 4) + 0);
+                indices[(quad * 6) + 1] = (ushort)((quad * 4) + 1);
+                indices[(quad * 6) + 2] = (ushort)((quad * 4) + 2);
+                indices[(quad * 6) + 3] = (ushort)((quad * 4) + 0);
+                indices[(quad * 6) + 4] = (ushort)((quad * 4) + 2);
+                indices[(quad * 6) + 5] = (ushort)((quad * 4) + 3);
+            }
+
+            deviceQuadIndexBuffer = device!.CreateBuffer(new BufferDesc(
                 SharedQuadIndexCount * sizeof(ushort),
-                BufferUsage.Index,
+                BufferUsage.Index | BufferUsage.CopyDestination,
                 BufferMemory.DeviceLocal,
-                nameof(QuadIndexBuffer));
+                nameof(QuadIndexBuffer)));
+
+            device.UploadBuffer(deviceQuadIndexBuffer, 0, MemoryMarshal.AsBytes<ushort>(indices));
+
+            return deviceQuadIndexBuffer;
+        }
 
         // Font metrics for JetBrainsMono-Regular.ttf generated using msdf-atlas-gen (use Misc/FontMsdfGen)
         private const float AtlasSize = 512f;
