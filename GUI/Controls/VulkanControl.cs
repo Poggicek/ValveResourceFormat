@@ -296,9 +296,10 @@ public sealed partial class VulkanControl : Control
     /// Draws the frame into the acquired swapchain image, or <see langword="null"/> to clear it to
     /// <see cref="ClearColor"/>.
     /// </summary>
-    /// <remarks>This is the seam the renderer attaches to. The callback receives the backbuffer as an
-    /// <see cref="ITexture"/> it may name as a render pass colour attachment, because on Vulkan a
-    /// swapchain image is a real <c>VkImage</c> and the frame renders straight into it.</remarks>
+    /// <remarks>This is the seam the renderer attaches to. The callback receives the acquired image and
+    /// the device the frame is open on, and records through command lists it begins and submits itself;
+    /// <see cref="VulkanPresentFrame"/> says why it owns them rather than being handed one, and why
+    /// reaching the backbuffer is still a copy rather than a render pass that names it.</remarks>
     public VulkanPresentFrameCallback? RenderFrame { get; set; }
 
     /// <summary>
@@ -706,17 +707,11 @@ public sealed partial class VulkanControl : Control
         // from Undefined and the first barrier discards whatever the presentation engine left.
         backbuffer.OverrideTrackedState(ResourceState.Undefined);
 
-        // A real command list from the device, not a raw command buffer off the pool. That is what
-        // makes a windowed frame the same kind of frame the offscreen path records: whatever draws
-        // here gets the device's recorder, its descriptor binder and its pipelines.
-        var commands = device.BeginCommandList($"{nameof(VulkanControl)} frame {device.CurrentFrameSerial}");
-        var commandBuffer = ((VulkanCommandList)commands).Handle;
-
         var callback = RenderFrame;
 
         if (callback is not null)
         {
-            var frame = new VulkanPresentFrame(backbuffer, commands, commandBuffer, frameIndex);
+            var frame = new VulkanPresentFrame(backbuffer, device, frameIndex);
 
             // A throwing callback must not take the frame with it. The acquire semaphore has already
             // been signalled by the presentation engine, and the only thing that can unsignal it is a
@@ -733,7 +728,20 @@ public sealed partial class VulkanControl : Control
                 Log.Error(nameof(VulkanControl), $"The frame callback threw, presenting the partial frame: {exception}");
             }
         }
-        else
+
+        // A real command list from the device, not a raw command buffer off the pool. That is what
+        // makes a windowed frame the same kind of frame the offscreen path records: whatever draws
+        // here gets the device's recorder, its descriptor binder and its pipelines.
+        //
+        // Begun after the callback and not before it. This device reuses one command list and refuses
+        // to begin a second while the first is unsubmitted, and a callback that draws a scene needs
+        // several -- so a list opened here first would refuse every one of them. What is left for this
+        // one is the transition into Present, which is the presentation layer's own work and belongs at
+        // the end of the frame's batch anyway.
+        var commands = device.BeginCommandList($"{nameof(VulkanControl)} present {device.CurrentFrameSerial}");
+        var commandBuffer = ((VulkanCommandList)commands).Handle;
+
+        if (callback is null)
         {
             RecordClear(commandBuffer, backbuffer);
         }

@@ -33,9 +33,9 @@ namespace ValveResourceFormat.Renderer.RHI.Vulkan;
 /// </remarks>
 public class VulkanRecordingDevice : VulkanDevice
 {
-    private readonly IVulkanDescriptorBinder? Binder;
     private readonly List<CommandBuffer> PendingSubmission = [];
 
+    private IVulkanDescriptorBinder? Binder;
     private VulkanCommandList? CommandList;
 
     /// <summary>Creates a device, and the Vulkan core underneath it.</summary>
@@ -64,6 +64,36 @@ public class VulkanRecordingDevice : VulkanDevice
     public VulkanRecordingDevice(VulkanCoreDevice core, bool ownsCore = false, IVulkanDescriptorBinder? binder = null)
         : base(core, ownsCore)
     {
+        Binder = binder;
+    }
+
+    /// <summary>
+    /// Supplies the binder a derived device could only build after this constructor had run.
+    /// </summary>
+    /// <param name="binder">Where the command list writes descriptor bindings.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="binder"/> is <see langword="null"/>.</exception>
+    /// <exception cref="InvalidOperationException">A command list already exists, so it was created
+    /// without this binder and would keep using none.</exception>
+    /// <remarks>
+    /// <b>The constructor parameter cannot serve every device.</b> A binder needs the descriptor set
+    /// layout and pipeline layout caches to write against, and on <c>VulkanPipelineDevice</c> and
+    /// everything derived from it those caches are the device's own and do not exist until its
+    /// constructor has finished. Passing one in through the options works only for a caller that builds
+    /// the pipeline device separately and composes the two, which is what the golden harness does and
+    /// what the presentation layer cannot: its device <i>is</i> the pipeline device. Without this, that
+    /// device records a frame whose every <c>BindUniformBuffer</c> throws, which is a Vulkan window that
+    /// draws nothing for a reason that has nothing to do with the renderer.
+    /// </remarks>
+    protected void AttachDescriptorBinder(IVulkanDescriptorBinder binder)
+    {
+        ArgumentNullException.ThrowIfNull(binder);
+
+        if (CommandList is not null)
+        {
+            throw new InvalidOperationException(
+                $"A command list has already been created, so it captured the binder this device had at the time. {nameof(AttachDescriptorBinder)} must run before the first {nameof(BeginCommandList)}.");
+        }
+
         Binder = binder;
     }
 

@@ -14,6 +14,7 @@ using ValveResourceFormat.Renderer.RHI;
 using ValveResourceFormat.Renderer.RHI.Vulkan.Present;
 using Windows.Win32;
 using GLRecordingDevice = ValveResourceFormat.Renderer.RHI.OpenGL.GLRecordingDevice;
+using PhysicalDeviceType = Silk.NET.Vulkan.PhysicalDeviceType;
 
 namespace GUI.Types.GLViewers;
 
@@ -106,6 +107,36 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
     protected Framebuffer? MainFramebuffer;
 
     /// <summary>
+    /// Where the tonemap writes on Vulkan, and null on OpenGL.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// OpenGL tonemaps straight onto framebuffer 0 and needs no target of its own. Vulkan cannot: the
+    /// swapchain image is not a <c>VulkanTexture</c>, so it cannot be named in a render pass, and the
+    /// post-process chain only records when its output is texture backed. So the chain writes here and
+    /// <see cref="DrawVulkanFrame"/> copies this onto the acquired image.
+    /// </para>
+    /// <para>
+    /// Single sampled and eight bit, because it holds the tonemapped result rather than scene radiance.
+    /// <see cref="MainFramebuffer"/> keeps its HDR format and its MSAA sample count; nothing about the
+    /// scene passes changes.
+    /// </para>
+    /// </remarks>
+    protected Framebuffer? PresentFramebuffer { get; private set; }
+
+    /// <summary>
+    /// Whether this frame's <see cref="PresentToScreen"/> wrote <see cref="PresentFramebuffer"/>.
+    /// </summary>
+    /// <remarks>Read by <see cref="DrawVulkanFrame"/>, which has to tell a frame that produced an image
+    /// from one that did not: the difference between presenting the scene and presenting an uninitialised
+    /// texture is not visible from the texture itself.</remarks>
+    protected bool PresentTargetWritten;
+
+    // Set by Draw and read by DrawVulkanFrame, which runs inside the DrawFrame call below it, on the
+    // same thread and under the same lock.
+    private bool pendingIsPaused;
+
+    /// <summary>
     /// The graphics device this viewer renders through. Created in <see cref="InitializeLoad"/> once the
     /// GL context is current, and published on <see cref="RendererContext"/> so the renderer can reach it.
     /// Null until then.
@@ -183,6 +214,10 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
             VulkanSurface = new VulkanControl(glLock, VulkanSession)
             {
                 Dock = DockStyle.Fill,
+
+                // The seam the whole backend hangs off. Without it the control clears the acquired
+                // image and presents that, which is a window that works and shows nothing.
+                RenderFrame = DrawVulkanFrame,
             };
 
             UiControl.GLControlContainer.Controls.Add(VulkanSurface);
@@ -376,10 +411,17 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
         GLDefaultFramebuffer.Resize(w, h);
 
-        if (MainFramebuffer != GLDefaultFramebuffer)
+        // ReferenceEquals, not the type's own equality, which compares OpenGL framebuffer handles. Every
+        // framebuffer on a Vulkan device has handle 0, so == reports all of them equal and this resize
+        // would be skipped -- leaving the scene target at its 4x4 initial size for the whole session.
+        // Identical on OpenGL, where the fallback assigns the same instance rather than an equal one.
+        if (!ReferenceEquals(MainFramebuffer, GLDefaultFramebuffer))
         {
             MainFramebuffer.Resize(w, h, NumSamples);
         }
+
+        // Null on OpenGL, where framebuffer 0 is the present target and resizing it is the line above.
+        PresentFramebuffer?.Resize(w, h);
     }
 
     public void OnLostFocus(object? sender, EventArgs e)
@@ -472,6 +514,11 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
             // already gone with UiControl, and disposing a WinForms control twice is a no-op.
             VulkanSurface?.Dispose();
             VulkanSurface = null;
+
+            // After the surface, whose teardown waits for the device to go idle, so nothing in flight is
+            // still reading the image this releases.
+            PresentFramebuffer?.Delete();
+            PresentFramebuffer = null;
 
             // The device is shared and process-lifetime, so a closing tab drops a reference rather than
             // destroying it. Disposing it here would take every other Vulkan tab down and unload the
@@ -857,9 +904,26 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
         if (UsingVulkan)
         {
-            // Scene loading is the largest remaining body of direct OpenGL, so on a Vulkan device it is
-            // expected to fail. Contained here so that it fails once, by name, into the log, and leaves
-            // the viewer presenting an empty window rather than taking the tab down with it.
+            // The target the tonemap writes into, standing where framebuffer 0 stands on OpenGL. Sized
+            // to nothing yet: the swapchain does not exist until the control has a window, and the
+            // first frame resizes this to the image it acquired.
+            PresentFramebuffer = Framebuffer.Prepare(nameof(PresentFramebuffer),
+                4, 4,
+                0,
+                new(PixelInternalFormat.Rgba8, PixelFormat.Rgba, PixelType.UnsignedByte),
+                null
+            );
+
+            var presentStatus = PresentFramebuffer.Initialize();
+
+            if (presentStatus != FramebufferErrorCode.FramebufferComplete)
+            {
+                Log.Error(nameof(GLBaseControl), $"The Vulkan present target failed to initialize with error: {presentStatus}");
+            }
+
+            // Scene loading still reaches direct OpenGL in places a Vulkan device cannot serve, so it is
+            // contained here: a failure is reported once, by name, into the log, and leaves the viewer
+            // presenting an empty window rather than taking the tab down with it.
             try
             {
                 OnGLLoad();
@@ -867,7 +931,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
             catch (Exception exception)
             {
                 Log.Error(nameof(GLBaseControl),
-                    $"Loading this scene on the Vulkan backend failed. The renderer still issues direct OpenGL calls that a Vulkan device cannot serve; the window will present but stay empty. {exception.Message}");
+                    $"Loading this scene on the Vulkan backend failed, so the window will present but stay empty. The renderer still issues direct OpenGL calls that a Vulkan device cannot serve. {exception.Message}");
             }
 
             return;
@@ -881,11 +945,18 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>OpenGL is the default and stays the parity oracle.</b> Requesting Vulkan is not a promise that
-    /// a scene will appear: the renderer still makes a large number of direct OpenGL calls that no
-    /// Vulkan device can serve, and until those are gone a Vulkan viewer presents a cleared window. What
-    /// this does guarantee is that asking for Vulkan gets a real, complete Vulkan device, and that
-    /// failing to get one is reported by name and falls back rather than crashing.
+    /// <b>OpenGL is the default and stays the parity oracle.</b> A Vulkan viewer renders its scene
+    /// through the RHI and presents it, but it is not at parity: the 2D skybox, the picker and the
+    /// thumbnail renderer are still direct OpenGL, so a Vulkan window has a black background where an
+    /// OpenGL one has a sky, and the paths no test covers may still throw. What this guarantees is that
+    /// asking for Vulkan gets a real, complete Vulkan device, and that failing to get one is reported by
+    /// name and falls back rather than crashing.
+    /// </para>
+    /// <para>
+    /// <b>Recording is turned on with the device, not globally.</b> A Vulkan device that is never asked
+    /// to record leaves the renderer taking its direct OpenGL route everywhere, which looks exactly like
+    /// a Vulkan window that draws nothing. The OpenGL viewer is deliberately left alone: recording
+    /// changes what the oracle executes, and the oracle is only an oracle while it does not change.
     /// </para>
     /// <para>
     /// The GLFW window and its context are created either way. They are what the shared render loop,
@@ -893,6 +964,19 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
     /// last step of the port rather than the first.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// The variable that refuses anything but a CPU Vulkan adapter, for a run that must not reach the
+    /// display driver. Unset is the normal case and gets whatever the loader picks.
+    /// </summary>
+    /// <remarks>Named after, and meant to be set alongside, <c>VK_DRIVER_FILES</c>. Pointing the loader
+    /// at a software driver is a preference the loader may not honour; this is the check that makes it a
+    /// guarantee, and it is the same split the golden suite's <c>SoftwareVulkanIcd</c> documents after
+    /// the incident that earned it.</remarks>
+    private const string RequireCpuAdapterVariable = "VRF_RHI_REQUIRE_CPU";
+
+    private static bool RequireCpuAdapter
+        => Environment.GetEnvironmentVariable(RequireCpuAdapterVariable) is "1" or "true";
+
     private IDevice CreateDevice()
     {
         if (RhiBackendSelection.Requested != RhiBackend.Vulkan)
@@ -904,10 +988,27 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         try
         {
             var session = VulkanPresentSession.Acquire();
+            var adapter = session.PresentDevice.Core.Adapter;
+
+            if (RequireCpuAdapter && adapter.DeviceType != PhysicalDeviceType.Cpu)
+            {
+                // Not a paranoid check. VK_DRIVER_FILES is a request to the loader; this is the driver's
+                // own answer, and only the answer is safe to act on. A hardware adapter reaching this
+                // point is the configuration that hung a display driver and bugchecked the machine, so
+                // the window comes up on OpenGL rather than submitting a single command to it.
+                VulkanPresentSession.Release();
+
+                throw new InvalidOperationException(
+                    $"{RequireCpuAdapterVariable} is set, but the Vulkan loader selected '{adapter.Name}', "
+                    + $"which reports itself as {adapter.DeviceType} rather than Cpu. Nothing was submitted to it.");
+            }
+
             VulkanSession = session;
 
+            ValveResourceFormat.Renderer.Renderer.EnableRhiRecording = true;
+
             Log.Info(nameof(GLBaseControl),
-                $"Vulkan backend selected on {session.PresentDevice.Core.Adapter.Name}. Scene rendering is not ported yet; the window will present but stay empty.");
+                $"Vulkan backend selected on {session.PresentDevice.Core.Adapter.Name}. The scene renders through the RHI; the 2D skybox is still direct OpenGL, so the background stays black.");
 
             return session.PresentDevice;
         }
@@ -964,8 +1065,11 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         {
             // Acquire, record, present. No context to make current and no buffers to swap: the
             // swapchain is the surface, and the frame is one submission the device batches.
-            Paused = isPaused;
-            LastUpdate = Stopwatch.GetTimestamp();
+            //
+            // The frame itself runs inside DrawFrame rather than here, because every command list the
+            // renderer opens has to be inside the device frame that DrawFrame opens and closes. See
+            // DrawVulkanFrame, which is the same update, paint and present this method performs below.
+            pendingIsPaused = isPaused;
 
             VulkanSurface.DrawFrame();
             return;
@@ -995,6 +1099,26 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
             FirstPaint = false;
         }
 
+        var frameTime = AdvanceFrameClock(isPaused);
+
+        OnUpdate(frameTime);
+
+        OnPaint(frameTime);
+
+        GLNativeWindow.Context.SwapBuffers();
+
+        GLNativeWindow.Context.MakeNoneCurrent();
+    }
+
+    /// <summary>
+    /// Moves the frame clock on and returns how long this frame covers, in seconds.
+    /// </summary>
+    /// <param name="isPaused">Whether the render loop is paused this frame.</param>
+    /// <remarks>The clamp is not cosmetic: a tab that was paused for a minute would otherwise resume
+    /// with a minute of elapsed time, which particle simulation and animation both integrate over.
+    /// Resuming is reported as a zero-length frame for the same reason.</remarks>
+    private float AdvanceFrameClock(bool isPaused)
+    {
         var wasPaused = Paused;
         var resumingRender = wasPaused && !isPaused;
         Paused = isPaused;
@@ -1007,13 +1131,69 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         // Clamp frametime so it does not cause issues in things like particle rendering
         var frameTime = MathF.Min(1f, (float)elapsed.TotalSeconds);
         LastUpdate = currentTime;
+
+        return frameTime;
+    }
+
+    /// <summary>
+    /// Runs one frame inside an acquired swapchain image: the same update and paint the OpenGL path in
+    /// <see cref="Draw"/> performs, then the copy onto the backbuffer.
+    /// </summary>
+    /// <param name="frame">The acquired image and the device the frame is open on.</param>
+    /// <remarks>
+    /// <para>
+    /// <b>This has to be a callback rather than code beside <c>DrawFrame</c>.</b> Every command list the
+    /// renderer opens must be inside a device frame, and the device frame is opened and closed by
+    /// <see cref="VulkanControl.DrawFrame"/> around the acquire and the present. Rendering before that
+    /// call would record into no frame at all; rendering after it would record into the next one.
+    /// </para>
+    /// <para>
+    /// <b>The swapchain is the authority on size.</b> The OpenGL path resizes to the GLFW window, which
+    /// on a Vulkan viewer is a hidden 4x4 window that nothing presents. The acquired image is the real
+    /// client area, so the viewer's own targets are matched to it here, which also covers the resizes
+    /// <see cref="ShouldResize"/> never saw because the swapchain rebuilt itself from the surface.
+    /// </para>
+    /// <para>
+    /// The scene is drawn into <see cref="MainFramebuffer"/> and tonemapped into
+    /// <see cref="PresentFramebuffer"/> exactly as on OpenGL, and only the last step differs: OpenGL
+    /// blits onto framebuffer 0, and this copies onto the acquired image. That is what
+    /// <see cref="PresentToScreen"/> is for.
+    /// </para>
+    /// </remarks>
+    private void DrawVulkanFrame(in VulkanPresentFrame frame)
+    {
+        var backbuffer = frame.Backbuffer;
+
+        if (ShouldResize || PresentFramebuffer?.Width != backbuffer.Width || PresentFramebuffer?.Height != backbuffer.Height)
+        {
+            OnResize(backbuffer.Width, backbuffer.Height);
+            ShouldResize = false;
+        }
+
+        if (FirstPaint)
+        {
+            OnFirstPaint();
+            FirstPaint = false;
+        }
+
+        var frameTime = AdvanceFrameClock(pendingIsPaused);
+
+        PresentTargetWritten = false;
+
         OnUpdate(frameTime);
 
         OnPaint(frameTime);
 
-        GLNativeWindow.Context.SwapBuffers();
+        if (PresentTargetWritten && PresentFramebuffer?.Color is { } presented)
+        {
+            frame.PresentTexture(presented.RhiTexture);
+            return;
+        }
 
-        GLNativeWindow.Context.MakeNoneCurrent();
+        // Nothing drew this frame -- a viewer that does not tonemap into an offscreen target yet, or a
+        // paint that threw. The acquired image holds whatever the presentation engine last left in it,
+        // so it is cleared rather than presented as it is.
+        frame.ClearBackbuffer(0.1f, 0.1f, 0.12f);
     }
 
     /// <summary>
@@ -1029,10 +1209,16 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
     /// owns, and this method is where that target reaches the screen.
     /// </para>
     /// <para>
-    /// That asymmetry is the backend's, not the renderer's: a Vulkan swapchain image is a real
-    /// <c>VkImage</c> and can be rendered into directly, so its implementation of this step is an
-    /// acquire and a present rather than a copy. Keeping the copy behind this one virtual is what lets
-    /// the frame above it be identical on both.
+    /// On Vulkan the destination is <see cref="PresentFramebuffer"/> rather than framebuffer 0, and the
+    /// copy from there onto the acquired swapchain image is <see cref="DrawVulkanFrame"/>'s. In
+    /// principle a swapchain image is a real <c>VkImage</c> that a pass could name directly, which
+    /// would remove the copy; in practice it cannot yet, because every <c>ITexture</c> argument in the
+    /// contract is resolved by a cast a swapchain image does not satisfy. <c>VulkanPresentFrame</c>
+    /// records what closing that gap would take.
+    /// </para>
+    /// <para>
+    /// An override that writes <see cref="PresentFramebuffer"/> must set
+    /// <see cref="PresentTargetWritten"/>, which is what tells the Vulkan frame it has an image to show.
     /// </para>
     /// </remarks>
     protected virtual void PresentToScreen()

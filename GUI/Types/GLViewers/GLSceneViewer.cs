@@ -604,22 +604,38 @@ namespace GUI.Types.GLViewers
 
         /// <inheritdoc/>
         /// <remarks>
-        /// The post-process chain writes straight onto the presented surface, so tonemapping and
-        /// presenting are the same draw here. Once that chain records through an
-        /// <see cref="ICommandList"/> it has to write into an offscreen colour target instead, because a
-        /// render pass cannot name framebuffer 0, and this method becomes the copy from that target.
+        /// <para>
+        /// On OpenGL the post-process chain writes straight onto the presented surface, so tonemapping
+        /// and presenting are the same draw and this is the whole of it.
+        /// </para>
+        /// <para>
+        /// On Vulkan it writes into <see cref="PresentFramebuffer"/> instead, and the frame copies that
+        /// onto the acquired swapchain image afterwards. That is not a Vulkan-specific chain: the chain
+        /// only records through an <see cref="ICommandList"/> when its output is texture backed, because
+        /// a render pass cannot name framebuffer 0, so an offscreen destination is what turns this draw
+        /// into recorded work at all.
+        /// </para>
         /// </remarks>
         protected override void PresentToScreen()
         {
-            if (MainFramebuffer == GLDefaultFramebuffer)
+            var output = PresentFramebuffer ?? GLDefaultFramebuffer;
+
+            // ReferenceEquals, not the type's own equality, which compares OpenGL framebuffer handles.
+            // On a Vulkan device every framebuffer has handle 0, so == calls the scene target and the
+            // present target the same object and this returns without ever tonemapping.
+            if (ReferenceEquals(MainFramebuffer, output))
             {
                 return; // already on the presented surface
             }
 
             Debug.Assert(MainFramebuffer != null);
-            Debug.Assert(GLDefaultFramebuffer != null);
+            Debug.Assert(output != null);
 
-            Renderer.PostprocessRender(MainFramebuffer, GLDefaultFramebuffer);
+            Renderer.PostprocessRender(MainFramebuffer, output);
+
+            // Only after the chain returned, so a frame whose tonemap threw is reported as having drawn
+            // nothing rather than presenting whatever the target held from an earlier one.
+            PresentTargetWritten = output == PresentFramebuffer;
         }
 
         protected override void OnPaint(float frameTime)

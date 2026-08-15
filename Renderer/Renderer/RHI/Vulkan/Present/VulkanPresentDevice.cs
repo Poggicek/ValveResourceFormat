@@ -1,6 +1,7 @@
 using System.Threading;
 using Silk.NET.Vulkan;
 using ValveResourceFormat.Renderer.RHI.Vulkan.Core;
+using ValveResourceFormat.Renderer.RHI.Vulkan.Descriptors;
 using VkSemaphore = Silk.NET.Vulkan.Semaphore;
 
 namespace ValveResourceFormat.Renderer.RHI.Vulkan.Present;
@@ -92,7 +93,29 @@ public sealed class VulkanPresentDevice : VulkanPipelineDevice
     private VulkanPresentDevice(VulkanCoreOptions coreOptions, VulkanPipelineOptions? pipelineOptions)
         : base(new VulkanCoreDevice(coreOptions), ownsCore: true, pipelineOptions)
     {
+        if (pipelineOptions?.DescriptorBinder is not null)
+        {
+            // The caller composed its own, which is the shape the golden harness uses.
+            return;
+        }
+
+        // Built here rather than passed in, because a binder writes against the descriptor set layout
+        // and pipeline layout caches this device owns, and those do not exist until the base constructor
+        // has run. A device that comes up without one records a frame whose every BindUniformBuffer
+        // throws -- a window that presents and draws nothing, for a reason that is not the renderer's.
+        OwnedBinder = new VulkanDescriptorBinder(
+            Core.Api,
+            Core.Handle,
+            Core.DebugNames,
+            Core.FrameRing,
+            DescriptorSetLayouts,
+            PipelineLayouts);
+
+        AttachDescriptorBinder(OwnedBinder);
     }
+
+    /// <summary>The binder this device built for itself, or null when the caller supplied one.</summary>
+    private VulkanDescriptorBinder? OwnedBinder;
 
     /// <summary>
     /// Returns the shared presentation device, creating it on first use, and takes a reference to it.
@@ -380,6 +403,12 @@ public sealed class VulkanPresentDevice : VulkanPipelineDevice
         {
             using var _ = SubmissionLock.EnterScope();
             FrameCommandBuffers.Clear();
+
+            // Before the base class, which waits for idle and then destroys the layout caches the
+            // binder's pools were allocated against.
+            OwnedBinder?.Dispose();
+            OwnedBinder = null;
+
             base.Dispose(disposing);
             return;
         }
