@@ -63,6 +63,20 @@ public enum TextureDimension
     Texture2D,
     /// <summary>An array of two dimensional slices.</summary>
     Texture2DArray,
+    /// <summary>
+    /// Two dimensional, multisampled. Distinct from <see cref="Texture2D"/> rather than implied by a
+    /// sample count above one, because the renderer really does allocate a multisample target
+    /// carrying a <em>single</em> sample.
+    /// </summary>
+    /// <remarks>
+    /// That shape is deliberate: it exercises the post-process chain's resolve without depending on
+    /// any driver's multisample resolve pattern. It is also inexpressible if multisample-ness is
+    /// inferred from the count, and the failure is silent — the shaders declare <c>sampler2DMS</c>,
+    /// so a plain texture handed to them reads as black rather than erroring. OpenGL has always
+    /// distinguished the two as separate targets; a one-sample multisampled image is likewise legal
+    /// in Vulkan.
+    /// </remarks>
+    Texture2DMultisample,
     /// <summary>Three dimensional (volume).</summary>
     Texture3D,
     /// <summary>Cube map, six faces.</summary>
