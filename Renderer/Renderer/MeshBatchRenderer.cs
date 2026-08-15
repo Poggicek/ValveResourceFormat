@@ -215,6 +215,9 @@ namespace ValveResourceFormat.Renderer
             // same three things that make the OpenGL path rebind: the shader, the material, and the VAO.
             var rebindPipeline = false;
 
+            // Reused across every material change in this batch; CollectTextureBindings clears it.
+            var materialTextures = commandList != null ? new List<RenderMaterial.TextureBinding>() : null;
+
             var counters = PerfStats.Active;
 
             foreach (var request in requests)
@@ -311,6 +314,16 @@ namespace ValveResourceFormat.Renderer
 
                     material = requestMaterial;
                     material.Render(shader);
+
+                    // Render's texture binds are OpenGL's own and record nothing, so a backend that binds
+                    // by descriptor set gets set 3 restated here. Done on the material change rather than
+                    // per draw because that is when the set's contents change; the run of draws that
+                    // follows shares them, exactly as it shares the OpenGL units.
+                    if (commandList != null)
+                    {
+                        BindMaterialTextures(commandList, material, shader!, materialTextures!);
+                    }
+
                     rebindPipeline = true;
                 }
 
@@ -346,6 +359,39 @@ namespace ValveResourceFormat.Renderer
             if (vao > -1)
             {
                 material!.PostRender();
+            }
+        }
+
+        /// <summary>
+        /// Records this material's own textures into <see cref="DescriptorSets.MaterialTextures"/>.
+        /// </summary>
+        /// <param name="commandList">The command list to record into.</param>
+        /// <param name="material">The material whose textures are being bound.</param>
+        /// <param name="shader">The shader being drawn with, which may be a replacement rather than the
+        /// material's own; it is what decides which samplers exist and where they live.</param>
+        /// <param name="bindings">Scratch list, cleared by the collect.</param>
+        /// <remarks>
+        /// <para>
+        /// The slots are the shader's, not a count: <see cref="RenderMaterial.CollectTextureBindings"/>
+        /// reads them out of the SPIR-V when there is any, so a sampler the compiler dropped leaves its
+        /// number unused instead of shifting every later texture down one. On OpenGL there is no module
+        /// and it falls back to the same walk <see cref="RenderMaterial.Render"/> makes, which is what
+        /// keeps the recorded units identical to the ones that path binds directly.
+        /// </para>
+        /// <para>
+        /// Each binding carries its own sampler rather than defaulting, because a recorded bind settles
+        /// the sampler either way and defaulting would drop the material's
+        /// <c>g_nTextureAddressModeU</c>/<c>V</c> back to repeat. See
+        /// <see cref="RenderMaterial.SamplerFor"/>.
+        /// </para>
+        /// </remarks>
+        private static void BindMaterialTextures(ICommandList commandList, RenderMaterial material, Shader shader, List<RenderMaterial.TextureBinding> bindings)
+        {
+            material.CollectTextureBindings(shader, bindings);
+
+            foreach (var binding in bindings)
+            {
+                commandList.BindTexture(binding.DescriptorSet, binding.Binding, binding.Texture.RhiTexture, material.SamplerFor(binding));
             }
         }
 

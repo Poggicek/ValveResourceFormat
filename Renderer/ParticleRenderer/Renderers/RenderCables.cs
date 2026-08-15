@@ -459,7 +459,11 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
                 foreach (var binding in textureBindings)
                 {
-                    commandList.BindTexture(binding.DescriptorSet, binding.Binding, binding.Texture.RhiTexture);
+                    // The sampler has to travel with the binding. A recorded bind always settles the
+                    // unit's sampler, and a null one settles it on the default -- which on OpenGL means
+                    // undoing the g_nTextureAddressModeU/V sampler material.Render just bound above, so
+                    // the cable would tile differently the moment recording was switched on.
+                    commandList.BindTexture(binding.DescriptorSet, binding.Binding, binding.Texture.RhiTexture, material.SamplerFor(binding));
                 }
             }
 

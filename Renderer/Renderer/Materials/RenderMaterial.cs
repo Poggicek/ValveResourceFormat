@@ -679,6 +679,17 @@ namespace ValveResourceFormat.Renderer.Materials
 
             foreach (var (name, defaultTexture) in shader.Default.Textures)
             {
+                var texture = Textures.GetValueOrDefault(name, defaultTexture);
+
+                // Mirrors Shader.SetTexture's first branch, which returns false before Render consumes a
+                // unit. Checked ahead of the slot so the counting path below skips exactly what Render
+                // skips; a binding recorded here for a texture that does not exist would also be a null
+                // dereference at the bind itself.
+                if (texture == null)
+                {
+                    continue;
+                }
+
                 int slot;
 
                 if (declared != null)
@@ -710,9 +721,47 @@ namespace ValveResourceFormat.Renderer.Materials
                     RHI.DescriptorSets.MaterialTextures,
                     slot,
                     name,
-                    Textures.GetValueOrDefault(name, defaultTexture),
+                    texture,
                     hasUserConfigSampler && shader.SamplerUserConfigUniforms.Contains(name)));
             }
+        }
+
+        /// <summary>
+        /// Resolves the sampler a collected binding takes, ready to hand to
+        /// <see cref="RHI.ICommandList.BindTexture"/>.
+        /// </summary>
+        /// <param name="binding">A binding from <see cref="CollectTextureBindings"/>.</param>
+        /// <returns>
+        /// The user-config sampler when <see cref="TextureBinding.UsesUserConfigSampler"/> says the
+        /// binding takes one, otherwise <see langword="null"/> for the backend's default.
+        /// </returns>
+        /// <remarks>
+        /// <para>
+        /// <b>Passing this is not optional on OpenGL.</b> A recorded bind sets the unit's sampler either
+        /// way: <c>GLCommandList.BindTexture</c> answers a null sampler with <c>glBindSampler(unit, 0)</c>,
+        /// which is not "leave it alone" but "defer to the texture object". Recording a bind for a
+        /// binding that <see cref="Render"/> just gave <c>g_nTextureAddressModeU</c>/<c>V</c> without its
+        /// sampler therefore undoes that address mode, and the material tiles differently than it did
+        /// before anything was recorded. OpenGL is the parity oracle, so that is a moved golden image
+        /// rather than a cosmetic difference.
+        /// </para>
+        /// <para>
+        /// The sampler comes from the same <see cref="MaterialLoader"/> cache and is the same object
+        /// <see cref="Render"/> binds the handle of, so the two paths cannot describe it differently.
+        /// A material whose address modes are both the default resolves to <see langword="null"/>, which
+        /// is exactly the case where <see cref="Render"/> binds no sampler either.
+        /// </para>
+        /// </remarks>
+        public RHI.ISampler? SamplerFor(in TextureBinding binding)
+        {
+            if (!binding.UsesUserConfigSampler || Loader == null)
+            {
+                return null;
+            }
+
+            var (addressModeU, addressModeV) = UserConfigAddressModes;
+
+            return Loader.GetOrCreateRhiSampler(addressModeU, addressModeV);
         }
 
         private static void SetMatrix(Shader shader, Globals buffer, string name, Matrix4x4 value)

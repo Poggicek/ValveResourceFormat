@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using NUnit.Framework;
+using ValveResourceFormat.Renderer.Buffers;
 using ValveResourceFormat.Renderer.RHI;
 using ValveResourceFormat.Renderer.RHI.Vulkan.Descriptors;
 using ValveResourceFormat.Renderer.Shaders;
@@ -228,6 +229,81 @@ namespace Tests.Renderer
                 Assert.That(() => VulkanDescriptorSetUsage.EnsureBound("histogram", used, used & ~MaskOf(DescriptorSets.StorageBuffers)),
                     Throws.InstanceOf<InvalidOperationException>()
                         .With.Message.Contains($"set {DescriptorSets.StorageBuffers}"));
+            }
+        }
+
+        /// <summary>
+        /// Every uniform and storage block the renderer's shaders declare is at the
+        /// <see cref="ReservedBufferSlots"/> number the renderer records it at.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The buffer half of what <c>ShaderBindingOracle</c> does for textures, and the reason it is a
+        /// comparison rather than a derivation: a buffer's binding is a literal written once in a shared
+        /// include, and the renderer's copy of it is a <see cref="ReservedBufferSlots"/> value. Nothing
+        /// computes one from the other, so nothing notices either moving &#8212; the golden suite least
+        /// of all, since an OpenGL binding is global and a buffer bound one slot over still lands
+        /// somewhere the frame reads.
+        /// </para>
+        /// <para>
+        /// Compiled from the real sources through the real emitter, so what is checked is the decoration
+        /// glslang actually wrote, not the text the parser was handed.
+        /// </para>
+        /// </remarks>
+        [Test]
+        public void EveryDeclaredBufferIsAtItsReservedSlot()
+        {
+            var checkedBlocks = 0;
+            var problems = new List<string>();
+
+            using var compiler = new SpirvCompiler();
+
+            foreach (var shaderName in SpirvShaderValidation.EnumerateShaders())
+            {
+                foreach (var stage in SpirvShaderValidation.CompileShader(shaderName, compiler, flavour: ShaderFlavour.Vulkan))
+                {
+                    if (stage.Reflection is null)
+                    {
+                        continue;
+                    }
+
+                    foreach (var binding in stage.Reflection.DescriptorBindings)
+                    {
+                        var storage = binding.Kind == SpirvResourceKind.StorageBuffer;
+
+                        if (!storage && binding.Kind != SpirvResourceKind.UniformBuffer)
+                        {
+                            continue;
+                        }
+
+                        checkedBlocks++;
+
+                        var expectedSet = storage ? DescriptorSets.StorageBuffers : DescriptorSets.UniformBuffers;
+
+                        if (!ReservedBufferBlocks.TryGetSlot(binding.Name, storage, out var slot))
+                        {
+                            problems.Add($"{shaderName} [{stage.Stage}]: '{binding.Name}' is a {binding.Kind} the renderer has no buffer for.");
+                            continue;
+                        }
+
+                        if (binding.Set != expectedSet || binding.Binding != (int)slot)
+                        {
+                            // The number rather than the enum member, because ReservedBufferSlots overlaps
+                            // its uniform and storage index spaces and ToString cannot tell them apart.
+                            problems.Add(
+                                $"{shaderName} [{stage.Stage}]: '{binding.Name}' is declared at set {binding.Set} binding {binding.Binding}, "
+                                + $"but the renderer records it at set {expectedSet} binding {(int)slot}.");
+                        }
+                    }
+                }
+            }
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(problems, Is.Empty, string.Join(Environment.NewLine, problems));
+
+                // A run that compiled nothing would pass the assertion above without checking anything.
+                Assert.That(checkedBlocks, Is.GreaterThan(100), "Too few buffer declarations were reached for this to mean anything.");
             }
         }
 

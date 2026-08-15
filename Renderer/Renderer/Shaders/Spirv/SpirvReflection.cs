@@ -603,6 +603,30 @@ public static class SpirvReflection
                 continue;
             }
 
+            // The same check the texture branch below makes, on the other index space. A buffer's binding
+            // number exists twice -- as a literal in the shader and as a ReservedBufferSlots value the
+            // renderer records at -- and neither side can notice the other moving. A block the table does
+            // not know is a block no buffer is ever bound for, which is the silent case worth naming.
+            if (expected >= 0)
+            {
+                var storage = binding.Kind == SpirvResourceKind.StorageBuffer;
+
+                if (!ReservedBufferBlocks.TryGetSlot(binding.Name, storage, out var slot))
+                {
+                    problems.Add(string.Create(CultureInfo.InvariantCulture,
+                        $"{where} is a {binding.Kind} the renderer has no buffer for, so nothing would ever bind it."));
+                }
+                else if (binding.Binding != (int)slot)
+                {
+                    // The number, not the enum member: ReservedBufferSlots overlaps its two index spaces,
+                    // so ToString on a storage slot below 8 prints whichever uniform slot shares its value.
+                    problems.Add(string.Create(CultureInfo.InvariantCulture,
+                        $"{where} is a {binding.Kind} the renderer binds at binding {(int)slot} of set {expected}."));
+                }
+
+                continue;
+            }
+
             // A storage image is a third index space, not a texture: binding it addresses image units,
             // which OpenGL keeps separate from texture units and Vulkan does not. Set 4 is where the
             // contract puts them. Set 2 is still accepted because shader emission has not moved yet,

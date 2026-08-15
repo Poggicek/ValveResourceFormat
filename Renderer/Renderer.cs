@@ -1238,6 +1238,18 @@ public class Renderer
         ViewBuffer.Data.SunLightShadowBias = Scene.LightingInfo.SunLightShadowBias;
         ViewBuffer.Update();
 
+        // The first draws recorded on this frame's list, and nothing has bound a buffer on it yet:
+        // UpdatePerViewGpuBuffers and SetSceneBuffers both run inside RenderScenesWithView, which is
+        // after the shadow passes. depth_only declares ViewConstants in set 0 and the object, transform
+        // and bone transform buffers in set 1, so both sets have to be filled here or the draw reads
+        // descriptor sets nothing ever wrote. OpenGL hides this: its bindings are global and were set
+        // when the buffers were constructed, so the shadow pass has always found them already there.
+        if (renderContext.CommandList is { } shadowList)
+        {
+            BindUniformBuffer(shadowList, ViewBuffer);
+            Scene.BindGeometryBuffers(shadowList);
+        }
+
         using var shadowPass = BeginPass(in renderContext, "Sun Shadows");
 
         using (new GLDebugGroup("Direct Light Shadows"))
@@ -1550,6 +1562,16 @@ public class Renderer
 
         try
         {
+            // A list of its own, so nothing the frame bound on the scene's list is bound on this one. Every
+            // shader in the chain includes ViewConstants -- msaa_resolve for its depth of field variant,
+            // post_processing for the viewport size, dof2 for the projection -- so set 0 has to be filled
+            // before the first dispatch or the guard refuses it. The view buffer is not written between the
+            // scene's last use of it and here, so this binds the same contents the scene was drawn with.
+            if (commandList is not null && ViewBuffer is not null)
+            {
+                BindUniformBuffer(commandList, ViewBuffer);
+            }
+
             Postprocess.Render(inputFramebuffer, outputFramebuffer, ResolvedSceneColor!, Camera, flipY, commandList);
             recorded = true;
         }

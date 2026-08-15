@@ -142,14 +142,34 @@ public sealed class Globals : Buffer
     }
 
     /// <summary>Uploads any pending writes and binds this buffer to <see cref="ReservedBufferSlots.Globals"/>.</summary>
+    /// <param name="commandList">The command list to record into, or <see langword="null"/> to bind through
+    /// OpenGL directly.</param>
     /// <remarks>
+    /// <para>
     /// Binds unconditionally. Which buffer occupies the slot is state of the GL context, which outlives any
     /// one thread and can be swapped for another, so there is nothing safe to cache it in.
+    /// </para>
+    /// <para>
+    /// <b>The command list is not yet supplied by the renderer's own draw path.</b>
+    /// <c>RenderMaterial.Render</c> is the only caller and holds no list, so on Vulkan every draw whose
+    /// shader has a non-empty <see cref="GlobalsLayout"/> reaches the device with set 0 binding 7 unwritten
+    /// &#8212; which the validation layer reports as <c>variable "Globals" ... never updated</c>. The
+    /// draw-time guard does not catch it, because that checks whether a set was bound at all and set 0
+    /// carries the view and lighting buffers regardless. Threading a list to that call site is the fix; this
+    /// parameter is what it will pass.
+    /// </para>
     /// </remarks>
-    public void Bind()
+    public void Bind(RHI.ICommandList? commandList = null)
     {
         Flush();
-        BindBufferBase();
+
+        if (commandList is null)
+        {
+            BindBufferBase();
+            return;
+        }
+
+        commandList.BindUniformBuffer(BindingPoint, RhiBuffer);
     }
 
     private void Commit(in GlobalsMember constant, ReadOnlySpan<byte> value)

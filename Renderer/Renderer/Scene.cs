@@ -752,6 +752,50 @@ namespace ValveResourceFormat.Renderer
             LightingInfo.BindBarnLightBuffer(commandList);
 
             LightBinner.Bind(commandList);
+
+            BindGeometryBuffers(commandList);
+        }
+
+        /// <summary>
+        /// Records this scene's object and transform buffers, which every vertex stage reads to place a
+        /// draw in the world.
+        /// </summary>
+        /// <param name="commandList">The command list to record into, or <see langword="null"/> to do nothing.</param>
+        /// <remarks>
+        /// <para>
+        /// <b>Recording only, deliberately.</b> The OpenGL path already binds these three, in
+        /// <c>MeshBatchRenderer</c>, once per shader change; adding a second <c>glBindBufferBase</c> here
+        /// would be a redundant call rather than a missing one. What OpenGL does not have is a per-command
+        /// list scope, and set 1 has to be non-empty on <em>this</em> list before the first draw that
+        /// declares it &#8212; which <c>depth_only</c>, <c>complex</c> and every other vertex stage
+        /// including <c>common/instancing.slang</c> does.
+        /// </para>
+        /// <para>
+        /// <b>The bone transform slot is the scene's fallback, not the per-mesh matrices.</b>
+        /// <c>MeshBatchRenderer</c> binds <see cref="TransformBufferGpu"/> at
+        /// <see cref="ReservedBufferSlots.BoneTransforms"/> for an unskinned draw and the mesh's own
+        /// <c>BoneMatricesGpu</c> for a skinned one, and only the first of those is scene-wide. Recording
+        /// the fallback here fills the slot for every draw; the per-mesh override still has to be recorded
+        /// where the draw is, which is a call site in a file this change does not own.
+        /// </para>
+        /// </remarks>
+        public void BindGeometryBuffers(RHI.ICommandList? commandList)
+        {
+            if (commandList is null)
+            {
+                return;
+            }
+
+            if (InstanceBufferGpu is { Size: > 0 } instances)
+            {
+                commandList.BindStorageBuffer(instances.BindingPoint, instances.RhiBuffer);
+            }
+
+            if (TransformBufferGpu is { Size: > 0 } transforms)
+            {
+                commandList.BindStorageBuffer(transforms.BindingPoint, transforms.RhiBuffer);
+                commandList.BindStorageBuffer((int)ReservedBufferSlots.BoneTransforms, transforms.RhiBuffer);
+            }
         }
 
         /// <summary>
