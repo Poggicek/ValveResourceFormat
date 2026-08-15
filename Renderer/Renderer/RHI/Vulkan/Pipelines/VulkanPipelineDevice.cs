@@ -47,6 +47,15 @@ public sealed record VulkanPipelineOptions
     /// being reported. On for a test, off for the viewer.</summary>
     public bool TreatInterfaceProblemsAsErrors { get; init; }
 
+    /// <summary>Gets where the command list writes descriptor bindings, or <see langword="null"/> while
+    /// no <see cref="IVulkanDescriptorBinder"/> implementation exists, in which case the binding calls
+    /// refuse and everything else records.</summary>
+    /// <remarks>Here rather than on <see cref="VulkanCoreOptions"/> because this is the layer that owns
+    /// the descriptor set and pipeline layout caches a binder has to write against. When the adapter
+    /// joining <c>VulkanDescriptorWriter</c> and <c>VulkanDescriptorAllocator</c> to the command list is
+    /// written, this is where it is supplied.</remarks>
+    public IVulkanDescriptorBinder? DescriptorBinder { get; init; }
+
     /// <summary>Gets which triangle winding is front facing.</summary>
     /// <remarks>
     /// <see cref="FrontFace.Clockwise"/>, not counter-clockwise, and the difference is not cosmetic.
@@ -61,11 +70,25 @@ public sealed record VulkanPipelineOptions
 }
 
 /// <summary>
-/// A <see cref="VulkanDevice"/> that creates pipelines: layouts from SPIR-V reflection, an in-memory
-/// cache on <see cref="PipelineCacheKey"/>, a <c>VkPipelineCache</c> that survives the process, and
-/// compilation that can be spread across threads.
+/// The complete Vulkan device: everything <see cref="VulkanRecordingDevice"/> can do, plus pipelines
+/// built from SPIR-V reflection, an in-memory cache on <see cref="PipelineCacheKey"/>, a
+/// <c>VkPipelineCache</c> that survives the process, and compilation that can be spread across threads.
 /// </summary>
 /// <remarks>
+/// <para>
+/// <b>This is the type to construct.</b> It is the only one in the backend that satisfies
+/// <see cref="IDevice"/> with no member left throwing, and it sits at the end of the same chain the
+/// OpenGL backend has: <see cref="VulkanDevice"/> creates resources,
+/// <see cref="VulkanRecordingDevice"/> adds recording and submission, and this adds pipelines, mirroring
+/// <c>GLDevice</c> to <c>GLRendererDevice</c> to <c>GLRecordingDevice</c>.
+/// </para>
+/// <para>
+/// It derived from <see cref="VulkanDevice"/> directly until the golden harness went to render through
+/// Vulkan and found it could not: recording and pipeline creation lived on two <i>siblings</i>, so no
+/// single device had both, and the harness had to stand two devices over one core and forward pipeline
+/// creation between them. That cost two upload staging rings and two default samplers per device, one
+/// of each never used. Deriving here rather than composing there is what removes the need.
+/// </para>
 /// <para>
 /// <see cref="VulkanDevice"/> deliberately cannot create a pipeline, for the same reason
 /// <c>GLDevice</c> cannot: a pipeline needs machinery the resource layer has no business owning. This
@@ -90,7 +113,7 @@ public sealed record VulkanPipelineOptions
 /// this device keeps the single-thread rule.
 /// </para>
 /// </remarks>
-public class VulkanPipelineDevice : VulkanDevice
+public class VulkanPipelineDevice : VulkanRecordingDevice
 {
     private readonly ConcurrentDictionary<PipelineCacheKey, Lazy<VulkanGraphicsPipeline>> GraphicsPipelines
         = new(VulkanPipelineKey.Comparer.Instance);
@@ -148,7 +171,7 @@ public class VulkanPipelineDevice : VulkanDevice
     /// <exception cref="ArgumentNullException"><paramref name="core"/> is <see langword="null"/>.</exception>
     /// <exception cref="VulkanException">Creation failed.</exception>
     public VulkanPipelineDevice(VulkanCoreDevice core, bool ownsCore = false, VulkanPipelineOptions? options = null)
-        : base(core, ownsCore)
+        : base(core, ownsCore, options?.DescriptorBinder)
     {
         ArgumentNullException.ThrowIfNull(core);
 
@@ -549,6 +572,9 @@ public class VulkanPipelineDevice : VulkanDevice
 
     /// <summary>Destroys every pipeline, layout and cache this device owns, saving the disk cache first.</summary>
     /// <param name="disposing">Whether managed resources should be released.</param>
+    /// <remarks>First in the chain, and the order is load bearing: pipelines and layouts go before the
+    /// command list's cached image views, which go before the resources those views alias, which go
+    /// before the core. Each level of <c>Dispose</c> releases what it owns and then calls the next.</remarks>
     protected override void Dispose(bool disposing)
     {
         if (disposing && !PipelinesDisposed)

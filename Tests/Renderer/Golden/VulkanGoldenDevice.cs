@@ -2,6 +2,7 @@ using System.Diagnostics.CodeAnalysis;
 using ValveResourceFormat.Renderer.RHI;
 using ValveResourceFormat.Renderer.RHI.Vulkan;
 using ValveResourceFormat.Renderer.RHI.Vulkan.Core;
+using ValveResourceFormat.Renderer.RHI.Vulkan.Descriptors;
 
 namespace Tests.Renderer.Golden
 {
@@ -37,27 +38,29 @@ namespace Tests.Renderer.Golden
     /// no platform extension. That half of the task turned out to be free.
     /// </para>
     /// <para>
-    /// <b>The command list is built with no descriptor binder, because none exists.</b>
+    /// <b>The command list is built with the descriptor layer's binder.</b>
     /// <c>IVulkanDescriptorBinder</c> is the seam <c>VulkanCommandList</c> writes every
     /// <c>BindUniformBuffer</c>, <c>BindStorageBuffer</c>, <c>BindTexture</c> and <c>BindStorageTexture</c>
-    /// through, and nothing in the repository implements it -- the descriptor layer supplies an allocator,
-    /// a pool, a layout cache and a writer, but not the adapter that joins them to the command list. Every
-    /// binding call therefore refuses with the message <c>VulkanCommandList.RequireBinder</c> raises.
-    /// Supplying a stand-in from the test project was rejected deliberately: it would be a second opinion
-    /// about descriptor strategy living outside the layer that owns it, and it would hide the gap rather
-    /// than report it.
+    /// through. It had no implementation when this harness was written, and every binding call refused;
+    /// <c>VulkanDescriptorBinder</c> now supplies one, so the binder is constructed here from the
+    /// pipeline device's two caches and handed to the recording half. Writing a stand-in in this project
+    /// was rejected at the time and remains the right call -- it would have been a second opinion about
+    /// descriptor strategy living outside the layer that owns it, and it would have hidden the gap
+    /// instead of reporting it.
     /// </para>
     /// </remarks>
     internal sealed class VulkanGoldenDevice : VulkanRecordingDevice
     {
         private readonly VulkanPipelineDevice Pipelines;
+        private readonly VulkanDescriptorBinder DescriptorBinder;
 
         private bool PipelinesDisposed;
 
-        private VulkanGoldenDevice(VulkanCoreDevice core, VulkanPipelineDevice pipelines)
-            : base(core, ownsCore: true, binder: null)
+        private VulkanGoldenDevice(VulkanCoreDevice core, VulkanPipelineDevice pipelines, VulkanDescriptorBinder binder)
+            : base(core, ownsCore: true, binder: binder)
         {
             Pipelines = pipelines;
+            DescriptorBinder = binder;
         }
 
         /// <summary>The adapter this device selected, for the run banner and failure messages.</summary>
@@ -103,7 +106,18 @@ namespace Tests.Renderer.Golden
                     EnableDiskCache = false,
                 });
 
-                return new VulkanGoldenDevice(core, pipelines);
+                // The binder needs both of the pipeline device's caches: the descriptor set layouts to
+                // allocate against, and the pipeline layouts to resolve the bare VkPipelineLayout that
+                // IVulkanDescriptorBinder.Flush is handed.
+                var binder = new VulkanDescriptorBinder(
+                    core.Api,
+                    core.Handle,
+                    core.DebugNames,
+                    core.FrameRing,
+                    pipelines.DescriptorSetLayouts,
+                    pipelines.PipelineLayouts);
+
+                return new VulkanGoldenDevice(core, pipelines, binder);
             }
             catch
             {
@@ -219,6 +233,10 @@ namespace Tests.Renderer.Golden
             if (disposing && !PipelinesDisposed)
             {
                 PipelinesDisposed = true;
+
+                // The binder first: its descriptor pools reference nothing the pipeline device owns, but
+                // its sets name the layouts the pipeline device is about to destroy.
+                DescriptorBinder.Dispose();
                 Pipelines.Dispose();
             }
 

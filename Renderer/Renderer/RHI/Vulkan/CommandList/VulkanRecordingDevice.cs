@@ -1,3 +1,4 @@
+using Silk.NET.Vulkan;
 using ValveResourceFormat.Renderer.RHI.Vulkan.Core;
 
 namespace ValveResourceFormat.Renderer.RHI.Vulkan;
@@ -22,17 +23,20 @@ namespace ValveResourceFormat.Renderer.RHI.Vulkan;
 /// which the frame ring resets once the slot's previous work has retired.
 /// </para>
 /// <para>
-/// <b>One submission per frame.</b> See <see cref="Submit"/>: the frame's timeline value can only be
-/// signalled once, and a second submission that did not signal it would let the ring recycle a pool
-/// whose command buffers were still executing.
+/// <b>Several command lists per frame, one signal.</b> <see cref="Submit"/> queues a command list and
+/// <see cref="EndFrame"/> hands the whole frame to the queue in a single batch that signals the timeline
+/// once. That shape is forced rather than chosen: the frame's timeline value can only be signalled once
+/// because a timeline only moves upwards, and a frame legitimately contains several lists &#8212; the
+/// scene, the post-process chain and the overlay are three, because a transfer or a dispatch is not
+/// valid inside a render pass and the overlay runs after the renderer has closed its own list.
 /// </para>
 /// </remarks>
 public class VulkanRecordingDevice : VulkanDevice
 {
     private readonly IVulkanDescriptorBinder? Binder;
+    private readonly List<CommandBuffer> PendingSubmission = [];
 
     private VulkanCommandList? CommandList;
-    private ulong SubmittedSerial;
 
     /// <summary>Creates a device, and the Vulkan core underneath it.</summary>
     /// <param name="messageCallback">Where to route validation and driver diagnostics, or
@@ -64,10 +68,29 @@ public class VulkanRecordingDevice : VulkanDevice
     }
 
     /// <inheritdoc/>
-    /// <remarks>Returns the device's one command list, rebound to a command buffer from this frame's
-    /// pool. The returned list is only valid until the next call.</remarks>
+    /// <exception cref="InvalidOperationException">No device frame is open, or the previous command list
+    /// was never submitted.</exception>
+    /// <remarks>
+    /// <para>
+    /// Returns the device's one command list, rebound to a command buffer from this frame's pool. The
+    /// returned list is only valid until the next call.
+    /// </para>
+    /// <para>
+    /// <b>Beginning a second list before the first is submitted is refused.</b> One
+    /// <see cref="VulkanCommandList"/> is reused, so rebinding it would leave the previous command buffer
+    /// recorded, unended and never queued &#8212; its work silently gone. That is invisible on OpenGL,
+    /// where a recorded call has already executed by the time the next list is acquired, so it is exactly
+    /// the class of mistake the oracle cannot catch and this has to name.
+    /// </para>
+    /// </remarks>
     public override ICommandList BeginCommandList(string name)
     {
+        if (CommandList is { IsRecording: true })
+        {
+            throw new InvalidOperationException(
+                $"Command list '{name}' was begun while the previous one is still recording and unsubmitted. Hand it back with {nameof(IDevice)}.{nameof(Submit)} first; this device reuses one list, so its work would otherwise be discarded.");
+        }
+
         CommandList ??= new VulkanCommandList(this, Binder, name);
         CommandList.Begin(Core.FrameRing.CurrentPool.Acquire(name));
 
@@ -79,32 +102,33 @@ public class VulkanRecordingDevice : VulkanDevice
     {
         base.BeginFrame();
 
-        SubmittedSerial = 0;
+        // The pool backing them was just reset, so anything left here belongs to a frame that never
+        // ended and its handles are already invalid. The same goes for a list still open from that
+        // frame: its recording is gone with the pool, and holding it against the new frame would make
+        // one frame's abandoned work look like the next frame's mistake.
+        PendingSubmission.Clear();
+        CommandList?.Abandon();
     }
 
     /// <inheritdoc/>
     /// <exception cref="ArgumentException"><paramref name="commandList"/> is not this device's.</exception>
-    /// <exception cref="InvalidOperationException">A command list was already submitted this frame, or
-    /// a render pass is still open on this one.</exception>
+    /// <exception cref="InvalidOperationException">A render pass is still open on it.</exception>
     /// <remarks>
     /// <para>
-    /// Ends the command buffer, submits it through
-    /// <see cref="VulkanCoreDevice.SubmitAndSignal"/> so the frame timeline is signalled to this frame's
-    /// serial, and then reports that through <c>NotifyFrameSignalled</c>. Without the last step
-    /// <see cref="VulkanDevice.EndFrame"/> would submit its empty signalling command buffer as well:
-    /// harmless but a wasted submission every frame, and the reason it is there is that the ring
-    /// deadlocks three frames later on a serial nothing ever signalled.
+    /// Closes the command buffer and queues it for the frame's submission. Nothing reaches the GPU until
+    /// <see cref="EndFrame"/>, which hands the frame over as one batch.
     /// </para>
     /// <para>
-    /// <b>Why a second submission in one frame is refused.</b> The signal has to be the frame's last
-    /// piece of work, because <see cref="Core.VulkanFrameRing"/> takes a signalled serial as permission
-    /// to reset that slot's command pool. A timeline semaphore can only be signalled to a strictly
-    /// greater value, so a second submission cannot signal the same serial again; and a second
-    /// submission that did not signal would leave the ring free to reset a pool whose command buffers
-    /// were still executing, since submissions on one queue are ordered when they start and not when
-    /// they finish. Recording several passes into one command list is the shape this backend supports;
-    /// several command lists per frame needs the core to grow a submission that both waits and signals,
-    /// which is a change to a file this layer does not own.
+    /// <b>Why the submission is deferred rather than made here.</b> The frame's timeline value can only
+    /// be signalled once &#8212; a timeline semaphore only moves upwards &#8212; and
+    /// <see cref="Core.VulkanFrameRing"/> treats that signal as permission to reset the slot's command
+    /// pool. So the signal must come after every command buffer of the frame has finished. Submitting
+    /// each list as it arrives and signalling on the last would not achieve that: submissions to one
+    /// queue are ordered when they <i>start</i> and not when they <i>finish</i>, so an earlier
+    /// submission could still be executing when a later one's signal lands, and the ring would recycle a
+    /// pool out from under it. Batching them into a single <c>vkQueueSubmit2</c> is what makes the signal
+    /// genuinely last, because within one batch the signal happens after all of its command buffers
+    /// complete.
     /// </para>
     /// </remarks>
     public override void Submit(ICommandList commandList)
@@ -116,20 +140,82 @@ public class VulkanRecordingDevice : VulkanDevice
             throw new ArgumentException($"This command list did not come from {nameof(VulkanRecordingDevice)}.{nameof(BeginCommandList)}.", nameof(commandList));
         }
 
-        var serial = Core.FrameRing.CurrentSerial;
-
-        if (SubmittedSerial == serial && serial != 0)
-        {
-            throw new InvalidOperationException(
-                $"Frame {serial} has already submitted a command list. Its timeline value can only be signalled once, so record every pass of a frame into the one list.");
-        }
-
         CommandList.End();
         Core.Api.EndCommandBuffer(CommandList.Handle).Check("vkEndCommandBuffer");
-        Core.SubmitAndSignal(CommandList.Handle);
 
-        SubmittedSerial = serial;
-        NotifyFrameSignalled();
+        PendingSubmission.Add(CommandList.Handle);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Hands everything <see cref="Submit"/> queued to the graphics queue as one batch signalling the
+    /// frame timeline, then reports that through <c>NotifyFrameSignalled</c> so the base class does not
+    /// submit its empty signalling command buffer as well. A frame that submitted nothing leaves that
+    /// empty submission to do the signalling, which is what keeps the ring honest either way.
+    /// </remarks>
+    public override void EndFrame()
+    {
+        if (PendingSubmission.Count > 0)
+        {
+            SubmitFrame();
+            PendingSubmission.Clear();
+
+            NotifyFrameSignalled();
+        }
+
+        base.EndFrame();
+    }
+
+    /// <summary>
+    /// Submits the frame's command buffers in one batch that signals the frame timeline.
+    /// </summary>
+    /// <remarks>
+    /// The single-buffer case goes through <see cref="VulkanCoreDevice.SubmitAndSignal"/>, which is the
+    /// core's own sanctioned path and by far the common one. The batch below is the same submission with
+    /// more than one command buffer in it, written here only because the core exposes no span overload;
+    /// it belongs beside <see cref="VulkanCoreDevice.SubmitAndSignal"/> and should move there when that
+    /// file can be changed.
+    /// </remarks>
+    private unsafe void SubmitFrame()
+    {
+        if (PendingSubmission.Count == 1)
+        {
+            Core.SubmitAndSignal(PendingSubmission[0]);
+            return;
+        }
+
+        var infos = new CommandBufferSubmitInfo[PendingSubmission.Count];
+
+        for (var i = 0; i < infos.Length; i++)
+        {
+            infos[i] = new CommandBufferSubmitInfo
+            {
+                SType = StructureType.CommandBufferSubmitInfo,
+                CommandBuffer = PendingSubmission[i],
+            };
+        }
+
+        var signal = new SemaphoreSubmitInfo
+        {
+            SType = StructureType.SemaphoreSubmitInfo,
+            Semaphore = Core.FrameRing.TimelineSemaphore,
+            Value = Core.FrameRing.CurrentSerial,
+            StageMask = PipelineStageFlags2.AllCommandsBit,
+        };
+
+        fixed (CommandBufferSubmitInfo* commands = infos)
+        {
+            var submit = new SubmitInfo2
+            {
+                SType = StructureType.SubmitInfo2,
+                CommandBufferInfoCount = (uint)infos.Length,
+                PCommandBufferInfos = commands,
+                SignalSemaphoreInfoCount = 1,
+                PSignalSemaphoreInfos = &signal,
+            };
+
+            Core.Api.QueueSubmit2(Core.GraphicsQueue, 1, &submit, default).Check("vkQueueSubmit2");
+        }
     }
 
     /// <inheritdoc/>

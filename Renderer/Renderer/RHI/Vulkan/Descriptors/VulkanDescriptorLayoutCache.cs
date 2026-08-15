@@ -52,6 +52,7 @@ public sealed class VulkanDescriptorLayoutCache : IDisposable
     private readonly VulkanDebugNames DebugNames;
     private readonly Action<bool>? OnLookup;
     private readonly Dictionary<LayoutKey, VulkanDescriptorSetLayout> Layouts = [];
+    private readonly Dictionary<ulong, VulkanDescriptorSetLayout> ByHandle = [];
     private readonly VulkanDescriptorSetLayout?[] EmptyLayouts = new VulkanDescriptorSetLayout?[DescriptorSets.Count];
     private readonly Lock Gate = new();
 
@@ -231,6 +232,26 @@ public sealed class VulkanDescriptorLayoutCache : IDisposable
         }
     }
 
+    /// <summary>
+    /// Finds the layout object behind a raw <c>VkDescriptorSetLayout</c> handle.
+    /// </summary>
+    /// <param name="handle">The handle, as held by a pipeline layout.</param>
+    /// <param name="layout">Receives the layout.</param>
+    /// <returns><see langword="true"/> when this cache created it.</returns>
+    /// <remarks>
+    /// A <c>VkDescriptorSetLayout</c> is opaque and cannot be queried for its bindings, and a pipeline
+    /// layout keeps only handles. <see cref="VulkanDescriptorBinder"/> needs the binding table behind one
+    /// to allocate against it and to check what it is being asked to write, so the cache that created
+    /// every layout is where that lookup belongs.
+    /// </remarks>
+    public bool TryResolve(DescriptorSetLayout handle, out VulkanDescriptorSetLayout layout)
+    {
+        lock (Gate)
+        {
+            return ByHandle.TryGetValue(handle.Handle, out layout!);
+        }
+    }
+
     private VulkanDescriptorSetLayout GetOrCreateCore(int set, ImmutableArray<VulkanDescriptorBinding> bindings, string name)
     {
         var sorted = bindings.IsDefault
@@ -247,6 +268,7 @@ public sealed class VulkanDescriptorLayoutCache : IDisposable
 
         var layout = new VulkanDescriptorSetLayout(Api, Device, DebugNames, set, sorted, name);
         Layouts[key] = layout;
+        ByHandle[layout.Handle.Handle] = layout;
         OnLookup?.Invoke(true);
         return layout;
     }
@@ -283,6 +305,7 @@ public sealed class VulkanDescriptorLayoutCache : IDisposable
             }
 
             Layouts.Clear();
+            ByHandle.Clear();
             Array.Clear(EmptyLayouts);
             UniformBuffersLayout = null;
             StorageBuffersLayout = null;

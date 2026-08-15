@@ -203,6 +203,7 @@ public static class VulkanCommandListSmokeTest
             ResolveMultisampled(device, checks);
             DebugLabels(device, checks);
             Refusals(device, checks);
+            MultipleCommandListsInOneFrame(device, checks);
             FrameLifecycle(device, checks);
 
             device.WaitIdle();
@@ -691,16 +692,63 @@ public static class VulkanCommandListSmokeTest
                 Throws<InvalidOperationException>(() => list.SetPushConstants(0f))));
         });
 
-        // The frame timeline can only be signalled once, so a second submission has to be refused rather
-        // than left to corrupt the ring three frames later.
+        // One list is reused, so beginning a second before the first is handed back would leave the
+        // first's command buffer recorded and never queued. Invisible on OpenGL, where the work has
+        // already executed by then.
         device.BeginFrame();
-        var second = device.BeginCommandList("SmokeTest double submit");
-        device.Submit(second);
+        var first = device.BeginCommandList("SmokeTest orphan A");
 
-        checks.Add(("refusal: a second submission in one frame is refused",
-            Throws<InvalidOperationException>(() => device.Submit(second))));
+        checks.Add(("refusal: beginning a second list before submitting the first is refused",
+            Throws<InvalidOperationException>(() => device.BeginCommandList("SmokeTest orphan B"))));
+
+        device.Submit(first);
+        device.EndFrame();
+    }
+
+    /// <summary>
+    /// Submits three command lists in one device frame and proves all three ran, in order.
+    /// </summary>
+    /// <remarks>
+    /// The shape a real frame has: the scene, the post-process chain and the overlay are three lists,
+    /// because a transfer is not valid inside a render pass and the overlay draws after the renderer has
+    /// closed its own. They reach the queue as one batch signalling the timeline once, so this checks
+    /// both that nothing was dropped and that the batch executes in submission order &#8212; the second
+    /// list reads what the first wrote, and the third reads what the second wrote.
+    /// </remarks>
+    private static void MultipleCommandListsInOneFrame(VulkanRecordingDevice device, List<(string, bool)> checks)
+    {
+        using var texture = ColorTarget(device, "SmokeTest batched target");
+        using var readback = Readback(device, ImageSize * ImageSize * 4, "SmokeTest batched readback");
+
+        device.BeginFrame();
+
+        var scene = device.BeginCommandList("SmokeTest batch 1 of 3");
+
+        scene.BeginRenderPass(new RenderPassDesc(
+            [new ColorAttachmentDesc(texture, LoadOp.Clear, StoreOp.Store, ClearBlue)],
+            null,
+            "SmokeTest batched pass"));
+        scene.EndRenderPass();
+
+        device.Submit(scene);
+
+        var transfer = device.BeginCommandList("SmokeTest batch 2 of 3");
+
+        transfer.Barrier(new TextureBarrier(texture, ResourceState.ColorTarget, ResourceState.CopySource));
+        device.Submit(transfer);
+
+        var copy = device.BeginCommandList("SmokeTest batch 3 of 3");
+
+        copy.CopyTextureToBuffer(texture, 0, 0, readback);
+        device.Submit(copy);
 
         device.EndFrame();
+        device.WaitIdle();
+
+        // A dropped list, a batch submitted out of order, or a signal that landed before the work
+        // finished all show up here rather than as a silent wrong pixel later.
+        checks.Add(("frames: three command lists in one frame all run, in submission order",
+            IsSolid(readback, [0, 0, 255, 255])));
     }
 
     private static void FrameLifecycle(VulkanRecordingDevice device, List<(string, bool)> checks)

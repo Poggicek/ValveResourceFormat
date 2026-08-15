@@ -51,18 +51,22 @@ public interface ICommandList : IDisposable
 
     /// <summary>Sets the viewport.</summary>
     /// <param name="x">Left edge in pixels.</param>
-    /// <param name="y">Top edge in pixels.</param>
+    /// <param name="y">Bottom edge in pixels, counted upwards from the bottom of the target, as
+    /// <c>glViewport</c> takes it. The Vulkan backend converts to its own top-left origin with a
+    /// negative viewport height.</param>
     /// <param name="width">Width in pixels.</param>
     /// <param name="height">Height in pixels.</param>
-    /// <param name="minDepth">Minimum depth, normally 0.</param>
-    /// <param name="maxDepth">Maximum depth, normally 1.</param>
+    /// <param name="minDepth">Minimum depth. Carries the depth range: there is deliberately no
+    /// separate depth-range call, because Vulkan has none.</param>
+    /// <param name="maxDepth">Maximum depth.</param>
     /// <remarks>The Vulkan backend flips Y with a negative viewport height rather than in shaders,
     /// which keeps screen-space derivatives and the post-process chain correct.</remarks>
     void SetViewport(int x, int y, int width, int height, float minDepth = 0f, float maxDepth = 1f);
 
     /// <summary>Sets the scissor rectangle.</summary>
     /// <param name="x">Left edge in pixels.</param>
-    /// <param name="y">Top edge in pixels.</param>
+    /// <param name="y">Bottom edge in pixels, counted upwards from the bottom of the target, as
+    /// <c>glScissor</c> takes it.</param>
     /// <param name="width">Width in pixels.</param>
     /// <param name="height">Height in pixels.</param>
     void SetScissor(int x, int y, int width, int height);

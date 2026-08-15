@@ -54,6 +54,9 @@ public sealed class VulkanDescriptorAllocator : IDisposable
     /// <summary>Gets the layout cache these sets are allocated against.</summary>
     public VulkanDescriptorLayoutCache Layouts { get; }
 
+    /// <summary>Gets the logical device the pools belong to.</summary>
+    public Device Device { get; }
+
     /// <summary>Creates an allocator.</summary>
     /// <param name="api">The Vulkan entry points.</param>
     /// <param name="device">The logical device.</param>
@@ -77,6 +80,7 @@ public sealed class VulkanDescriptorAllocator : IDisposable
 
         FrameRing = frameRing;
         Layouts = layouts;
+        Device = device;
 
         FramePools = new VulkanDescriptorPool[frameRing.FramesInFlight];
         SlotSerials = new ulong[frameRing.FramesInFlight];

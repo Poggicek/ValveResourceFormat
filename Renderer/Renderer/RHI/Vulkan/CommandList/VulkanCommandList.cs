@@ -144,6 +144,34 @@ public sealed unsafe class VulkanCommandList : ICommandList
         Recording = false;
     }
 
+    /// <summary>
+    /// Drops whatever was being recorded, without ending the command buffer or requiring a render pass
+    /// to have been closed.
+    /// </summary>
+    /// <remarks>
+    /// For a frame that ended while this list was still open: the frame ring resets the slot's command
+    /// pool on the way into the next frame, which invalidates every buffer it handed out, so the
+    /// recording is already gone and only this object's opinion of it remains. Deliberately not a way to
+    /// discard work mid-frame &#8212; that is what <see cref="VulkanRecordingDevice.BeginCommandList"/>
+    /// refuses, and this is what keeps the refusal from outliving the frame that earned it.
+    /// </remarks>
+    public void Abandon()
+    {
+        if (Disposed)
+        {
+            return;
+        }
+
+        Command = default;
+        Recording = false;
+        InRenderPass = false;
+        PassHeight = 0;
+
+        Pipeline = null;
+        PipelineIsGraphics = false;
+        IndexBufferBound = false;
+    }
+
     // ---- render passes ----
 
     /// <inheritdoc/>

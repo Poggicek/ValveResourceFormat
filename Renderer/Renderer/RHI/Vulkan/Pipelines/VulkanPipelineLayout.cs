@@ -192,6 +192,7 @@ public sealed class VulkanPipelineLayoutCache : IDisposable
     private readonly VulkanPipelineStats Stats;
     private readonly VulkanDescriptorLayoutCache SetLayouts;
     private readonly Dictionary<ulong, VulkanPipelineLayout> Cache = [];
+    private readonly Dictionary<ulong, VulkanPipelineLayout> ByHandle = [];
     private readonly Lock Gate = new();
 
     private bool Disposed;
@@ -210,6 +211,26 @@ public sealed class VulkanPipelineLayoutCache : IDisposable
 
     /// <summary>Gets the descriptor set layout cache the layouts are built from.</summary>
     public VulkanDescriptorLayoutCache DescriptorSetLayouts => SetLayouts;
+
+    /// <summary>
+    /// Finds the pipeline layout behind a raw <c>VkPipelineLayout</c> handle.
+    /// </summary>
+    /// <param name="handle">The handle, as carried by <see cref="IVulkanPipeline.Layout"/>.</param>
+    /// <param name="layout">Receives the layout.</param>
+    /// <returns><see langword="true"/> when this cache created it.</returns>
+    /// <remarks>
+    /// <see cref="IVulkanDescriptorBinder.Flush"/> is handed a bare handle, deliberately: the contract's
+    /// pipeline interfaces carry no Vulkan types, so that is all the command list has. Allocating a
+    /// descriptor set needs the <c>VkDescriptorSetLayout</c> the pipeline layout declared at that index,
+    /// and a pipeline layout cannot be queried for it, so the cache that created it answers instead.
+    /// </remarks>
+    public bool TryGetByHandle(PipelineLayout handle, out VulkanPipelineLayout layout)
+    {
+        lock (Gate)
+        {
+            return ByHandle.TryGetValue(handle.Handle, out layout!);
+        }
+    }
 
     /// <summary>Initializes the cache.</summary>
     /// <param name="api">The Vulkan entry points.</param>
@@ -287,6 +308,7 @@ public sealed class VulkanPipelineLayoutCache : IDisposable
 
             var created = new VulkanPipelineLayout(Api, Device, DebugNames, setLayouts, pushConstants, problems, name);
             Cache[hash] = created;
+            ByHandle[created.Handle.Handle] = created;
             Stats.Count(VulkanPipelineCounter.PipelineLayoutsCreated);
 
             return created;
@@ -311,6 +333,7 @@ public sealed class VulkanPipelineLayoutCache : IDisposable
             }
 
             Cache.Clear();
+            ByHandle.Clear();
         }
     }
 }

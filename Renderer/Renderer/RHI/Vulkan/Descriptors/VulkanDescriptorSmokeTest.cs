@@ -212,6 +212,7 @@ public static unsafe class VulkanDescriptorSmokeTest
             CheckTypeGuards(device, cache, allocator, writer, probe, checks);
             CheckFrameLifecycle(device, cache, allocator, checks);
             CheckPersistent(cache, allocator, checks);
+            CheckBinder(device, cache, allocator, probe, checks);
 
             if (provocation != VulkanDescriptorProvocation.None)
             {
@@ -306,6 +307,16 @@ public static unsafe class VulkanDescriptorSmokeTest
 
         checks.Add(("canonical: every set of the contract resolves to a layout",
             AllSetsResolve(cache)));
+
+        // What the shaders are decorated with and what the layouts declare have to be the same numbers,
+        // or a binding lands in a set the layout describes differently and the wrong resource is read
+        // without an error. Cheap to assert and the only place the two halves meet.
+        checks.Add(("emission: the shader emitter and this layer agree on every set number",
+            VulkanGlsl.UniformBufferSet == DescriptorSets.UniformBuffers
+            && VulkanGlsl.StorageBufferSet == DescriptorSets.StorageBuffers
+            && VulkanGlsl.GlobalTextureSet == DescriptorSets.ReservedTextures
+            && VulkanGlsl.MaterialTextureSet == DescriptorSets.MaterialTextures
+            && VulkanGlsl.StorageImageSet == DescriptorSets.StorageImages));
     }
 
     /// <summary>
@@ -686,6 +697,149 @@ public static unsafe class VulkanDescriptorSmokeTest
         // load must settle rather than grow with the frame count.
         checks.Add(("frames: pool count stays bounded across the wrap",
             after.FramePoolCount <= before.FrameSlots * 2));
+    }
+
+    /// <summary>
+    /// Drives <see cref="VulkanDescriptorBinder"/> against a real pipeline layout and a real command
+    /// buffer, with the validation layer watching.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The command buffer is recorded and thrown away rather than submitted, the same shape the
+    /// provocations use. That is enough: <c>vkCmdBindDescriptorSets</c> checks a set against the pipeline
+    /// layout's declaration at <i>record</i> time, so the thing most worth proving here &#8212; that a set
+    /// allocated from this layer's layout is compatible with a layout the pipeline layer built &#8212; is
+    /// established without a draw, a shader or a render pass.
+    /// </para>
+    /// <para>
+    /// The pipeline layout is built through the real <see cref="VulkanPipelineLayoutCache"/> rather than
+    /// by hand, because a hand-built one would not be in the cache the binder resolves through and the
+    /// test would be checking a path no frame takes.
+    /// </para>
+    /// </remarks>
+    private static void CheckBinder(
+        VulkanDevice device,
+        VulkanDescriptorLayoutCache cache,
+        VulkanDescriptorAllocator allocator,
+        DescriptorProbe probe,
+        List<(string, bool)> checks)
+    {
+        var core = device.Core;
+
+        using var pipelineLayouts = new VulkanPipelineLayoutCache(core.Api, core.Handle, core.DebugNames, new VulkanPipelineStats(), cache);
+        using var binder = new VulkanDescriptorBinder(core.Api, cache, pipelineLayouts, allocator);
+
+        // A shader touching all five sets, so every one of them resolves and the binder has somewhere to
+        // put each kind of binding.
+        var reflection = new SpirvReflectionResult
+        {
+            Stage = ShaderStage.Compute,
+            DescriptorBindings =
+            [
+                new("ViewConstants", DescriptorSets.UniformBuffers, (int)ReservedBufferSlots.View, SpirvResourceKind.UniformBuffer, 1, 256),
+                new("g_objectBuffer", DescriptorSets.StorageBuffers, (int)ReservedBufferSlots.Objects, SpirvResourceKind.StorageBuffer, 1, 64),
+                new("g_tBRDFLookup", DescriptorSets.ReservedTextures, (int)ReservedTextureSlots.BRDFLookup, SpirvResourceKind.CombinedImageSampler, 1, 0),
+                new("g_tColor", DescriptorSets.MaterialTextures, 0, SpirvResourceKind.CombinedImageSampler, 1, 0),
+                new("g_tDest", DescriptorSets.StorageImages, 1, SpirvResourceKind.StorageImage, 1, 0),
+            ],
+        };
+
+        var layout = pipelineLayouts.GetOrCreate([reflection], device.Limits.MaxPushConstantSize, "SmokeTest binder layout");
+
+        checks.Add(("binder: the pipeline layout resolves back through the cache",
+            pipelineLayouts.TryGetByHandle(layout.Handle, out var found) && ReferenceEquals(found, layout)));
+        checks.Add(("binder: its set layouts resolve back to this layer's objects",
+            cache.TryResolve(layout.SetLayouts[DescriptorSets.UniformBuffers], out var resolved)
+            && ReferenceEquals(resolved, cache.UniformBuffers)));
+
+        using var pool = new VulkanCommandPool(core.Api, core.Handle, core.GraphicsQueueFamily, core.DebugNames, "SmokeTest binder pool");
+
+        var command = pool.Acquire("SmokeTest binder");
+        binder.Reset(command);
+
+        // Nothing bound yet, so a flush before any binding must issue no Vulkan call at all.
+        binder.Flush(command, PipelineBindPoint.Compute, layout.Handle);
+
+        checks.Add(("binder: a flush with nothing bound issues nothing", binder.Statistics.NoOpFlushes == 1));
+
+        binder.BindUniformBuffer((int)ReservedBufferSlots.View, probe.Uniform.Handle, 0, (ulong)probe.Uniform.SizeInBytes);
+        binder.BindStorageBuffer((int)ReservedBufferSlots.Objects, probe.Storage.Handle, 0, (ulong)probe.Storage.SizeInBytes);
+        binder.BindSampledImage(DescriptorSets.ReservedTextures, (int)ReservedTextureSlots.BRDFLookup,
+            probe.Texture.View, device.DefaultSampler.Handle, ImageLayout.ShaderReadOnlyOptimal);
+        binder.BindSampledImage(DescriptorSets.MaterialTextures, 0,
+            probe.Texture.View, device.DefaultSampler.Handle, ImageLayout.ShaderReadOnlyOptimal);
+
+        binder.Flush(command, PipelineBindPoint.Compute, layout.Handle);
+
+        var afterFirst = binder.Statistics;
+
+        checks.Add(("binder: the first flush allocated one set per touched set", afterFirst.SetsAllocated == 4));
+        checks.Add(("binder: and wrote every binding", afterFirst.DescriptorsWritten == 4));
+        checks.Add(("binder: in a single vkUpdateDescriptorSets", afterFirst.UpdateCalls == 1));
+
+        // Sets 0, 1, 2 and 3 are consecutive, so they bind in one call rather than four.
+        checks.Add(("binder: consecutive sets bind in one call", afterFirst.BindCalls == 1));
+
+        // The property the interface asks for in so many words: a binder that has seen no change since
+        // the last flush should do nothing.
+        binder.Flush(command, PipelineBindPoint.Compute, layout.Handle);
+
+        checks.Add(("binder: an unchanged flush does nothing", binder.Statistics.NoOpFlushes == 2
+            && binder.Statistics.SetsAllocated == afterFirst.SetsAllocated));
+
+        // Rebinding the identical resource is not a change either, which is what stops a batch that
+        // rebinds the same material's textures from allocating a set per draw.
+        binder.BindUniformBuffer((int)ReservedBufferSlots.View, probe.Uniform.Handle, 0, (ulong)probe.Uniform.SizeInBytes);
+        binder.Flush(command, PipelineBindPoint.Compute, layout.Handle);
+
+        checks.Add(("binder: rebinding the same resource is not a change", binder.Statistics.SetsAllocated == afterFirst.SetsAllocated));
+
+        // Changing one binding must produce a NEW set, never a rewrite: the previous set is referenced by
+        // commands already recorded, and rewriting it would change what they read.
+        var previous = binder.Statistics.SetsAllocated;
+        binder.BindUniformBuffer((int)ReservedBufferSlots.View, probe.Uniform.Handle, 256, 256);
+        binder.Flush(command, PipelineBindPoint.Compute, layout.Handle);
+
+        checks.Add(("binder: a changed binding allocates a fresh set rather than rewriting one",
+            binder.Statistics.SetsAllocated == previous + 1));
+        checks.Add(("binder: and rebinds only that set", binder.Statistics.BindCalls == afterFirst.BindCalls + 1));
+
+        // Set 4 is not consecutive with 0 to 3, so it costs its own bind call.
+        var beforeImage = binder.Statistics.BindCalls;
+        binder.BindStorageImage(1, probe.StorageImage?.View ?? probe.Texture.View, ImageLayout.General);
+
+        if (probe.StorageImage is not null)
+        {
+            binder.Flush(command, PipelineBindPoint.Compute, layout.Handle);
+
+            checks.Add(("binder: a storage image lands in set 4 and binds separately",
+                binder.Statistics.BindCalls == beforeImage + 1));
+        }
+        else
+        {
+            checks.Add(("binder: no storage image format supported here, skipped", true));
+        }
+
+        // A pipeline layout this binder cannot resolve is refused rather than guessed at.
+        checks.Add(("binder: an unknown pipeline layout is refused",
+            Throws<InvalidOperationException>(() => binder.Flush(command, PipelineBindPoint.Compute, default))));
+
+        binder.Reset(command);
+
+        checks.Add(("binder: reset drops everything accumulated", ResetIsQuiet(binder, command, layout)));
+
+        core.Api.EndCommandBuffer(command).Check("vkEndCommandBuffer");
+    }
+
+    private static bool ResetIsQuiet(VulkanDescriptorBinder binder, CommandBuffer command, VulkanPipelineLayout layout)
+    {
+        var before = binder.Statistics;
+        binder.Flush(command, PipelineBindPoint.Compute, layout.Handle);
+        var after = binder.Statistics;
+
+        return after.SetsAllocated == before.SetsAllocated
+            && after.BindCalls == before.BindCalls
+            && after.NoOpFlushes == before.NoOpFlushes + 1;
     }
 
     private static void CheckPersistent(

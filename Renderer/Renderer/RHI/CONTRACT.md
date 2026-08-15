@@ -192,6 +192,17 @@ That is not a defect in those sites so much as an ordering artifact, and the gol
 surfaced it: with the flag on, every drawing scene fails identically. Turn the flag on once the scene
 passes are wrapped and the material path produces pipelines, and let the suite say whether it worked.
 
+## Viewport and scissor are bottom-left origin
+
+As OpenGL takes them; the Vulkan backend converts. **This is not a preference.** Call sites hand the
+same numbers to `glViewport` and to `ICommandList.SetViewport` in consecutive lines — the barn light
+atlas does exactly that, once per shadow caster — so the two must denote the same rectangle.
+
+Front-face winding follows from it, which is why the Vulkan pipeline layer sets
+`FrontFace.Clockwise`: the negative-height viewport that flips the image also flips the sign of the
+area Vulkan classifies by. **Change the two together or geometry renders inside out**, which reads as
+a modelling fault rather than a viewport one.
+
 ## Depth range belongs to the viewport, and the renderer's layer scheme has to follow
 
 `SetViewport` carries `minDepth`/`maxDepth`, and there is deliberately no separate depth-range call.
