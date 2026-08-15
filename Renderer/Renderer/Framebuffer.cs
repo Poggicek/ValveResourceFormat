@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using OpenTK.Graphics.OpenGL;
 using OpenTK.Mathematics;
+using ValveResourceFormat.Renderer.Buffers;
 using ValveResourceFormat.Renderer.RHI;
 
 namespace ValveResourceFormat.Renderer;
@@ -87,6 +88,14 @@ public class Framebuffer
     public void Bind(FramebufferTarget targetState)
     {
         TargetState = targetState;
+
+        if (!RendererDevice.IsOpenGL())
+        {
+            // There is no framebuffer object to make current. The equivalent is beginning a render pass
+            // over this framebuffer's attachments, which <see cref="RenderPass"/> describes.
+            return;
+        }
+
         GL.BindFramebuffer(targetState, FboHandle);
     }
 
@@ -197,10 +206,18 @@ public class Framebuffer
     /// <param name="name">Debug label applied to the framebuffer object.</param>
     public Framebuffer(string name)
     {
+        DebugName = name;
+
+        if (!RendererDevice.IsOpenGL())
+        {
+            // Nothing to create. Under dynamic rendering a pass names its attachments directly, so this
+            // object is a description of them rather than a handle; see <see cref="RenderPass"/>.
+            return;
+        }
+
         GL.CreateFramebuffers(1, out int handle);
         GL.ObjectLabel(ObjectLabelIdentifier.Framebuffer, handle, name.Length, name);
         FboHandle = handle;
-        DebugName = name;
     }
 
     #region Default OpenGL Framebuffer instance, and equality checks
@@ -331,6 +348,15 @@ public class Framebuffer
 
         CreateAttachments();
 
+        if (!RendererDevice.IsOpenGL())
+        {
+            // Completeness is a property of a framebuffer object, and there is none. The attachments were
+            // allocated through the device, which throws on a format or extent it cannot honour, so the
+            // check OpenGL performs here has already happened by construction.
+            InitialStatus = FramebufferErrorCode.FramebufferComplete;
+            return InitialStatus;
+        }
+
         var fboTarget = FramebufferTarget.Framebuffer;
         Bind(fboTarget);
 
@@ -371,22 +397,39 @@ public class Framebuffer
 
     private void CreateAttachments()
     {
-        Color?.Delete();
-        Depth?.Delete();
+        // The stencil view aliases the depth attachment's storage, so it is released before its parent.
         Stencil?.Delete();
+        Depth?.Delete();
+        Color?.Delete();
 
         var (width, height) = (Width, Height);
 
         if (ColorFormat != null)
         {
-            Color = CreateAttachment(ColorFormat, width, height, NumMips);
+            Color = CreateAttachment(
+                ColorFormat,
+                width,
+                height,
+                NumMips,
+                TextureUsage.ColorTarget | TextureUsage.Sampled | TextureUsage.CopySource | TextureUsage.CopyDestination,
+                "FramebufferColor");
+
             Color.SetLabel("FramebufferColor");
+
+            // Inert on a device with no framebuffer object; the attachment is named by RenderPass instead.
             Color.AttachToFramebuffer(this, FramebufferAttachment.ColorAttachment0, 0);
         }
 
         if (DepthFormat != null)
         {
-            Depth = CreateAttachment(DepthFormat, width, height);
+            Depth = CreateAttachment(
+                DepthFormat,
+                width,
+                height,
+                1,
+                TextureUsage.DepthStencilTarget | TextureUsage.Sampled | TextureUsage.CopySource,
+                "FramebufferDepth");
+
             Depth.SetLabel("FramebufferDepth");
             Depth.AttachToFramebuffer(this, FramebufferAttachment.DepthAttachment, 0);
 
@@ -394,28 +437,107 @@ public class Framebuffer
             {
                 Depth.AttachToFramebuffer(this, FramebufferAttachment.DepthStencilAttachment, 0);
 
-                Stencil = Depth.CreateView(DepthFormat.InternalFormat);
-
-                Stencil.SetLabel("FramebufferStencil");
-                Stencil.SetBaseMaxLevel(0, 0);
-                Stencil.RhiFormat = Depth.RhiFormat;
-                GL.TextureParameter(Stencil.Handle, TextureParameterName.DepthStencilTextureMode, (int)DepthStencilTextureMode.StencilIndex);
+                // The stencil aspect travels on the view rather than as a texture parameter. Only OpenGL
+                // lets a texture object carry DepthStencilTextureMode, and the view has one mip, so the
+                // base and max level this used to clamp are already the only ones it has.
+                if (DeviceCanAllocate && Depth.RhiFormat != RhiFormat.Undefined)
+                {
+                    // The stencil aspect travels on the view rather than as a texture parameter. Only
+                    // OpenGL lets a texture object carry DepthStencilTextureMode, and the view has one
+                    // mip, so the base and max level this used to clamp are already the only ones it has.
+                    Stencil = Depth.CreateView(0, 1, 0, 1, Depth.RhiFormat, TextureAspect.Stencil);
+                    Stencil.SetLabel("FramebufferStencil");
+                }
+                else
+                {
+                    // The depth attachment was allocated outside the device, so its RHI description would
+                    // report the wrong sample count and glTextureView would reject the view. See
+                    // DeviceCanAllocate.
+                    Stencil = Depth.CreateView(DepthFormat.InternalFormat);
+                    Stencil.SetLabel("FramebufferStencil");
+                    Stencil.SetBaseMaxLevel(0, 0);
+                    Stencil.RhiFormat = Depth.RhiFormat;
+                    GL.TextureParameter(Stencil.Handle, TextureParameterName.DepthStencilTextureMode, (int)DepthStencilTextureMode.StencilIndex);
+                }
             }
         }
     }
 
-    private RenderTexture CreateAttachment(AttachmentFormat format, int width, int height, int numMips = 1)
+    /// <summary>
+    /// Gets a value indicating whether this framebuffer's attachments can be described to the device.
+    /// </summary>
+    /// <remarks>
+    /// False for exactly one shape: a multisample target carrying a single sample. A
+    /// <see cref="TextureDesc"/> decides multisample-ness from <see cref="TextureDesc.SampleCount"/>
+    /// being greater than one, so a one-sample multisample texture cannot be described at all, and asking
+    /// for it yields a plain 2D texture that a <c>sampler2DMS</c> then reads as black. The renderer uses
+    /// this shape deliberately &#8212; it exercises the post-process chain's multisample resolve without
+    /// depending on any driver's sample pattern &#8212; so those attachments keep the OpenGL allocation
+    /// rather than being silently allocated as something else.
+    /// </remarks>
+    private bool DeviceCanAllocate => Target != TextureTarget.Texture2DMultisample || NumSamples > 1;
+
+    /// <summary>
+    /// Allocates one attachment, through the device when there is one that can express its format.
+    /// </summary>
+    /// <remarks>
+    /// Not <c>new RenderTexture(target, format, ...)</c>, because that constructor always describes its
+    /// storage as single-sampled and this is the one place in the renderer that allocates multisampled
+    /// storage. The texture is created from a descriptor carrying the real sample count and wrapped.
+    /// </remarks>
+    private RenderTexture CreateAttachment(AttachmentFormat format, int width, int height, int numMips, TextureUsage usage, string name)
     {
-        var attachment = new RenderTexture(Target, width, height, 1, numMips);
-        var mipCount = Math.Min(RenderTexture.MaxMipCount(width, height), attachment.NumMipLevels);
+        var mipCount = Math.Min(RenderTexture.MaxMipCount(width, height), numMips);
+        var multisampled = Target == TextureTarget.Texture2DMultisample;
+        var sampleCount = multisampled ? Math.Max(1, NumSamples) : 1;
 
-        if (Target == TextureTarget.Texture2DMultisample)
+        if (multisampled && mipCount > 1)
         {
-            if (mipCount > 1)
-            {
-                throw new InvalidOperationException("Multisample textures do not support mipmaps");
-            }
+            throw new InvalidOperationException("Multisample textures do not support mipmaps");
+        }
 
+        if (multisampled)
+        {
+            mipCount = 1;
+        }
+
+        var rhiFormat = ToRhiFormat(format.InternalFormat);
+        var device = RendererDevice.Current;
+
+        if (device is not null && rhiFormat != RhiFormat.Undefined && DeviceCanAllocate)
+        {
+            var texture = device.CreateTexture(new TextureDesc(
+                width,
+                height,
+                rhiFormat,
+                usage,
+                name,
+                Depth: 1,
+                MipLevels: mipCount,
+                SampleCount: sampleCount,
+                Dimension: TextureDimension.Texture2D));
+
+            var allocated = new RenderTexture(texture, Target);
+
+            // Sampler state that only an OpenGL texture object carries. A no-op elsewhere, and the mip
+            // clamp is what stops a sampler reading levels this attachment never allocated.
+            allocated.SetBaseMaxLevel(0, mipCount - 1);
+            return allocated;
+        }
+
+        if (device is not null && device.Backend != RhiBackend.OpenGL)
+        {
+            throw new InvalidOperationException(DeviceCanAllocate
+                ? $"Attachment format {format.InternalFormat} has no {nameof(RhiFormat)} member, so it cannot be allocated on a {device.Backend} device. Add it to {nameof(ToRhiFormat)}, or give the call site a format the contract carries."
+                : $"Framebuffer '{DebugName}' asks for a multisample target with {NumSamples} sample(s), which no {nameof(TextureDesc)} can describe: multisample-ness is decided by {nameof(TextureDesc.SampleCount)} being greater than one. Use a real sample count, or a non-multisample target.");
+        }
+
+        // No device at all: the direct OpenGL allocation this replaces, kept for the tools that use the
+        // renderer without a presentation layer.
+        var attachment = new RenderTexture(Target, width, height, 1, numMips);
+
+        if (multisampled)
+        {
             GL.TextureStorage2DMultisample(attachment.Handle, NumSamples, (SizedInternalFormat)format.InternalFormat, width, height, fixedsamplelocations: true);
         }
         else
@@ -424,7 +546,7 @@ public class Framebuffer
         }
 
         attachment.SetBaseMaxLevel(0, mipCount - 1);
-        attachment.RhiFormat = ToRhiFormat(format.InternalFormat);
+        attachment.RhiFormat = rhiFormat;
         return attachment;
     }
 
@@ -524,22 +646,21 @@ public class Framebuffer
     /// </summary>
     public void Delete()
     {
-        GL.DeleteFramebuffer(FboHandle);
-
-        if (Color != null)
+        if (FboHandle != 0)
         {
-            GL.DeleteTexture(Color.Handle);
+            GL.DeleteFramebuffer(FboHandle);
         }
 
-        if (Depth != null)
-        {
-            GL.DeleteTexture(Depth.Handle);
-        }
+        // Through the textures rather than glDeleteTexture, so device-allocated storage is retired by the
+        // device. Destroying one directly while a frame still references it is undefined on Vulkan.
+        // The stencil view aliases the depth attachment's storage, so it goes first.
+        Stencil?.Delete();
+        Depth?.Delete();
+        Color?.Delete();
 
-        if (Stencil != null)
-        {
-            GL.DeleteTexture(Stencil.Handle);
-        }
+        Stencil = null;
+        Depth = null;
+        Color = null;
     }
 
     /// <summary>
