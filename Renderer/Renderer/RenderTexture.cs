@@ -16,8 +16,14 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Gets the OpenGL texture target (e.g. Texture2D, TextureCubeMap).</summary>
         public TextureTarget Target { get; }
 
-        /// <summary>Gets the OpenGL texture object handle, or 0 once <see cref="Delete"/> has been called.</summary>
-        public int Handle { get; private set; }
+        /// <summary>Gets the OpenGL texture object handle, or 0 once <see cref="Delete"/> has been called
+        /// or when the device is not an OpenGL one.</summary>
+        /// <remarks>Derived from <see cref="RhiTexture"/> when the storage was allocated through a device.
+        /// A texture's identity is the <see cref="ITexture"/>; this is the OpenGL name inside it, kept
+        /// because the renderer still has direct GL call sites that need one.</remarks>
+        public int Handle => rhiTexture is GLTexture gl ? gl.Handle : legacyHandle;
+
+        private int legacyHandle;
 
         /// <summary>Gets optional spritesheet layout data when the texture is a sprite atlas.</summary>
         public Texture.SpritesheetData? SpriteSheetData { get; }
@@ -53,43 +59,59 @@ namespace ValveResourceFormat.Renderer
         /// only costs the ability to upload to or create a view of this texture through the RHI.</remarks>
         public RhiFormat RhiFormat { get; set; }
 
-        private GLTexture? rhiTexture;
+        private ITexture? rhiTexture;
+        private readonly IDevice? explicitDevice;
+        private bool ownsLegacyHandle;
+
+        /// <summary>Gets the device this texture was allocated through, or <see langword="null"/> when it
+        /// came from the legacy direct-OpenGL path.</summary>
+        private IDevice? Device => RendererDevice.Resolve(explicitDevice);
 
         /// <summary>
         /// Gets this texture as an <see cref="ITexture"/>, so it can be passed to
         /// <see cref="ICommandList.BindTexture"/>.
         /// </summary>
         /// <remarks>
-        /// A non-owning wrapper around the same OpenGL object, not a second allocation: this texture
-        /// keeps ownership and <see cref="Delete"/> is still what frees it. It is the bridge that lets
-        /// material and global texture bindings move onto the RHI before texture allocation does, and it
-        /// goes away as those allocations move onto <see cref="IDevice.CreateTexture"/>.
+        /// <para>
+        /// When the texture was created with a known <see cref="RhiFormat"/> this <i>is</i> the texture:
+        /// the device allocated it and <see cref="Delete"/> destroys it through the device.
+        /// </para>
+        /// <para>
+        /// The remaining constructors take a target and an extent but no format, and cannot allocate:
+        /// <see cref="IDevice.CreateTexture"/> needs the format up front, whereas OpenGL is happy to hand
+        /// out a name and be told the format later by whoever calls <c>glTextureStorage</c>. Those
+        /// textures keep a bare OpenGL name and this wraps it, exactly as before. Every such call site has
+        /// to move to a format-carrying constructor before it can run on Vulkan.
+        /// </para>
         /// </remarks>
         public ITexture RhiTexture
         {
             get
             {
-                if (rhiTexture is null || rhiTexture.Handle != Handle)
+                if (rhiTexture is null || (rhiTexture is GLTexture gl && gl.Handle != Handle))
                 {
                     // Permissive usage on purpose: OpenGL ignores it at creation, and the only thing that
                     // reads it is barrier translation, where a superset is the conservative answer.
-                    var desc = new TextureDesc(
-                        Math.Max(Width, 1),
-                        Math.Max(Height, 1),
-                        RhiFormat,
-                        TextureUsage.Sampled | TextureUsage.Storage | TextureUsage.CopySource | TextureUsage.CopyDestination,
-                        Name ?? string.Empty,
-                        Math.Max(Depth, 1),
-                        Math.Max(NumMipLevels, 1),
-                        1,
-                        GLTexture.ToDimension(Target));
-
-                    rhiTexture = GLTexture.Wrap(Handle, Target, in desc);
+                    rhiTexture = GLTexture.Wrap(legacyHandle, Target, Describe(RhiFormat, LegacyUsage));
                 }
 
                 return rhiTexture;
             }
         }
+
+        private const TextureUsage LegacyUsage =
+            TextureUsage.Sampled | TextureUsage.Storage | TextureUsage.CopySource | TextureUsage.CopyDestination;
+
+        private TextureDesc Describe(RhiFormat format, TextureUsage usage) => new(
+            Math.Max(Width, 1),
+            Math.Max(Height, 1),
+            format,
+            usage,
+            Name ?? string.Empty,
+            Math.Max(Depth, 1),
+            Math.Max(NumMipLevels, 1),
+            1,
+            GLTexture.ToDimension(Target));
 
         /// <summary>Gets or sets the debug label last assigned through <see cref="SetLabel"/>.</summary>
         public string? Name { get; private set; }
@@ -97,8 +119,134 @@ namespace ValveResourceFormat.Renderer
         RenderTexture(TextureTarget target)
         {
             Target = target;
-            GL.CreateTextures(target, 1, out int handle);
-            Handle = handle;
+            GL.CreateTextures(target, 1, out legacyHandle);
+            ownsLegacyHandle = true;
+        }
+
+        /// <summary>
+        /// Creates a texture and allocates its storage through the device.
+        /// </summary>
+        /// <param name="target">OpenGL texture target, which fixes the shape.</param>
+        /// <param name="format">Pixel format. Storage is allocated for it immediately.</param>
+        /// <param name="width">Width in texels.</param>
+        /// <param name="height">Height in texels.</param>
+        /// <param name="depth">Volume depth, or array layer count, or 1.</param>
+        /// <param name="mipCount">Number of mip levels.</param>
+        /// <param name="name">Debug name, surfaced to graphics debuggers.</param>
+        /// <param name="usage">Every use the texture will be put to.</param>
+        /// <param name="device">The device to allocate through, or <see langword="null"/> to resolve one
+        /// from <see cref="RendererDevice"/>.</param>
+        /// <remarks>This is the constructor that works on both backends. Allocation is one step here
+        /// because that is the only shape a <c>VkImage</c> has; the older two-step form, where a name is
+        /// created and <c>glTextureStorage</c> gives it a format later, has no Vulkan equivalent.</remarks>
+        public RenderTexture(
+            TextureTarget target,
+            RhiFormat format,
+            int width,
+            int height,
+            int depth,
+            int mipCount,
+            string name,
+            TextureUsage usage = LegacyUsage,
+            IDevice? device = null)
+        {
+            Target = target;
+            Width = width;
+            Height = height;
+            Depth = depth;
+            NumMipLevels = mipCount;
+            RhiFormat = format;
+            Name = name;
+            explicitDevice = device;
+
+            var resolved = Device;
+
+            if (resolved is null)
+            {
+                // No device yet: the legacy OpenGL path, which is what the renderer ran on before the RHI
+                // existed and what tooling without a presentation layer still runs on.
+                GL.CreateTextures(target, 1, out legacyHandle);
+                ownsLegacyHandle = true;
+                AllocateLegacyStorage();
+                return;
+            }
+
+            rhiTexture = resolved.CreateTexture(Describe(format, usage));
+        }
+
+        /// <summary>
+        /// Creates a texture from a source resource, allocating storage that may be smaller than the
+        /// source.
+        /// </summary>
+        /// <param name="target">OpenGL texture target.</param>
+        /// <param name="storage">The storage to allocate: the format, extent and mip count actually
+        /// created.</param>
+        /// <param name="source">The source resource, supplying spritesheet, reflectivity and radiance
+        /// metadata and the dimensions this texture reports.</param>
+        /// <param name="device">The device to allocate through, or <see langword="null"/> to resolve one
+        /// from <see cref="RendererDevice"/>.</param>
+        /// <remarks>
+        /// <see cref="Width"/>, <see cref="Height"/> and <see cref="NumMipLevels"/> report the
+        /// <paramref name="source"/> dimensions while the storage is <paramref name="storage"/>, and the
+        /// two differ whenever the top mip levels were dropped to respect
+        /// <see cref="RendererContext.MaxTextureSize"/>. That split is long-standing behaviour, kept
+        /// deliberately: callers read these to reason about the asset, while the device has to be told
+        /// what was really allocated.
+        /// </remarks>
+        public RenderTexture(TextureTarget target, in TextureDesc storage, Texture source, IDevice? device = null)
+        {
+            ArgumentNullException.ThrowIfNull(source);
+
+            Target = target;
+            RhiFormat = storage.Format;
+            Name = storage.Name;
+            explicitDevice = device;
+
+            Width = source.Width;
+            Height = source.Height;
+            Depth = source.Depth;
+            NumMipLevels = source.NumMipLevels;
+            SpriteSheetData = source.GetSpriteSheetData();
+            Reflectivity = source.Reflectivity;
+            RadianceCoefficients = source.RadianceCoefficients;
+
+            var resolved = Device;
+
+            if (resolved is null)
+            {
+                GL.CreateTextures(target, 1, out legacyHandle);
+                ownsLegacyHandle = true;
+                AllocateLegacyStorage(in storage);
+                return;
+            }
+
+            rhiTexture = resolved.CreateTexture(in storage);
+        }
+
+        private void AllocateLegacyStorage() => AllocateLegacyStorage(Describe(RhiFormat, LegacyUsage));
+
+        private void AllocateLegacyStorage(in TextureDesc storage)
+        {
+            var internalFormat = FormatTables.ToGLSizedInternalFormat(storage.Format);
+
+            switch (Target)
+            {
+                // glTextureStorage2D allocates all six faces of a cube map, so only an array of them needs
+                // the 3D entry point.
+                case TextureTarget.Texture3D:
+                case TextureTarget.Texture2DArray:
+                case TextureTarget.TextureCubeMapArray:
+                    GL.TextureStorage3D(legacyHandle, storage.MipLevels, internalFormat, storage.Width, storage.Height, storage.Depth);
+                    break;
+
+                case TextureTarget.Texture1D:
+                    GL.TextureStorage1D(legacyHandle, storage.MipLevels, internalFormat, storage.Width);
+                    break;
+
+                default:
+                    GL.TextureStorage2D(legacyHandle, storage.MipLevels, internalFormat, storage.Width, storage.Height);
+                    break;
+            }
         }
 
         /// <summary>Creates a render texture and populates metadata from the given source texture resource.</summary>
@@ -135,8 +283,28 @@ namespace ValveResourceFormat.Renderer
         /// <param name="target">OpenGL texture target.</param>
         public RenderTexture(int handle, TextureTarget target)
         {
-            Handle = handle;
+            legacyHandle = handle;
             Target = target;
+        }
+
+        /// <summary>Wraps a texture the device already created.</summary>
+        /// <param name="texture">The texture to wrap. This instance does not take ownership of it.</param>
+        /// <param name="target">The OpenGL target it corresponds to, for the direct GL call sites.</param>
+        /// <remarks>The route for anything allocated through <see cref="IDevice.CreateTexture"/> elsewhere,
+        /// such as a render target, that still has to be handed to renderer code expecting a
+        /// <see cref="RenderTexture"/>.</remarks>
+        public RenderTexture(ITexture texture, TextureTarget target)
+        {
+            ArgumentNullException.ThrowIfNull(texture);
+
+            rhiTexture = texture;
+            Target = target;
+            Width = texture.Width;
+            Height = texture.Height;
+            Depth = texture.Depth;
+            NumMipLevels = texture.MipLevels;
+            RhiFormat = texture.Format;
+            Name = texture.Name;
         }
 
         /// <summary>Creates a 2D texture with immutable storage, optionally allocating a reduced mip chain sized by <see cref="MaxMipCount"/>.</summary>
@@ -187,11 +355,7 @@ namespace ValveResourceFormat.Renderer
         /// <param name="mipCount">Number of mip levels to allocate.</param>
         /// <returns>The newly created render texture, with <see cref="RhiFormat"/> recorded.</returns>
         public static RenderTexture Create(int width, int height, RhiFormat format, int mipCount)
-        {
-            var texture = Create(width, height, FormatTables.ToGLSizedInternalFormat(format), mipCount);
-            texture.RhiFormat = format;
-            return texture;
-        }
+            => new(TextureTarget.Texture2D, format, width, height, 1, mipCount, $"{format} {width}x{height}");
 
         /// <summary>Creates a texture view that reinterprets a subrange of this texture's storage.</summary>
         /// <param name="internalFormat">The reinterpreted pixel format for the view.</param>
@@ -205,6 +369,54 @@ namespace ValveResourceFormat.Renderer
             var view = new RenderTexture(GL.GenTexture(), Target);
             GL.TextureView(view.Handle, Target, Handle, internalFormat, minLevel, numLevels, minLayer, numLayers);
             return view;
+        }
+
+        /// <summary>Creates a view onto a subset of this texture's mips and layers, through the device.</summary>
+        /// <param name="baseMipLevel">First mip level in the view.</param>
+        /// <param name="mipLevelCount">Number of mip levels in the view.</param>
+        /// <param name="baseArrayLayer">First array layer in the view.</param>
+        /// <param name="arrayLayerCount">Number of array layers in the view.</param>
+        /// <param name="format">Format to reinterpret as, or <see cref="RhiFormat.Undefined"/> to keep this one's.</param>
+        /// <param name="aspect">Which aspect to address. Only meaningful for depth-stencil formats.</param>
+        /// <returns>A new <see cref="RenderTexture"/> over the view, which must be deleted before this one.</returns>
+        /// <remarks>The replacement for the <see cref="PixelInternalFormat"/> overload. It carries the
+        /// aspect, which is what a sampleable stencil view needs and what <c>glTextureView</c> alone cannot
+        /// express.</remarks>
+        public RenderTexture CreateView(
+            int baseMipLevel,
+            int mipLevelCount,
+            int baseArrayLayer,
+            int arrayLayerCount,
+            RhiFormat format = RhiFormat.Undefined,
+            TextureAspect aspect = TextureAspect.All)
+        {
+            var view = RhiTexture.CreateView(baseMipLevel, mipLevelCount, baseArrayLayer, arrayLayerCount, format, aspect);
+
+            return new RenderTexture(view, Target)
+            {
+                ownsLegacyHandle = false,
+            };
+        }
+
+        /// <summary>Uploads one mip level of one array layer or cube face.</summary>
+        /// <param name="mipLevel">Mip level to write.</param>
+        /// <param name="arrayLayer">Array layer or cube face to write.</param>
+        /// <param name="data">Texel data, or block data for a compressed format.</param>
+        /// <remarks>Goes through <see cref="IDevice.UploadTexture"/>, which stages the copy. On Vulkan the
+        /// texture is left in <see cref="ResourceState.CopyDestination"/> and needs an explicit transition
+        /// before it is sampled; that is deliberate, because guessing would be wrong for every storage
+        /// image and render target.</remarks>
+        public void Upload(int mipLevel, int arrayLayer, ReadOnlySpan<byte> data)
+        {
+            var device = Device;
+
+            if (device is not null && rhiTexture is not null)
+            {
+                device.UploadTexture(rhiTexture, mipLevel, arrayLayer, data);
+                return;
+            }
+
+            ((GLTexture)RhiTexture).Upload(mipLevel, arrayLayer, data);
         }
 
         /// <summary>Sets the wrap mode for all relevant texture dimensions.</summary>
@@ -245,23 +457,75 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Sets a single integer texture parameter.</summary>
         /// <param name="parameter">The parameter name to set.</param>
         /// <param name="value">The integer value to assign.</param>
+        /// <remarks>
+        /// <b>Not ported, and does nothing on a non-OpenGL device.</b> Filtering, wrapping and mip
+        /// clamping are properties of a sampler in the RHI, not of a texture: OpenGL is the odd one out in
+        /// letting a texture object carry them. The replacement is a <see cref="SamplerDesc"/> passed to
+        /// <see cref="IDevice.CreateSampler"/> and bound alongside the texture.
+        /// <para>
+        /// The OpenGL path must keep setting these, because the renderer binds sampler 0 for most textures
+        /// and sampler 0 means "use the texture object's own parameters". Removing them would change what
+        /// every material samples, so they stay until the call sites carry samplers.
+        /// </para>
+        /// </remarks>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void SetParameter(TextureParameterName parameter, int value)
-            => GL.TextureParameter(Handle, parameter, value);
+        {
+            if (!RendererDevice.IsOpenGL(explicitDevice))
+            {
+                return;
+            }
+
+            GL.TextureParameter(Handle, parameter, value);
+        }
 
         /// <summary>Assigns a debug label to the OpenGL texture object.</summary>
         /// <param name="label">Label string visible in graphics debuggers.</param>
+        /// <remarks>On a device-allocated texture the name was already given to
+        /// <see cref="IDevice.CreateTexture"/> and both backends applied it; this relabels the OpenGL
+        /// object for the call sites that name a texture only after creating it.</remarks>
         public void SetLabel(string label)
         {
             Name = label;
+
+            if (!RendererDevice.IsOpenGL(explicitDevice))
+            {
+                return;
+            }
+
             GL.ObjectLabel(ObjectLabelIdentifier.Texture, Handle, label.Length, label);
         }
 
-        /// <summary>Deletes the underlying OpenGL texture object.</summary>
+        /// <summary>Destroys this texture through the device that created it.</summary>
+        /// <remarks>Device-allocated storage goes through <see cref="IDevice.DeferredDestroy"/>, because a
+        /// frame in flight may still be sampling it. A bare OpenGL name from the legacy path is deleted
+        /// directly, which is what it always was.</remarks>
         public void Delete()
         {
-            GL.DeleteTexture(Handle);
-            Handle = 0;
+            if (rhiTexture is not null && !ownsLegacyHandle)
+            {
+                var device = Device;
+
+                if (device is not null)
+                {
+                    device.DeferredDestroy(rhiTexture);
+                }
+                else
+                {
+                    rhiTexture.Dispose();
+                }
+
+                rhiTexture = null;
+                return;
+            }
+
+            if (legacyHandle != 0)
+            {
+                GL.DeleteTexture(legacyHandle);
+                legacyHandle = 0;
+            }
+
+            rhiTexture = null;
         }
 
         /// <summary>Calculates a reasonable mip count for a texture of the given dimensions.</summary>
@@ -282,6 +546,13 @@ namespace ValveResourceFormat.Renderer
             if (mipLevel < 0 || mipLevel >= NumMipLevels)
             {
                 throw new ArgumentOutOfRangeException(nameof(mipLevel), $"Mip level {mipLevel} is out of range for attachment with {NumMipLevels} mips.");
+            }
+
+            if (!RendererDevice.IsOpenGL(explicitDevice))
+            {
+                // There is no framebuffer object to attach to on a Vulkan device. Attachments are named
+                // directly in a RenderPassDesc under dynamic rendering, which is Framebuffer's port to make.
+                return;
             }
 
             GL.NamedFramebufferTexture(framebuffer.FboHandle, attachment, Handle, mipLevel);

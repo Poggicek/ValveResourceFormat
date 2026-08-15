@@ -63,6 +63,12 @@ namespace ValveResourceFormat.Renderer.Materials
         public MaterialLoader(RendererContext rendererContext)
         {
             RendererContext = rendererContext;
+
+            // Publishes the context as the fallback every renderer-owned allocation resolves its device
+            // through. Done here because this runs inside the RendererContext constructor, which is the
+            // earliest point a context exists; its Device is assigned later by the presentation layer and
+            // is read at allocation time, not now. See RendererDevice for why the fallback exists at all.
+            RendererDevice.Publish(rendererContext);
         }
 
         private static readonly byte[] NewLineArray = "\n"u8.ToArray();
@@ -354,7 +360,7 @@ namespace ValveResourceFormat.Renderer.Materials
             if (data.IsRawAnyImage)
             {
                 using var bitmap = data.GenerateBitmap();
-                return LoadBitmapTexture(bitmap);
+                return LoadBitmapTexture(bitmap, RendererContext.Device);
             }
 
             var target = TextureTarget.Texture2D;
@@ -377,7 +383,6 @@ namespace ValveResourceFormat.Renderer.Materials
                 target = (data.Flags & VTexFlags.VOLUME_TEXTURE) != 0 ? TextureTarget.Texture3D : TextureTarget.Texture2DArray;
             }
 
-            var tex = new RenderTexture(target, data);
             var format = GetTextureFormat(data.Format);
 
             // todo: BC7 and BC6H are also problematic on pre-RDNA AMD GPUs, when using immutable storage
@@ -394,31 +399,12 @@ namespace ValveResourceFormat.Renderer.Materials
                 );
             }
 
-            var sizedInternalFormat = srgbRead && format.InternalSrgbFormat is not null ? format.InternalSrgbFormat.Value : format.InternalFormat;
             var uploadsAsSrgb = srgbRead && format.InternalSrgbFormat is not null;
 
-            // Recorded, not acted on: the GL enums above still drive every allocation and upload below, so
-            // this cannot change what is uploaded. It is what lets tex.RhiTexture describe itself fully.
             // GetTextureFormat has already thrown for anything FormatTables cannot map, so this is total.
-            tex.RhiFormat = rgba8UncompressedFallback
+            var rhiFormat = rgba8UncompressedFallback
                 ? (uploadsAsSrgb ? RHI.RhiFormat.R8G8B8A8_SRgb : RHI.RhiFormat.R8G8B8A8_UNorm)
                 : RHI.FormatTables.FromVTexFormat(data.Format, uploadsAsSrgb);
-
-#if DEBUG
-            var textureName = System.IO.Path.GetFileName(textureResource.FileName);
-
-            if (textureName != null)
-            {
-                tex.SetLabel(textureName);
-            }
-#endif
-
-            var texDepth = data.Depth;
-
-            if (target == TextureTarget.TextureCubeMap || target == TextureTarget.TextureCubeMapArray)
-            {
-                texDepth *= 6;
-            }
 
             var minMipLevelAllowed = 0;
             var texWidth = data.Width;
@@ -437,14 +423,25 @@ namespace ValveResourceFormat.Renderer.Materials
                 }
             }
 
-            if (is3d && target != TextureTarget.TextureCubeMap)
-            {
-                GL.TextureStorage3D(tex.Handle, data.NumMipLevels - minMipLevelAllowed, sizedInternalFormat, texWidth, texHeight, texDepth);
-            }
-            else
-            {
-                GL.TextureStorage2D(tex.Handle, data.NumMipLevels - minMipLevelAllowed, sizedInternalFormat, texWidth, texHeight);
-            }
+            var textureName = System.IO.Path.GetFileName(textureResource.FileName) ?? string.Empty;
+
+            // Depth is the layer count in RHI terms, and a cube map's six faces are implied by its shape
+            // rather than multiplied in here: GLTexture and the Vulkan backend both expand it themselves.
+            var storage = new RHI.TextureDesc(
+                texWidth,
+                texHeight,
+                rhiFormat,
+                RHI.TextureUsage.Sampled | RHI.TextureUsage.CopySource | RHI.TextureUsage.CopyDestination,
+                textureName,
+                data.Depth,
+                data.NumMipLevels - minMipLevelAllowed,
+                1,
+                RHI.OpenGL.GLTexture.ToDimension(target));
+
+            // The device comes from this loader's own context, never from the ambient fallback: a process
+            // can hold several contexts on different devices, and a texture must be allocated on the one
+            // whose renderer is going to sample it.
+            var tex = new RenderTexture(target, in storage, data, RendererContext.Device);
 
             var buffer = ArrayPool<byte>.Shared.Rent(data.GetBiggestBufferSize());
             byte[]? decodedBuffer = null;
@@ -467,29 +464,27 @@ namespace ValveResourceFormat.Renderer.Materials
                         uploadBuffer = decodedBuffer;
                     }
 
-                    if (format.PixelType is not null)
-                    {
-                        Debug.Assert(format.PixelFormat is not null);
+                    // The decoded fallback buffer is sized from the source extent, not the mip's, so the
+                    // amount actually written is the mip's own size rather than the whole rental.
+                    var uploadSize = decodedBuffer != null ? width * height * depth * 4 : bufferSize;
+                    var mipData = uploadBuffer.AsSpan(0, uploadSize);
 
-                        if (is3d)
+                    if (target is TextureTarget.Texture2DArray or TextureTarget.TextureCubeMap or TextureTarget.TextureCubeMapArray)
+                    {
+                        // A layered texture arrives as every slice of this mip end to end, but the RHI
+                        // uploads one layer at a time, because that is the granularity a Vulkan buffer to
+                        // image copy addresses. Volume textures are the exception: their depth is part of
+                        // the extent, so they go up whole.
+                        var sliceSize = uploadSize / depth;
+
+                        for (var slice = 0; slice < depth; slice++)
                         {
-                            GL.TextureSubImage3D(tex.Handle, realLevel, 0, 0, 0, width, height, depth, format.PixelFormat.Value, format.PixelType.Value, uploadBuffer);
-                        }
-                        else
-                        {
-                            GL.TextureSubImage2D(tex.Handle, realLevel, 0, 0, width, height, format.PixelFormat.Value, format.PixelType.Value, uploadBuffer);
+                            tex.Upload(realLevel, slice, mipData.Slice(slice * sliceSize, sliceSize));
                         }
                     }
                     else
                     {
-                        if (is3d)
-                        {
-                            GL.CompressedTextureSubImage3D(tex.Handle, realLevel, 0, 0, 0, width, height, depth, (PixelFormat)sizedInternalFormat, bufferSize, uploadBuffer);
-                        }
-                        else
-                        {
-                            GL.CompressedTextureSubImage2D(tex.Handle, realLevel, 0, 0, width, height, (PixelFormat)sizedInternalFormat, bufferSize, uploadBuffer);
-                        }
+                        tex.Upload(realLevel, 0, mipData);
                     }
                 }
             }
@@ -512,9 +507,9 @@ namespace ValveResourceFormat.Renderer.Materials
 
             tex.SetFiltering(TextureMinFilter.LinearMipmapLinear, TextureMagFilter.Linear);
 
-            GL.TextureParameter(tex.Handle, TextureParameterName.TextureWrapS, (int)clampModeS);
-            GL.TextureParameter(tex.Handle, TextureParameterName.TextureWrapT, (int)clampModeT);
-            GL.TextureParameter(tex.Handle, TextureParameterName.TextureWrapR, (int)clampModeU);
+            tex.SetParameter(TextureParameterName.TextureWrapS, (int)clampModeS);
+            tex.SetParameter(TextureParameterName.TextureWrapT, (int)clampModeT);
+            tex.SetParameter(TextureParameterName.TextureWrapR, (int)clampModeU);
 
             return tex;
         }
@@ -641,13 +636,13 @@ namespace ValveResourceFormat.Renderer.Materials
                     colorToUse.CopyTo(pixel);
                 }
 
-                ErrorTexture = GenerateColorTexture(4, 4, color);
+                ErrorTexture = GenerateColorTexture(4, 4, color, RendererContext.Device);
             }
 
             return ErrorTexture;
         }
 
-        private static RenderTexture CreateSolidTexture(byte r, byte g, byte b) => GenerateColorTexture(1, 1, [r, g, b]);
+        private RenderTexture CreateSolidTexture(byte r, byte g, byte b) => GenerateColorTexture(1, 1, [r, g, b], RendererContext.Device);
         /// <summary>Returns a lazily created 1×1 flat normal map texture (127, 127, 255).</summary>
         public RenderTexture GetDefaultNormal() => DefaultNormal ??= CreateSolidTexture(127, 127, 255);
 
@@ -664,16 +659,11 @@ namespace ValveResourceFormat.Renderer.Materials
         {
             if (DefaultVolume == null)
             {
-                DefaultVolume = new RenderTexture(TextureTarget.Texture3D, 1, 1, 1, 1);
+                DefaultVolume = new RenderTexture(TextureTarget.Texture3D, RHI.RhiFormat.R8G8B8_UNorm, 1, 1, 1, 1, "DefaultVolume", device: RendererContext.Device);
                 DefaultVolume.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
                 DefaultVolume.SetWrapMode(TextureWrapMode.ClampToEdge);
 
-                GL.TextureStorage3D(DefaultVolume.Handle, 1, SizedInternalFormat.Rgb8, 1, 1, 1);
-                GL.TextureSubImage3D(DefaultVolume.Handle, 0, 0, 0, 0, 1, 1, 1, PixelFormat.Rgb, PixelType.UnsignedByte, WhiteTexel);
-
-#if DEBUG
-                DefaultVolume.SetLabel("DefaultVolume");
-#endif
+                DefaultVolume.Upload(0, 0, WhiteTexel);
             }
 
             return DefaultVolume;
@@ -691,26 +681,29 @@ namespace ValveResourceFormat.Renderer.Materials
 
         /// <summary>Uploads an <see cref="SKBitmap"/> as a 2D texture and returns the resulting <see cref="RenderTexture"/>.</summary>
         /// <param name="bitmap">The bitmap whose pixels are uploaded to the GPU.</param>
-        public static RenderTexture LoadBitmapTexture(SKBitmap bitmap)
+        /// <param name="device">The device to allocate through, or <see langword="null"/> to resolve one from <see cref="RendererDevice"/>.</param>
+        public static RenderTexture LoadBitmapTexture(SKBitmap bitmap, RHI.IDevice? device = null)
         {
-            var texture = new RenderTexture(TextureTarget.Texture2D, bitmap.Width, bitmap.Height, 1, 1);
-
-            // var isHdr = bitmap.ColorType == Texture.HdrBitmapColorType;
-            // var store = GetImageExportFormat(isHdr);
-
-            var store = bitmap.ColorType switch
+            // Bgra8888 keeps its byte order rather than being swizzled here: the RHI carries a BGRA format
+            // and both backends know how to sample it, which is what the OpenGL PixelFormat.Bgra upload did.
+            var format = bitmap.ColorType switch
             {
-                SKColorType.Rgba8888 => new TextureFormatMapping(SizedInternalFormat.Rgba8, PixelFormat.Rgba, PixelType.UnsignedByte),
-                SKColorType.Bgra8888 => new TextureFormatMapping(SizedInternalFormat.Rgba8, PixelFormat.Bgra, PixelType.UnsignedByte),
-                SKColorType.Rgb888x => new TextureFormatMapping(SizedInternalFormat.Rgb8, PixelFormat.Rgba, PixelType.UnsignedByte),
-                SKColorType.Gray8 => new TextureFormatMapping(SizedInternalFormat.R8, PixelFormat.Red, PixelType.UnsignedByte),
-                SKColorType.RgbaF16 => new TextureFormatMapping(SizedInternalFormat.Rgba16f, PixelFormat.Rgba, PixelType.HalfFloat),
-                SKColorType.RgbaF32 => new TextureFormatMapping(SizedInternalFormat.Rgba32f, PixelFormat.Rgba, PixelType.Float),
+                SKColorType.Rgba8888 => RHI.RhiFormat.R8G8B8A8_UNorm,
+                SKColorType.Bgra8888 => RHI.RhiFormat.B8G8R8A8_UNorm,
+                SKColorType.Rgb888x => RHI.RhiFormat.R8G8B8A8_UNorm,
+                SKColorType.Gray8 => RHI.RhiFormat.R8_UNorm,
+                SKColorType.RgbaF16 => RHI.RhiFormat.R16G16B16A16_SFloat,
+                SKColorType.RgbaF32 => RHI.RhiFormat.R32G32B32A32_SFloat,
                 _ => throw new NotSupportedException($"Unsupported bitmap color type for GPU upload {bitmap.ColorType}"),
             };
 
-            GL.TextureStorage2D(texture.Handle, 1, store.InternalFormat, texture.Width, texture.Height);
-            GL.TextureSubImage2D(texture.Handle, 0, 0, 0, texture.Width, texture.Height, store.PixelFormat!.Value, store.PixelType!.Value, bitmap.GetPixels());
+            var texture = new RenderTexture(TextureTarget.Texture2D, format, bitmap.Width, bitmap.Height, 1, 1, nameof(LoadBitmapTexture), device: device);
+
+            unsafe
+            {
+                var pixels = new ReadOnlySpan<byte>((void*)bitmap.GetPixels(), bitmap.ByteCount);
+                texture.Upload(0, 0, pixels);
+            }
 
             return texture;
         }
@@ -719,7 +712,8 @@ namespace ValveResourceFormat.Renderer.Materials
         /// Builds a one-dimensional colour ramp from a list of gradient stops.
         /// </summary>
         /// <param name="stops">Gradient stops, each a position in 0-1 and its colour. Need not be sorted.</param>
-        public static RenderTexture GenerateGradientTexture(ReadOnlySpan<(float Position, Color32 Color)> stops)
+        /// <param name="device">The device to allocate through, or <see langword="null"/> to resolve one from <see cref="RendererDevice"/>.</param>
+        public static RenderTexture GenerateGradientTexture(ReadOnlySpan<(float Position, Color32 Color)> stops, RHI.IDevice? device = null)
         {
             const int Width = 256;
 
@@ -736,19 +730,15 @@ namespace ValveResourceFormat.Renderer.Materials
                 texels[(x * 4) + 3] = color.A;
             }
 
-            var texture = new RenderTexture(TextureTarget.Texture2D, Width, 1, 1, 1);
+            // sRGB storage, so a sample lands in linear space like every other layer's texture.
+            var texture = new RenderTexture(TextureTarget.Texture2D, RHI.RhiFormat.R8G8B8A8_SRgb, Width, 1, 1, 1, "GeneratedGradient", device: device);
+
             // Clamped and filtered: the ramp is addressed by a luminance, so the ends have to hold rather
             // than wrap, and the steps between stops should not be visible.
             texture.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
             texture.SetWrapMode(TextureWrapMode.ClampToEdge);
 
-            // sRGB storage, so a sample lands in linear space like every other layer's texture.
-            GL.TextureStorage2D(texture.Handle, 1, SizedInternalFormat.Srgb8Alpha8, Width, 1);
-            GL.TextureSubImage2D(texture.Handle, 0, 0, 0, Width, 1, PixelFormat.Rgba, PixelType.UnsignedByte, texels);
-
-#if DEBUG
-            texture.SetLabel("GeneratedGradient");
-#endif
+            texture.Upload(0, 0, texels);
 
             return texture;
         }
@@ -802,21 +792,24 @@ namespace ValveResourceFormat.Renderer.Materials
                 (byte)float.Round(float.Lerp(lower.Color.A, upper.Color.A, t)));
         }
 
-        private static RenderTexture GenerateColorTexture(int width, int height, byte[] color)
+        private static RenderTexture GenerateColorTexture(int width, int height, byte[] color, RHI.IDevice? device = null)
         {
-            var texture = new RenderTexture(TextureTarget.Texture2D, width, height, 1, 1);
+            var texture = new RenderTexture(
+                TextureTarget.Texture2D,
+                RHI.RhiFormat.R8G8B8_UNorm,
+                width,
+                height,
+                1,
+                1,
+                width > 1 ? "ErrorTexture" : "ColorTexture");
+
             texture.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
             texture.SetWrapMode(TextureWrapMode.Repeat);
 
             var color32 = new Color32(color[0], color[1], color[2]);
             texture.Reflectivity = color32.ToLinearColor();
 
-            GL.TextureStorage2D(texture.Handle, 1, SizedInternalFormat.Rgb8, width, height);
-            GL.TextureSubImage2D(texture.Handle, 0, 0, 0, width, height, PixelFormat.Rgb, PixelType.UnsignedByte, color);
-
-#if DEBUG
-            texture.SetLabel(width > 1 ? "ErrorTexture" : "ColorTexture");
-#endif
+            texture.Upload(0, 0, color);
 
             return texture;
         }

@@ -63,16 +63,17 @@ namespace ValveResourceFormat.Renderer.Buffers
 
         private void Initialize()
         {
-            WriteToCpuBuffer();
-            GL.NamedBufferData(Handle, Size, cpuBuffer, BufferUsageHint.StaticDraw);
+            Update();
             BindBufferBase();
         }
 
         /// <summary>Marshals <see cref="Data"/> into the intermediate CPU buffer and uploads it to the GPU.</summary>
+        /// <remarks>The size is fixed by <typeparamref name="T"/> and set in the constructor, so the first
+        /// call here is what allocates the storage and every later one only writes it.</remarks>
         public void Update()
         {
             WriteToCpuBuffer();
-            GL.NamedBufferSubData(Handle, IntPtr.Zero, Size, cpuBuffer);
+            Upload(MemoryMarshal.AsBytes(cpuBuffer.AsSpan())[..Size]);
         }
 
         /// <inheritdoc/>

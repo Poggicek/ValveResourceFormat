@@ -86,7 +86,10 @@ namespace ValveResourceFormat.Renderer
         {
             if (!gpuBuffers.TryGetValue(meshName, out var gpuVbib))
             {
-                gpuVbib = new GPUMeshBuffers(vbib);
+                // The device comes from this cache's own context, never from the ambient fallback: a
+                // process can hold several contexts on different devices, and mesh data must be allocated
+                // on the one whose renderer is going to draw it.
+                gpuVbib = new GPUMeshBuffers(vbib, RendererContext.Device);
                 gpuBuffers.Add(meshName, gpuVbib);
                 RegisterRhiBuffers(gpuVbib);
 

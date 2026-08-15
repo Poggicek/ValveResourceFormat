@@ -42,7 +42,10 @@ public sealed class Globals : Buffer
 
         if (allocate)
         {
-            GL.NamedBufferData(Handle, Size, bytes, BufferUsageHint.DynamicDraw);
+            // Reallocating and filling in one go: the whole block is written, so there is no dirty range
+            // left for EndFill to flush.
+            EnsureStorage(Size);
+            Upload(bytes.AsSpan(0, Size));
 
             dirtyStart = int.MaxValue;
             dirtyEnd = 0;
@@ -58,7 +61,7 @@ public sealed class Globals : Buffer
     {
         filling = false;
 
-        Upload();
+        Flush();
     }
 
     /// <summary>Writes a scalar member, converting to the declared component type.</summary>
@@ -145,7 +148,7 @@ public sealed class Globals : Buffer
     /// </remarks>
     public void Bind()
     {
-        Upload();
+        Flush();
         BindBufferBase();
     }
 
@@ -165,18 +168,22 @@ public sealed class Globals : Buffer
 
         if (!filling)
         {
-            Upload();
+            Flush();
         }
     }
 
-    private void Upload()
+    /// <summary>Uploads the pending dirty range, if any, as one write.</summary>
+    /// <remarks>The batching this preserves is the point of <see cref="BeginFill"/>: one upload per fill
+    /// rather than one per member. That matters more through the RHI than it did on OpenGL, because on
+    /// Vulkan each upload of a device local buffer is a staged copy.</remarks>
+    private void Flush()
     {
         if (dirtyStart >= dirtyEnd)
         {
             return;
         }
 
-        GL.NamedBufferSubData(Handle, dirtyStart, dirtyEnd - dirtyStart, ref bytes[dirtyStart]);
+        Upload(bytes.AsSpan(dirtyStart, dirtyEnd - dirtyStart), dirtyStart);
 
         dirtyStart = int.MaxValue;
         dirtyEnd = 0;
