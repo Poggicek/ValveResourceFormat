@@ -583,9 +583,9 @@ namespace ValveResourceFormat.Renderer.Shaders
     /// </summary>
     /// <remarks>
     /// The descriptor set numbering is the one fixed in <c>RHI/CONTRACT.md</c>. The binding numbers are the
-    /// existing <see cref="ReservedBufferSlots"/> and <see cref="ReservedTextureSlots"/> values, unchanged: those
-    /// two enums deliberately overlap their uniform and storage index spaces, which GL keeps apart per binding
-    /// target and Vulkan does not, so the sets are what makes the collision unrepresentable.
+    /// existing <see cref="ReservedBufferSlots"/> and <see cref="ReservedTextureSlots"/> values and the image units
+    /// the shaders declare, all unchanged: those index spaces deliberately overlap, and OpenGL keeps them apart per
+    /// binding target while Vulkan does not, so the sets are what makes the collision unrepresentable.
     /// </remarks>
     public static partial class VulkanGlsl
     {
@@ -595,11 +595,22 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <summary>Descriptor set holding the storage buffers, bound by <see cref="ReservedBufferSlots"/> SSBO number.</summary>
         public const int StorageBufferSet = 1;
 
-        /// <summary>Descriptor set holding the globally bound textures and images, bound by <see cref="ReservedTextureSlots"/> number.</summary>
+        /// <summary>Descriptor set holding the globally bound textures, bound by <see cref="ReservedTextureSlots"/> number.</summary>
         public const int GlobalTextureSet = 2;
 
         /// <summary>Descriptor set holding the textures a material supplies, numbered per shader in declaration order.</summary>
         public const int MaterialTextureSet = 3;
+
+        /// <summary>
+        /// Descriptor set holding the storage images, bound by the image unit the shader declares.
+        /// </summary>
+        /// <remarks>
+        /// Separate from <see cref="GlobalTextureSet"/> for the same reason sets 0 and 1 are separate, one index
+        /// space further on: <c>glBindImageTexture</c> addresses image units, which OpenGL keeps apart from texture
+        /// units and Vulkan does not. The numbers really do collide, and no renumbering fixes it inside one set,
+        /// since <c>depth_pyramid.comp</c> declares a sampler at 0 and images at 1 and 2 in the same shader.
+        /// </remarks>
+        public const int StorageImageSet = 4;
 
         /// <summary>
         /// The size of the per-draw push constant block in bytes, inside the 128 byte floor every Vulkan
@@ -719,9 +730,14 @@ namespace ValveResourceFormat.Renderer.Shaders
         [GeneratedRegex(@"^layout\s*\(\s*(?<Qualifiers>[^)]*)\)\s*uniform\s+(?<Rest>[^;]*\b[iu]?image[0-9A-Za-z]*\s+[A-Za-z_][A-Za-z0-9_]*\s*;)", RegexOptions.Multiline)]
         private static partial Regex RegexImageDeclaration();
 
-        // uniform sampler2D g_tFoo; and the macro typed sampler of texture_decode
-        [GeneratedRegex(@"^uniform\s+(?<Type>[iu]?sampler[0-9A-Za-z]*|TEXTURE_TYPE)\s+(?<Name>[A-Za-z_][A-Za-z0-9_]*)\s*;", RegexOptions.Multiline)]
+        // uniform sampler2D g_tFoo; and the macro typed sampler of texture_decode. A sampler may place itself with
+        // a layout qualifier on either side of the uniform keyword, and several of the compute shaders do.
+        [GeneratedRegex(@"^(?:layout\s*\(\s*(?<Qualifiers>[^)]*)\)\s*)?uniform\s+(?:layout\s*\(\s*(?<InnerQualifiers>[^)]*)\)\s*)?(?<Type>[iu]?sampler[0-9A-Za-z]*|TEXTURE_TYPE)\s+(?<Name>[A-Za-z_][A-Za-z0-9_]*)\s*;", RegexOptions.Multiline)]
         private static partial Regex RegexSamplerDeclaration();
+
+        // Picks the binding out of a layout qualifier list, leaving whatever else it carries
+        [GeneratedRegex(@"\bbinding\s*=\s*(?<Binding>[0-9]+)\s*,?\s*")]
+        private static partial Regex RegexBindingQualifier();
 
         // A stage interface declaration. Requires the terminating semicolon, so that an 'in' or 'out' function
         // parameter sitting on its own line cannot match.
@@ -752,6 +768,24 @@ namespace ValveResourceFormat.Renderer.Shaders
         [GeneratedRegex(@"\bgl_InstanceID\b")]
         private static partial Regex RegexInstanceIdBuiltin();
 
+        // gl_DepthRange reflects glDepthRange, which Vulkan has no equivalent of. ViewConstants already carries
+        // the same two values the renderer passes to it, so the members resolve to those.
+        [GeneratedRegex(@"\bgl_DepthRange\s*\.\s*(?<Member>near|far|diff)\b")]
+        private static partial Regex RegexDepthRangeBuiltin();
+
+        // An object-like define with no body, which the sources use as a flag tested with defined()
+        [GeneratedRegex(@"^#define (?<Name>[A-Za-z_][A-Za-z0-9_]*)[ \t]*$", RegexOptions.Multiline)]
+        private static partial Regex RegexFlagDefine();
+
+        [GeneratedRegex(@"\bdefined\s*\(\s*(?<Name>[A-Za-z_][A-Za-z0-9_]*)\s*\)")]
+        private static partial Regex RegexDefinedOperator();
+
+        [GeneratedRegex(@"//[^\n]*")]
+        private static partial Regex RegexLineComment();
+
+        /// <summary>The suffix given to the value a flag macro is rewritten to carry.</summary>
+        private const string FlagSuffix = "_VrfDefined";
+
         /// <summary>
         /// Rewrites one preprocessed stage into Vulkan GLSL, and records what it found on <paramref name="parsedData"/>.
         /// </summary>
@@ -770,7 +804,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             source = RegexSamplerDeclaration().Replace(source, match => DecorateSampler(match, parsedData));
 
             source = RegexImageDeclaration().Replace(source,
-                match => $"layout(set = {GlobalTextureSet}, {match.Groups["Qualifiers"].Value}) uniform {match.Groups["Rest"].Value}");
+                match => $"layout(set = {StorageImageSet}, {match.Groups["Qualifiers"].Value}) uniform {match.Groups["Rest"].Value}");
 
             source = RegexUniformBlockLayout().Replace(source, match => $"layout(set = {UniformBufferSet}, {match.Groups["Qualifiers"].Value})");
             source = RegexStorageBlockLayout().Replace(source, match => $"layout(set = {StorageBufferSet}, {match.Groups["Qualifiers"].Value})");
@@ -785,12 +819,96 @@ namespace ValveResourceFormat.Renderer.Shaders
             source = RegexVertexIdBuiltin().Replace(source, "gl_VertexIndex");
             source = RegexInstanceIdBuiltin().Replace(source, "(gl_InstanceIndex - gl_BaseInstance)");
 
+            source = RegexDepthRangeBuiltin().Replace(source, static match => match.Groups["Member"].Value switch
+            {
+                "near" => "g_flViewportMinZ",
+                "far" => "g_flViewportMaxZ",
+                _ => "(g_flViewportMaxZ - g_flViewportMinZ)",
+            });
+
+            source = RewriteFlagMacros(source, parsedData);
+
+            return source;
+        }
+
+        /// <summary>
+        /// Turns the flag macros the sources test with <c>defined()</c> into ones that carry a value instead.
+        /// </summary>
+        /// <remarks>
+        /// <c>defined</c> may not survive into a macro expansion, and several of the sources build a macro whose
+        /// body tests one of these flags, which GL drivers accept and Vulkan rejects. Rewriting the flag to a
+        /// valued macro removes the operator entirely: an identifier that was never defined evaluates to 0 in a
+        /// preprocessor expression, which is exactly what <c>defined()</c> would have yielded.
+        ///
+        /// A name is only rewritten when every mention of it in the source is a preprocessor reference, so a flag
+        /// that is also used as a value is left alone rather than silently changed.
+        /// </remarks>
+        private static string RewriteFlagMacros(string source, ParsedShaderData parsedData)
+        {
+            var flags = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (Match match in RegexFlagDefine().Matches(source))
+            {
+                flags.Add(match.Groups["Name"].Value);
+            }
+
+            if (flags.Count == 0)
+            {
+                return source;
+            }
+
+            var queried = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (Match match in RegexDefinedOperator().Matches(source))
+            {
+                var name = match.Groups["Name"].Value;
+
+                if (flags.Contains(name))
+                {
+                    queried.Add(name);
+                }
+            }
+
+            // A flag named in a comment is not a use of it, and several of the sources name these in comments
+            var code = RegexLineComment().Replace(source, string.Empty);
+
+            foreach (var name in queried)
+            {
+                var escaped = Regex.Escape(name);
+
+                var mentions = Regex.Count(code, $@"\b{escaped}\b");
+                var references = Regex.Count(code, $@"^[ \t]*#(?:define|ifdef|ifndef|undef) {escaped}\b", RegexOptions.Multiline)
+                    + Regex.Count(code, $@"\bdefined\s*\(\s*{escaped}\s*\)");
+
+                if (mentions != references)
+                {
+                    parsedData.VulkanDiagnostics.Add(
+                        $"Flag macro '{name}' is also used as a value, so 'defined({name})' was left as it is and will not compile inside a macro body.");
+                    continue;
+                }
+
+                source = Regex.Replace(source, $@"\bdefined\s*\(\s*{escaped}\s*\)", name + FlagSuffix);
+                source = Regex.Replace(source, $@"^(?<Indent>[ \t]*)#define {escaped}[ \t]*$", $"${{Indent}}#define {name}{FlagSuffix} 1", RegexOptions.Multiline);
+                source = Regex.Replace(source, $@"^(?<Indent>[ \t]*)#ifdef {escaped}\b", $"${{Indent}}#if {name}{FlagSuffix}", RegexOptions.Multiline);
+                source = Regex.Replace(source, $@"^(?<Indent>[ \t]*)#ifndef {escaped}\b", $"${{Indent}}#if !{name}{FlagSuffix}", RegexOptions.Multiline);
+                source = Regex.Replace(source, $@"^(?<Indent>[ \t]*)#undef {escaped}\b", $"${{Indent}}#undef {name}{FlagSuffix}", RegexOptions.Multiline);
+            }
+
             return source;
         }
 
         private static string DecorateSampler(Match match, ParsedShaderData parsedData)
         {
             var name = match.Groups["Name"].Value;
+
+            // A sampler may place itself on either side of the uniform keyword. Whichever list it used is taken
+            // apart here so the binding it declared survives and the rest of the qualifiers carry through.
+            var qualifiers = match.Groups["Qualifiers"].Success ? match.Groups["Qualifiers"].Value
+                : match.Groups["InnerQualifiers"].Success ? match.Groups["InnerQualifiers"].Value
+                : string.Empty;
+
+            var declared = RegexBindingQualifier().Match(qualifiers);
+            var rest = (declared.Success ? RegexBindingQualifier().Replace(qualifiers, string.Empty) : qualifiers).Trim().Trim(',').Trim();
 
             int set, binding;
 
@@ -803,16 +921,22 @@ namespace ValveResourceFormat.Renderer.Shaders
             {
                 set = MaterialTextureSet;
 
-                // Numbered per shader in declaration order, shared across its stages because the whole shader
-                // parses into one ParsedShaderData
+                // A sampler that placed itself keeps the unit it named, since the dispatch that binds it already
+                // uses that number. The rest are numbered per shader in declaration order, shared across its
+                // stages because the whole shader parses into one ParsedShaderData.
                 if (!parsedData.MaterialTextureBindings.TryGetValue(name, out binding))
                 {
-                    binding = parsedData.MaterialTextureBindings.Count;
+                    binding = declared.Success
+                        ? int.Parse(declared.Groups["Binding"].Value, CultureInfo.InvariantCulture)
+                        : parsedData.MaterialTextureBindings.Count;
+
                     parsedData.MaterialTextureBindings.Add(name, binding);
                 }
             }
 
-            return $"layout(set = {set}, binding = {binding}) {match.Value}";
+            var carried = rest.Length > 0 ? $", {rest}" : string.Empty;
+
+            return $"layout(set = {set}, binding = {binding}{carried}) uniform {match.Groups["Type"].Value} {name};";
         }
 
         private static string RewriteLooseUniform(Match match, ParsedShaderData parsedData)
