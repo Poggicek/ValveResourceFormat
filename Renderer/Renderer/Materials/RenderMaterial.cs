@@ -642,10 +642,16 @@ namespace ValveResourceFormat.Renderer.Materials
         /// <param name="bindings">Receives the bindings. Cleared first, so one list can be reused per draw.</param>
         /// <remarks>
         /// <para>
-        /// This walks the shader's textures in the same order and skips the same entries as
-        /// <see cref="Render"/>, so binding <c>N</c> here is the texture that path puts on OpenGL texture
-        /// unit <c>TextureUnitStart + N</c>. That correspondence is what lets the two backends stay a
-        /// parity oracle for each other, so the two loops must be changed together.
+        /// On the OpenGL path this walks the shader's textures in the same order and skips the same
+        /// entries as <see cref="Render"/>, so binding <c>N</c> here is the texture that path puts on
+        /// OpenGL texture unit <c>TextureUnitStart + N</c>. That correspondence is what lets the two
+        /// backends stay a parity oracle for each other, so the two loops must be changed together.
+        /// </para>
+        /// <para>
+        /// On the SPIR-V path the slot is read from <see cref="Shader.SpirvInterface"/> instead, because
+        /// there the numbering is the shader's rather than this material's: emission gave every sampler
+        /// the source declares a number, and the compiler is free to drop one. Counting over what
+        /// survives would shift every later texture down by one against what the shader samples.
         /// </para>
         /// <para>
         /// Slot numbering is the material's own, per the contract's descriptor set table: the reserved
@@ -668,20 +674,41 @@ namespace ValveResourceFormat.Renderer.Materials
             }
 
             var hasUserConfigSampler = shader.SamplerUserConfigUniforms.Count > 0 && Loader != null;
+            var declared = shader.SpirvInterface;
             var binding = 0;
 
             foreach (var (name, defaultTexture) in shader.Default.Textures)
             {
-                // Mirrors Shader.SetTexture returning false: a texture the shader never declared is
-                // skipped without consuming a slot.
-                if (shader.GetUniformLocation(name) < 0)
+                int slot;
+
+                if (declared != null)
                 {
-                    continue;
+                    // The SPIR-V path takes the slot from the shader rather than counting one out. The
+                    // count is only right when nothing was dropped: emission numbers every sampler the
+                    // source declares, so a sampler the compiler eliminated leaves a hole, and counting
+                    // over the survivors closes it and shifts every later texture down one. That failure
+                    // renders plausibly rather than obviously -- a material's normal map arriving where
+                    // its albedo belongs -- which is why it is read rather than recomputed.
+                    if (!declared.TryGetMaterialTextureSlot(name, out slot))
+                    {
+                        continue;
+                    }
+                }
+                else
+                {
+                    // Mirrors Shader.SetTexture returning false: a texture the shader never declared is
+                    // skipped without consuming a slot.
+                    if (shader.GetUniformLocation(name) < 0)
+                    {
+                        continue;
+                    }
+
+                    slot = binding++;
                 }
 
                 bindings.Add(new TextureBinding(
                     RHI.DescriptorSets.MaterialTextures,
-                    binding++,
+                    slot,
                     name,
                     Textures.GetValueOrDefault(name, defaultTexture),
                     hasUserConfigSampler && shader.SamplerUserConfigUniforms.Contains(name)));

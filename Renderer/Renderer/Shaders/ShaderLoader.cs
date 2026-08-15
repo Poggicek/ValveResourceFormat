@@ -557,6 +557,12 @@ namespace ValveResourceFormat.Renderer.Shaders
 
             var modules = new Dictionary<ShaderProgramType, IShaderModule>(sources.Count);
 
+            // Reflected here rather than later because this is the only place the SPIR-V itself is in
+            // hand: IShaderModule keeps a handle and a hash, not the words. Everything the bind side
+            // needs to know about the shader is read out of it, so what the renderer records and what
+            // the shader declares come from one source.
+            var reflected = new List<SpirvReflectionResult>(sources.Count);
+
             try
             {
                 foreach (var (stage, source) in sources)
@@ -577,6 +583,7 @@ namespace ValveResourceFormat.Renderer.Shaders
                         ThrowSpirvError(result, describedFile, shaderName, "Failed to set up shader", parsedData);
                     }
 
+                    reflected.Add(SpirvReflection.Reflect(result.Spirv.Span));
                     modules[stage] = CreateModule(device, registry, result.Spirv.Span, rhiStage, debugName);
                 }
             }
@@ -615,6 +622,16 @@ namespace ValveResourceFormat.Renderer.Shaders
                 SamplerUserConfigUniforms = parsedData.SamplerUserConfigUniforms,
                 ReservedTexturesUsed = [.. parsedData.ReservedTextures],
             };
+
+            // Before anything can bind: this is what replaces the OpenGL introspection that
+            // StoreUniformLocations does for a linked program, and it is what seeds the material texture
+            // defaults that set 3 numbering is drawn from.
+            shader.AdoptSpirvInterface(SpirvShaderInterface.FromStages(reflected, shaderName));
+
+            // Seeded from the source, and trimmed the way the linker trims it on the OpenGL path: a
+            // reserved sampler behind a combo the compiler dropped is not in the module, and binding one
+            // would write a descriptor no draw reads.
+            shader.ReservedTexturesUsed.RemoveWhere(reserved => !shader.SpirvInterface!.TryGetTexture(reserved, out _));
 
             SpirvModules[shader] = modules;
 

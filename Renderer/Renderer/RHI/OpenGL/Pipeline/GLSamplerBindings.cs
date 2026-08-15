@@ -25,13 +25,20 @@ namespace ValveResourceFormat.Renderer.RHI.OpenGL;
 /// pays once. Either way the caller makes one call and writes no uniform of its own.
 /// </para>
 /// <para>
-/// The bindings are read from the program and from the renderer's existing conventions rather than from
-/// SPIR-V reflection. <see cref="Shaders.Spirv.SpirvReflection"/> reports the same thing, but it needs
-/// the module, and on the OpenGL path there is none: programs are linked from GLSL and the SPIR-V
-/// toolchain is a validation step that needs a native shaderc. Deriving the map from the program keeps
-/// it available at runtime with nothing to deploy, and keeps it in agreement with
-/// <see cref="RenderMaterial.CollectTextureBindings"/> by construction, because both walk the same list
-/// in the same order.
+/// Where the bindings are read from depends on which path built the shader, because only one of the two
+/// sources exists at a time. On the OpenGL path they come from the linked program and the renderer's
+/// existing conventions: there is no module to reflect, since programs are linked from GLSL and the
+/// SPIR-V toolchain is a validation step needing a native shaderc. On the SPIR-V path there is no
+/// program to query and the map comes from <see cref="Shaders.Spirv.SpirvShaderInterface"/> instead,
+/// which is the set and binding glslang wrote from emission's own decorations.
+/// </para>
+/// <para>
+/// Either way the map agrees with <see cref="RenderMaterial.CollectTextureBindings"/> by construction,
+/// because that path reads the same source for the same shader: the program's texture walk on OpenGL,
+/// the module's declarations on SPIR-V. The two sources are <em>not</em> interchangeable and must not be
+/// mixed &#8212; OpenGL numbers a material's samplers sequentially over what the linker kept, while
+/// emission numbers every one the source declared, so they diverge for any shader with a sampler behind
+/// a combo the compiler dropped.
 /// </para>
 /// </remarks>
 public sealed class GLSamplerBindings
@@ -55,6 +62,17 @@ public sealed class GLSamplerBindings
     private readonly Dictionary<string, SamplerBinding> byName;
     private readonly Dictionary<int, int> pointedAt = [];
     private readonly int program;
+
+    /// <summary>
+    /// Whether the map came out of the shader's SPIR-V rather than out of a linked OpenGL program.
+    /// </summary>
+    /// <remarks>
+    /// A reflected map carries no uniform locations, because there is no program to have any, and every
+    /// method here that aims a sampler at a unit is a no-op for one. Kept as its own flag rather than a
+    /// <c>program == 0</c> test so the intent survives someone changing what an absent program looks
+    /// like.
+    /// </remarks>
+    private readonly bool reflected;
 
     /// <summary>Gets every sampler this program declares that the descriptor scheme covers, in set then
     /// binding order.</summary>
@@ -92,6 +110,30 @@ public sealed class GLSamplerBindings
 
         var bindings = ImmutableArray.CreateBuilder<SamplerBinding>();
 
+        if (shader.SpirvInterface is { } declared)
+        {
+            // The SPIR-V path. Both sets come straight from the module: the set and binding are the ones
+            // glslang wrote from the decorations emission put there, so the map cannot disagree with the
+            // shader. Nothing is queried and no uniform location exists, which is why UniformLocation is
+            // -1 and every aiming call below turns into a no-op.
+            reflected = true;
+
+            foreach (var texture in declared.Textures)
+            {
+                if (texture.Set is not (DescriptorSets.ReservedTextures or DescriptorSets.MaterialTextures))
+                {
+                    continue;
+                }
+
+                bindings.Add(new SamplerBinding(texture.Name, texture.Set, texture.Binding,
+                    UnitFor(texture.Set, texture.Binding), UniformLocationAbsent));
+            }
+
+            Bindings = [.. bindings];
+            byName = BuildLookup(Bindings);
+            return;
+        }
+
         // Set 2, the global textures. Table driven, because the reserved samplers include array and
         // shadow samplers that the program's own uniform walk does not classify.
         foreach (var (name, slot) in MaterialLoader.ReservedTextureSlotByName)
@@ -124,13 +166,22 @@ public sealed class GLSamplerBindings
         }
 
         Bindings = [.. bindings];
+        byName = BuildLookup(Bindings);
+    }
 
-        byName = new Dictionary<string, SamplerBinding>(Bindings.Length, StringComparer.Ordinal);
+    /// <summary>The location a sampler has when there is no program for it to have one in.</summary>
+    private const int UniformLocationAbsent = -1;
 
-        foreach (var binding in Bindings)
+    private static Dictionary<string, SamplerBinding> BuildLookup(ImmutableArray<SamplerBinding> bindings)
+    {
+        var lookup = new Dictionary<string, SamplerBinding>(bindings.Length, StringComparer.Ordinal);
+
+        foreach (var binding in bindings)
         {
-            byName[binding.Name] = binding;
+            lookup[binding.Name] = binding;
         }
+
+        return lookup;
     }
 
     /// <summary>Finds where a named sampler binds.</summary>
@@ -175,6 +226,13 @@ public sealed class GLSamplerBindings
     /// </remarks>
     public void PointReservedSamplersAtUnits()
     {
+        if (reflected)
+        {
+            // Vulkan reads the set and binding from the pipeline layout; there is no sampler uniform to
+            // aim, and no program to aim it in.
+            return;
+        }
+
         foreach (var binding in Bindings)
         {
             if (binding.DescriptorSet == DescriptorSets.ReservedTextures)
@@ -196,6 +254,11 @@ public sealed class GLSamplerBindings
     /// </remarks>
     public void EnsurePointedAt(int uniformLocation, int textureUnit)
     {
+        if (reflected)
+        {
+            return;
+        }
+
         if (pointedAt.TryGetValue(uniformLocation, out var current) && current == textureUnit)
         {
             return;

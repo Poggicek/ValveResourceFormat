@@ -98,6 +98,68 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// </summary>
         public bool ReadsSceneColor => ReservedTexturesUsed.Contains("g_tSceneColor");
 
+        /// <summary>
+        /// Gets what this shader's SPIR-V modules declare, or <see langword="null"/> on the OpenGL path.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Non-null exactly when the shader was compiled to SPIR-V, which is exactly when
+        /// <see cref="Program"/> is zero and no OpenGL introspection can answer anything. Every bind-side
+        /// question the renderer used to put to the driver &#8212; does this program declare that sampler,
+        /// and which slot does it take &#8212; is answered from here instead, so what is recorded and what
+        /// the shader declares cannot disagree.
+        /// </para>
+        /// <para>
+        /// Callers use it as the discriminator for the two paths rather than testing
+        /// <see cref="Program"/>: a trapped or contextless <c>glGetUniformLocation</c> returns zero rather
+        /// than -1, which reads as a valid location and is how the old test managed to pass on the very
+        /// path it was meant to exclude.
+        /// </para>
+        /// </remarks>
+        public Spirv.SpirvShaderInterface? SpirvInterface { get; private set; }
+
+        /// <summary>
+        /// Adopts the interface reflected out of this shader's SPIR-V, and seeds the material texture
+        /// defaults that <see cref="StoreUniformLocations"/> seeds from the linked program on the OpenGL
+        /// path.
+        /// </summary>
+        /// <param name="declared">What the modules declare.</param>
+        /// <exception cref="ArgumentNullException"><paramref name="declared"/> is <see langword="null"/>.</exception>
+        /// <remarks>
+        /// Seeded in binding order so that <see cref="Default"/>'s texture walk order and the
+        /// shader's own numbering are the same order, and seeded with the same fallback textures the
+        /// OpenGL path picks, so a material that omits a texture gets the same stand-in on both backends.
+        /// </remarks>
+        internal void AdoptSpirvInterface(Spirv.SpirvShaderInterface declared)
+        {
+            ArgumentNullException.ThrowIfNull(declared);
+
+            SpirvInterface = declared;
+
+            // MaterialTextureNames already excludes the reserved samplers, which are bound scene-wide
+            // rather than by a material, exactly as StoreUniformLocations excludes them on the OpenGL
+            // path.
+            foreach (var name in declared.MaterialTextureNames)
+            {
+                if (Default.Textures.ContainsKey(name))
+                {
+                    continue;
+                }
+
+                Default.Textures[name] = FallbackTextureFor(name);
+            }
+        }
+
+        /// <summary>The stand-in a material texture gets when the material does not supply one.</summary>
+        /// <remarks>Shared by the OpenGL and SPIR-V seeding paths so the two cannot pick differently.</remarks>
+        private RenderTexture FallbackTextureFor(string name) => name switch
+        {
+            _ when name.Contains("color", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetErrorTexture(),
+            _ when name.Contains("normal", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetDefaultNormal(),
+            _ when name.Contains("mask", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetDefaultMask(),
+            _ => MaterialLoader.GetErrorTexture(),
+        };
+
         private readonly Dictionary<string, (ActiveUniformType Type, int Location, bool SrgbRead)> Uniforms = [];
 
         /// <summary>Gets the default <see cref="RenderMaterial"/> whose values serve as fallbacks when a material omits a uniform.</summary>
@@ -207,7 +269,14 @@ namespace ValveResourceFormat.Renderer.Shaders
         {
             get
             {
-                EnsureLoaded();
+                // On the SPIR-V path the map is read out of the modules, so there is nothing to link and
+                // nothing to introspect. Calling EnsureLoaded here would be a glGetProgram on a program
+                // that does not exist, and would leave IsValid false for a shader that compiled fine.
+                if (SpirvInterface == null)
+                {
+                    EnsureLoaded();
+                }
+
                 return samplerBindings ??= new GLSamplerBindings(this);
             }
         }
@@ -403,13 +472,7 @@ namespace ValveResourceFormat.Renderer.Shaders
                         continue;
                     }
 
-                    Default.Textures[name] = name switch
-                    {
-                        _ when name.Contains("color", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetErrorTexture(),
-                        _ when name.Contains("normal", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetDefaultNormal(),
-                        _ when name.Contains("mask", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetDefaultMask(),
-                        _ => MaterialLoader.GetErrorTexture(),
-                    };
+                    Default.Textures[name] = FallbackTextureFor(name);
                 }
                 else if (isVector && !Default.VectorParams.ContainsKey(name))
                 {
@@ -944,6 +1007,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             RenderModes.UnionWith(shader.RenderModes);
 
             GlobalsLayout = shader.GlobalsLayout;
+            SpirvInterface = shader.SpirvInterface;
 
             ReservedTexturesUsed.Clear();
             ReservedTexturesUsed.UnionWith(shader.ReservedTexturesUsed);

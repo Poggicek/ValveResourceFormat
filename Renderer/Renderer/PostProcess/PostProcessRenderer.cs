@@ -195,11 +195,32 @@ namespace ValveResourceFormat.Renderer.PostProcess
         /// <param name="slot">The texture unit, which is also the binding within the descriptor set.</param>
         /// <param name="name">The sampler uniform name.</param>
         /// <param name="texture">The texture to bind, or <see langword="null"/> to do nothing.</param>
-        /// <param name="descriptorSet">Which set the binding belongs to. Defaults to the reserved globals.</param>
+        /// <param name="descriptorSet">Which set the binding belongs to on the OpenGL path. Defaults to
+        /// the reserved globals, and is ignored on the SPIR-V path, where the shader itself says.</param>
         /// <remarks>
-        /// Only the bind moves onto the command list. Which unit a sampler reads is program state rather
-        /// than a binding, so it stays a <c>glProgramUniform</c> on both paths &#8212; and a program that
-        /// does not declare the sampler binds nothing at all, exactly as <c>Shader.SetTexture</c> does.
+        /// <para>
+        /// On OpenGL only the bind moves onto the command list. Which unit a sampler reads is program
+        /// state rather than a binding, so it stays a <c>glProgramUniform</c> on both of that backend's
+        /// paths &#8212; and a program that does not declare the sampler binds nothing at all, exactly as
+        /// <c>Shader.SetTexture</c> does.
+        /// </para>
+        /// <para>
+        /// <b>On the SPIR-V path the caller's <paramref name="slot"/> and
+        /// <paramref name="descriptorSet"/> are not where the texture goes.</b> They are an OpenGL
+        /// texture unit and the set that unit was assumed to belong to, and the assumption was wrong for
+        /// most of this chain: <c>g_tColorBuffer</c>, <c>g_tColorCorrectionLUT</c>, <c>g_tBloom</c>,
+        /// <c>g_tSourceMsaa</c>, <c>inputImage</c> and the four <c>g_tColorCorrection</c> LUTs are none of
+        /// them reserved samplers, so emission puts every one of them in
+        /// <see cref="DescriptorSets.MaterialTextures"/> while every call here defaulted to
+        /// <see cref="DescriptorSets.ReservedTextures"/>. Set 3 was therefore never recorded and never
+        /// bound, which is what "uses set 3 but that set is not bound" was reporting. The shader's own
+        /// declaration is used instead, so the two cannot drift again.
+        /// </para>
+        /// <para>
+        /// A name the module does not declare records nothing, which is the same outcome the OpenGL path
+        /// reaches through a missing uniform location, and covers the sampler a compiler eliminated as
+        /// well as the one a shader never had.
+        /// </para>
         /// </remarks>
         internal static void BindTexture(ICommandList? commandList, Shader shader, int slot, string name,
             RenderTexture? texture, int descriptorSet = DescriptorSets.ReservedTextures)
@@ -212,6 +233,19 @@ namespace ValveResourceFormat.Renderer.PostProcess
             if (commandList == null)
             {
                 shader.SetTexture(slot, name, texture);
+                return;
+            }
+
+            if (shader.SpirvInterface is { } declared)
+            {
+                if (!declared.TryGetTexture(name, out var declaredAt))
+                {
+                    return;
+                }
+
+                // SamplerFor, never RhiSampler, for the reason Shader.BindTexture spells out: on OpenGL
+                // it is null so the unit keeps sampler 0 and the texture's own parameters stay in charge.
+                commandList.BindTexture(declaredAt.Set, declaredAt.Binding, texture.RhiTexture, texture.SamplerFor(commandList.Device));
                 return;
             }
 

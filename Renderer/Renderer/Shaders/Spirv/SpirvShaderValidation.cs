@@ -17,6 +17,11 @@ namespace ValveResourceFormat.Renderer.Shaders.Spirv;
 /// from <see cref="ShaderLoader.ParsedShaderData.VulkanDiagnostics"/>. Worth reading even when the
 /// stage compiled, and worth reading instead of the compiler log when it did not: glslang reports only
 /// the first offending declaration per translation unit, so it undercounts how much work is left.</param>
+/// <param name="EmittedMaterialTextureBindings">The slot the preprocessor assigned each material
+/// sampler, from <see cref="ShaderLoader.ParsedShaderData.MaterialTextureBindings"/>, before glslang
+/// saw the source. Carried so a caller can check what the module ended up declaring against what
+/// emission asked for, which is the one link in the chain neither side of the renderer can verify on
+/// its own.</param>
 /// <param name="Elapsed">Wall clock time for the compile alone, excluding preprocessing.</param>
 public sealed record SpirvShaderValidationResult(
     string ShaderName,
@@ -26,6 +31,7 @@ public sealed record SpirvShaderValidationResult(
     SpirvReflectionResult? Reflection,
     ImmutableArray<string> ContractViolations,
     ImmutableArray<string> SourceDiagnostics,
+    ImmutableArray<KeyValuePair<string, int>> EmittedMaterialTextureBindings,
     TimeSpan Elapsed);
 
 /// <summary>
@@ -84,6 +90,7 @@ public static class SpirvShaderValidation
         var header = BuildHeader(parsed, shaderName);
         var sourceMap = new SpirvSourceMap(parsed.SourceFiles);
         var sourceDiagnostics = parsed.VulkanDiagnostics.ToImmutableArray();
+        var emittedBindings = parsed.MaterialTextureBindings.ToImmutableArray();
 
         var results = ImmutableArray.CreateBuilder<SpirvShaderValidationResult>();
 
@@ -117,7 +124,7 @@ public static class SpirvShaderValidation
                 violations = SpirvReflection.ValidateDescriptorSets(reflection);
             }
 
-            results.Add(new SpirvShaderValidationResult(shaderName, stage, resolvedFlavour, result, reflection, violations, sourceDiagnostics, stopwatch.Elapsed));
+            results.Add(new SpirvShaderValidationResult(shaderName, stage, resolvedFlavour, result, reflection, violations, sourceDiagnostics, emittedBindings, stopwatch.Elapsed));
         }
 
         return results.ToImmutable();

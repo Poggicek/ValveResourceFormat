@@ -625,6 +625,34 @@ public static class SpirvReflection
                 continue;
             }
 
+            // Which of the two texture sets is decided by the sampler's name, and accepting either was a
+            // hole wide enough to drive the whole scheme through: a probe that moved all 128 reserved
+            // texture bindings into set 3 drew zero violations from this. A reserved sampler is bound
+            // scene-wide at its ReservedTextureSlots number and a material sampler is numbered per
+            // shader, so the two are not interchangeable and swapping them binds the wrong texture in
+            // silence.
+            if (expected < 0)
+            {
+                var reserved = MaterialLoader.ReservedTextureSlotByName.TryGetValue(binding.Name, out var slot);
+                var wanted = reserved ? DescriptorSets.ReservedTextures : DescriptorSets.MaterialTextures;
+
+                if (binding.Set != wanted && reserved)
+                {
+                    problems.Add(string.Create(CultureInfo.InvariantCulture,
+                        $"{where} is the reserved texture {slot} and belongs in set {DescriptorSets.ReservedTextures} at binding {(int)slot}."));
+                }
+                else if (binding.Set != wanted)
+                {
+                    problems.Add(string.Create(CultureInfo.InvariantCulture,
+                        $"{where} is not a reserved texture, so it belongs in set {DescriptorSets.MaterialTextures} at the number its shader assigned it."));
+                }
+                else if (reserved && binding.Binding != (int)slot)
+                {
+                    problems.Add(string.Create(CultureInfo.InvariantCulture,
+                        $"{where} is the reserved texture {slot}, which is bound scene-wide at binding {(int)slot}."));
+                }
+            }
+
             if (binding.Kind == SpirvResourceKind.UniformBuffer && binding.Binding >= (int)ReservedBufferSlots.Max)
             {
                 problems.Add(string.Create(CultureInfo.InvariantCulture,
