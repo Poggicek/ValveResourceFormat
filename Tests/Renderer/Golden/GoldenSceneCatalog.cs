@@ -460,6 +460,14 @@ namespace Tests.Renderer.Golden
             // and one recorded from the RHI path would fail the default mode. The scene was therefore
             // withdrawn rather than left encoding either. Restoring DXT1 coverage needs a plain 2D DXT1
             // fixture, and the divergence on this one needs explaining first.
+            //
+            // Narrowing that, for whoever picks it up: this fixture is the only CUBE texture among the
+            // format set, and every fixture that agrees is 2D. So the variable under test is almost
+            // certainly the texture target rather than the block format -- a cube sampled through the
+            // viewer's 2D quad -- and the two paths reaching different answers about it says the target
+            // is carried differently by RenderTexture's own binding than by the RHI's. That makes it a
+            // cube-versus-2D binding question, not a DXT1 decode question, and it is worth confirming
+            // that way round before anyone goes looking at the decompressor.
             var textures = new[]
             {
                 ("texture_dxt5", "DXT5_mod_dire_lava_000b_vmat_g_tnormal1_5a28bd86.vtex_c"),
