@@ -550,7 +550,7 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
             if (resolveColor)
             {
-                shaderMsaaResolve.Use();
+                shaderMsaaResolve.Use(commandList);
                 BindComputePipeline(commandList, shaderMsaaResolve);
                 BindTexture(commandList, shaderMsaaResolve, 0, "g_tSourceMsaa", source.Color);
                 BindStorageImage(commandList, 1, destColor, SizedInternalFormat.Rgba16f);
@@ -559,7 +559,7 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
             if (resolveDepth)
             {
-                shaderDepthResolve.Use();
+                shaderDepthResolve.Use(commandList);
                 BindComputePipeline(commandList, shaderDepthResolve);
                 BindTexture(commandList, shaderDepthResolve, 0, "g_tSourceDepthMsaa", source.Depth);
                 BindStorageImage(commandList, 1, destDepth, SizedInternalFormat.R32f);
@@ -624,7 +624,7 @@ namespace ValveResourceFormat.Renderer.PostProcess
             var weights = Vector4.Zero;
             var totalWeight = 0f;
 
-            shaderCombineLuts.Use();
+            shaderCombineLuts.Use(commandList);
             BindComputePipeline(commandList, shaderCombineLuts);
 
             for (var i = 0; i < WorldPostProcessInfo.MaxBlendedLuts; i++)
@@ -708,7 +708,7 @@ namespace ValveResourceFormat.Renderer.PostProcess
             {
                 var msaaResolveShader = DOF.Enabled ? DOF.MsaaResolveDof : shaderMsaaResolve;
 
-                msaaResolveShader.Use();
+                msaaResolveShader.Use(commandList);
                 BindComputePipeline(commandList, msaaResolveShader);
 
                 // The last thing to touch this framebuffer was the translucent or overlay pass, so its
@@ -750,7 +750,7 @@ namespace ValveResourceFormat.Renderer.PostProcess
                 }
 
                 colorBufferDraw.Bind(FramebufferTarget.DrawFramebuffer);
-                postProcessShader.Use();
+                postProcessShader.Use(commandList);
 
                 // Loaded rather than cleared: the tonemap covers every texel of its own viewport, but that
                 // viewport is the scene's size rather than the target's, so a clear would wipe whatever

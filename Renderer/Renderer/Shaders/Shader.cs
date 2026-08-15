@@ -525,12 +525,25 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// buffer with its own; shaders drawn without a material keep it, and <see cref="SetUniform(string, float)"/>
         /// writes into it.
         /// </summary>
-        public void Use()
+        /// <param name="commandList">
+        /// The list this shader's work is being recorded into, or <see langword="null"/> when the caller is
+        /// issuing OpenGL directly. Only the constant buffer bind uses it; installing the program is still
+        /// <c>glUseProgram</c>, and a recording backend takes the program from the pipeline instead.
+        /// </param>
+        /// <remarks>
+        /// Passing the list matters most for the shaders that are never drawn through a
+        /// <see cref="RenderMaterial"/> at all &#8212; the post-process and compute ones. A material's
+        /// <see cref="RenderMaterial.Render"/> rebinds set 0 binding 7 with its own buffer immediately
+        /// after this, so for a mesh draw this bind is redundant; for <c>msaa_resolve</c> or
+        /// <c>post_processing</c> it is the only one there is, and without it the draw reads a descriptor
+        /// nothing ever wrote.
+        /// </remarks>
+        public void Use(RHI.ICommandList? commandList = null)
         {
             EnsureLoaded();
             GL.UseProgram(Program);
 
-            Default.BindGlobals(this);
+            Default.BindGlobals(this, commandList);
         }
 
         /// <summary>Sets a packed global uniform in this shader's own constant buffer.</summary>

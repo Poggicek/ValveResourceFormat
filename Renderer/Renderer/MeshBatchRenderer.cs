@@ -215,6 +215,9 @@ namespace ValveResourceFormat.Renderer
             // same three things that make the OpenGL path rebind: the shader, the material, and the VAO.
             var rebindPipeline = false;
 
+            // Set alongside it whenever the material changes, and consumed after the pipeline bind.
+            var rebindMaterialTextures = false;
+
             // Reused across every material change in this batch; CollectTextureBindings clears it.
             var materialTextures = commandList != null ? new List<RenderMaterial.TextureBinding>() : null;
 
@@ -298,7 +301,10 @@ namespace ValveResourceFormat.Renderer
                             uniforms.ShaderProgramId = shader.GetUniformLocation("shaderProgramId");
                         }
 
-                        shader.Use();
+                        // The list goes in for the shaders that are drawn without a material at all: a
+                        // replacement shader with IgnoreMaterialData set never reaches
+                        // RenderMaterial.Render, so this is the only bind of its constant buffer.
+                        shader.Use(commandList);
 
                         Debug.Assert(context.Scene.InstanceBufferGpu != null && context.Scene.TransformBufferGpu != null);
                         context.Scene.TransformBufferGpu.BindBufferBase();
@@ -313,18 +319,21 @@ namespace ValveResourceFormat.Renderer
                     }
 
                     material = requestMaterial;
-                    material.Render(shader);
 
-                    // Render's texture binds are OpenGL's own and record nothing, so a backend that binds
-                    // by descriptor set gets set 3 restated here. Done on the material change rather than
-                    // per draw because that is when the set's contents change; the run of draws that
-                    // follows shares them, exactly as it shares the OpenGL units.
-                    if (commandList != null)
-                    {
-                        BindMaterialTextures(commandList, material, shader!, materialTextures!);
-                    }
+                    // The list goes in so the material's constant buffer is bound as set 0 binding 7
+                    // rather than only through OpenGL. Its texture binds still are not recorded from in
+                    // there; those are restated below.
+                    material.Render(shader, commandList);
 
                     rebindPipeline = true;
+
+                    // Render's texture binds are OpenGL's own and record nothing, so a backend that binds
+                    // by descriptor set gets set 3 restated. Deferred to after the pipeline bind below
+                    // rather than done here: a descriptor write is validated against the layout of the
+                    // pipeline that is bound when it happens, so writing this material's slots while the
+                    // previous draw's pipeline is still bound checks them against the wrong set 3 and
+                    // rejects any slot that one does not declare.
+                    rebindMaterialTextures = true;
                 }
 
                 var requestVao = request.Call.GetVertexArrayObject();
@@ -351,6 +360,14 @@ namespace ValveResourceFormat.Renderer
                 {
                     BindPipelineAndGeometry(shader!, material!, request.Call, ref config);
                     rebindPipeline = false;
+                }
+
+                // After the pipeline, so the writes are checked against the set 3 this draw actually
+                // reads. See where the flag is set.
+                if (commandList != null && rebindMaterialTextures)
+                {
+                    BindMaterialTextures(commandList, material!, shader!, materialTextures!);
+                    rebindMaterialTextures = false;
                 }
 
                 Draw(shader!, ref uniforms, ref config, new(request.Mesh, request.Call, request.Node));
@@ -557,16 +574,32 @@ namespace ValveResourceFormat.Renderer
                 var numBones = 0u;
                 var boneStart = 0u;
 
+                // BoneTransforms is per-draw, not per-scene: a skinned mesh overrides the slot with its
+                // own matrices and an unskinned one puts the scene's transforms back. Recording only the
+                // scene-wide fallback satisfies the draw-time guard for every draw -- set 1 is bound
+                // either way -- while leaving a skinned model on Vulkan reading node transforms as bone
+                // matrices. That renders wrong rather than failing, so nothing but this catches it.
                 if (bAnimated)
                 {
-                    request.Mesh.BoneMatricesGpu!.BindBufferBase();
+                    var boneMatrices = request.Mesh.BoneMatricesGpu!;
+
+                    boneMatrices.BindBufferBase();
+                    config.CommandList?.BindStorageBuffer((int)ReservedBufferSlots.BoneTransforms, boneMatrices.RhiBuffer);
+
                     numBones = (uint)request.Mesh.MeshBoneCount;
                     boneStart = (uint)request.Mesh.MeshBoneOffset;
                 }
                 else
                 {
                     // todo: this is not resetting when there are no aggregates in scene
-                    request.Node.Scene.TransformBufferGpu?.BindBufferBase(ReservedBufferSlots.BoneTransforms);
+                    var transforms = request.Node.Scene.TransformBufferGpu;
+
+                    transforms?.BindBufferBase(ReservedBufferSlots.BoneTransforms);
+
+                    if (transforms != null)
+                    {
+                        config.CommandList?.BindStorageBuffer((int)ReservedBufferSlots.BoneTransforms, transforms.RhiBuffer);
+                    }
                 }
 
                 GL.ProgramUniform3((uint)shader.Program, uniforms.AnimationData, bAnimated ? 1u : 0u, boneStart, numBones);

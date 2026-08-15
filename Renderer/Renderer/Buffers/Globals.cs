@@ -150,13 +150,15 @@ public sealed class Globals : Buffer
     /// one thread and can be swapped for another, so there is nothing safe to cache it in.
     /// </para>
     /// <para>
-    /// <b>The command list is not yet supplied by the renderer's own draw path.</b>
-    /// <c>RenderMaterial.Render</c> is the only caller and holds no list, so on Vulkan every draw whose
-    /// shader has a non-empty <see cref="GlobalsLayout"/> reaches the device with set 0 binding 7 unwritten
-    /// &#8212; which the validation layer reports as <c>variable "Globals" ... never updated</c>. The
-    /// draw-time guard does not catch it, because that checks whether a set was bound at all and set 0
-    /// carries the view and lighting buffers regardless. Threading a list to that call site is the fix; this
-    /// parameter is what it will pass.
+    /// <b>Supplying the list is what writes set 0 binding 7.</b> The two callers are
+    /// <c>RenderMaterial.Render</c>, for a mesh draw, and <c>Shader.Use</c>, for the post-process and
+    /// compute shaders that are never drawn through a material at all; both now thread one through where
+    /// their own caller has it. When neither does, a draw whose shader has a non-empty
+    /// <see cref="GlobalsLayout"/> reaches the device with that binding unwritten, which the validation
+    /// layer reports as <c>variable "Globals" ... never updated</c> and reading it is undefined behaviour.
+    /// <b>Nothing in the suite catches a regression here.</b> The draw-time guard checks whether a set was
+    /// bound at all, and set 0 carries the view and lighting buffers regardless, so the only signal is the
+    /// validation log.
     /// </para>
     /// </remarks>
     public void Bind(RHI.ICommandList? commandList = null)

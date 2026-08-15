@@ -130,7 +130,7 @@ public class BloomRenderer
         {
             Debug.Assert(input.Target == TextureTarget.Texture2D);
 
-            firstDownsampleBloomThreshold.Use();
+            firstDownsampleBloomThreshold.Use(commandList);
             PostProcessRenderer.BindTexture(commandList, firstDownsampleBloomThreshold, 0, "inputTexture", input);
 
             if (commandList == null)
@@ -216,7 +216,7 @@ public class BloomRenderer
                 ? firstUpsample
                 : upsample;
 
-            upsampleShader.Use();
+            upsampleShader.Use(commandList);
 
             // Only the coarser level being sampled is made readable, before the pass claims the finer one
             // as its target. The two levels are in different states for the length of this pass, which is
@@ -288,7 +288,7 @@ public class BloomRenderer
             pong.Bind(FramebufferTarget.DrawFramebuffer);
         }
 
-        shader.Use();
+        shader.Use(commandList);
 
         // The source was rendered into by the previous step of the ping-pong, so it is still a colour
         // target. Transitioned before the destination's pass opens, since the two are different textures

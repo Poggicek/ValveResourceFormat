@@ -120,7 +120,7 @@ public class DOFRenderer
 
         using (new GLDebugGroup("Depth Of Field"))
         {
-            DOF.Use();
+            DOF.Use(commandList);
 
             BlurredResult.Resize(input.Width, input.Height);
 

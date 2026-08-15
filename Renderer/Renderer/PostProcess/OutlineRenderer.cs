@@ -33,7 +33,7 @@ public class OutlineRenderer(RendererContext rendererContext)
     {
         Debug.Assert(outlineEdge != null);
 
-        outlineEdge.Use();
+        outlineEdge.Use(commandList);
 
         outlineEdge.SetUniform("g_bFlipY", flipY);
         outlineEdge.SetUniform("g_nNumSamplesMSAA", numSamples);

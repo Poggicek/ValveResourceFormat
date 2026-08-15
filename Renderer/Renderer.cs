@@ -1365,7 +1365,7 @@ public class Renderer
             var logMin = -8f;
             var logRange = 13f;
 
-            shader.Use();
+            shader.Use(commandList);
             PostProcess.PostProcessRenderer.BindComputePipeline(commandList, shader);
             PostProcess.PostProcessRenderer.BindTexture(commandList, shader, 0, "inputImage", texture);
             shader.SetUniform1("logMinLuminance", logMin);

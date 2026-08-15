@@ -451,7 +451,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
             // Sets the material's uniforms and render state on both paths; the texture binds it also does
             // are what CollectTextureBindings restates below for a backend that binds by descriptor set.
-            material.Render(shader);
+            material.Render(shader, commandList);
 
             if (commandList != null)
             {

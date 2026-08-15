@@ -387,14 +387,19 @@ namespace ValveResourceFormat.Renderer.Materials
         /// The shader being drawn with, whose layout the buffer is filled for. Usually <see cref="Shader"/>,
         /// but a few renderers draw a material through a shader of their own.
         /// </param>
-        internal void BindGlobals(Shader shader)
+        /// <param name="commandList">
+        /// The command list to record the bind into, or <see langword="null"/> to bind through OpenGL.
+        /// Supplying it is what writes set 0 binding 7; see <see cref="Globals.Bind"/> for what a draw
+        /// reads when nothing does.
+        /// </param>
+        internal void BindGlobals(Shader shader, RHI.ICommandList? commandList = null)
         {
             if (shader.GlobalsLayout.Size == 0)
             {
                 return;
             }
 
-            EnsureGlobals(shader).Bind();
+            EnsureGlobals(shader).Bind(commandList);
         }
 
         private Globals EnsureGlobals(Shader shader)
@@ -546,7 +551,13 @@ namespace ValveResourceFormat.Renderer.Materials
 
         /// <summary>Binds textures, sets material uniforms, and applies blend/depth render state for this material.</summary>
         /// <param name="shader">The shader to use for this draw call, or <see langword="null"/> to use <see cref="Shader"/>.</param>
-        public void Render(Shader? shader = default)
+        /// <param name="commandList">
+        /// The command list this draw is being recorded into, or <see langword="null"/> when the caller is
+        /// issuing OpenGL directly. Only the constant buffer bind uses it; the texture binds this method
+        /// makes are still OpenGL's own, and a recording caller restates them from
+        /// <see cref="CollectTextureBindings"/>.
+        /// </param>
+        public void Render(Shader? shader = default, RHI.ICommandList? commandList = null)
         {
             textureUnit = TextureUnitStart;
 
@@ -557,7 +568,7 @@ namespace ValveResourceFormat.Renderer.Materials
                 return;
             }
 
-            BindGlobals(shader);
+            BindGlobals(shader, commandList);
 
             boundSamplerUnits.Clear();
 

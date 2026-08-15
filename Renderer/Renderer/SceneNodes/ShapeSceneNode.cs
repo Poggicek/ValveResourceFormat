@@ -410,8 +410,10 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 return;
             }
 
+            var commandList = context.CommandList;
+
             var renderShader = context.ReplacementShader ?? shader;
-            renderShader.Use();
+            renderShader.Use(commandList);
             renderShader.SetUniform3x4("transform", Transform);
             renderShader.SetBoneAnimationData(false);
 
@@ -423,8 +425,6 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 renderShader.SetTexture(0, "g_tColor", ToolTexture);
             }
 
-            var commandList = context.CommandList;
-
             if (commandList == null)
             {
                 VertexArray.Bind(vao, renderShader);
@@ -434,9 +434,25 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 commandList.BindVertexBuffer(0, vertexRhiBuffer!);
                 commandList.BindIndexBuffer(indexRhiBuffer!, IndexType.UInt32);
 
-                if (ToolTexture != null)
+                // g_tColor is declared unconditionally: g_bTriplanarMapping is a runtime uniform rather
+                // than a static combo, so the compiler cannot drop the sampler for the shapes that have
+                // no tool texture. OpenGL does not notice, because it leaves whatever texture was last on
+                // unit 0 there and the branch never samples it; a descriptor set has no such leftover, so
+                // binding only when there is a tool texture leaves set 3 unbound for most shapes and the
+                // draw-time guard refuses the draw. The stand-in is the one Shader picks for a missing
+                // sampler whose name reads as a colour.
+                //
+                // The slot is the shader's own, read the same way RenderMaterial.CollectTextureBindings
+                // reads it, rather than the unit 0 the OpenGL call above uses. Those two numbering schemes
+                // agree only when nothing before g_tColor was dropped, and here they do not: basic_shape
+                // declares no binding 0 at all. A replacement shader that has no g_tColor declares no slot
+                // and binds nothing, which is also what its own set 3 wants.
+                var toolTexture = ToolTexture ?? Scene.RendererContext.MaterialLoader.GetErrorTexture();
+                var slot = 0;
+
+                if (renderShader.SpirvInterface is not { } declared || declared.TryGetMaterialTextureSlot("g_tColor", out slot))
                 {
-                    commandList.BindTexture(DescriptorSets.MaterialTextures, 0, ToolTexture.RhiTexture);
+                    commandList.BindTexture(DescriptorSets.MaterialTextures, slot, toolTexture.RhiTexture);
                 }
             }
 
