@@ -9,6 +9,9 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.Vulkan;
+using ValveResourceFormat.Renderer.Shaders.Spirv;
 
 namespace ValveResourceFormat.Renderer.Shaders
 {
@@ -83,6 +86,36 @@ namespace ValveResourceFormat.Renderer.Shaders
         private static readonly ShaderParser Parser = new();
 
         private readonly RendererContext RendererContext;
+
+        // Keyed by Shader identity. The modules cannot live on Shader itself: that type is the OpenGL
+        // program wrapper and is owned elsewhere, so the mapping is held beside it here.
+        private readonly Dictionary<Shader, Dictionary<ShaderProgramType, IShaderModule>> SpirvModules = [];
+
+        /// <summary>
+        /// Gets a value indicating whether shaders are compiled to SPIR-V rather than through OpenGL.
+        /// </summary>
+        /// <remarks>
+        /// Keyed off the device actually in use, not off <see cref="Flavour"/>. The dialect is a
+        /// property of the generated source; whether the result is handed to <c>glCompileShader</c> or
+        /// to <see cref="IDevice.CreateShaderModule"/> is a property of the backend, and only the
+        /// backend can decide it. A device that is absent means the OpenGL path, which is what every
+        /// existing caller already relies on.
+        /// </remarks>
+        public bool UseSpirvPath => RendererContext.Device?.Backend == RhiBackend.Vulkan;
+
+        /// <summary>
+        /// Gets the dialect this loader preprocesses into: Vulkan GLSL whenever the device is Vulkan,
+        /// otherwise whatever <see cref="Flavour"/> selects.
+        /// </summary>
+        private ShaderFlavour EffectiveFlavour => UseSpirvPath ? ShaderFlavour.Vulkan : Flavour;
+
+        /// <summary>Gets the shader modules compiled for a shader, or <see langword="null"/> on the OpenGL path.</summary>
+        /// <param name="shader">The shader to look up.</param>
+        /// <returns>One module per stage the shader declares.</returns>
+        /// <remarks>What a pipeline is built from. The modules are owned by this loader and are
+        /// destroyed with it.</remarks>
+        public IReadOnlyDictionary<ShaderProgramType, IShaderModule>? GetShaderModules(Shader shader)
+            => SpirvModules.GetValueOrDefault(shader);
 
         /// <summary>
         /// Preprocessed shader source with defines, uniforms, and compiled stage code.
@@ -168,7 +201,10 @@ namespace ValveResourceFormat.Renderer.Shaders
                 {
                     foreach (var shader in Parser.AvailableShaders.Keys)
                     {
-                        GetOrParseShader(shader);
+                        // Warms the cache for the statically selected dialect. A Vulkan device warms its
+                        // own entries on first load; the cache is keyed by dialect so neither evicts the
+                        // other.
+                        GetOrParseShader(shader, Flavour);
                     }
                 }
                 catch (Exception e)
@@ -208,7 +244,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             arguments ??= EmptyArgs;
 
             var shaderFileName = GetShaderFileByName(shaderName);
-            var parsedData = GetOrParseShader(shaderFileName);
+            var parsedData = GetOrParseShader(shaderFileName, EffectiveFlavour);
             var shaderCacheHash = CalculateShaderCacheHash(shaderName, parsedData.Defines, arguments);
 
             if (CachedShaders.TryGetValue(shaderCacheHash, out var cachedShader))
@@ -227,8 +263,19 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// happens: run it before rendering a frame that has to see each shader's final state, such as a pre-warm
         /// pass. Must be called on the thread holding the GL context.
         /// </summary>
+        /// <remarks>
+        /// A no-op on the SPIR-V path. There is nothing to link: a SPIR-V module is complete when it is
+        /// created, and what joins the stages together is the pipeline, built later from the modules.
+        /// Calling <see cref="Shader.EnsureLoaded"/> there would be a <c>glGetProgram</c> on a program
+        /// that does not exist.
+        /// </remarks>
         public void LinkLoadedShaders()
         {
+            if (UseSpirvPath)
+            {
+                return;
+            }
+
             foreach (var shader in CachedShaders.Values)
             {
                 if (!shader.EnsureLoaded())
@@ -252,11 +299,9 @@ namespace ValveResourceFormat.Renderer.Shaders
             Parser.RefreshAvailableShaders();
         }
 
-        private static ParsedShaderData GetOrParseShader(string shaderFileName)
+        private static ParsedShaderData GetOrParseShader(string shaderFileName, ShaderFlavour flavour)
         {
             using var _ = ParserLock.EnterScope();
-
-            var flavour = Flavour;
 
             if (ParsedCache.TryGetValue((flavour, shaderFileName), out var cached))
             {
@@ -297,19 +342,35 @@ namespace ValveResourceFormat.Renderer.Shaders
             return parsedData;
         }
 
+        /// <summary>
+        /// Trims the stages actually compiled for a shader. <c>depth_only</c> with no combos writes
+        /// depth alone, so it has no fragment stage to compile.
+        /// </summary>
+        private static Dictionary<ShaderProgramType, string> SelectStages(string shaderName, ParsedShaderData parsedData, IReadOnlyDictionary<string, byte> arguments)
+        {
+            var sources = parsedData.Sources;
+
+            if (shaderName == "depth_only" && arguments.Count == 0)
+            {
+                sources = new(sources);
+                sources.Remove(ShaderProgramType.Fragment);
+            }
+
+            return sources;
+        }
+
         private Shader CompileAndLinkShader(string shaderName, string shaderFileName, ParsedShaderData parsedData, IReadOnlyDictionary<string, byte> arguments, bool blocking = true)
         {
+            if (UseSpirvPath)
+            {
+                return CompileSpirvShader(shaderName, shaderFileName, parsedData, arguments);
+            }
+
             var shaderProgram = -1;
 
             try
             {
-                var sources = parsedData.Sources;
-
-                if (shaderName == "depth_only" && arguments.Count == 0)
-                {
-                    sources = new(sources);
-                    sources.Remove(ShaderProgramType.Fragment);
-                }
+                var sources = SelectStages(shaderName, parsedData, arguments);
 
                 static ShaderType ToShaderType(ShaderProgramType type) => type switch
                 {
@@ -409,7 +470,160 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
-        private static void CompileShaderObjects(int[] shaderObjects, string[] shaderSources, string shaderFile, string originalShaderName, IReadOnlyDictionary<string, byte> arguments, ParsedShaderData parsedData)
+        /// <summary>
+        /// Compiles every stage to SPIR-V and creates a shader module per stage on the device.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// This path issues no OpenGL call at all, which is the point: on a Vulkan device there is no GL
+        /// context for <c>glCompileShader</c> to run against, and the golden suite's Vulkan run died at
+        /// four separate load stages for exactly that reason.
+        /// </para>
+        /// <para>
+        /// There is no link step. A Vulkan pipeline is what binds stages together, and it is created
+        /// later from these modules; that is why the modules are registered with the pipeline device
+        /// here, since <see cref="IDevice.CreateShaderModule"/> keeps only a handle and a hash and a
+        /// pipeline layout cannot be derived from that alone.
+        /// </para>
+        /// </remarks>
+        private Shader CompileSpirvShader(string shaderName, string shaderFileName, ParsedShaderData parsedData, IReadOnlyDictionary<string, byte> arguments)
+        {
+            var device = RendererContext.Device
+                ?? throw new ShaderCompilerException($"Cannot compile '{shaderName}' to SPIR-V because the renderer context has no device.");
+
+            var sources = SelectStages(shaderName, parsedData, arguments);
+            var headerText = BuildHeader(parsedData, shaderName, arguments);
+            var sourceMap = new SpirvSourceMap(parsedData.SourceFiles);
+            var describedFile = string.Concat(shaderFileName, GetArgumentDescription(arguments));
+
+            var modules = new Dictionary<ShaderProgramType, IShaderModule>(sources.Count);
+
+            try
+            {
+                foreach (var (stage, source) in sources)
+                {
+                    var rhiStage = SpirvCompiler.ToShaderStage(stage);
+                    var debugName = string.Create(CultureInfo.InvariantCulture, $"{shaderFileName}.{ShaderParser.ProgramTypeToExtension[stage]}");
+
+                    var result = SpirvCompiler.Shared.Compile(source, rhiStage, new SpirvCompileOptions
+                    {
+                        FileName = string.Create(CultureInfo.InvariantCulture, $"{shaderFileName}.{ShaderParser.ProgramTypeToExtension[stage]}.slang"),
+                        Header = headerText,
+                        SourceMap = sourceMap,
+                        Target = SpirvTargetEnvironment.Vulkan13,
+                    });
+
+                    if (!result.Success)
+                    {
+                        ThrowSpirvError(result, describedFile, shaderName, "Failed to set up shader", parsedData);
+                    }
+
+                    // CreateReflectedShaderModule records the interface a pipeline layout is derived
+                    // from. Falling back to CreateShaderModule keeps a non-pipeline device usable, and
+                    // the pipeline device says plainly which call was missed if one ever reaches it.
+                    modules[stage] = device is VulkanPipelineDevice pipelineDevice
+                        ? pipelineDevice.CreateReflectedShaderModule(result.Spirv.Span, rhiStage, debugName)
+                        : device.CreateShaderModule(result.Spirv.Span, rhiStage, debugName);
+                }
+            }
+            catch
+            {
+                foreach (var module in modules.Values)
+                {
+                    module.Dispose();
+                }
+
+                throw;
+            }
+
+            // What the source declares is known before any pipeline exists, and the renderer needs it
+            // that early to have a texture bound by the first draw that samples it. Only ever grows.
+            DeclaredReservedTextures.UnionWith(parsedData.ReservedTextures);
+
+            var shader = new Shader(shaderName, RendererContext)
+            {
+#if DEBUG
+                FileName = shaderFileName,
+#endif
+
+                Parameters = arguments,
+                GlobalsLayout = parsedData.GlobalsLayout,
+
+                // There is no GL program or GL shader object behind a SPIR-V module. Leaving these at
+                // zero rather than inventing a handle keeps any accidental GL call an obvious no-op
+                // instead of corrupting an unrelated object.
+                Program = 0,
+                ShaderObjects = [],
+
+                RenderModes = parsedData.RenderModes,
+                UniformNames = parsedData.Uniforms,
+                SrgbUniforms = parsedData.SrgbUniforms,
+                SamplerUserConfigUniforms = parsedData.SamplerUserConfigUniforms,
+                ReservedTexturesUsed = [.. parsedData.ReservedTextures],
+            };
+
+            SpirvModules[shader] = modules;
+
+            var argsDescription = GetArgumentDescription(SortAndFilterArguments(parsedData.Defines, arguments));
+
+            if (IsVfxShaderName(shaderName))
+            {
+                RendererContext.Logger.LogInformation("Shader '{ShaderName}' as '{ShaderFileName}'{ArgsDescription} compiled to SPIR-V ({StageCount} stage(s))", shaderName, shaderFileName, argsDescription, modules.Count);
+            }
+            else
+            {
+                RendererContext.Logger.LogInformation("Shader '{ShaderName}'{ArgsDescription} compiled to SPIR-V ({StageCount} stage(s))", shaderName, argsDescription, modules.Count);
+            }
+
+            return shader;
+        }
+
+        /// <summary>
+        /// Reports a SPIR-V compile failure, mapped back to the shader file and line the author wrote.
+        /// </summary>
+        /// <remarks>
+        /// glslang's log is worded differently from every GL driver's, so the three driver patterns do
+        /// not match it and <see cref="SpirvDiagnosticParser"/> does the locating instead. The failure
+        /// then reads the same and annotates CI the same as the OpenGL path, which is what keeps hot
+        /// reload pointing at the edited line on either backend.
+        /// </remarks>
+        private static void ThrowSpirvError(SpirvCompilationResult result, string shaderFile, ReadOnlySpan<char> originalShaderName, string errorType, ParsedShaderData parsedData)
+        {
+            var primary = result.PrimaryError;
+            var info = result.FormatDiagnostics();
+
+            if (string.IsNullOrWhiteSpace(info))
+            {
+                info = string.Create(CultureInfo.InvariantCulture, $"The shader compiler reported {result.Status} without a message.");
+            }
+
+            ThrowLocatedShaderError(
+                info,
+                primary?.SourceFile,
+                primary?.SourceFileIndex ?? -1,
+                primary?.Line ?? -1,
+                shaderFile,
+                originalShaderName,
+                errorType,
+                parsedData);
+        }
+
+        /// <summary>
+        /// Builds the preamble prepended to every stage: the version, the hoisted extensions, the
+        /// resolved static combo defines, the packed globals block for the flavour, and for Vulkan the
+        /// per-draw push constant block.
+        /// </summary>
+        /// <param name="parsedData">The preprocessed shader.</param>
+        /// <param name="originalShaderName">The name the shader was requested under, which decides
+        /// which <c>GameVfx_</c> variant define is turned on.</param>
+        /// <param name="arguments">Static combo overrides.</param>
+        /// <returns>The header text.</returns>
+        /// <remarks>
+        /// Shared by the OpenGL and SPIR-V paths, and by <see cref="SpirvShaderValidation"/>, so that
+        /// what validation measures is what the renderer compiles. It used to be rebuilt in each of the
+        /// three, which is how the flavour ever managed to differ between them.
+        /// </remarks>
+        internal static string BuildHeader(ParsedShaderData parsedData, string originalShaderName, IReadOnlyDictionary<string, byte> arguments)
         {
             var header = new StringBuilder();
             header.Append(ShaderParser.ExpectedShaderVersion);
@@ -458,7 +672,12 @@ namespace ValveResourceFormat.Renderer.Shaders
                 header.Append(VulkanGlsl.PushConstantBlockSource);
             }
 
-            var headerText = header.ToString();
+            return header.ToString();
+        }
+
+        private static void CompileShaderObjects(int[] shaderObjects, string[] shaderSources, string shaderFile, string originalShaderName, IReadOnlyDictionary<string, byte> arguments, ParsedShaderData parsedData)
+        {
+            var headerText = BuildHeader(parsedData, originalShaderName, arguments);
 
             for (var i = 0; i < shaderObjects.Length; i++)
             {
@@ -514,6 +733,20 @@ namespace ValveResourceFormat.Renderer.Shaders
                 }
             }
 
+            ThrowLocatedShaderError(info, sourceFile, errorSourceFile, errorLine, shaderFile, originalShaderName, errorType, parsedData);
+        }
+
+        /// <summary>
+        /// Reports a compile or link failure whose location has already been resolved to a shader file
+        /// and line, whichever compiler resolved it.
+        /// </summary>
+        /// <remarks>
+        /// The GL drivers and glslang word their logs differently and are matched by different patterns,
+        /// but a located failure has to read the same and produce the same CI annotation either way,
+        /// because hot reload and the CI log both consume this.
+        /// </remarks>
+        private static void ThrowLocatedShaderError(string info, string? sourceFile, int errorSourceFile, int errorLine, string shaderFile, ReadOnlySpan<char> originalShaderName, string errorType, ParsedShaderData parsedData)
+        {
 #if DEBUG
             // Output GitHub Actions annotation https://docs.github.com/en/actions/reference/workflow-commands-for-github-actions
             if (IsCI)
@@ -644,6 +877,16 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
 
             CachedShaders.Clear();
+
+            foreach (var modules in SpirvModules.Values)
+            {
+                foreach (var module in modules.Values)
+                {
+                    module.Dispose();
+                }
+            }
+
+            SpirvModules.Clear();
         }
 
         private static IEnumerable<KeyValuePair<string, byte>> SortAndFilterArguments(Dictionary<string, byte> defines, IReadOnlyDictionary<string, byte> arguments)
@@ -746,10 +989,56 @@ namespace ValveResourceFormat.Renderer.Shaders
                 }
 
                 var fileName = GetShaderFileByName(shader.Name);
-                var parsed = GetOrParseShader(fileName);
+                var parsed = GetOrParseShader(fileName, EffectiveFlavour);
                 var newShader = CompileAndLinkShader(shader.Name, fileName, parsed, shader.Parameters, blocking: false);
+
+                if (UseSpirvPath)
+                {
+                    ReplaceSpirvModules(shader, newShader);
+                    continue;
+                }
+
                 shader.ReplaceWith(newShader);
             }
+        }
+
+        /// <summary>
+        /// Moves a freshly compiled shader's modules onto the instance the renderer already holds, and
+        /// destroys the modules it replaces.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <see cref="Shader.ReplaceWith"/> cannot be used here: it opens with a <c>glDeleteProgram</c>,
+        /// and on a Vulkan device there is neither a program to delete nor a context to delete it in.
+        /// The state it copies across is instead already shared, because both instances were built from
+        /// the same <see cref="ParsedShaderData"/>; only the modules differ.
+        /// </para>
+        /// <para>
+        /// <b>Pipelines built from the old modules are not invalidated by this.</b> A pipeline holds the
+        /// modules it was created from, and nothing here tells the pipeline cache to drop them, so a
+        /// reloaded shader does not reach the screen until pipeline invalidation is wired. Reload
+        /// recompiles and reports diagnostics correctly on Vulkan today; it does not yet redraw.
+        /// </para>
+        /// </remarks>
+        private void ReplaceSpirvModules(Shader shader, Shader newShader)
+        {
+            if (!SpirvModules.Remove(newShader, out var replacement))
+            {
+                return;
+            }
+
+            if (SpirvModules.TryGetValue(shader, out var previous))
+            {
+                foreach (var module in previous.Values)
+                {
+                    RendererContext.Device?.DeferredDestroy(module);
+                }
+            }
+
+            SpirvModules[shader] = replacement;
+
+            RendererContext.Logger.LogInformation(
+                "Shader '{ShaderName}' recompiled to SPIR-V; pipelines built from the previous modules are not invalidated yet", shader.Name);
         }
 
         /// <summary>Compiles every known shader (and all their define combinations) to validate correctness (debug builds only).</summary>
@@ -801,7 +1090,7 @@ namespace ValveResourceFormat.Renderer.Shaders
 
                 // Test all defines one by one
                 var shaderFileName = GetShaderFileByName(shaderName);
-                var parsed = GetOrParseShader(shaderFileName);
+                var parsed = GetOrParseShader(shaderFileName, loader.EffectiveFlavour);
                 var defines = parsed.Defines.Where(static x => !x.Key.StartsWith("GameVfx_", StringComparison.Ordinal)).ToDictionary();
                 var variants = parsed.Defines.Keys.Where(static x => x.StartsWith("GameVfx_", StringComparison.Ordinal));
                 var sourceLines = parsed.SourceFileLines;

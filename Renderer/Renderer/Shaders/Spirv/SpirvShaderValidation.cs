@@ -2,7 +2,6 @@ using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
-using System.Text;
 
 namespace ValveResourceFormat.Renderer.Shaders.Spirv;
 
@@ -82,7 +81,7 @@ public static class SpirvShaderValidation
         var resolvedFlavour = flavour ?? ShaderLoader.Flavour;
 
         var parsed = Preprocess(shaderName, resolvedFlavour);
-        var header = BuildHeader(parsed);
+        var header = BuildHeader(parsed, shaderName);
         var sourceMap = new SpirvSourceMap(parsed.SourceFiles);
         var sourceDiagnostics = parsed.VulkanDiagnostics.ToImmutableArray();
 
@@ -290,46 +289,17 @@ public static class SpirvShaderValidation
     }
 
     /// <summary>
-    /// Rebuilds the preamble <see cref="ShaderLoader"/> prepends: the version, the hoisted extensions,
-    /// the resolved defines, the packed globals block for the flavour, and for Vulkan the per-draw push
-    /// constant block that OpenGL sets one <c>glProgramUniform</c> at a time.
+    /// The preamble the renderer prepends, built by the renderer's own code rather than a copy of it.
     /// </summary>
     /// <remarks>
-    /// This mirrors <c>ShaderLoader.CompileShaderObjects</c> and has to keep mirroring it while the
-    /// module stays unwired. Anything appended there and not here compiles differently under
-    /// validation than it does in the renderer, which is how the flavour gap went unnoticed.
+    /// This used to be a reimplementation, and the two drifted: the copy here missed the Vulkan push
+    /// constant block, so validation measured a header the renderer never compiles. Calling
+    /// <see cref="ShaderLoader.BuildHeader"/> is what makes a measurement here evidence about the real
+    /// path. The shader file name is passed as the requested name because validation compiles renderer
+    /// shaders as themselves, never as a <c>.vfx</c> variant.
     /// </remarks>
-    private static string BuildHeader(ShaderLoader.ParsedShaderData parsed)
-    {
-        var header = new StringBuilder();
+    private static string BuildHeader(ShaderLoader.ParsedShaderData parsed, string shaderName)
+        => ShaderLoader.BuildHeader(parsed, shaderName, EmptyArguments);
 
-        header.Append(ShaderParser.ExpectedShaderVersion);
-        header.Append('\n');
-        header.Append("#extension GL_KHR_shader_subgroup_arithmetic : enable\n");
-        header.Append("#extension GL_KHR_shader_subgroup_vote : enable\n");
-
-        foreach (var extension in parsed.Extensions)
-        {
-            header.Append(extension);
-            header.Append('\n');
-        }
-
-        foreach (var (defineName, defaultValue) in parsed.Defines)
-        {
-            header.Append("#define ");
-            header.Append(defineName);
-            header.Append(' ');
-            header.Append(defaultValue.ToString(CultureInfo.InvariantCulture));
-            header.Append('\n');
-        }
-
-        header.Append(parsed.GlobalsLayout.GetBlockSource(parsed.Flavour));
-
-        if (parsed.Flavour == ShaderFlavour.Vulkan)
-        {
-            header.Append(VulkanGlsl.PushConstantBlockSource);
-        }
-
-        return header.ToString();
-    }
+    private static readonly Dictionary<string, byte> EmptyArguments = [];
 }
