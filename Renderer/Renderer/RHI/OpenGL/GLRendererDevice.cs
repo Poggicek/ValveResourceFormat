@@ -131,6 +131,84 @@ public class GLRendererDevice : GLDevice
     }
 
     /// <summary>
+    /// Gets the pipeline that draws a program with a render state, on whichever backend the device is.
+    /// </summary>
+    /// <param name="device">The device to create through, normally <see cref="ICommandList.Device"/>.</param>
+    /// <param name="program">The linked program to draw with.</param>
+    /// <param name="renderState">The rasterizer, depth-stencil and blend state to draw under.</param>
+    /// <param name="vertexInput">The vertex layout, or <see langword="null"/> for <see cref="VertexInputDesc.Empty"/>.</param>
+    /// <param name="topology">The primitive topology.</param>
+    /// <param name="colorFormats">The colour attachment formats, or <see langword="null"/> for none.</param>
+    /// <param name="depthFormat">The depth attachment format, or <see cref="RhiFormat.Undefined"/> for none.</param>
+    /// <param name="sampleCount">The sample count, which must match the render pass.</param>
+    /// <param name="pushConstants">The push constant range, or <see langword="null"/> for none.</param>
+    /// <param name="name">The debug name, or <see langword="null"/> to name the pipeline after the program.</param>
+    /// <returns>The pipeline, cached on its <see cref="PipelineCacheKey"/> by whichever device made it.</returns>
+    /// <exception cref="NotSupportedException">The device is not an OpenGL one and the program has no
+    /// compiled modules to build a pipeline from.</exception>
+    /// <remarks>
+    /// <para>
+    /// What a draw site should call. The instance <see cref="GetOrCreatePipeline"/> below is an OpenGL
+    /// convenience, so reaching it means casting the device to this type &#8212; which is exactly what
+    /// every draw site used to do, and what threw the moment a device was anything else.
+    /// </para>
+    /// <para>
+    /// OpenGL still goes through that same method, unchanged, so its pipelines and their cache keys are
+    /// what they always were. Any other backend is handed the modules <see cref="ShaderLoader"/> actually
+    /// compiled: <see cref="ModuleFor"/> returns a stand-in naming a linked OpenGL program, which a
+    /// device that never linked it cannot derive a layout from.
+    /// </para>
+    /// </remarks>
+    public static IGraphicsPipeline PipelineFor(
+        IDevice device,
+        Shader program,
+        in RenderState renderState,
+        VertexInputDesc? vertexInput = null,
+        PrimitiveTopology topology = PrimitiveTopology.TriangleList,
+        RhiFormat[]? colorFormats = null,
+        RhiFormat depthFormat = RhiFormat.Undefined,
+        int sampleCount = 1,
+        PushConstantRange? pushConstants = null,
+        string? name = null)
+    {
+        ArgumentNullException.ThrowIfNull(device);
+        ArgumentNullException.ThrowIfNull(program);
+
+        if (device is GLRendererDevice gl)
+        {
+            return gl.GetOrCreatePipeline(program, in renderState, vertexInput, topology, colorFormats, depthFormat, sampleCount, pushConstants, name);
+        }
+
+        var modules = program.RendererContext.ShaderLoader.GetShaderModules(program)
+            ?? throw new NotSupportedException(
+                $"Shader '{program.Name}' has no compiled modules, so no pipeline can be built for a {device.Backend} device. Only the OpenGL backend can draw with a linked program alone.");
+
+        if (!modules.TryGetValue(ShaderProgramType.Vertex, out var vertexModule))
+        {
+            throw new NotSupportedException(
+                $"Shader '{program.Name}' compiled no vertex stage, which a graphics pipeline cannot be built without.");
+        }
+
+        var desc = new GraphicsPipelineDesc
+        {
+            VertexShader = vertexModule,
+
+            // Absent for a depth-only pipeline, which the contract allows and the shadow passes use.
+            FragmentShader = modules.GetValueOrDefault(ShaderProgramType.Fragment),
+            VertexInput = vertexInput ?? VertexInputDesc.Empty,
+            RenderState = renderState,
+            Topology = topology,
+            ColorFormats = colorFormats ?? [],
+            DepthFormat = depthFormat,
+            SampleCount = sampleCount,
+            PushConstants = pushConstants,
+            Name = name ?? program.Name,
+        };
+
+        return device.CreateGraphicsPipeline(desc);
+    }
+
+    /// <summary>
     /// Gets the pipeline that draws a program with a render state, creating it on first request.
     /// </summary>
     /// <param name="program">The linked program to draw with, from <see cref="ShaderLoader"/>.</param>
@@ -149,9 +227,9 @@ public class GLRendererDevice : GLDevice
     /// <returns>The pipeline, cached on its <see cref="PipelineCacheKey"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="program"/> is <see langword="null"/>.</exception>
     /// <remarks>
-    /// The one-call form of <see cref="CreateGraphicsPipeline"/> for a caller that already holds a
-    /// <see cref="Shader"/>, which is every caller inside the renderer. It fills the description's two
-    /// shader modules from the one program, since on OpenGL the stages are not separable.
+    /// The OpenGL backend's own caching path, kept because it is what makes a pipeline out of a linked
+    /// program alone. Call sites should go through <see cref="PipelineFor"/>, which reaches this when the
+    /// device is an OpenGL one and builds a description from real modules when it is not.
     /// </remarks>
     public GLGraphicsPipeline GetOrCreatePipeline(
         Shader program,

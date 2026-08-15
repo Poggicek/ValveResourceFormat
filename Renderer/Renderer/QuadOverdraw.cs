@@ -177,9 +177,8 @@ public class QuadOverdraw(RendererContext rendererContext)
             if (commandList != null)
             {
                 var framebuffer = context!.Value.Framebuffer;
-                var device = (GLRendererDevice)commandList.Device;
-
-                var pipeline = device.GetOrCreatePipeline(
+                var pipeline = GLRendererDevice.PipelineFor(
+                    commandList.Device,
                     visualizeShader,
                     rendererContext.RenderState.CurrentPass,
                     VertexInputDesc.Empty,

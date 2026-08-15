@@ -147,8 +147,6 @@ namespace ValveResourceFormat.Renderer
             }
             else
             {
-                var device = (GLRendererDevice)commandList.Device;
-
                 vertexInputDesc ??= MorphRectVertex.InputLayout.ToVertexInputDesc();
 
                 // Colour only, no depth, never multisampled: this draws into the composite texture, not
@@ -159,7 +157,8 @@ namespace ValveResourceFormat.Renderer
                 // the texture actually reports rather than a guessed widening, so it stays honest and
                 // wrong in the same one place; deciding the format with the shader fixes both this and
                 // the render pass that cannot yet be described for this target.
-                var pipeline = device.GetOrCreatePipeline(
+                var pipeline = GLRendererDevice.PipelineFor(
+                    commandList.Device,
                     shader,
                     renderState.CurrentPass,
                     vertexInputDesc,

@@ -403,6 +403,8 @@ public static unsafe class VulkanPipelineSmokeTest
         checks.Add(("layout: every set layout is a real handle",
             mesh.Layout.SetLayouts.All(static l => l.Handle != 0)));
 
+        CheckBindingSeam(mesh, PipelineBindPoint.Graphics, checks);
+
         // Asking twice must hand back the same object, which is what IDevice.CreateGraphicsPipeline
         // promises and what stops a scene rebuilding its pipelines every frame.
         var again = device.CreateGraphicsPipeline(DescribeMeshPipeline(vertex, fragment, RenderState.Default, "mesh"));
@@ -518,6 +520,53 @@ public static unsafe class VulkanPipelineSmokeTest
 
         checks.Add(("compute: a graphics module is refused",
             Throws<ArgumentException>(() => device.CreateComputePipeline(new ComputePipelineDesc(graphicsModule, "wrong stage")))));
+
+        CheckBindingSeam(pipeline, PipelineBindPoint.Compute, checks);
+    }
+
+    /// <summary>
+    /// Checks that a pipeline can actually be bound: that it implements <see cref="IVulkanPipeline"/>,
+    /// and that every member the command list reads through it answers correctly.
+    /// </summary>
+    /// <param name="pipeline">The pipeline to inspect.</param>
+    /// <param name="expected">The bind point it should report.</param>
+    /// <param name="checks">Where to record the outcome.</param>
+    /// <remarks>
+    /// This is a type test, which normally is not worth a check. It is worth one here because the whole
+    /// Vulkan path was blocked on exactly this: the pipelines were built, cached and validated clean, and
+    /// nothing could bind a single one of them because neither type implemented the interface the command
+    /// list binds through. Nothing in pipeline creation notices, since the interface has no bearing on
+    /// whether a <c>VkPipeline</c> is well formed &#8212; the failure only appears at the first draw.
+    /// </remarks>
+    private static void CheckBindingSeam(
+        IRhiResource pipeline,
+        PipelineBindPoint expected,
+        List<(string, bool)> checks)
+    {
+        var kind = pipeline.GetType().Name;
+
+        if (pipeline is not IVulkanPipeline bindable)
+        {
+            checks.Add(($"binding: {kind} implements {nameof(IVulkanPipeline)}", false));
+            return;
+        }
+
+        checks.Add(($"binding: {kind} implements {nameof(IVulkanPipeline)}", true));
+        checks.Add(($"binding: {kind} exposes its pipeline handle", bindable.Handle.Handle != 0));
+        checks.Add(($"binding: {kind} exposes its layout handle", bindable.Layout.Handle != 0));
+        checks.Add(($"binding: {kind} binds to {expected}", bindable.BindPoint == expected));
+
+        // The interface's range has to be the layout's, not a restatement of it: a command list bounds
+        // every vkCmdPushConstants write against whatever this answers.
+        var layoutRange = pipeline switch
+        {
+            VulkanGraphicsPipeline graphics => graphics.Layout.PushConstants,
+            VulkanComputePipeline compute => compute.Layout.PushConstants,
+            _ => null,
+        };
+
+        checks.Add(($"binding: {kind} reports the layout's own push constant range",
+            bindable.PushConstants == layoutRange));
     }
 
     private static void CheckVariantFanOut(
@@ -722,7 +771,11 @@ public static unsafe class VulkanPipelineSmokeTest
 
         api.CmdSetViewport(command, 0, 1, &viewport);
         api.CmdSetScissor(command, 0, 1, &scissor);
-        api.CmdBindPipeline(command, PipelineBindPoint.Graphics, pipeline.Handle);
+
+        // BindPoint rather than a literal, so this reads the same member VulkanCommandList binds through.
+        // The seam itself is covered by CheckBindingSeam, which is what would have caught the pipelines
+        // not implementing IVulkanPipeline at all.
+        api.CmdBindPipeline(command, pipeline.BindPoint, pipeline.Handle);
         api.CmdDraw(command, 3, 1, 0, 0);
 
         api.CmdEndRendering(command);

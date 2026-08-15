@@ -178,9 +178,9 @@ namespace ValveResourceFormat.Renderer
                 // so there is no vertex buffer and the layout is empty. The two draws differ only in
                 // depth function, which is part of the state, so each gets its own cached pipeline.
                 var framebuffer = context!.Value.Framebuffer;
-                var device = (GLRendererDevice)commandList.Device;
 
-                var pipeline = device.GetOrCreatePipeline(
+                var pipeline = GLRendererDevice.PipelineFor(
+                    commandList.Device,
                     shader,
                     in state,
                     VertexInputDesc.Empty,

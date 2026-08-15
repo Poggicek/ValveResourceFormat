@@ -488,10 +488,9 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
         // Resolved per draw because the material supplies the blend and depth state the pipeline bakes in.
         // Cached on the pipeline key, so only the first draw of each state builds one.
-        private GLGraphicsPipeline PipelineFor(ICommandList commandList, Scene.RenderContext context)
+        private IGraphicsPipeline PipelineFor(ICommandList commandList, Scene.RenderContext context)
         {
             var framebuffer = context.Framebuffer;
-            var device = (GLRendererDevice)commandList.Device;
 
             vertexInputDesc ??= CableVertex.InputLayout.ToVertexInputDesc();
 
@@ -502,7 +501,8 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             // pipeline is the only thing that decides.
             var passState = scene.RendererContext.RenderState.CurrentPass;
 
-            return device.GetOrCreatePipeline(
+            return GLRendererDevice.PipelineFor(
+                commandList.Device,
                 shader,
                 material.GetRenderState(in passState),
                 vertexInputDesc,

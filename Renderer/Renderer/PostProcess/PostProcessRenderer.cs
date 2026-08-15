@@ -143,10 +143,10 @@ namespace ValveResourceFormat.Renderer.PostProcess
                 return;
             }
 
-            var device = (GLRendererDevice)commandList.Device;
             var state = rendererContext.RenderState.CurrentPass;
 
-            commandList.BindPipeline(device.GetOrCreatePipeline(
+            commandList.BindPipeline(GLRendererDevice.PipelineFor(
+                commandList.Device,
                 shader,
                 in state,
                 VertexInputDesc.Empty,

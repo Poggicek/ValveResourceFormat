@@ -465,14 +465,14 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         // The replacement shader changes between passes, and the two translucent draws differ in state,
         // so the pipeline is resolved per draw. Lookups are cached on the pipeline key, so only the
         // first of each distinct combination actually builds anything.
-        private GLGraphicsPipeline PipelineFor(ICommandList commandList, Scene.RenderContext context, Shader renderShader, in RenderState state)
+        private IGraphicsPipeline PipelineFor(ICommandList commandList, Scene.RenderContext context, Shader renderShader, in RenderState state)
         {
             var framebuffer = context.Framebuffer;
-            var device = (GLRendererDevice)commandList.Device;
 
             vertexInputDesc ??= SimpleVertexNormal.InputLayout.ToVertexInputDesc();
 
-            return device.GetOrCreatePipeline(
+            return GLRendererDevice.PipelineFor(
+                commandList.Device,
                 renderShader,
                 in state,
                 vertexInputDesc,

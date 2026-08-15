@@ -22,7 +22,7 @@ namespace ValveResourceFormat.Renderer.RHI.Vulkan;
 /// dispatch sites have to supply group counts directly.
 /// </para>
 /// </remarks>
-public sealed unsafe class VulkanComputePipeline : IComputePipeline
+public sealed unsafe class VulkanComputePipeline : IComputePipeline, IVulkanPipeline
 {
     private readonly Vk Api;
     private readonly Device Device;
@@ -42,6 +42,22 @@ public sealed unsafe class VulkanComputePipeline : IComputePipeline
     /// <summary>Gets the layout descriptor sets and push constants are bound through. Owned by the
     /// layout cache, not by this pipeline.</summary>
     public VulkanPipelineLayout Layout { get; }
+
+    /// <inheritdoc/>
+    /// <remarks>Explicit, for the reason given on
+    /// <see cref="VulkanGraphicsPipeline"/>: the interface wants the bare <c>VkPipelineLayout</c> under
+    /// a name this type already uses for the layout object, and narrowing to
+    /// <see cref="VulkanPipelineLayout.Handle"/> is all it is doing.</remarks>
+    PipelineLayout IVulkanPipeline.Layout => Layout.Handle;
+
+    /// <inheritdoc/>
+    public PipelineBindPoint BindPoint => PipelineBindPoint.Compute;
+
+    /// <inheritdoc/>
+    /// <remarks>Derived from SPIR-V reflection when the layout was built. A compute shader's block is
+    /// usually its own rather than the graphics per-draw block, which is exactly why the range is read
+    /// from the module instead of assumed.</remarks>
+    public PushConstantRange? PushConstants => Layout.PushConstants;
 
     /// <summary>Gets one message per interface problem found while building this pipeline. Empty when
     /// the shader conforms to the contract's descriptor set scheme.</summary>

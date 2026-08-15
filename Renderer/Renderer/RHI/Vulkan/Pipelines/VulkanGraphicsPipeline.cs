@@ -33,7 +33,7 @@ namespace ValveResourceFormat.Renderer.RHI.Vulkan;
 /// <see cref="Dispose"/> destroys only the <c>VkPipeline</c>.
 /// </para>
 /// </remarks>
-public sealed unsafe class VulkanGraphicsPipeline : IGraphicsPipeline
+public sealed unsafe class VulkanGraphicsPipeline : IGraphicsPipeline, IVulkanPipeline
 {
     private readonly Vk Api;
     private readonly Device Device;
@@ -53,6 +53,23 @@ public sealed unsafe class VulkanGraphicsPipeline : IGraphicsPipeline
     /// <summary>Gets the layout this pipeline was created with, which is what descriptor sets and push
     /// constants are bound through. Owned by the layout cache, not by this pipeline.</summary>
     public VulkanPipelineLayout Layout { get; }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Explicit, because <see cref="IVulkanPipeline"/> wants the bare <c>VkPipelineLayout</c> under the
+    /// same name this type already uses for the layout object. The two do not disagree &#8212; this is
+    /// literally <see cref="VulkanPipelineLayout.Handle"/> &#8212; the interface simply narrows to the
+    /// handle, which is all <c>vkCmdPushConstants</c> and <c>vkCmdBindDescriptorSets</c> take.
+    /// </remarks>
+    PipelineLayout IVulkanPipeline.Layout => Layout.Handle;
+
+    /// <inheritdoc/>
+    public PipelineBindPoint BindPoint => PipelineBindPoint.Graphics;
+
+    /// <inheritdoc/>
+    /// <remarks>Derived from SPIR-V reflection when the layout was built, not restated here, so the range
+    /// a command list writes against is the one the shaders actually declare.</remarks>
+    public PushConstantRange? PushConstants => Layout.PushConstants;
 
     /// <summary>Gets the key this pipeline is cached under.</summary>
     public PipelineCacheKey CacheKey { get; }

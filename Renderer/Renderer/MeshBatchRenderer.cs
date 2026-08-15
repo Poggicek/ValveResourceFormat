@@ -151,7 +151,7 @@ namespace ValveResourceFormat.Renderer
             public ICommandList? CommandList;
 
             /// <summary>The device backing <see cref="CommandList"/>, which builds the pipelines.</summary>
-            public GLRendererDevice? Device;
+            public IDevice? Device;
 
             /// <summary>The state tracker whose current pass every pipeline's state is composed over.</summary>
             public RenderStateTracker? RenderState;
@@ -204,7 +204,7 @@ namespace ValveResourceFormat.Renderer
                 IndirectDraw = context.Scene.DrawMeshletsIndirect && context.RenderPass < RenderPass.Opaque,
 
                 CommandList = commandList,
-                Device = commandList is null ? null : (GLRendererDevice)commandList.Device,
+                Device = commandList?.Device,
                 RenderState = context.Scene.RendererContext.RenderState,
                 ColorFormats = framebuffer.Color is { } color ? [color.RhiFormat] : [],
                 DepthFormat = framebuffer.Depth?.RhiFormat ?? RhiFormat.Undefined,
@@ -368,7 +368,8 @@ namespace ValveResourceFormat.Renderer
             var passState = config.RenderState!.CurrentPass;
             var state = shader.IgnoreMaterialData ? passState : material.GetRenderState(in passState);
 
-            var pipeline = config.Device!.GetOrCreatePipeline(
+            var pipeline = GLRendererDevice.PipelineFor(
+                config.Device!,
                 shader,
                 in state,
                 DescribeVertexInput(call, vertexBuffers),

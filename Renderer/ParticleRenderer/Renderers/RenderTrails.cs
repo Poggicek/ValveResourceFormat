@@ -475,14 +475,14 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
         // Resolved per draw because the blend state depends on the output blend mode, which the pipeline
         // has to bake in. Cached on the pipeline key, so only the first draw of each state builds one.
-        private GLGraphicsPipeline PipelineFor(ICommandList commandList, Scene.RenderContext context)
+        private IGraphicsPipeline PipelineFor(ICommandList commandList, Scene.RenderContext context)
         {
             var framebuffer = context.Framebuffer;
-            var device = (GLRendererDevice)commandList.Device;
 
             vertexInputDesc ??= Vertex.InputLayout.ToVertexInputDesc();
 
-            return device.GetOrCreatePipeline(
+            return GLRendererDevice.PipelineFor(
+                commandList.Device,
                 shader,
                 rendererContext.RenderState.CurrentPass,
                 vertexInputDesc,

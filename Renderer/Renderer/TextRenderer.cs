@@ -518,12 +518,11 @@ namespace ValveResourceFormat.Renderer
                 else
                 {
                     var framebuffer = context!.Value.Framebuffer;
-                    var device = (GLRendererDevice)commandList.Device;
-
                     vertexInputDesc ??= Vertex.InputLayout.ToVertexInputDesc();
 
                     // Glyph quads, two triangles each through the shared quad index buffer.
-                    var pipeline = device.GetOrCreatePipeline(
+                    var pipeline = GLRendererDevice.PipelineFor(
+                        commandList.Device,
                         shader,
                         RendererContext.RenderState.CurrentPass,
                         vertexInputDesc,
