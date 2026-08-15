@@ -495,7 +495,10 @@ namespace ValveResourceFormat.Renderer
                 blend: true, srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha))
             {
                 shader.Use();
-                shader.SetUniform4x4("transform", Matrix4x4.CreateOrthographicOffCenter(0f, camera.WindowSize.X, camera.WindowSize.Y, 0f, -100f, 100f));
+                // The routed overload, not SetUniform4x4: the numbered setters write by GL location and
+                // do nothing at all when there isn't one, which is exactly what a packed uniform has.
+                // This one goes through the globals buffer, so it works on either backend.
+                shader.SetUniform("g_matTextTransform", Matrix4x4.CreateOrthographicOffCenter(0f, camera.WindowSize.X, camera.WindowSize.Y, 0f, -100f, 100f));
                 shader.SetTexture(0, "msdf", fontTexture);
 
                 if (sceneDepth != null)
