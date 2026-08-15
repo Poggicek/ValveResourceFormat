@@ -157,6 +157,16 @@ public class VulkanRecordingDevice : VulkanDevice
     {
         if (PendingSubmission.Count > 0)
         {
+            // Everything staged since BeginFrame has to reach the device before the frame that reads it
+            // runs. BeginFrame flushes what was staged before the frame opened, which covers resources
+            // built during loading, but a frame writes uniforms of its own -- the view constants carrying
+            // the projection matrix are written by Renderer.Update, after the frame is open -- and those
+            // uploads sit in the batch until something else forces it out. The frame then executes reading
+            // buffers whose contents were never copied, which is not a visible error anywhere: the render
+            // pass still clears, the draws are still recorded, and every vertex simply transforms by
+            // whatever the uninitialised buffer holds.
+            Uploads.Flush();
+
             SubmitFrame();
             PendingSubmission.Clear();
 

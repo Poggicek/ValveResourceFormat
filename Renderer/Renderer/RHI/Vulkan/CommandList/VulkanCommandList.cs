@@ -272,6 +272,11 @@ public sealed unsafe class VulkanCommandList : ICommandList
             Api.CmdBeginRendering(Command, &info);
         }
 
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(BeginRenderPass), DescribePass(in desc, width, height));
+        }
+
         InRenderPass = true;
 
         // The contract says a pass opens with viewport and scissor covering the whole attachment. Both
@@ -368,6 +373,69 @@ public sealed unsafe class VulkanCommandList : ICommandList
         return (info, RhiFormatInfo.IsStencil(texture.Format));
     }
 
+    /// <summary>Formats a pass for <see cref="VulkanCommandCensus"/>: which images, loaded or cleared,
+    /// and how big.</summary>
+    private static string DescribePass(in RenderPassDesc desc, int width, int height)
+    {
+        var colors = desc.ColorAttachments ?? [];
+        var parts = new List<string>(colors.Length + 2)
+        {
+            string.Create(CultureInfo.InvariantCulture, $"'{desc.Name}' {width}x{height}"),
+        };
+
+        foreach (var color in colors)
+        {
+            parts.Add(string.Create(CultureInfo.InvariantCulture,
+                $"color {Identify(color.Texture)} mip {color.MipLevel} layer {color.ArrayLayer} {color.LoadOp}/{color.StoreOp} clear {color.ClearColor}"));
+        }
+
+        if (desc.DepthAttachment is { } depth)
+        {
+            parts.Add(string.Create(CultureInfo.InvariantCulture,
+                $"depth {Identify(depth.Texture)} {depth.DepthLoadOp}/{depth.DepthStoreOp} clear {depth.ClearDepth} readOnly {depth.ReadOnly}"));
+        }
+
+        return string.Join(", ", parts);
+    }
+
+    /// <summary>
+    /// Names a texture for <see cref="VulkanCommandCensus"/> by identity as well as by debug name.
+    /// </summary>
+    /// <remarks>The debug names in this renderer are not unique &#8212; every
+    /// <c>Framebuffer</c> calls its colour attachment <c>FramebufferColor</c> &#8212; so a transcript that
+    /// printed only names could not say whether a pass rendered into the image a later readback reads.
+    /// The image handle is what actually decides that.</remarks>
+    /// <summary>
+    /// Describes the fixed-function state a graphics pipeline baked, for
+    /// <see cref="VulkanCommandCensus"/>.
+    /// </summary>
+    /// <remarks>The state that decides whether a recorded draw produces a fragment at all: a zero colour
+    /// write mask, a cull mode that rejects both windings, or a depth comparison pointing the wrong way
+    /// down a reverse-Z range each turn a correct-looking transcript into a blank image, and none of them
+    /// is visible anywhere else once the pipeline object exists.</remarks>
+    private static string DescribeBakedState(IVulkanPipeline pipeline)
+    {
+        if (pipeline is not VulkanGraphicsPipeline graphics)
+        {
+            return string.Empty;
+        }
+
+        var state = graphics.Description.RenderState;
+
+        return string.Create(CultureInfo.InvariantCulture,
+            $"cull {state.Rasterizer.CullMode} fill {state.Rasterizer.FillMode} "
+            + $"depth test {state.DepthStencil.DepthTestEnable} write {state.DepthStencil.DepthWriteEnable} func {state.DepthStencil.DepthFunc} "
+            + $"blend {state.Blend.BlendEnable} writeMask {state.Blend.RenderTargetWriteMask:x} "
+            + $"colorFormats {graphics.Description.ColorFormats.Length} depthFormat {graphics.Description.DepthFormat} samples {graphics.Description.SampleCount}");
+    }
+
+    private static string Identify(ITexture texture)
+    {
+        var handle = texture is VulkanTexture vulkan ? vulkan.Handle.Handle : 0;
+
+        return string.Create(CultureInfo.InvariantCulture, $"'{texture.Name}'#{handle:x}");
+    }
+
     private static void TakeExtent(VulkanTexture view, ref int width, ref int height)
     {
         // The view already addresses a single mip level, so its own extent is the pass extent.
@@ -432,6 +500,8 @@ public sealed unsafe class VulkanCommandList : ICommandList
 
         Api.CmdEndRendering(Command);
 
+        VulkanCommandCensus.Note(nameof(EndRenderPass));
+
         InRenderPass = false;
         PassHeight = 0;
         PassAttachments.Clear();
@@ -467,6 +537,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
         var viewport = FlipViewport(x, y, width, height, PassHeight, minDepth, maxDepth);
 
         Api.CmdSetViewport(Command, 0, 1, &viewport);
+
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(SetViewport), string.Create(CultureInfo.InvariantCulture,
+                $"gl({x},{y},{width},{height}) depth {minDepth}..{maxDepth} over target height {PassHeight} => vk({viewport.X},{viewport.Y},{viewport.Width},{viewport.Height})"));
+        }
     }
 
     /// <summary>
@@ -520,6 +596,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
         var scissor = FlipScissor(x, y, width, height, PassHeight);
 
         Api.CmdSetScissor(Command, 0, 1, &scissor);
+
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(SetScissor), string.Create(CultureInfo.InvariantCulture,
+                $"gl({x},{y},{width},{height}) over target height {PassHeight} => vk({scissor.Offset.X},{scissor.Offset.Y},{scissor.Extent.Width},{scissor.Extent.Height})"));
+        }
     }
 
     // ---- binding ----
@@ -536,6 +618,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
 
         Api.CmdBindPipeline(Command, PipelineBindPoint.Graphics, vulkan.Handle);
 
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note("BindPipeline(graphics)", string.Create(CultureInfo.InvariantCulture,
+                $"'{pipeline.Name}' sets {vulkan.UsedDescriptorSets:x} vertexBindings {vulkan.UsedVertexBindings:x} {DescribeBakedState(vulkan)}"));
+        }
+
         Pipeline = vulkan;
         PipelineIsGraphics = true;
     }
@@ -551,6 +639,8 @@ public sealed unsafe class VulkanCommandList : ICommandList
         var vulkan = AsVulkanPipeline(pipeline, PipelineBindPoint.Compute, nameof(pipeline));
 
         Api.CmdBindPipeline(Command, PipelineBindPoint.Compute, vulkan.Handle);
+
+        VulkanCommandCensus.Note("BindPipeline(compute)", pipeline.Name);
 
         Pipeline = vulkan;
         PipelineIsGraphics = false;
@@ -572,6 +662,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
         var offset = (ulong)offsetInBytes;
 
         Api.CmdBindVertexBuffers(Command, (uint)binding, 1, &handle, &offset);
+
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(BindVertexBuffer), string.Create(CultureInfo.InvariantCulture,
+                $"binding {binding} '{vulkan.Name}' offset {offsetInBytes} size {vulkan.SizeInBytes}"));
+        }
 
         if (binding < 32)
         {
@@ -599,6 +695,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
             (ulong)offsetInBytes,
             indexType == IndexType.UInt16 ? Silk.NET.Vulkan.IndexType.Uint16 : Silk.NET.Vulkan.IndexType.Uint32);
 
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(BindIndexBuffer), string.Create(CultureInfo.InvariantCulture,
+                $"'{vulkan.Name}' {indexType} offset {offsetInBytes} size {vulkan.SizeInBytes}"));
+        }
+
         IndexBufferBound = true;
     }
 
@@ -616,6 +718,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
         var (offset, size) = Range(vulkan, offsetInBytes, sizeInBytes);
 
         RequireBinder(nameof(BindUniformBuffer)).BindUniformBuffer(binding, vulkan.Handle, offset, size);
+
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(BindUniformBuffer), string.Create(CultureInfo.InvariantCulture,
+                $"binding {binding} '{vulkan.Name}' offset {offset} size {size} of {vulkan.SizeInBytes}"));
+        }
     }
 
     /// <inheritdoc/>
@@ -789,6 +897,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
         BeginDraw();
 
         Api.CmdDraw(Command, (uint)vertexCount, (uint)instanceCount, (uint)firstVertex, (uint)firstInstance);
+
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(Draw), string.Create(CultureInfo.InvariantCulture,
+                $"{vertexCount} vertices x{instanceCount} first {firstVertex} baseInstance {firstInstance} pipeline '{PipelineName}'"));
+        }
     }
 
     /// <inheritdoc/>
@@ -800,6 +914,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
         EnsureIndexBuffer();
 
         Api.CmdDrawIndexed(Command, (uint)indexCount, (uint)instanceCount, (uint)firstIndex, baseVertex, (uint)firstInstance);
+
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(DrawIndexed), string.Create(CultureInfo.InvariantCulture,
+                $"{indexCount} indices x{instanceCount} first {firstIndex} baseVertex {baseVertex} baseInstance {firstInstance} pipeline '{PipelineName}'"));
+        }
     }
 
     /// <inheritdoc/>
@@ -814,6 +934,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
         var stride = strideInBytes == 0 ? DrawIndirectStride : strideInBytes;
 
         Api.CmdDrawIndirect(Command, buffer.Handle, (ulong)offsetInBytes, (uint)drawCount, (uint)stride);
+
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(DrawIndirect), string.Create(CultureInfo.InvariantCulture,
+                $"{drawCount} draws from '{buffer.Name}' at {offsetInBytes} stride {stride} pipeline '{PipelineName}'"));
+        }
     }
 
     /// <inheritdoc/>
@@ -829,6 +955,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
         var stride = strideInBytes == 0 ? DrawIndexedIndirectStride : strideInBytes;
 
         Api.CmdDrawIndexedIndirect(Command, buffer.Handle, (ulong)offsetInBytes, (uint)drawCount, (uint)stride);
+
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(DrawIndexedIndirect), string.Create(CultureInfo.InvariantCulture,
+                $"{drawCount} draws from '{buffer.Name}' at {offsetInBytes} stride {stride} pipeline '{PipelineName}'"));
+        }
     }
 
     /// <inheritdoc/>
@@ -865,6 +997,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
             (ulong)countOffsetInBytes,
             (uint)maxDrawCount,
             (uint)stride);
+
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(DrawIndexedIndirectCount), string.Create(CultureInfo.InvariantCulture,
+                $"up to {maxDrawCount} draws from '{arguments.Name}' at {argumentOffsetInBytes}, count from '{counts.Name}' at {countOffsetInBytes}, stride {stride} pipeline '{PipelineName}'"));
+        }
     }
 
     // ---- compute ----
@@ -876,6 +1014,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
         BeginDispatch();
 
         Api.CmdDispatch(Command, (uint)groupCountX, (uint)groupCountY, (uint)groupCountZ);
+
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(Dispatch), string.Create(CultureInfo.InvariantCulture,
+                $"{groupCountX}x{groupCountY}x{groupCountZ} pipeline '{PipelineName}'"));
+        }
     }
 
     /// <inheritdoc/>
@@ -1035,6 +1179,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
         };
 
         Api.CmdCopyImageToBuffer(Command, from.Handle, ImageLayout.TransferSrcOptimal, to.Handle, 1, &copy);
+
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(CopyTextureToBuffer), string.Create(CultureInfo.InvariantCulture,
+                $"{Identify(from)} mip {mipLevel} layer {arrayLayer} {width}x{height} => '{to.Name}' at {destinationOffsetInBytes}"));
+        }
     }
 
     /// <inheritdoc/>

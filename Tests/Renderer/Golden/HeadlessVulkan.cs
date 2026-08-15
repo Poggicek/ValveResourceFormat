@@ -292,6 +292,8 @@ namespace Tests.Renderer.Golden
             return new VulkanSceneOutcome(scene.Name, stages, reachedByHarness, GLCallTrap.ReportByFile(), GLCallTrap.TotalCalls)
             {
                 Image = captured,
+                RecordedCommands = VulkanCommandCensus.Transcript,
+                RecordedSummary = VulkanCommandCensus.Summary(),
             };
         }
 
@@ -316,6 +318,12 @@ namespace Tests.Renderer.Golden
             // staged pass would take the direct OpenGL route everywhere and the device would go unused for
             // a reason that had nothing to do with the port.
             ValveResourceFormat.Renderer.Renderer.EnableRhiRecording = true;
+
+            // Per scene, and covering the whole probe rather than just the frame: the readback's own copy
+            // has to appear in the same transcript as the pass that was supposed to fill the image it
+            // reads, or the two cannot be checked against each other.
+            VulkanCommandCensus.IsEnabled = true;
+            VulkanCommandCensus.Reset();
 
             GLCallTrap.CurrentStage = "environment";
             stages.Add(Run("gl-environment", () =>
@@ -485,7 +493,7 @@ namespace Tests.Renderer.Golden
             stages.Add(Run("frame-end", () => DeviceCensus!.EndFrame()));
 
             GLCallTrap.CurrentStage = "readback";
-            stages.Add(Run("readback", () => image = ReadCapture(captureFramebuffer)));
+            stages.Add(Run("readback", () => image = ReadCapture(captureFramebuffer, sceneFramebuffer)));
 
             GLCallTrap.CurrentStage = "(none)";
             captured = image;
@@ -563,7 +571,7 @@ namespace Tests.Renderer.Golden
         /// </remarks>
         /// <exception cref="GoldenRenderException">There is no device or no capture target, or the copy
         /// came back empty.</exception>
-        private static SKBitmap ReadCapture(Framebuffer? captureFramebuffer)
+        private static SKBitmap ReadCapture(Framebuffer? captureFramebuffer, Framebuffer? sceneFramebuffer)
         {
             var device = Device
                 ?? throw new GoldenRenderException("No Vulkan device was created, so nothing can be read back.");
@@ -595,11 +603,22 @@ namespace Tests.Renderer.Golden
 
             if (pixels.IndexOfAnyExcept((byte)0) < 0)
             {
+                // The scene target is probed only on the way to this failure, and it is what separates the
+                // two very different causes that both end here. Its first pass opens with LoadOp.Clear to
+                // (0, 0, 0, 1), so an executed frame leaves a non-zero alpha in it whether or not a single
+                // draw produced a fragment. Scene target zero as well therefore means the recorded work
+                // never ran at all, which is a submission or lifetime fault; scene target non-zero and
+                // capture zero means the frame ran and the tonemap pass is what failed to write.
+                var scene = ProbeForNonZero(device, sceneFramebuffer?.Color, "the scene colour target");
+                var depth = ProbeSceneDepth(device, sceneFramebuffer);
+
                 throw new GoldenRenderException(
                     "The readback copy completed and the capture target was entirely zero, so nothing was drawn into it. "
                     + "This is a statement about the stages above rather than about the readback: the copy goes through "
                     + "ICommandList.CopyTextureToBuffer, and the device self-test reported at the top of this file proves "
-                    + "that path returns the pixels it was given.");
+                    + "that path returns the pixels it was given." + Environment.NewLine
+                    + "  " + scene + Environment.NewLine
+                    + "  " + depth);
             }
 
             var bitmap = new SKBitmap(width, height, SKColorType.Bgra8888, SKAlphaType.Opaque);
@@ -614,6 +633,119 @@ namespace Tests.Renderer.Golden
             }
 
             return bitmap;
+        }
+
+        /// <summary>
+        /// Probes the scene depth attachment, which is what separates "no fragment was ever rasterised"
+        /// from "fragments were rasterised and wrote no colour".
+        /// </summary>
+        /// <param name="device">The device to copy through.</param>
+        /// <param name="sceneFramebuffer">The scene framebuffer, or <see langword="null"/>.</param>
+        /// <returns>One sentence, suitable for appending to a failure message.</returns>
+        /// <remarks>
+        /// The scene passes clear depth to the reverse-Z far plane, which is 0, and draw with depth writes
+        /// on and <see cref="Comparison.Closer"/>. So any triangle that produced a fragment left a non-zero
+        /// depth behind, whatever its shader wrote to colour. A depth buffer that is still entirely zero
+        /// after a frame that recorded draws means the geometry never reached the rasteriser at all, which
+        /// points at the vertex stage rather than at anything to do with colour.
+        /// <para>Through a depth-aspect view, because the attachment is depth-stencil and a buffer copy
+        /// may only name one aspect.</para>
+        /// </remarks>
+        private static string ProbeSceneDepth(IDevice device, Framebuffer? sceneFramebuffer)
+        {
+            if (sceneFramebuffer?.Depth is not { } depth)
+            {
+                return "the scene depth target was never created, so it could not be probed.";
+            }
+
+            RenderTexture? view = null;
+
+            try
+            {
+                view = depth.CreateView(0, 1, 0, 1, RhiFormat.Undefined, TextureAspect.Depth);
+
+                return ProbeForNonZero(device, view, "the scene depth target");
+            }
+#pragma warning disable CA1031 // A probe on a failure path must not replace the failure it is describing.
+            catch (Exception e)
+#pragma warning restore CA1031
+            {
+                return $"the scene depth target could not be viewed for probing: {e.GetType().Name}: {Condense(e.Message)}";
+            }
+            finally
+            {
+                view?.Delete();
+            }
+        }
+
+        /// <summary>
+        /// Reads a texture back and says whether anything in it is non-zero.
+        /// </summary>
+        /// <param name="device">The device to copy through.</param>
+        /// <param name="texture">The texture to probe, or <see langword="null"/> when there is none.</param>
+        /// <param name="label">How to name the texture in the answer.</param>
+        /// <returns>One sentence, suitable for appending to a failure message.</returns>
+        /// <remarks>
+        /// Deliberately never throws. This runs while a failure is already being reported, and a probe that
+        /// replaced that failure with an exception about probing would destroy the finding it exists to
+        /// support.
+        /// </remarks>
+        private static string ProbeForNonZero(IDevice device, RenderTexture? texture, string label)
+        {
+            if (texture is null)
+            {
+                return $"{label} was never created, so it could not be probed.";
+            }
+
+            try
+            {
+                var rhi = texture.RhiTexture;
+                var sizeInBytes = rhi is VulkanTexture vulkan
+                    ? vulkan.MipSizeInBytes(0)
+                    : texture.Width * texture.Height * 4;
+
+                using var readback = device.CreateBuffer(new BufferDesc(sizeInBytes,
+                    BufferUsage.CopyDestination, BufferMemory.HostReadback, "GoldenVulkanProbe"));
+
+                device.BeginFrame();
+
+                var commandList = device.BeginCommandList("GoldenProbe");
+                commandList.CopyTextureToBuffer(rhi, 0, 0, readback);
+
+                device.Submit(commandList);
+                device.EndFrame();
+                device.WaitIdle();
+
+                var pixels = readback.MappedData[..sizeInBytes];
+                var first = pixels.IndexOfAnyExcept((byte)0);
+
+                if (first < 0)
+                {
+                    return $"{label} ('{rhi.Name}', {texture.Width}x{texture.Height}, {rhi.Format}) is entirely zero as well. "
+                        + "Its first pass opens with LoadOp.Clear, so not even the clear reached the image: the recorded "
+                        + "frame did not execute.";
+                }
+
+                var nonZero = 0;
+
+                for (var i = 0; i < pixels.Length; i++)
+                {
+                    if (pixels[i] != 0)
+                    {
+                        nonZero++;
+                    }
+                }
+
+                return $"{label} ('{rhi.Name}', {texture.Width}x{texture.Height}, {rhi.Format}) is NOT zero: "
+                    + $"{nonZero:N0} of {sizeInBytes:N0} bytes are set, first at offset {first}. "
+                    + "The recorded frame did execute, so what failed is between that image and the capture target.";
+            }
+#pragma warning disable CA1031 // A probe on a failure path must not replace the failure it is describing.
+            catch (Exception e)
+#pragma warning restore CA1031
+            {
+                return $"{label} could not be probed: {e.GetType().Name}: {Condense(e.Message)}";
+            }
         }
 
         /// <summary>
@@ -780,6 +912,9 @@ namespace Tests.Renderer.Golden
             lines.Add($"What the run asked of the Vulkan device, in the same period ({DeviceCensus?.TotalCalls ?? 0:N0} calls):");
             lines.Add(DeviceCensus?.Report() ?? "  no device was created.");
 
+            lines.Add(string.Empty);
+            lines.AddRange(RecordedCommandReport(outcomes));
+
             foreach (var note in DerivedNotes())
             {
                 lines.Add(string.Empty);
@@ -787,6 +922,72 @@ namespace Tests.Renderer.Golden
             }
 
             return string.Join(Environment.NewLine, lines);
+        }
+
+        /// <summary>
+        /// Names the scene whose full command transcript is printed. Unset prints the first scene
+        /// attempted, which is enough because every scene records the same shape of frame.
+        /// </summary>
+        public const string TranscriptSceneVariable = "VRF_VK_TRANSCRIPT_SCENE";
+
+        /// <summary>
+        /// What actually reached a Vulkan command buffer: one line of totals per scene, then one scene's
+        /// transcript in full.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The question "why is the capture target black" cannot be answered by the other two censuses.
+        /// <see cref="GLCallTrap"/> counts what never left OpenGL and <see cref="RhiDeviceCensus"/> counts
+        /// what reached <see cref="IDevice"/>, but a draw is recorded on a command list, so a frame that
+        /// records no draw at all and a frame that records a hundred into the wrong attachment produce
+        /// exactly the same numbers in both of them.
+        /// </para>
+        /// <para>
+        /// The transcript is ordered rather than counted for the same reason: the load operation a pass
+        /// opened with, the attachment it named, and whether a draw fell between that and its
+        /// <c>EndRenderPass</c> are all questions about sequence.
+        /// </para>
+        /// </remarks>
+        private static IEnumerable<string> RecordedCommandReport(List<VulkanSceneOutcome> outcomes)
+        {
+            yield return "What reached a Vulkan command buffer, per scene (passes/draws/dispatches):";
+
+            foreach (var outcome in outcomes)
+            {
+                var passes = outcome.RecordedCommands.Count(static line => line.StartsWith("BeginRenderPass", StringComparison.Ordinal));
+                var draws = outcome.RecordedCommands.Count(static line => line.StartsWith("Draw", StringComparison.Ordinal));
+                var dispatches = outcome.RecordedCommands.Count(static line => line.StartsWith("Dispatch", StringComparison.Ordinal));
+
+                yield return $"  {outcome.Scene,-34} {passes,4} passes, {draws,5} draws, {dispatches,4} dispatches, "
+                    + $"{outcome.RecordedCommands.Count,6} commands";
+            }
+
+            var wanted = Environment.GetEnvironmentVariable(TranscriptSceneVariable);
+
+            var chosen = outcomes.FirstOrDefault(outcome => string.Equals(outcome.Scene, wanted, StringComparison.Ordinal))
+                ?? outcomes[0];
+
+            yield return string.Empty;
+            yield return $"Full command transcript for '{chosen.Scene}' (set {TranscriptSceneVariable} to choose another):";
+            yield return chosen.RecordedSummary;
+            yield return string.Empty;
+
+            var depth = 0;
+
+            foreach (var command in chosen.RecordedCommands)
+            {
+                if (command.StartsWith("EndRenderPass", StringComparison.Ordinal))
+                {
+                    depth = Math.Max(0, depth - 1);
+                }
+
+                yield return "  " + new string(' ', depth * 2) + command;
+
+                if (command.StartsWith("BeginRenderPass", StringComparison.Ordinal))
+                {
+                    depth++;
+                }
+            }
         }
 
         /// <summary>
@@ -919,6 +1120,17 @@ namespace Tests.Renderer.Golden
     {
         /// <summary>The captured frame, when the scene got as far as producing one. Owned by the caller.</summary>
         public SKBitmap? Image { get; init; }
+
+        /// <summary>
+        /// Every command the frame put into a Vulkan command buffer, in order.
+        /// </summary>
+        /// <remarks>The third census. <see cref="GLCallTrap"/> says what never left OpenGL and
+        /// <see cref="RhiDeviceCensus"/> says what reached the device, but draws are recorded on a command
+        /// list rather than on a device, so neither can see whether a frame drew. This can.</remarks>
+        public IReadOnlyList<string> RecordedCommands { get; init; } = [];
+
+        /// <summary>The same commands as counters, most-used first.</summary>
+        public string RecordedSummary { get; init; } = string.Empty;
 
         /// <summary>Whether every stage completed, which would mean the scene actually produced an image.</summary>
         public bool Rendered => Stages.All(static stage => stage.Failure == null);

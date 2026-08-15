@@ -166,6 +166,22 @@ public sealed unsafe class VulkanCoreDevice : IDisposable
             ShaderSubgroupExtendedTypes = supported12.ShaderSubgroupExtendedTypes,
         };
 
+        var features11 = new PhysicalDeviceVulkan11Features
+        {
+            SType = StructureType.PhysicalDeviceVulkan11Features,
+            PNext = &features12,
+
+            // gl_BaseInstance, which is how the renderer passes a scene node id into a draw. The shader
+            // emitter rewrites every instance-id read as gl_InstanceIndex - gl_BaseInstance, so the SPIR-V
+            // declares the DrawParameters capability; creating a module that declares a capability the
+            // device did not enable is a validation error (VUID-VkShaderModuleCreateInfo-pCode-08740) and
+            // reading the built-in under it is undefined. The query above already asked for this struct
+            // and its answer went unused, so this is the enable that was missing rather than a new
+            // requirement: a device that does not support it still gets false and fails at the same place
+            // it would have anyway.
+            ShaderDrawParameters = supported11.ShaderDrawParameters,
+        };
+
         var features = new PhysicalDeviceFeatures
         {
             MultiDrawIndirect = true,
@@ -190,7 +206,7 @@ public sealed unsafe class VulkanCoreDevice : IDisposable
         var features2 = new PhysicalDeviceFeatures2
         {
             SType = StructureType.PhysicalDeviceFeatures2,
-            PNext = &features12,
+            PNext = &features11,
             Features = features,
         };
 
