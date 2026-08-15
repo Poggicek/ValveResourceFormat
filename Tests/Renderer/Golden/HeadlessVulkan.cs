@@ -635,6 +635,16 @@ namespace Tests.Renderer.Golden
 
                 lines.Add($"  [{scenes.Count,2} scenes] {group.Key}");
                 lines.Add($"             scenes: {shown}{more}");
+
+                // The key is condensed to one line so scenes failing the same way group together, but a
+                // shader error puts only its header there and the diagnostic that says what is actually
+                // wrong on the lines after it. Printing the body once per group is what makes the report
+                // diagnosable rather than merely countable -- one blocker went two rounds unread because
+                // its cause was on line two.
+                foreach (var line in Body(group.First().Stage.Failure!.Message))
+                {
+                    lines.Add($"               {line}");
+                }
             }
 
             lines.Add(string.Empty);
@@ -729,6 +739,18 @@ namespace Tests.Renderer.Golden
 
             return single.Length > 160 ? single[..160] + "..." : single;
         }
+
+        /// <summary>
+        /// The lines of a message after the first, trimmed and capped, for printing under a grouped
+        /// blocker. Empty when the message is a single line, which is the common case.
+        /// </summary>
+        private static IEnumerable<string> Body(string message)
+            => message.Replace("\r\n", "\n", StringComparison.Ordinal)
+                .Split('\n')
+                .Skip(1)
+                .Select(static line => line.TrimEnd())
+                .Where(static line => line.Length > 0)
+                .Take(12);
 
         /// <summary>Destroys the device and stops the thread.</summary>
         public static void Shutdown()
