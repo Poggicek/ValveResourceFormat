@@ -1,6 +1,5 @@
 using System.Linq;
 using NUnit.Framework;
-using SkiaSharp;
 
 namespace Tests.Renderer.Golden
 {
@@ -163,17 +162,20 @@ namespace Tests.Renderer.Golden
         }
 
         /// <summary>
-        /// Runs a scene on the Vulkan device and reports what stopped it.
+        /// Renders a scene on the Vulkan device and scores it against the OpenGL baseline.
         ///
-        /// <para>A failure here is the expected result and says so: the renderer still reaches OpenGL
-        /// directly for its framebuffers, shaders, textures and buffers, none of which exists on a Vulkan
-        /// device. What makes the failure worth having is its content -- which stage was reached, and
-        /// which direct OpenGL call sites the scene touched on the way -- so the message carries the whole
-        /// staged report rather than one exception.</para>
+        /// <para><b>The pixel difference is the verdict, not the stage list.</b> A scene can fail a stage
+        /// the port has yet to reach -- the skybox, the overlay text -- and still produce a frame, and the
+        /// only useful thing to say about that frame is how far it is from the image OpenGL produces. So
+        /// the image is diffed whenever there is one, exactly as an OpenGL run diffs its own, and the
+        /// number is recorded on the outcome so the run's report can print the whole table in one place.
+        /// The stages are still named in the failure text, because "5% of pixels differ" and "and the text
+        /// renderer threw" are the two halves of the same diagnosis.</para>
         ///
-        /// <para>If a scene ever does render, it is diffed against the same baseline the OpenGL run is
-        /// compared to. That comparison is the reason the RHI has two backends at all, and until a scene
-        /// gets that far nothing has ever made it.</para>
+        /// <para>A scene that failed a stage and still matched the baseline is not passed quietly: the
+        /// stages are reported and the scene fails on them. Matching pixels do not make a thrown exception
+        /// go away, and this suite has been bitten before by results that were green because something had
+        /// stopped being checked.</para>
         /// </summary>
         private static void RunOnVulkan(GoldenScene scene)
         {
@@ -181,66 +183,22 @@ namespace Tests.Renderer.Golden
 
             using var actual = outcome.Image;
 
-            if (!outcome.Rendered || actual == null)
+            var stageReport = $"{outcome.Describe()}"
+                + (ValidationGate.Collected.Count == 0
+                    ? string.Empty
+                    : $"{Environment.NewLine}  Vulkan validation also reported:{Environment.NewLine}{ValidationGate.Describe()}");
+
+            if (actual == null)
             {
                 var blocker = outcome.FirstFailure;
 
-                Assert.Fail($"Scene '{scene.Name}' did not render on the Vulkan device. "
-                    + $"First blocker: {blocker?.Name} ({blocker?.Failure?.GetType().Name}).{Environment.NewLine}"
-                    + $"{outcome.Describe()}"
-                    + DescribeCapturedImage(scene, actual)
-                    + (ValidationGate.Collected.Count == 0
-                        ? string.Empty
-                        : $"{Environment.NewLine}  Vulkan validation also reported:{Environment.NewLine}{ValidationGate.Describe()}"));
+                outcome.Score = $"NO IMAGE   blocked at {blocker?.Name} ({blocker?.Failure?.GetType().Name})";
+
+                Assert.Fail($"Scene '{scene.Name}' produced no image on the Vulkan device, so it could not be "
+                    + $"scored. First blocker: {blocker?.Name} ({blocker?.Failure?.GetType().Name})."
+                    + $"{Environment.NewLine}{stageReport}");
 
                 return;
-            }
-
-            var baselinePath = GoldenImageStore.FindBaseline(scene.Name);
-
-            if (baselinePath == null)
-            {
-                Assert.Fail($"Scene '{scene.Name}' rendered on Vulkan but has no OpenGL baseline to be compared against.");
-                return;
-            }
-
-            using var expected = GoldenImageStore.LoadBaseline(baselinePath);
-            var diff = ImageDiff.Compare(expected, actual, scene.Tolerance);
-
-            if (diff.IsWithin(scene.Tolerance))
-            {
-                TestContext.Out.WriteLine($"{scene.Name}: Vulkan matches the OpenGL baseline. {diff.Describe(scene.Tolerance)}");
-                return;
-            }
-
-            var artifactDirectory = GoldenImageStore.WriteFailureArtifacts(scene.Name, expected, actual);
-
-            Assert.Fail($"Scene '{scene.Name}' rendered on Vulkan but deviates from the OpenGL baseline.{Environment.NewLine}"
-                + $"  {diff.Describe(scene.Tolerance)}{Environment.NewLine}"
-                + $"  Device: {GoldenBackend.DeviceDescription}{Environment.NewLine}"
-                + $"  Expected, actual and diff PNGs written to: {artifactDirectory}");
-        }
-
-        /// <summary>
-        /// Says what a Vulkan scene put on screen even though some stage of it failed, and writes the
-        /// pixels next to the other failure artifacts.
-        /// </summary>
-        /// <param name="scene">The scene that was attempted.</param>
-        /// <param name="actual">The captured frame, or <see langword="null"/> when there was none.</param>
-        /// <returns>Lines to append to the failure message, or empty when nothing was captured.</returns>
-        /// <remarks>
-        /// A scene can produce an image and still be reported as not rendered: a stage the port has yet to
-        /// reach fails, every later stage runs anyway, and the readback at the end returns real pixels. That
-        /// image was being discarded, which is the wrong thing to throw away -- the whole point of the
-        /// second backend is the diff against the OpenGL baseline, and "how far off is it" is the only
-        /// measure of progress once frames stop coming back blank. Written and measured here, so a run says
-        /// so without anyone having to add instrumentation again.
-        /// </remarks>
-        private static string DescribeCapturedImage(GoldenScene scene, SKBitmap? actual)
-        {
-            if (actual == null)
-            {
-                return string.Empty;
             }
 
             var baselinePath = GoldenImageStore.FindBaseline(scene.Name);
@@ -249,8 +207,12 @@ namespace Tests.Renderer.Golden
             {
                 var directory = GoldenImageStore.WriteFailureArtifacts(scene.Name, expected: null, actual);
 
-                return $"{Environment.NewLine}  It did capture an image, written to {directory}. There is no "
-                    + "OpenGL baseline to compare it against.";
+                outcome.Score = "NOT SCORED no OpenGL baseline exists";
+
+                Assert.Fail($"Scene '{scene.Name}' rendered on Vulkan but has no OpenGL baseline to be compared "
+                    + $"against. The captured image was written to {directory}.");
+
+                return;
             }
 
             using var expected = GoldenImageStore.LoadBaseline(baselinePath);
@@ -259,15 +221,43 @@ namespace Tests.Renderer.Golden
             {
                 var mismatched = GoldenImageStore.WriteFailureArtifacts(scene.Name, expected: null, actual);
 
-                return $"{Environment.NewLine}  It did capture a {actual.Width}x{actual.Height} image, but the "
-                    + $"baseline is {expected.Width}x{expected.Height}. Written to {mismatched}.";
+                outcome.Score = $"NOT SCORED captured {actual.Width}x{actual.Height}, baseline is "
+                    + $"{expected.Width}x{expected.Height}";
+
+                Assert.Fail($"Scene '{scene.Name}' rendered at {actual.Width}x{actual.Height} on Vulkan but its "
+                    + $"baseline is {expected.Width}x{expected.Height}. Written to {mismatched}.");
+
+                return;
             }
 
             var diff = ImageDiff.Compare(expected, actual, scene.Tolerance);
-            var artifacts = GoldenImageStore.WriteFailureArtifacts(scene.Name, expected, actual);
+            var within = diff.IsWithin(scene.Tolerance);
 
-            return $"{Environment.NewLine}  It did capture an image: {diff.Describe(scene.Tolerance)}"
-                + $"{Environment.NewLine}  Expected, actual and diff PNGs written to: {artifacts}";
+            outcome.Score = $"{(within ? "match" : "DIFFER"),-6} {diff.Describe(scene.Tolerance)}";
+
+            if (within && outcome.Failures.Count == 0)
+            {
+                TestContext.Out.WriteLine($"{scene.Name}: Vulkan matches the OpenGL baseline. {diff.Describe(scene.Tolerance)}");
+                return;
+            }
+
+            // Written whenever the scene is going to fail, matching the OpenGL path: the three PNGs are how
+            // a difference gets looked at rather than only counted.
+            var artifactDirectory = GoldenImageStore.WriteFailureArtifacts(scene.Name, expected, actual);
+
+            var headline = within
+                ? $"Scene '{scene.Name}' matched the OpenGL baseline on Vulkan, but {outcome.Failures.Count} "
+                    + "stage(s) of it failed. The image is not evidence that those stages are unnecessary."
+                : $"Scene '{scene.Name}' rendered on Vulkan and deviates from the OpenGL baseline.";
+
+            Assert.Fail($"{headline}{Environment.NewLine}"
+                + $"  {diff.Describe(scene.Tolerance)}{Environment.NewLine}"
+                + (outcome.CaptureCaveat.Length == 0
+                    ? string.Empty
+                    : $"  Note: {outcome.CaptureCaveat}{Environment.NewLine}")
+                + $"  Device: {GoldenBackend.DeviceDescription}{Environment.NewLine}"
+                + $"  Expected, actual and diff PNGs written to: {artifactDirectory}{Environment.NewLine}"
+                + stageReport);
         }
 
         /// <summary>

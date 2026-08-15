@@ -17,26 +17,29 @@ using ValveResourceFormat.Renderer.RHI.Vulkan.Core;
 namespace Tests.Renderer.Golden
 {
     /// <summary>
-    /// Runs the golden scenes against a real Vulkan device and reports what stops them.
+    /// Runs the golden scenes against a real Vulkan device, captures what each one drew, and reports what
+    /// stopped the stages that failed.
     ///
-    /// <para><b>This is not expected to produce an image, and it is not written as though it might.</b>
-    /// The renderer still makes several hundred direct OpenGL calls outside the OpenGL RHI backend --
-    /// every framebuffer, every shader compile, every texture upload, every buffer -- and none of them can
-    /// work on a Vulkan device. A harness that reported "36 failed" would be true and useless. This one
-    /// walks each scene through the stages the OpenGL harness performs, records what each stage reached
-    /// and what stopped it, and reports the causes grouped so the remaining work is a list rather than a
-    /// number.</para>
+    /// <para><b>The scenes render now, so the image is the verdict.</b> Each scene is walked through the
+    /// stages <see cref="GoldenRenderHarness"/> performs, stepping over each stage's failure so that what
+    /// lies past the first blocker is measured rather than assumed, and the captured frame is handed back
+    /// for <see cref="GoldenImageTests"/> to diff against the OpenGL baseline. The stage list is still
+    /// reported, and still grouped by cause, because a scene that produces a wrong image needs both halves
+    /// to be diagnosable: the number says how wrong, the stages say where.</para>
     ///
-    /// <para>Two passes are made per scene, for two different reasons:</para>
-    /// <list type="bullet">
-    /// <item><description><b>Fidelity.</b> <see cref="GoldenRenderHarness"/> is constructed exactly as the
-    /// OpenGL path constructs it, so the first blocker reported is the real one the suite hits, not one of
-    /// this file's choosing.</description></item>
-    /// <item><description><b>Depth.</b> The first blocker is reached within a few dozen calls, which would
-    /// leave everything past it unmeasured. A second staged pass repeats the same sequence while stepping
-    /// over each stage's failure, so the shader path, the scene build and the frame are enumerated
-    /// too.</description></item>
-    /// </list>
+    /// <para><b>There was a second, earlier pass here, and it was removed.</b> It constructed a
+    /// <see cref="GoldenRenderHarness"/> unmodified, and was documented as being there for fidelity -- so
+    /// that "the first blocker reported is the real one the suite hits, not one of this file's choosing".
+    /// That claim could not survive its own surroundings. <see cref="Initialize"/> calls
+    /// <see cref="GLCallTrap.Install"/>, so on a Vulkan run every OpenGL entry point in the process is a
+    /// thunk returning zero; the harness builds a <c>GLRecordingDevice</c> and compiles its shaders through
+    /// OpenGL, <c>glGetShader(CompileStatus)</c> answers 0, and the constructor throws
+    /// <c>ShaderCompilerException</c> for <c>quad_overdraw</c>. That blocker <em>is</em> one of this file's
+    /// choosing: it is this file's trap answering, not the port failing, and <c>quad_overdraw</c> compiles
+    /// clean when asked through SPIR-V. The pass therefore reported a constant, and because
+    /// <see cref="VulkanSceneOutcome.Rendered"/> required every stage to complete, that constant marked all
+    /// 35 scenes as not rendered and their images -- which existed -- went unscored. A measurement whose
+    /// result cannot vary is not a measurement, and this one was masking the only one that matters.</para>
     /// </summary>
     /// <remarks>
     /// Vulkan needs no window system, so unlike <see cref="HeadlessGL"/> there is nothing here that can
@@ -269,31 +272,17 @@ namespace Tests.Renderer.Golden
 
         private static VulkanSceneOutcome Attempt(GoldenScene scene)
         {
-            var stages = new List<VulkanStage>();
-
             CurrentScene = scene.Name;
             Trace($"scene {scene.Name}");
 
             GLCallTrap.Reset();
 
-            // Pass one: the OpenGL harness, unmodified. Whatever stops this is the blocker the suite
-            // really hits, before any allowance this file might make for it.
-            GLCallTrap.CurrentStage = "harness";
-            stages.Add(Run("harness-construction", static () =>
-            {
-                using var harness = new GoldenRenderHarness();
-            }));
+            var stages = Probe(scene, out var captured, out var caveat);
 
-            var reachedByHarness = GLCallTrap.TotalCalls;
-
-            // Pass two: the same sequence, stepping over each failure, so what lies past the first
-            // blocker is measured rather than assumed.
-            GLCallTrap.Reset();
-            stages.AddRange(Probe(scene, out var captured));
-
-            return new VulkanSceneOutcome(scene.Name, stages, reachedByHarness, GLCallTrap.ReportByFile(), GLCallTrap.TotalCalls)
+            return new VulkanSceneOutcome(scene.Name, stages, GLCallTrap.ReportByFile(), GLCallTrap.TotalCalls)
             {
                 Image = captured,
+                CaptureCaveat = caveat,
                 RecordedCommands = VulkanCommandCensus.Transcript,
                 RecordedSummary = VulkanCommandCensus.Summary(),
             };
@@ -304,21 +293,27 @@ namespace Tests.Renderer.Golden
         /// </summary>
         /// <remarks>
         /// The order mirrors <see cref="GoldenRenderHarness"/>: environment, render targets, renderer
-        /// construction and resources, scene build, shader link, one frame, readback. One frame rather
-        /// than the scene's own count, because what a stage reaches does not change with repetition and
-        /// every extra frame is another chance for a zeroed handle to take the process down.
+        /// construction and resources, scene build, shader link, the scene's frames, readback.
+        /// <para>
+        /// <b>What it does not mirror, and what that costs the diff.</b> Four scenes capture something other
+        /// than the tonemapped frame on the OpenGL path -- the sun shadow atlas, the morph composite, the
+        /// quad-overdraw heat map and the occlusion debug overlay -- and each is driven by harness code that
+        /// is direct OpenGL or needs <c>QuadOverdraw</c>, neither of which exists here. Those four are still
+        /// captured and still diffed, but what they capture is the ordinary shaded frame, so their numbers
+        /// measure the missing capture path rather than the port. <see cref="Score"/> says so per scene
+        /// rather than leaving it to be rediscovered from a suspiciously large diff.
+        /// </para>
         /// </remarks>
-        private static List<VulkanStage> Probe(GoldenScene scene, out SKBitmap? captured)
+        private static List<VulkanStage> Probe(GoldenScene scene, out SKBitmap? captured, out string caveat)
         {
             var context = Context!;
             var stages = new List<VulkanStage>();
             SKBitmap? image = null;
 
-            // Re-asserted, not set once at startup. The fidelity pass constructs a GoldenRenderHarness,
-            // whose constructor assigns this flag from VRF_RHI_RECORDING -- which on a Vulkan run is
-            // normally unset, so it turns recording back off for everything after it. Without this the
-            // staged pass would take the direct OpenGL route everywhere and the device would go unused for
-            // a reason that had nothing to do with the port.
+            // Re-asserted per scene rather than relied on from Initialize, because this is process-global
+            // static state that anything in the run is free to move. With it off the probe would take the
+            // direct OpenGL route everywhere and the device would go unused for a reason that had nothing
+            // to do with the port.
             ValveResourceFormat.Renderer.Renderer.EnableRhiRecording = true;
 
             // Per scene, and covering the whole probe rather than just the frame: the readback's own copy
@@ -394,7 +389,19 @@ namespace Tests.Renderer.Golden
                 renderer.Camera.CreateProjectionMatrix();
             }));
 
-            stages.Add(Run("postprocess-load", () => Require(renderer).Postprocess.Load(1)));
+            stages.Add(Run("postprocess-load", () =>
+            {
+                var postprocess = Require(renderer).Postprocess;
+
+                postprocess.Load(1);
+
+                // The two tonemap constants GoldenRenderHarness sets for every scene. Copied rather than
+                // left at their defaults because they are inputs to the pass that produced every baseline
+                // PNG: a probe that skipped them would shift the gamma and exposure of every scene it
+                // captured, and the diff would then be measuring this file rather than the port.
+                postprocess.FullScreenGamma = 2.01f;
+                postprocess.ExposureCompensation = -0.4f;
+            }));
             stages.Add(Run("renderer-initialize", () => Require(renderer).Initialize()));
 
             stages.Add(Run("renderer-resources", () =>
@@ -458,14 +465,7 @@ namespace Tests.Renderer.Golden
 
             GLCallTrap.CurrentStage = "frame";
 
-            // The frame boundary is the presentation layer's, which offscreen is this harness --
-            // Renderer.AcquireCommandList says so, and the windowed control does the same. Without it
-            // the first BeginCommandList of every scene throws "no frame is open" and every scene
-            // reports that instead of whatever would really have stopped it, which hides the causes
-            // this run exists to enumerate.
-            stages.Add(Run("frame-begin", () => DeviceCensus!.BeginFrame()));
-
-            stages.Add(Run("frame-update", () =>
+            void Simulate()
             {
                 var target = Require(renderer);
 
@@ -475,9 +475,9 @@ namespace Tests.Renderer.Golden
                     TextRenderer = setup?.TextRenderer!,
                     Timestep = GoldenRenderHarness.Timestep,
                 });
-            }));
+            }
 
-            stages.Add(Run("frame-render", () =>
+            void Draw()
             {
                 var target = Require(renderer);
 
@@ -488,9 +488,66 @@ namespace Tests.Renderer.Golden
                     Scene = target.Scene,
                     Textures = target.Textures,
                 });
-            }));
+            }
 
-            stages.Add(Run("postprocess-render", () => Require(renderer).PostprocessRender(sceneFramebuffer!, captureFramebuffer!)));
+            void Resolve()
+            {
+                var target = Require(renderer);
+
+                // Re-applied every frame for the same reason GoldenRenderHarness re-applies it: the
+                // renderer rebuilds its post-process state from the scene's volumes on each frame, and a
+                // hand-built scene has none, so anything set before the frame is gone by the time the
+                // stage runs.
+                if (setup?.EnableBloomAfterRender == true)
+                {
+                    target.Postprocess.State = target.Postprocess.State with { HasBloom = true };
+                }
+
+                target.PostprocessRender(sceneFramebuffer!, captureFramebuffer!);
+            }
+
+            // Every frame but the last, run as one stage. The captured image is a function of how many
+            // simulation steps preceded it -- animation, particles and the occlusion pyramid all sample
+            // Frames * Timestep seconds -- so a probe that always rendered one frame would hand the diff an
+            // image taken at the wrong moment for the four scenes that ask for more, and the resulting
+            // number would say nothing about Vulkan. The last frame is left to the stages below so the
+            // report still names which part of a frame failed.
+            if (scene.Frames > 1)
+            {
+                stages.Add(Run("frame-warmup", () =>
+                {
+                    for (var frame = 1; frame < scene.Frames; frame++)
+                    {
+                        DeviceCensus!.BeginFrame();
+
+                        try
+                        {
+                            Simulate();
+                            Draw();
+                            Resolve();
+                        }
+                        finally
+                        {
+                            // A frame left open would make every later BeginCommandList throw "a frame is
+                            // already open", turning one scene's failure into every later stage's.
+                            DeviceCensus!.EndFrame();
+                        }
+                    }
+                }));
+            }
+
+            // The frame boundary is the presentation layer's, which offscreen is this harness --
+            // Renderer.AcquireCommandList says so, and the windowed control does the same. Without it
+            // the first BeginCommandList of every scene throws "no frame is open" and every scene
+            // reports that instead of whatever would really have stopped it, which hides the causes
+            // this run exists to enumerate.
+            stages.Add(Run("frame-begin", () => DeviceCensus!.BeginFrame()));
+
+            stages.Add(Run("frame-update", Simulate));
+
+            stages.Add(Run("frame-render", Draw));
+
+            stages.Add(Run("postprocess-render", Resolve));
 
             stages.Add(Run("frame-end", () => DeviceCensus!.EndFrame()));
 
@@ -499,6 +556,7 @@ namespace Tests.Renderer.Golden
 
             GLCallTrap.CurrentStage = "(none)";
             captured = image;
+            caveat = DescribeCaptureGap(setup);
 
             sceneFramebuffer?.Delete();
             captureFramebuffer?.Delete();
@@ -514,6 +572,56 @@ namespace Tests.Renderer.Golden
             renderer?.Dispose();
 
             return stages;
+        }
+
+        /// <summary>
+        /// Says whether this scene's baseline was recorded from something other than the tonemapped frame,
+        /// and therefore whether its diff is a statement about the port at all.
+        /// </summary>
+        /// <param name="setup">The scene setup after <see cref="GoldenScene.Build"/>, or <see langword="null"/>
+        /// when the build never ran.</param>
+        /// <returns>The caveat, or an empty string when the scene captures the ordinary frame.</returns>
+        /// <remarks>
+        /// Read off the flags the scene itself set rather than from a list of scene names kept here, so a
+        /// new scene that opts into one of these capture paths is annotated without anyone remembering to
+        /// come back and add it. Each of these four capture paths lives in
+        /// <see cref="GoldenRenderHarness"/> and is direct OpenGL (<c>glGetTextureImage</c>,
+        /// <c>glGetTextureSubImage</c>) or needs its <c>QuadOverdraw</c> instance, so the probe captures the
+        /// shaded frame instead and the resulting number measures the missing path, not the backend.
+        /// </remarks>
+        private static string DescribeCaptureGap(GoldenSceneSetup? setup)
+        {
+            if (setup == null)
+            {
+                return string.Empty;
+            }
+
+            var missing = new List<string>();
+
+            if (setup.CaptureShadowAtlas)
+            {
+                missing.Add("the OpenGL harness reads the sun shadow atlas back instead of the frame");
+            }
+
+            if (setup.MorphComposite != null)
+            {
+                missing.Add("the OpenGL harness reads the morph composite atlas back instead of the frame");
+            }
+
+            if (setup.EnableQuadOverdraw)
+            {
+                missing.Add("the OpenGL harness runs the quad-overdraw counting and resolve passes");
+            }
+
+            if (setup.EnableOcclusionDebug)
+            {
+                missing.Add("the OpenGL harness enables occlusion culling and draws the debug overlay");
+            }
+
+            return missing.Count == 0
+                ? string.Empty
+                : "baseline is not comparable -- " + string.Join("; ", missing)
+                    + ", and this probe captures the ordinary shaded frame.";
         }
 
         /// <summary>
@@ -947,12 +1055,16 @@ namespace Tests.Renderer.Golden
             var lines = new List<string>
             {
                 $"Vulkan golden image run on {DeviceDescription}: {outcomes.Count} scene(s) attempted, "
-                    + $"{outcomes.Count(static outcome => outcome.Rendered)} rendered.",
+                    + $"{outcomes.Count(static outcome => outcome.Rendered)} produced an image.",
                 $"Driver selection ({SoftwareVulkanIcd.EnvironmentVariable}): {SoftwareVulkanIcd.Status}",
                 $"Device self-test (clear an offscreen target, copy it back, check the pixels): {SelfTestResult}.",
                 string.Empty,
-                "Blockers grouped by cause (stage :: exception type :: message):",
             };
+
+            lines.AddRange(ScoreTable(outcomes));
+
+            lines.Add(string.Empty);
+            lines.Add("Blockers grouped by cause (stage :: exception type :: message):");
 
             var byCause = outcomes
                 .SelectMany(static outcome => outcome.Stages
@@ -1017,6 +1129,39 @@ namespace Tests.Renderer.Golden
             }
 
             return string.Join(Environment.NewLine, lines);
+        }
+
+        /// <summary>
+        /// Every scene's captured frame measured against the OpenGL baseline, which is the work list the
+        /// rest of the port is scheduled from.
+        /// </summary>
+        /// <remarks>
+        /// This is the number the second backend exists to produce, so it goes at the top of the report and
+        /// into the file, rather than being left to be reassembled from 35 individual test failures. The
+        /// scores themselves come from <see cref="GoldenImageTests"/>, which owns the baselines and the
+        /// tolerances; a scene whose test never ran reads "not scored", which is a different and visible
+        /// thing from a scene that scored badly.
+        /// </remarks>
+        private static IEnumerable<string> ScoreTable(List<VulkanSceneOutcome> outcomes)
+        {
+            yield return "Each scene's captured frame against its OpenGL baseline. This is the verdict: a scene";
+            yield return "passes on the pixel difference, not on whether every stage of it completed.";
+
+            foreach (var outcome in outcomes.OrderBy(static outcome => outcome.Scene, StringComparer.Ordinal))
+            {
+                var failures = outcome.Failures;
+
+                var stageNote = failures.Count == 0
+                    ? string.Empty
+                    : $"  [{failures.Count} stage(s) failed: {string.Join(", ", failures.Select(static stage => stage.Name))}]";
+
+                yield return $"  {outcome.Scene,-32} {outcome.Score}{stageNote}";
+
+                if (outcome.CaptureCaveat.Length > 0)
+                {
+                    yield return $"  {string.Empty,-32} {outcome.CaptureCaveat}";
+                }
+            }
         }
 
         /// <summary>
@@ -1203,18 +1348,35 @@ namespace Tests.Renderer.Golden
     /// <summary>What happened to one scene on the Vulkan device.</summary>
     /// <param name="Scene">The scene name.</param>
     /// <param name="Stages">Every stage attempted, in order.</param>
-    /// <param name="HarnessGLCalls">Direct OpenGL calls the unmodified OpenGL harness reached before failing.</param>
     /// <param name="DirectGLReport">The direct OpenGL surface the staged pass reached, grouped by file.</param>
     /// <param name="DirectGLCalls">Direct OpenGL calls the staged pass reached in total.</param>
     internal sealed record VulkanSceneOutcome(
         string Scene,
         IReadOnlyList<VulkanStage> Stages,
-        int HarnessGLCalls,
         string DirectGLReport,
         int DirectGLCalls)
     {
         /// <summary>The captured frame, when the scene got as far as producing one. Owned by the caller.</summary>
         public SKBitmap? Image { get; init; }
+
+        /// <summary>
+        /// How the captured frame measured against the OpenGL baseline, once
+        /// <see cref="GoldenImageTests"/> has diffed it.
+        /// </summary>
+        /// <remarks>
+        /// Written back by the test rather than computed here, because scoring against a baseline is the
+        /// test's job and this class has no business deciding whether a scene passed. It is read only by
+        /// <see cref="HeadlessVulkan.Report"/>, so that the one file a Vulkan run leaves behind carries the
+        /// per-scene table as well as the blockers -- a table split across 35 separate test failures is not
+        /// a work list.
+        /// </remarks>
+        public string Score { get; set; } = "not scored";
+
+        /// <summary>
+        /// Why this scene's diff against the OpenGL baseline is not a statement about the Vulkan backend,
+        /// or empty when it is. See <c>HeadlessVulkan.DescribeCaptureGap</c>.
+        /// </summary>
+        public string CaptureCaveat { get; init; } = string.Empty;
 
         /// <summary>
         /// Every command the frame put into a Vulkan command buffer, in order.
@@ -1227,8 +1389,19 @@ namespace Tests.Renderer.Golden
         /// <summary>The same commands as counters, most-used first.</summary>
         public string RecordedSummary { get; init; } = string.Empty;
 
-        /// <summary>Whether every stage completed, which would mean the scene actually produced an image.</summary>
-        public bool Rendered => Stages.All(static stage => stage.Failure == null);
+        /// <summary>Whether the scene produced a frame that can be compared against a baseline.</summary>
+        /// <remarks>
+        /// The readback is the last stage, so this is equivalent to "every stage that the image depends on
+        /// completed" -- but it is deliberately keyed on the image rather than on every stage succeeding.
+        /// A stage can fail and the frame still arrive: <c>text-renderer</c> is an overlay, and a scene
+        /// missing its labels is a scene whose diff should say how much of the image the labels were.
+        /// Requiring a clean stage list here is what previously threw those images away.
+        /// </remarks>
+        public bool Rendered => Image != null;
+
+        /// <summary>Every stage that failed, in order. Empty when the whole frame came through clean.</summary>
+        public IReadOnlyList<VulkanStage> Failures
+            => [.. Stages.Where(static stage => stage.Failure != null)];
 
         /// <summary>The first stage that failed, which is the blocker to report for this scene.</summary>
         public VulkanStage? FirstFailure => Stages.FirstOrDefault(static stage => stage.Failure != null);
