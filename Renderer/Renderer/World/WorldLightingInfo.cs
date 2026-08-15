@@ -112,8 +112,8 @@ namespace ValveResourceFormat.Renderer.World
         private StorageBuffer? BarnLightStorageBuffer;
         private RenderTexture? BarnLightCookieAtlas { get; set; }
         private RenderTexture? DefaultCookieAtlas;
-        private GLSampler? CookieSamplerClampBorder;
-        private GLSampler? CookieSamplerWrap;
+        private ISampler? CookieSamplerClampBorder;
+        private ISampler? CookieSamplerWrap;
 
         /// <summary>Binds the scene's lightmap, light probe atlas, and barn light cookie textures to their reserved units.</summary>
         /// <param name="commandList">The command list to record into, or <see langword="null"/> to bind through OpenGL directly.</param>
@@ -214,7 +214,7 @@ namespace ValveResourceFormat.Renderer.World
         /// through two units that differ only in wrapping, which is exactly what a sampler object is for
         /// and why the sampler cannot be left as the texture's own state.
         /// </remarks>
-        private static void BindCookieAtlas(ICommandList? commandList, ReservedTextureSlots slot, RenderTexture atlas, GLSampler sampler)
+        private static void BindCookieAtlas(ICommandList? commandList, ReservedTextureSlots slot, RenderTexture atlas, ISampler sampler)
         {
             if (commandList != null)
             {
@@ -223,7 +223,7 @@ namespace ValveResourceFormat.Renderer.World
             }
 
             GL.BindTextureUnit((int)slot, atlas.Handle);
-            GL.BindSampler((int)slot, sampler.Handle);
+            GL.BindSampler((int)slot, (sampler as GLSampler)?.Handle ?? 0);
         }
 
         /// <summary>
@@ -698,12 +698,10 @@ namespace ValveResourceFormat.Renderer.World
         /// </summary>
         /// <remarks>
         /// <para>
-        /// Built as <see cref="GLSampler"/> rather than through <see cref="IDevice.CreateSampler"/> for the
-        /// same reason <see cref="MaterialLoader"/>'s samplers are: one object then serves both paths, the
-        /// recorded bind taking the <see cref="ISampler"/> and the OpenGL bind taking its
-        /// <see cref="GLSampler.Handle"/>, so the two cannot describe different filtering. Creating them
-        /// through a device would need a device this type has no route to, and would leave the OpenGL path
-        /// reaching into the object for its handle anyway.
+        /// Created through <see cref="IDevice.CreateSampler"/> when the scene's context has a device, so a
+        /// Vulkan run gets a <c>VkSampler</c> rather than an OpenGL name it cannot bind. The object still
+        /// serves both paths &#8212; the recorded bind takes the <see cref="ISampler"/> and the OpenGL bind
+        /// takes its <see cref="GLSampler.Handle"/> &#8212; so the two cannot describe different filtering.
         /// </para>
         /// <para>
         /// <see cref="MipFilterMode.None"/> reproduces the plain <c>GL_LINEAR</c> minification these
@@ -713,16 +711,23 @@ namespace ValveResourceFormat.Renderer.World
         /// </remarks>
         private void CreateCookieSamplers()
         {
-            CookieSamplerClampBorder = new GLSampler(
+            CookieSamplerClampBorder = CreateSampler(
                 new SamplerDesc(
                     MipFilter: MipFilterMode.None,
                     AddressU: AddressMode.ClampToBorder,
                     AddressV: AddressMode.ClampToBorder),
                 "LightCookieSamplerClampBorder");
 
-            CookieSamplerWrap = new GLSampler(
+            CookieSamplerWrap = CreateSampler(
                 new SamplerDesc(MipFilter: MipFilterMode.None),
                 "LightCookieSamplerWrap");
+        }
+
+        private ISampler CreateSampler(in SamplerDesc desc, string name)
+        {
+            var device = scene.RendererContext.Device;
+
+            return device is not null ? device.CreateSampler(desc) : new GLSampler(in desc, name);
         }
 
         /// <summary>Allocates the GPU storage buffer used to pass barn light data to shaders.</summary>

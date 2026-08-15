@@ -454,30 +454,227 @@ namespace ValveResourceFormat.Renderer
             SetParameter(TextureParameterName.TextureMaxLevel, maxLevel);
         }
 
-        /// <summary>Sets a single integer texture parameter.</summary>
-        /// <param name="parameter">The parameter name to set.</param>
-        /// <param name="value">The integer value to assign.</param>
+        // OpenGL's own defaults for a freshly created texture object, so a texture nobody configures
+        // samples through RhiSampler exactly as it does through sampler 0 on the OpenGL path.
+        private SamplerDesc samplerDesc = new(
+            MinFilter: FilterMode.Nearest,
+            MagFilter: FilterMode.Linear,
+            MipFilter: MipFilterMode.Linear,
+            AddressU: AddressMode.Repeat,
+            AddressV: AddressMode.Repeat,
+            AddressW: AddressMode.Repeat);
+
+        private ISampler? rhiSampler;
+
+        /// <summary>
+        /// Gets the sampler state this texture has been given, as the RHI models it.
+        /// </summary>
+        /// <remarks>Accumulated from every <see cref="SetParameter(TextureParameterName, int)"/>,
+        /// <see cref="SetFiltering"/> and <see cref="SetWrapMode"/> call, on every backend. Starts at
+        /// OpenGL's texture object defaults so that a texture nobody configures still describes itself
+        /// correctly.</remarks>
+        public SamplerDesc RhiSamplerDesc => samplerDesc;
+
+        /// <summary>
+        /// Gets a sampler carrying this texture's filtering, wrapping and comparison state, for
+        /// <see cref="ICommandList.BindTexture"/>.
+        /// </summary>
         /// <remarks>
-        /// <b>Not ported, and does nothing on a non-OpenGL device.</b> Filtering, wrapping and mip
-        /// clamping are properties of a sampler in the RHI, not of a texture: OpenGL is the odd one out in
-        /// letting a texture object carry them. The replacement is a <see cref="SamplerDesc"/> passed to
-        /// <see cref="IDevice.CreateSampler"/> and bound alongside the texture.
         /// <para>
-        /// The OpenGL path must keep setting these, because the renderer binds sampler 0 for most textures
-        /// and sampler 0 means "use the texture object's own parameters". Removing them would change what
-        /// every material samples, so they stay until the call sites carry samplers.
+        /// <b>This is what makes a texture sample correctly on Vulkan.</b> OpenGL is the odd one out in
+        /// letting a texture object carry filtering and wrap state, and the renderer leans on that: it
+        /// binds sampler object 0 nearly everywhere, which tells OpenGL to defer to those parameters.
+        /// Vulkan has no such fallback, so a texture bound with no sampler samples with defaults no matter
+        /// what the material asked for &#8212; silently, and looking exactly like a content bug.
+        /// </para>
+        /// <para>
+        /// Created once and cached, and thrown away whenever the state changes, so a caller that
+        /// configures a texture after binding it still gets a sampler that agrees.
         /// </para>
         /// </remarks>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void SetParameter(TextureParameterName parameter, int value)
+        public ISampler RhiSampler => rhiSampler ??= CreateSampler();
+
+        /// <summary>
+        /// Gets the sampler to pass to <see cref="ICommandList.BindTexture"/> for this texture, which is
+        /// <see langword="null"/> on OpenGL and <see cref="RhiSampler"/> everywhere else.
+        /// </summary>
+        /// <param name="device">The device the bind is being recorded on.</param>
+        /// <returns>The sampler to bind, or <see langword="null"/> to leave the unit on sampler 0.</returns>
+        /// <remarks>
+        /// <para>
+        /// <b>Both answers produce the same filtering.</b> On OpenGL a null sampler binds sampler object 0,
+        /// which is the instruction to use the parameters on the texture object &#8212; and those are kept in
+        /// step with <see cref="RhiSamplerDesc"/> by <see cref="SetParameter(TextureParameterName, int)"/>.
+        /// On Vulkan there is no such fallback, so the sampler has to be passed or the texture samples with
+        /// device defaults.
+        /// </para>
+        /// <para>
+        /// <b>Binding a real sampler on OpenGL is not harmless, which is why this exists.</b> A sampler
+        /// binding belongs to the texture unit and persists until something overwrites it. The renderer
+        /// still has passes that bind textures with raw <c>glBindTextureUnit</c> and never touch
+        /// <c>glBindSampler</c> &#8212; the post-process chain among them &#8212; so a sampler left on a
+        /// unit by an earlier recorded bind is still there when they sample through it, and they get the
+        /// wrong filtering. That is a real regression the golden suite catches, in a scene unrelated to the
+        /// bind that caused it. Binding samplers on OpenGL only becomes safe once every bind site records
+        /// through a command list.
+        /// </para>
+        /// </remarks>
+        public ISampler? SamplerFor(IDevice? device)
+            => RendererDevice.IsOpenGL(device ?? explicitDevice) ? null : RhiSampler;
+
+        private ISampler CreateSampler()
         {
-            if (!RendererDevice.IsOpenGL(explicitDevice))
+            var device = Device;
+            var name = $"{Name ?? "Texture"} sampler";
+
+            // GLSampler directly when there is no device, for the same reason the rest of this type has a
+            // legacy path: the renderer runs before the presentation layer brings a device up.
+            return device is not null
+                ? device.CreateSampler(samplerDesc)
+                : new GLSampler(samplerDesc, name);
+        }
+
+        private void UpdateSampler(SamplerDesc updated)
+        {
+            if (updated == samplerDesc)
             {
                 return;
             }
 
-            GL.TextureParameter(Handle, parameter, value);
+            samplerDesc = updated;
+
+            // Dropped rather than mutated: a sampler is immutable once created on both backends, and a
+            // stale one would describe the state this texture had when it was first bound.
+            if (rhiSampler is not null)
+            {
+                Device?.DeferredDestroy(rhiSampler);
+                rhiSampler = null;
+            }
         }
+
+        /// <summary>Sets a single integer texture parameter.</summary>
+        /// <param name="parameter">The parameter name to set.</param>
+        /// <param name="value">The integer value to assign.</param>
+        /// <remarks>
+        /// <para>
+        /// The single funnel every filtering and wrap call in the renderer passes through, which is why
+        /// the translation into <see cref="RhiSamplerDesc"/> lives here: it catches the twenty-odd call
+        /// sites spread across the post-process chain, the world loader and the GUI without any of them
+        /// having to change.
+        /// </para>
+        /// <para>
+        /// The state is recorded on every backend and the OpenGL call is made only on OpenGL, where it
+        /// stays load-bearing: the renderer binds sampler 0 nearly everywhere, and sampler 0 defers to
+        /// these parameters. Removing them would change what every material samples.
+        /// </para>
+        /// </remarks>
+        public void SetParameter(TextureParameterName parameter, int value)
+        {
+            RecordSamplerState(parameter, value);
+
+            if (RendererDevice.IsOpenGL(explicitDevice))
+            {
+                GL.TextureParameter(Handle, parameter, value);
+            }
+        }
+
+        /// <summary>Sets a single floating point texture parameter.</summary>
+        /// <param name="parameter">The parameter name to set.</param>
+        /// <param name="value">The value to assign.</param>
+        /// <remarks>Anisotropy is the only one of these the renderer sets, and it is sampler state like
+        /// the rest, so it is recorded into <see cref="RhiSamplerDesc"/> too.</remarks>
+        public void SetParameter(TextureParameterName parameter, float value)
+        {
+            if (parameter == (TextureParameterName)ExtTextureFilterAnisotropic.TextureMaxAnisotropyExt)
+            {
+                UpdateSampler(samplerDesc with { MaxAnisotropy = value });
+            }
+
+            if (RendererDevice.IsOpenGL(explicitDevice))
+            {
+                GL.TextureParameter(Handle, parameter, value);
+            }
+        }
+
+        private void RecordSamplerState(TextureParameterName parameter, int value)
+        {
+            switch (parameter)
+            {
+                case TextureParameterName.TextureWrapS:
+                    UpdateSampler(samplerDesc with { AddressU = ToAddressMode(value) });
+                    break;
+
+                case TextureParameterName.TextureWrapT:
+                    UpdateSampler(samplerDesc with { AddressV = ToAddressMode(value) });
+                    break;
+
+                case TextureParameterName.TextureWrapR:
+                    UpdateSampler(samplerDesc with { AddressW = ToAddressMode(value) });
+                    break;
+
+                case TextureParameterName.TextureMinFilter:
+                    var (min, mip) = ToMinFilter(value);
+                    UpdateSampler(samplerDesc with { MinFilter = min, MipFilter = mip });
+                    break;
+
+                case TextureParameterName.TextureMagFilter:
+                    UpdateSampler(samplerDesc with { MagFilter = (TextureMagFilter)value == TextureMagFilter.Nearest ? FilterMode.Nearest : FilterMode.Linear });
+                    break;
+
+                case TextureParameterName.TextureCompareMode:
+                    // Turning comparison off clears the function; turning it on without one yet gets the
+                    // OpenGL default, which is Lequal.
+                    UpdateSampler(samplerDesc with
+                    {
+                        CompareOp = (TextureCompareMode)value == TextureCompareMode.None
+                            ? null
+                            : samplerDesc.CompareOp ?? Comparison.LessEqual,
+                    });
+                    break;
+
+                case TextureParameterName.TextureCompareFunc:
+                    UpdateSampler(samplerDesc with { CompareOp = ToComparison(value) });
+                    break;
+
+                // TextureBaseLevel and TextureMaxLevel are deliberately not sampler state. A mip range is
+                // expressed as an image view in the RHI -- ITexture.CreateView(baseMip, mipCount, ...) --
+                // because that is what Vulkan has; SamplerDesc carries no LOD clamp to put them in.
+                default:
+                    break;
+            }
+        }
+
+        private static AddressMode ToAddressMode(int wrap) => (TextureWrapMode)wrap switch
+        {
+            TextureWrapMode.MirroredRepeat => AddressMode.MirroredRepeat,
+            TextureWrapMode.ClampToEdge => AddressMode.ClampToEdge,
+            TextureWrapMode.ClampToBorder => AddressMode.ClampToBorder,
+            _ => AddressMode.Repeat,
+        };
+
+        private static (FilterMode Min, MipFilterMode Mip) ToMinFilter(int filter) => (TextureMinFilter)filter switch
+        {
+            TextureMinFilter.Nearest => (FilterMode.Nearest, MipFilterMode.None),
+            TextureMinFilter.Linear => (FilterMode.Linear, MipFilterMode.None),
+            TextureMinFilter.NearestMipmapNearest => (FilterMode.Nearest, MipFilterMode.Nearest),
+            TextureMinFilter.LinearMipmapNearest => (FilterMode.Linear, MipFilterMode.Nearest),
+            TextureMinFilter.NearestMipmapLinear => (FilterMode.Nearest, MipFilterMode.Linear),
+            TextureMinFilter.LinearMipmapLinear => (FilterMode.Linear, MipFilterMode.Linear),
+            _ => (FilterMode.Linear, MipFilterMode.Linear),
+        };
+
+        // The inverse of the table GLSampler applies, so a round trip through both is the identity.
+        private static Comparison ToComparison(int func) => (DepthFunction)func switch
+        {
+            DepthFunction.Never => Comparison.Never,
+            DepthFunction.Less => Comparison.Less,
+            DepthFunction.Equal => Comparison.Equal,
+            DepthFunction.Lequal => Comparison.LessEqual,
+            DepthFunction.Greater => Comparison.Greater,
+            DepthFunction.Notequal => Comparison.NotEqual,
+            DepthFunction.Gequal => Comparison.GreaterEqual,
+            _ => Comparison.Always,
+        };
 
         /// <summary>Assigns a debug label to the OpenGL texture object.</summary>
         /// <param name="label">Label string visible in graphics debuggers.</param>
@@ -502,6 +699,22 @@ namespace ValveResourceFormat.Renderer
         /// directly, which is what it always was.</remarks>
         public void Delete()
         {
+            if (rhiSampler is not null)
+            {
+                var samplerDevice = Device;
+
+                if (samplerDevice is not null)
+                {
+                    samplerDevice.DeferredDestroy(rhiSampler);
+                }
+                else
+                {
+                    rhiSampler.Dispose();
+                }
+
+                rhiSampler = null;
+            }
+
             if (rhiTexture is not null && !ownsLegacyHandle)
             {
                 var device = Device;

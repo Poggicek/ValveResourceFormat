@@ -172,7 +172,15 @@ namespace ValveResourceFormat.Renderer
                 commandList.BindPipeline(pipeline);
                 commandList.BindVertexBuffer(0, VertexRhiBuffer(vertexSizeBytes));
                 commandList.BindIndexBuffer(QuadIndexRhiBuffer(), IndexType.UInt16);
-                commandList.BindTexture(DescriptorSets.MaterialTextures, 0, morphAtlas.RhiTexture);
+                // The atlas carries its own sampler state, so it is bound with it rather than with the
+                // device default. On OpenGL sampler 0 defers to the texture's parameters and the two agree;
+                // on Vulkan there is no such fallback, and omitting this samples the atlas with default
+                // filtering and wrap no matter what it was configured with.
+                // SamplerFor rather than RhiSampler: on OpenGL this stays null so the unit keeps sampler 0
+                // and defers to the atlas's own texture parameters, which is both identical in effect and
+                // the only safe answer while other passes still bind textures without touching
+                // glBindSampler. See RenderTexture.SamplerFor.
+                commandList.BindTexture(DescriptorSets.MaterialTextures, 0, morphAtlas.RhiTexture, morphAtlas.SamplerFor(commandList.Device));
                 commandList.DrawIndexed(usedRects.Count * 6);
 
                 // The composite is sampled by the morph shader path in a later pass, so the colour writes

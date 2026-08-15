@@ -836,7 +836,12 @@ namespace ValveResourceFormat.Renderer.Shaders
 
             if (commandList != null)
             {
-                commandList.BindTexture(binding.DescriptorSet, binding.Binding, texture.RhiTexture);
+                // SamplerFor, never RhiSampler: on OpenGL it returns null so the unit keeps sampler 0
+                // and the texture's own parameters stay in charge, which is what the rest of the
+                // renderer assumes. Binding a real sampler object here instead left it on the unit for
+                // whatever sampled through it next, and showed up as a corrupted post-process pass in a
+                // scene with nothing to do with the texture that set it.
+                commandList.BindTexture(binding.DescriptorSet, binding.Binding, texture.RhiTexture, texture.SamplerFor(commandList.Device));
                 return true;
             }
 

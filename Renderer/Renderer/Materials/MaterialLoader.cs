@@ -24,7 +24,7 @@ namespace ValveResourceFormat.Renderer.Materials
         private readonly Dictionary<string, RenderTexture> Textures = [];
         private readonly Dictionary<string, RenderTexture> TexturesSrgb = [];
         private readonly Dictionary<(int AddressU, int AddressV, bool AnisotropicFiltering), int> Samplers = [];
-        private readonly Dictionary<(int AddressU, int AddressV, bool AnisotropicFiltering), GLSampler> RhiSamplers = [];
+        private readonly Dictionary<(int AddressU, int AddressV, bool AnisotropicFiltering), RHI.ISampler> RhiSamplers = [];
         private readonly RendererContext RendererContext;
         private RenderTexture? ErrorTexture;
         private RenderTexture? DefaultNormal;
@@ -236,7 +236,9 @@ namespace ValveResourceFormat.Renderer.Materials
 
             if (anisotropicFiltering && MaxTextureMaxAnisotropy >= 4)
             {
-                GL.TextureParameter(tex.Handle, (TextureParameterName)ExtTextureFilterAnisotropic.TextureMaxAnisotropyExt, MaxTextureMaxAnisotropy);
+                // Through the texture rather than straight at OpenGL, so the anisotropy lands in
+                // RhiSamplerDesc as well and the sampler a Vulkan bind uses asks for it too.
+                tex.SetParameter((TextureParameterName)ExtTextureFilterAnisotropic.TextureMaxAnisotropyExt, MaxTextureMaxAnisotropy);
             }
 
             return tex;
@@ -259,7 +261,7 @@ namespace ValveResourceFormat.Renderer.Materials
                 return sampler;
             }
 
-            sampler = CreateSampler(addressModeU, addressModeV, mipmaps, anisotropicFiltering).Handle;
+            sampler = HandleOf(CreateSampler(addressModeU, addressModeV, mipmaps, anisotropicFiltering));
 
             Samplers[key] = sampler;
             return sampler;
@@ -295,11 +297,17 @@ namespace ValveResourceFormat.Renderer.Materials
             var created = CreateSampler(addressModeU, addressModeV, mipmaps, anisotropicFiltering);
 
             RhiSamplers[key] = created;
-            Samplers[key] = created.Handle;
+            Samplers[key] = HandleOf(created);
             return created;
         }
 
-        private GLSampler CreateSampler(int addressModeU, int addressModeV, bool mipmaps, bool anisotropicFiltering)
+        /// <summary>Gets the OpenGL name of a sampler, or 0 when it is not an OpenGL one.</summary>
+        /// <remarks>0 is also what <see cref="GetOrCreateSampler"/> returns for the default sampler state,
+        /// so the two are indistinguishable on a non-OpenGL device. That is harmless because the integer
+        /// handle only ever reaches <c>glBindSampler</c>, which does not run on one.</remarks>
+        private static int HandleOf(RHI.ISampler sampler) => (sampler as GLSampler)?.Handle ?? 0;
+
+        private RHI.ISampler CreateSampler(int addressModeU, int addressModeV, bool mipmaps, bool anisotropicFiltering)
         {
             var key = (addressModeU, addressModeV, anisotropicFiltering);
 
@@ -309,7 +317,7 @@ namespace ValveResourceFormat.Renderer.Materials
             }
 
             // Anisotropy is requested only when the device reports at least 4x, exactly as before;
-            // GLSampler applies the parameter only when the value exceeds 1, so the two agree.
+            // both backends apply the parameter only when the value exceeds 1, so the two agree.
             var desc = new RHI.SamplerDesc(
                 MinFilter: RHI.FilterMode.Linear,
                 MagFilter: RHI.FilterMode.Linear,
@@ -319,7 +327,14 @@ namespace ValveResourceFormat.Renderer.Materials
                 AddressW: RHI.AddressMode.Repeat,
                 MaxAnisotropy: anisotropicFiltering && MaxTextureMaxAnisotropy >= 4 ? MaxTextureMaxAnisotropy : 1f);
 
-            var sampler = new GLSampler(in desc, $"Material sampler {addressModeU},{addressModeV}");
+            // Through the device when there is one, so a Vulkan run gets a VkSampler rather than a GL name
+            // it cannot use. The OpenGL path still reads GLSampler.Handle off the result, which is the same
+            // object, so the two descriptions cannot drift apart.
+            var device = RendererContext.Device;
+
+            var sampler = device is not null
+                ? device.CreateSampler(desc)
+                : new GLSampler(in desc, $"Material sampler {addressModeU},{addressModeV}");
 
             RhiSamplers[key] = sampler;
             return sampler;

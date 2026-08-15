@@ -177,7 +177,9 @@ namespace ValveResourceFormat.Renderer
         {
             if (commandList != null)
             {
-                commandList.BindTexture(DescriptorSets.ReservedTextures, (int)slot, texture.RhiTexture);
+                // SamplerFor rather than RhiSampler: null on OpenGL, so the unit keeps sampler 0 and
+                // defers to the texture's own parameters. See the note at the matching call in Shader.
+                commandList.BindTexture(DescriptorSets.ReservedTextures, (int)slot, texture.RhiTexture, texture.SamplerFor(commandList.Device));
                 return;
             }
 
