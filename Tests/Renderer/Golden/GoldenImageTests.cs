@@ -40,6 +40,19 @@ namespace Tests.Renderer.Golden
                     + $"Backend error gate {(ValidationGate.IsEnforcing ? "enforcing" : "reporting only")} "
                     + $"({ValidationGate.EnvironmentVariable})."
                 : $"Golden images: no device. {GoldenBackend.UnavailableReason}");
+
+            // The device line above names the adapter; this one says why that adapter and not another. They
+            // are separate because the interesting failure is the pair disagreeing -- a run that meant to be
+            // on the CPU driver and is not -- and a single sentence would let that pass unread.
+            if (GoldenBackend.DriverSelection.Length > 0)
+            {
+                TestContext.Progress.WriteLine($"Golden images: {GoldenBackend.DriverSelection}");
+
+                // Named up front rather than at teardown, because the run this matters for does not reach
+                // its teardown: a driver fault kills the process, and this file is then the only surviving
+                // account of what it was doing.
+                TestContext.Progress.WriteLine($"Golden images: stage trace at {HeadlessVulkan.TracePath}");
+            }
         }
 
         [OneTimeTearDown]
@@ -211,12 +224,26 @@ namespace Tests.Renderer.Golden
         /// A run with no reachable GPU is not a regression. Every scene is ignored with the reason the
         /// device could not be created, so the suite stays green on machines that cannot render while still
         /// saying plainly that nothing was checked.
+        ///
+        /// <para><b>Unless the run was pinned to a software driver</b>, in which case it fails instead. A
+        /// CPU device is a file in this tree rather than a property of the machine, so there is no honest
+        /// "this box cannot" for it -- the driver is missing, the manifest is wrong, or the loader returned
+        /// a hardware adapter that was refused. Ignoring those would turn a run that verified nothing into a
+        /// green one, and the whole reason this gate is on a CPU device is that a silently wrong answer here
+        /// was what cost somebody a reboot.</para>
         /// </summary>
         private static void RequireDevice()
         {
             if (GoldenBackend.Available)
             {
                 return;
+            }
+
+            if (GoldenBackend.UnavailableIsFatal)
+            {
+                Assert.Fail($"No {GoldenBackend.BackendName} device is available and this run is pinned to a "
+                    + $"software driver, so that is a setup fault rather than a machine without a GPU: "
+                    + GoldenBackend.UnavailableReason);
             }
 
             Assert.Ignore($"No {GoldenBackend.BackendName} device is available: " + GoldenBackend.UnavailableReason);

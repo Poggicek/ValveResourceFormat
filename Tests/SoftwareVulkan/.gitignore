@@ -1,0 +1,4 @@
+# The vendored ICD is a 56 MB binary drop, not source. It is fetched rather than committed;
+# fetch-lavapipe.ps1 puts it here and README.md records exactly which build belongs here.
+vulkan_lvp.dll
+lvp_icd.x86_64.json

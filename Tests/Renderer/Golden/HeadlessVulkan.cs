@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -47,6 +47,8 @@ namespace Tests.Renderer.Golden
         private static readonly List<VulkanSceneOutcome> Outcomes = [];
 
         private static Thread? RenderThread;
+        private static StreamWriter? TraceWriter;
+        private static string CurrentScene = "(none)";
         private static VulkanGoldenDevice? Device;
         private static RhiDeviceCensus? DeviceCensus;
         private static RendererContext? Context;
@@ -68,6 +70,14 @@ namespace Tests.Renderer.Golden
         /// <summary>The adapter the device selected, for the run banner.</summary>
         public static string DeviceDescription { get; private set; } = "no device";
 
+        /// <summary>
+        /// Where the stage-by-stage trace is written, one flushed line at a time, so that a run the driver
+        /// kills outright still says what it was doing. <see cref="Trace"/> explains why that is the normal
+        /// case rather than a defensive nicety.
+        /// </summary>
+        public static string TracePath { get; }
+            = Path.Combine(GoldenImageStore.FailureDirectory, "vulkan-scene-trace.txt");
+
         /// <summary>Creates the device. Never throws; a failure is reported through <see cref="Available"/>.</summary>
         public static void Initialize()
         {
@@ -77,6 +87,18 @@ namespace Tests.Renderer.Golden
             }
 
             Initialized = true;
+
+            // Before the first Vulkan call of the process, because the loader reads its driver-selection
+            // environment at instance creation and there is no second chance afterwards. This is what keeps
+            // the run off the display driver; see SoftwareVulkanIcd for why that is not optional.
+            SoftwareVulkanIcd.Configure();
+
+            if (SoftwareVulkanIcd.ConfigurationError is { } error)
+            {
+                UnavailableReason = error;
+                Available = false;
+                return;
+            }
 
             // Before anything can call into OpenTK: a Vulkan run has no OpenGL context, and an unloaded
             // OpenTK entry point is a null pointer that takes the process with it rather than throwing.
@@ -104,12 +126,36 @@ namespace Tests.Renderer.Golden
                 UnavailableReason = Describe(e);
                 Available = false;
             }
+
+            // After the device, so the trace's own header can name it; the run has done nothing that could
+            // fault before this point, since the self-test is the only work submitted so far and it either
+            // returned or was recorded as a failed self-test.
+            OpenTrace();
         }
 
         private static void CreateDevice()
         {
             Device = VulkanGoldenDevice.Create(ValidationGate.OnMessage, enableValidation: true);
-            DeviceDescription = Device.AdapterName;
+            DeviceDescription = $"{Device.AdapterName} (device type {Device.AdapterTypeName})";
+
+            // The first thing done with the device, and before a single command is recorded or submitted.
+            // VK_DRIVER_FILES is a request; this is the answer, and the answer is what the run is allowed to
+            // act on. A hardware adapter here means the loader fell through to the display driver, which is
+            // the exact configuration that hung one and bugchecked the machine -- so the device is destroyed
+            // and the run reports itself unavailable rather than drawing anything.
+            if (SoftwareVulkanIcd.RequireCpuDevice && !Device.AdapterIsCpu)
+            {
+                var selected = DeviceDescription;
+
+                Device.Dispose();
+                Device = null;
+
+                throw new GoldenRenderException(
+                    $"The Vulkan loader selected {selected}, which is not a CPU device. No work was submitted to it "
+                    + "and it has been destroyed. The golden Vulkan run refuses hardware adapters because this "
+                    + "renderer still records draws that read descriptor sets it never bound, and a display driver "
+                    + $"answered that by hanging and bugchecking the machine. {SoftwareVulkanIcd.Status}");
+            }
 
             // Run before the census is attached, so the self-test's own device calls are not counted as
             // the suite reaching Vulkan. The distinction matters: the number that says whether the
@@ -222,6 +268,9 @@ namespace Tests.Renderer.Golden
         private static VulkanSceneOutcome Attempt(GoldenScene scene)
         {
             var stages = new List<VulkanStage>();
+
+            CurrentScene = scene.Name;
+            Trace($"scene {scene.Name}");
 
             GLCallTrap.Reset();
 
@@ -581,14 +630,73 @@ namespace Tests.Renderer.Golden
         {
             var before = GLCallTrap.TotalCalls;
 
+            // Written before the stage rather than after it, and flushed, because the thing this is here
+            // to survive cannot be caught. See Trace.
+            Trace($"  entering {name}");
+
             try
             {
                 step();
+                Trace($"  ok      {name}");
                 return new VulkanStage(name, null, GLCallTrap.TotalCalls - before);
             }
             catch (Exception e)
             {
+                Trace($"  FAIL    {name} -- {e.GetType().Name}: {Condense(e.Message)}");
                 return new VulkanStage(name, e, GLCallTrap.TotalCalls - before);
+            }
+        }
+
+        /// <summary>
+        /// Appends one line to the scene trace and flushes it.
+        ///
+        /// <para><b>This exists because the Vulkan run's characteristic failure is not an exception.</b> The
+        /// renderer records dispatches and draws whose pipelines statically use descriptor sets that were
+        /// never bound; the validation layer says so at record time, and then <c>frame-end</c> submits the
+        /// command buffer anyway. Executing it is undefined, and on the hardware path a display driver
+        /// answered that by hanging and taking the machine down. On the CPU driver the same undefined work
+        /// faults inside the driver's worker thread instead, which kills the test process outright.</para>
+        ///
+        /// <para>Nothing in .NET can catch that. <see cref="Report"/> runs in a one-time teardown that a
+        /// dead process never reaches, so without this a run that faults on its first scene produces
+        /// <em>no output whatsoever</em> -- not a stack, not a stage, not a scene name. An unbuffered line
+        /// per stage costs nothing and turns that silence into a file whose last line names the stage that
+        /// died. That is the difference between "the Vulkan gate crashes" and a bug report.</para>
+        /// </summary>
+        /// <remarks>Best effort by design: a trace that threw would replace the finding it exists to
+        /// preserve with an exception about writing it down.</remarks>
+        private static void Trace(string line)
+        {
+            try
+            {
+                TraceWriter?.WriteLine(line);
+            }
+            catch (IOException)
+            {
+            }
+        }
+
+        /// <summary>Opens the scene trace, replacing the previous run's.</summary>
+        private static void OpenTrace()
+        {
+            try
+            {
+                Directory.CreateDirectory(GoldenImageStore.FailureDirectory);
+
+                TraceWriter = new StreamWriter(TracePath, append: false) { AutoFlush = true };
+
+                Trace($"Vulkan golden run on {DeviceDescription}.");
+                Trace($"Driver selection ({SoftwareVulkanIcd.EnvironmentVariable}): {SoftwareVulkanIcd.Status}");
+                Trace($"Device self-test: {SelfTestResult}.");
+                Trace(string.Empty);
+            }
+            catch (IOException)
+            {
+                TraceWriter = null;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                TraceWriter = null;
             }
         }
 
@@ -613,6 +721,7 @@ namespace Tests.Renderer.Golden
             {
                 $"Vulkan golden image run on {DeviceDescription}: {outcomes.Count} scene(s) attempted, "
                     + $"{outcomes.Count(static outcome => outcome.Rendered)} rendered.",
+                $"Driver selection ({SoftwareVulkanIcd.EnvironmentVariable}): {SoftwareVulkanIcd.Status}",
                 $"Device self-test (clear an offscreen target, copy it back, check the pixels): {SelfTestResult}.",
                 string.Empty,
                 "Blockers grouped by cause (stage :: exception type :: message):",
@@ -777,6 +886,12 @@ namespace Tests.Renderer.Golden
 
             WorkQueue.CompleteAdding();
             RenderThread?.Join(TimeSpan.FromSeconds(30));
+
+            Trace(string.Empty);
+            Trace($"Run finished normally after {CurrentScene}.");
+
+            TraceWriter?.Dispose();
+            TraceWriter = null;
 
             Available = false;
             Initialized = false;

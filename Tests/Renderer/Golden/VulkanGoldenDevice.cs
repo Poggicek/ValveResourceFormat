@@ -67,6 +67,22 @@ namespace Tests.Renderer.Golden
         public string AdapterName => Core.Adapter.Name;
 
         /// <summary>
+        /// The adapter's <c>VkPhysicalDeviceProperties.deviceType</c>, named rather than numbered.
+        /// </summary>
+        /// <remarks>Reported next to the name in the banner because after a run bugchecked a machine,
+        /// "which device did that actually use" is not a question anyone should have to infer from a
+        /// marketing string.</remarks>
+        public string AdapterTypeName => Core.Adapter.DeviceType.ToString();
+
+        /// <summary>
+        /// Whether the adapter is a CPU implementation, straight from the driver rather than from the name.
+        /// </summary>
+        /// <remarks>This is what <see cref="SoftwareVulkanIcd.RequireCpuDevice"/> is checked against, and
+        /// it is deliberately the driver's own answer: <c>VK_DRIVER_FILES</c> asks the loader for a
+        /// software device, but only this says one was delivered.</remarks>
+        public bool AdapterIsCpu => Core.Adapter.DeviceType == Silk.NET.Vulkan.PhysicalDeviceType.Cpu;
+
+        /// <summary>
         /// Brings up Vulkan and assembles the device.
         /// </summary>
         /// <param name="messageCallback">Where validation and driver diagnostics are routed.</param>

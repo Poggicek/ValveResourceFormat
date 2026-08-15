@@ -46,6 +46,24 @@ namespace Tests.Renderer.Golden
         /// <summary>Which backend actually came up, named rather than assumed.</summary>
         public static string BackendName => IsVulkan ? nameof(RhiBackend.Vulkan) : HeadlessGL.BackendName;
 
+        /// <summary>
+        /// Whether an unavailable device is a failure rather than a reason to skip.
+        /// </summary>
+        /// <remarks>
+        /// <para>Skipping is right for the OpenGL run: a machine with no display cannot render, that is not
+        /// a regression, and the suite says so and moves on.</para>
+        /// <para>It is wrong for a Vulkan run pinned to a software driver. There is no such thing as a
+        /// machine that cannot create a CPU device -- the driver is a file in the tree -- so "no device"
+        /// there means the driver is missing, the manifest is wrong, or the loader handed back a hardware
+        /// adapter that was then refused. Every one of those is a setup fault, and skipping 36 scenes over a
+        /// setup fault produces a green run that checked nothing, which is precisely the shape of report
+        /// this suite exists to avoid.</para>
+        /// </remarks>
+        public static bool UnavailableIsFatal => IsVulkan && SoftwareVulkanIcd.RequireCpuDevice;
+
+        /// <summary>How this run chose its Vulkan driver, for the banner. Empty on the OpenGL path.</summary>
+        public static string DriverSelection => IsVulkan ? SoftwareVulkanIcd.Status : string.Empty;
+
         /// <summary>Creates the device for the selected backend. Never throws.</summary>
         public static void Initialize()
         {
