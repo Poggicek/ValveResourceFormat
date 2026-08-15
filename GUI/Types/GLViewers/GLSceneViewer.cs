@@ -748,7 +748,14 @@ namespace GUI.Types.GLViewers
 
                 if (ShowBaseGrid && baseGrid != null)
                 {
-                    baseGrid.Render();
+                    // The frame's own command list was submitted when Renderer.Render returned, so the
+                    // grid opens one of its own. On OpenGL this carries no list and the draw below takes
+                    // the direct path it always has. Scoped to the draw alone: the text below only queues
+                    // requests, and a pass left open across it would be one the renderer never closed.
+                    using (var overlay = Renderer.BeginOverlay(MainFramebuffer, "Base Grid"))
+                    {
+                        baseGrid.Render(overlay.CommandList, MainFramebuffer);
+                    }
 
                     DrawWorldSpaceText("+X", 10f, Vector3.UnitX * 120f, Color32.Red, renderContext);
                     DrawWorldSpaceText("-X", 10f, -Vector3.UnitX * 120f, Color32.Red, renderContext);

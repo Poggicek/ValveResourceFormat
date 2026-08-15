@@ -1008,7 +1008,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
             ValveResourceFormat.Renderer.Renderer.EnableRhiRecording = true;
 
             Log.Info(nameof(GLBaseControl),
-                $"Vulkan backend selected on {session.PresentDevice.Core.Adapter.Name}. The scene renders through the RHI; the 2D skybox is still direct OpenGL, so the background stays black.");
+                $"Vulkan backend selected on {session.PresentDevice.Core.Adapter.Name}. The scene, the 2D skybox and the base grid all render through the RHI.");
 
             return session.PresentDevice;
         }

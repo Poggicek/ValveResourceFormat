@@ -675,6 +675,68 @@ public class Renderer
     }
 
     /// <summary>
+    /// A command list and render pass opened for overlay work the viewer draws over a finished frame, or
+    /// nothing at all when the renderer is not recording.
+    /// </summary>
+    /// <remarks>
+    /// The frame's own list has already been submitted by the time a viewer draws its debug overlays, and
+    /// a submitted list records nothing, so overlay work needs one of its own rather than the one
+    /// <see cref="CommandList"/> still names. A <see langword="default"/> value holds no list, which is
+    /// what every OpenGL viewer gets and what makes the overlay call sites keep their direct GL path
+    /// untouched.
+    /// </remarks>
+    public readonly struct OverlayRecording : IDisposable
+    {
+        private readonly Renderer? renderer;
+
+        /// <summary>Gets the list to record into, or <see langword="null"/> to draw through OpenGL.</summary>
+        public RHI.ICommandList? CommandList { get; }
+
+        internal OverlayRecording(Renderer renderer, RHI.ICommandList commandList)
+        {
+            this.renderer = renderer;
+            CommandList = commandList;
+        }
+
+        /// <summary>Ends the pass and submits the list, if one was opened.</summary>
+        public void Dispose()
+        {
+            if (CommandList is null)
+            {
+                return;
+            }
+
+            CommandList.EndRenderPass();
+            renderer!.SubmitOwned(CommandList);
+        }
+    }
+
+    /// <summary>
+    /// Opens a command list and a render pass over <paramref name="framebuffer"/> so a viewer can draw
+    /// over a frame the renderer has already finished.
+    /// </summary>
+    /// <param name="framebuffer">The framebuffer the overlay draws into.</param>
+    /// <param name="name">Debug label for the list and the pass.</param>
+    /// <returns>A guard carrying the list, which ends the pass and submits on dispose. Carries no list at
+    /// all when the renderer is not recording, so the caller keeps its OpenGL path.</returns>
+    /// <remarks>The attachments load rather than clear: the frame being drawn over is in them.</remarks>
+    public OverlayRecording BeginOverlay(Framebuffer framebuffer, string name)
+    {
+        ArgumentNullException.ThrowIfNull(framebuffer);
+
+        var commandList = AcquireCommandList(name);
+
+        if (commandList is null)
+        {
+            return default;
+        }
+
+        commandList.BeginRenderPass(KeepContents(framebuffer.RenderPass(name)));
+
+        return new OverlayRecording(this, commandList);
+    }
+
+    /// <summary>
     /// Rewrites a descriptor's load operations to preserve what its attachments already hold.
     /// </summary>
     /// <param name="desc">The descriptor to rewrite.</param>
@@ -979,7 +1041,9 @@ public class Renderer
                 {
                     using (new GLDebugGroup("2D Sky Render"))
                     {
-                        Skybox2D?.Render();
+                        // Inside the opaque pass, which is still open, so the recorded draw has the pass
+                        // it needs and lands in the same place the OpenGL one does.
+                        Skybox2D?.Render(renderContext.CommandList, renderContext.Framebuffer);
                     }
                 }
 
