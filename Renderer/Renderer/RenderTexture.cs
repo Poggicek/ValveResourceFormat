@@ -99,8 +99,39 @@ namespace ValveResourceFormat.Renderer
             }
         }
 
+        /// <summary>
+        /// The usage a wrapped OpenGL name is described with: everything, because nothing knows better.
+        /// </summary>
+        /// <remarks>Only ever reaches <see cref="GLTexture.Wrap"/>, where it is genuinely free. It must
+        /// not become the default for an allocating constructor: Vulkan bakes usage into the image and
+        /// checks it against the format, so declaring <see cref="TextureUsage.Storage"/> for a texture
+        /// that is only ever sampled makes an otherwise legal format illegal. <c>R8G8B8A8_SRGB</c> is the
+        /// concrete case &#8212; the spec's required-format table gives it
+        /// <c>SAMPLED_IMAGE</c> and <c>COLOR_ATTACHMENT</c> but never <c>STORAGE_IMAGE</c>, and no known
+        /// implementation offers sRGB storage images.</remarks>
         private const TextureUsage LegacyUsage =
             TextureUsage.Sampled | TextureUsage.Storage | TextureUsage.CopySource | TextureUsage.CopyDestination;
+
+        /// <summary>
+        /// What a content texture is for: sampled, uploaded into, and readable back.
+        /// </summary>
+        /// <remarks>The default for the allocating constructor, because every call site that reaches it
+        /// is loading or generating a texture a shader will sample. A texture that is also written by a
+        /// compute pass has to say so; <see cref="Create(int, int, RhiFormat, int, TextureUsage)"/> is
+        /// the factory that does.</remarks>
+        public const TextureUsage SampledUsage =
+            TextureUsage.Sampled | TextureUsage.CopySource | TextureUsage.CopyDestination;
+
+        /// <summary>
+        /// What a scratch render or compute target is for, adding <see cref="TextureUsage.Storage"/> to
+        /// <see cref="SampledUsage"/>.
+        /// </summary>
+        /// <remarks>The default for the <see cref="Create(int, int, RhiFormat, int, TextureUsage)"/>
+        /// factories, whose callers are the depth pyramid, the MSAA resolve targets and the overdraw
+        /// counters &#8212; all of them images a compute pass writes through
+        /// <see cref="ICommandList.BindStorageTexture"/>. Every format they use is one Vulkan requires
+        /// <c>STORAGE_IMAGE</c> support for.</remarks>
+        public const TextureUsage StorageTargetUsage = SampledUsage | TextureUsage.Storage;
 
         private TextureDesc Describe(RhiFormat format, TextureUsage usage) => new(
             Math.Max(Width, 1),
@@ -133,7 +164,10 @@ namespace ValveResourceFormat.Renderer
         /// <param name="depth">Volume depth, or array layer count, or 1.</param>
         /// <param name="mipCount">Number of mip levels.</param>
         /// <param name="name">Debug name, surfaced to graphics debuggers.</param>
-        /// <param name="usage">Every use the texture will be put to.</param>
+        /// <param name="usage">Every use the texture will be put to. Defaults to
+        /// <see cref="SampledUsage"/>; a texture a compute pass writes must add
+        /// <see cref="TextureUsage.Storage"/> itself, because declaring it unconditionally rules out
+        /// every format that has no storage-image support.</param>
         /// <param name="device">The device to allocate through, or <see langword="null"/> to resolve one
         /// from <see cref="RendererDevice"/>.</param>
         /// <remarks>This is the constructor that works on both backends. Allocation is one step here
@@ -147,7 +181,7 @@ namespace ValveResourceFormat.Renderer
             int depth,
             int mipCount,
             string name,
-            TextureUsage usage = LegacyUsage,
+            TextureUsage usage = SampledUsage,
             IDevice? device = null)
         {
             Target = target;
@@ -342,20 +376,25 @@ namespace ValveResourceFormat.Renderer
         /// <param name="height">Texture height in texels.</param>
         /// <param name="format">Pixel format, translated through <see cref="FormatTables"/>.</param>
         /// <param name="mips">When <see langword="true"/>, allocates a reduced mip chain (see <see cref="MaxMipCount"/>) rather than a single level.</param>
+        /// <param name="usage">Every use the texture will be put to. Defaults to
+        /// <see cref="StorageTargetUsage"/>.</param>
         /// <returns>The newly created render texture, with <see cref="RhiFormat"/> recorded.</returns>
         /// <remarks>Prefer this over the <see cref="SizedInternalFormat"/> overloads: it records the
         /// format, which is what lets <see cref="RhiTexture"/> describe the texture completely.</remarks>
-        public static RenderTexture Create(int width, int height, RhiFormat format, bool mips = false)
-            => Create(width, height, format, mips ? MaxMipCount(width, height) : 1);
+        public static RenderTexture Create(int width, int height, RhiFormat format, bool mips = false, TextureUsage usage = StorageTargetUsage)
+            => Create(width, height, format, mips ? MaxMipCount(width, height) : 1, usage);
 
         /// <summary>Creates a 2D texture with immutable storage and an explicit mip count, in an RHI format.</summary>
         /// <param name="width">Texture width in texels.</param>
         /// <param name="height">Texture height in texels.</param>
         /// <param name="format">Pixel format, translated through <see cref="FormatTables"/>.</param>
         /// <param name="mipCount">Number of mip levels to allocate.</param>
+        /// <param name="usage">Every use the texture will be put to. Defaults to
+        /// <see cref="StorageTargetUsage"/>, because every caller of this factory is allocating a target
+        /// a compute pass writes: the depth pyramid, the MSAA resolve pair and the overdraw counters.</param>
         /// <returns>The newly created render texture, with <see cref="RhiFormat"/> recorded.</returns>
-        public static RenderTexture Create(int width, int height, RhiFormat format, int mipCount)
-            => new(TextureTarget.Texture2D, format, width, height, 1, mipCount, $"{format} {width}x{height}");
+        public static RenderTexture Create(int width, int height, RhiFormat format, int mipCount, TextureUsage usage = StorageTargetUsage)
+            => new(TextureTarget.Texture2D, format, width, height, 1, mipCount, $"{format} {width}x{height}", usage);
 
         /// <summary>Creates a texture view that reinterprets a subrange of this texture's storage.</summary>
         /// <param name="internalFormat">The reinterpreted pixel format for the view.</param>

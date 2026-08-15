@@ -233,8 +233,15 @@ public class VulkanDevice : IDevice
         => new VulkanBuffer(Core.Api, Core.Handle, Core.Allocator, Core.DebugNames, in desc);
 
     /// <inheritdoc/>
+    /// <exception cref="NotSupportedException">The device cannot back one of the declared usages with the
+    /// declared format. See <see cref="VulkanTexture.RequireSupportedFormat"/> for why the check has to
+    /// happen here rather than being read off <c>vkCreateImage</c>'s result.</exception>
     public ITexture CreateTexture(in TextureDesc desc)
-        => new VulkanTexture(Core.Api, Core.Handle, Core.Allocator, Core.DebugNames, in desc);
+    {
+        VulkanTexture.RequireSupportedFormat(Limits, in desc);
+
+        return new VulkanTexture(Core.Api, Core.Handle, Core.Allocator, Core.DebugNames, in desc);
+    }
 
     /// <inheritdoc/>
     /// <remarks>Anisotropy is clamped to <see cref="IDeviceLimits.MaxSamplerAnisotropy"/> here, and to

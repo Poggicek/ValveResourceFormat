@@ -231,6 +231,66 @@ public sealed unsafe class VulkanTexture : ITexture
         LayerCount = arrayLayerCount;
     }
 
+    /// <summary>
+    /// Throws unless this device can back every usage <paramref name="desc"/> declares with the format it
+    /// declares.
+    /// </summary>
+    /// <param name="limits">The device's limits, whose <see cref="IDeviceLimits.SupportsFormat"/> is a
+    /// real <c>vkGetPhysicalDeviceFormatProperties</c> query.</param>
+    /// <param name="desc">The texture about to be created.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="limits"/> is <see langword="null"/>.</exception>
+    /// <exception cref="NotSupportedException">The device offers no format features for one of the
+    /// declared usages.</exception>
+    /// <remarks>
+    /// <para>
+    /// <b>Nothing else stops this.</b> An unsupported format/usage pair is a violation of
+    /// <c>VUID-VkImageCreateInfo-imageCreateMaxMipLevels-02251</c>, and a violation is not an error code:
+    /// <c>vkCreateImage</c> is free to return <c>VK_SUCCESS</c> and hand back a handle, which is exactly
+    /// what lavapipe does. The run then creates a view of that image, copies into it, and samples it, each
+    /// step producing its own validation error and none of them producing a result code anyone could have
+    /// checked. So there is no swallowed failure to find upstream &#8212; the only place the mistake can
+    /// be caught is before the call, by asking the device first.
+    /// </para>
+    /// <para>
+    /// It throws rather than quietly dropping the offending usage bit, for the reason
+    /// <see cref="RhiFormat"/> gives: a backend that cannot map a request must fail loudly at load time
+    /// instead of rendering black. Dropping <see cref="TextureUsage.Storage"/> here would move the failure
+    /// to whichever draw eventually sampled a texture nobody had written.
+    /// </para>
+    /// </remarks>
+    public static void RequireSupportedFormat(IDeviceLimits limits, in TextureDesc desc)
+    {
+        ArgumentNullException.ThrowIfNull(limits);
+
+        // Undefined and None are the constructor's own arguments to reject, with its own messages.
+        if (desc.Format == RhiFormat.Undefined || desc.Usage == TextureUsage.None)
+        {
+            return;
+        }
+
+        List<TextureUsage>? unsupported = null;
+
+        foreach (var usage in Enum.GetValues<TextureUsage>())
+        {
+            if (usage == TextureUsage.None || !desc.Usage.HasFlag(usage) || limits.SupportsFormat(desc.Format, usage))
+            {
+                continue;
+            }
+
+            (unsupported ??= []).Add(usage);
+        }
+
+        if (unsupported is null)
+        {
+            return;
+        }
+
+        throw new NotSupportedException(
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"Texture '{desc.Name}' asks for {desc.Format} with usage {desc.Usage}, but this device offers no format features for {string.Join(", ", unsupported)}. Declare only the usages the texture is really put to, or pick a format the device supports for them."));
+    }
+
     /// <summary>Translates the contract's usage flags to Vulkan's.</summary>
     /// <param name="usage">The usage to translate.</param>
     /// <returns>The matching <see cref="ImageUsageFlags"/>.</returns>

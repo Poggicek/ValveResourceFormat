@@ -678,7 +678,12 @@ namespace ValveResourceFormat.Renderer.Materials
         {
             if (DefaultVolume == null)
             {
-                DefaultVolume = new RenderTexture(TextureTarget.Texture3D, RHI.RhiFormat.R8G8B8_UNorm, 1, 1, 1, 1, "DefaultVolume", device: RendererContext.Device);
+                // R8G8B8A8 rather than R8G8B8: 24 bit RGB is not in Vulkan's required-format table at all,
+                // so an implementation may support it for nothing, and lavapipe reports exactly that --
+                // zero format features, which makes the image, its view and the upload into it all
+                // illegal. The fourth channel is the fix that works everywhere; a white texel sampled from
+                // either format returns the same (1, 1, 1, 1).
+                DefaultVolume = new RenderTexture(TextureTarget.Texture3D, RHI.RhiFormat.R8G8B8A8_UNorm, 1, 1, 1, 1, "DefaultVolume", device: RendererContext.Device);
                 DefaultVolume.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
                 DefaultVolume.SetWrapMode(TextureWrapMode.ClampToEdge);
 
@@ -689,7 +694,7 @@ namespace ValveResourceFormat.Renderer.Materials
             return DefaultVolume;
         }
 
-        private static readonly byte[] WhiteTexel = [255, 255, 255];
+        private static readonly byte[] WhiteTexel = [255, 255, 255, 255];
 
         /// <summary>Returns the OpenGL format triple appropriate for exporting a rendered image, choosing between 8-bit BGRA and 32-bit float RGBA.</summary>
         /// <param name="hdr">Whether to use the HDR (32-bit float) format.</param>
@@ -814,16 +819,30 @@ namespace ValveResourceFormat.Renderer.Materials
                 (byte)float.Round(float.Lerp(lower.Color.A, upper.Color.A, t)));
         }
 
+        /// <summary>Creates a small texture filled with the given tightly packed 24 bit RGB texels.</summary>
+        /// <param name="width">Width in texels.</param>
+        /// <param name="height">Height in texels.</param>
+        /// <param name="color">Three bytes per texel, row major.</param>
+        /// <param name="device">The device to allocate through.</param>
+        /// <remarks>The storage is <see cref="RHI.RhiFormat.R8G8B8A8_UNorm"/> and the texels are widened
+        /// on the way in. 24 bit RGB is absent from Vulkan's required-format table, so an implementation
+        /// is free to support it for nothing at all &#8212; and one does: lavapipe reports zero format
+        /// features for <c>VK_FORMAT_R8G8B8_UNORM</c>, which makes the image, its view and the upload into
+        /// it all illegal. Widening costs one byte per texel on a handful of 1x1 and 4x4 textures and is
+        /// invisible to the sampler, which returned an opaque alpha for the three channel format too.</remarks>
         private static RenderTexture GenerateColorTexture(int width, int height, byte[] color, RHI.IDevice? device = null)
         {
+            ArgumentNullException.ThrowIfNull(color);
+
             var texture = new RenderTexture(
                 TextureTarget.Texture2D,
-                RHI.RhiFormat.R8G8B8_UNorm,
+                RHI.RhiFormat.R8G8B8A8_UNorm,
                 width,
                 height,
                 1,
                 1,
-                width > 1 ? "ErrorTexture" : "ColorTexture");
+                width > 1 ? "ErrorTexture" : "ColorTexture",
+                device: device);
 
             texture.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
             texture.SetWrapMode(TextureWrapMode.Repeat);
@@ -831,10 +850,27 @@ namespace ValveResourceFormat.Renderer.Materials
             var color32 = new Color32(color[0], color[1], color[2]);
             texture.Reflectivity = color32.ToLinearColor();
 
-            texture.Upload(0, 0, color);
+            texture.Upload(0, 0, WidenToOpaqueRgba(color));
             texture.TransitionTo(RHI.ResourceState.ShaderRead, RHI.ResourceState.CopyDestination);
 
             return texture;
+        }
+
+        /// <summary>Widens tightly packed 24 bit RGB texels to 32 bit RGBA with an opaque alpha.</summary>
+        /// <param name="rgb">Three bytes per texel.</param>
+        /// <returns>Four bytes per texel.</returns>
+        private static byte[] WidenToOpaqueRgba(ReadOnlySpan<byte> rgb)
+        {
+            var texels = rgb.Length / 3;
+            var rgba = new byte[texels * 4];
+
+            for (var i = 0; i < texels; i++)
+            {
+                rgb.Slice(i * 3, 3).CopyTo(rgba.AsSpan(i * 4, 3));
+                rgba[(i * 4) + 3] = byte.MaxValue;
+            }
+
+            return rgba;
         }
     }
 }
