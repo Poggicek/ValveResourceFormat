@@ -72,6 +72,11 @@ public sealed unsafe class VulkanCommandList : ICommandList
     private int PassHeight;
     private bool Disposed;
 
+    /// <summary>The images the open render pass writes, so a bind can tell it would be a feedback loop.</summary>
+    /// <remarks>Roots rather than views: an attachment and a texture sampled through a view of it are the
+    /// same image, and it is the image that has one layout.</remarks>
+    private readonly List<VulkanTexture> PassAttachments = [];
+
     /// <inheritdoc/>
     public IDevice Device => Owner;
 
@@ -216,6 +221,8 @@ public sealed unsafe class VulkanCommandList : ICommandList
         var width = 0;
         var height = 0;
 
+        PassAttachments.Clear();
+
         for (var i = 0; i < colors.Length; i++)
         {
             colorInfos[i] = BuildColorAttachment(in colors[i], ref width, ref height);
@@ -269,6 +276,8 @@ public sealed unsafe class VulkanCommandList : ICommandList
     {
         var texture = VulkanBarrierTranslation.AsVulkanTexture(attachment.Texture);
         texture.RequireUsage(TextureUsage.ColorTarget, "Rendering into a colour attachment");
+
+        PassAttachments.Add(texture.Root);
 
         var view = Views.Subresource(texture, attachment.MipLevel, attachment.ArrayLayer);
         view.TransitionTo(Command, ResourceState.ColorTarget);
@@ -326,6 +335,13 @@ public sealed unsafe class VulkanCommandList : ICommandList
         var state = attachment.ReadOnly ? ResourceState.DepthRead : ResourceState.DepthWrite;
         view.TransitionTo(Command, state);
 
+        if (!attachment.ReadOnly)
+        {
+            // Only a written attachment is a hazard to sample. A read-only one is bound precisely so it
+            // can be, which is what DepthRead means.
+            PassAttachments.Add(texture.Root);
+        }
+
         TakeExtent(view, ref width, ref height);
 
         var info = new RenderingAttachmentInfo
@@ -356,6 +372,51 @@ public sealed unsafe class VulkanCommandList : ICommandList
     /// <remarks>Nothing is transitioned here. The attachments stay in their attachment layouts, which
     /// is what the tracking table already says, so a pass that reopens over the same targets needs no
     /// barrier and one that samples them next issues the transition it was always going to issue.</remarks>
+    /// <summary>
+    /// Returns <see langword="true"/> when a texture is written by the render pass that is open.
+    /// </summary>
+    /// <param name="texture">The texture about to be bound for sampling.</param>
+    /// <remarks>
+    /// <para>
+    /// Sampling an image the open pass writes is a feedback loop with no defined ordering between the
+    /// write and the read. Vulkan cannot express it at all: an image holds one layout, and it cannot be
+    /// a depth target and a sampled texture at once. OpenGL tolerates the same sequence, which is why
+    /// this went unnoticed until a Vulkan device looked at it.
+    /// </para>
+    /// <para>
+    /// The renderer reaches this through the shadow passes:
+    /// <see cref="MeshBatchRenderer.Render"/> binds every reserved texture at the top of each pass, and
+    /// the shadow atlases are reserved textures, so the sun shadow pass binds the attachment it is
+    /// writing. Nothing samples it, since the depth-only shader has no use for a shadow map, so the bind
+    /// is dropped rather than made an error. Later passes sample the atlas legitimately, once it is no
+    /// longer an attachment and has been transitioned to <see cref="ResourceState.ShaderRead"/>.
+    /// </para>
+    /// <para>
+    /// A read-only depth attachment is deliberately absent from the list it checks: being sampled while
+    /// bound is exactly what <see cref="ResourceState.DepthRead"/> is for.
+    /// </para>
+    /// </remarks>
+    private bool IsAttachmentOfOpenPass(VulkanTexture texture)
+    {
+        if (!InRenderPass)
+        {
+            return false;
+        }
+
+        var root = texture.Root;
+
+        foreach (var attachment in PassAttachments)
+        {
+            if (ReferenceEquals(attachment, root))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <inheritdoc/>
     public void EndRenderPass()
     {
         EnsureRecording();
@@ -365,6 +426,7 @@ public sealed unsafe class VulkanCommandList : ICommandList
 
         InRenderPass = false;
         PassHeight = 0;
+        PassAttachments.Clear();
     }
 
     /// <inheritdoc/>
@@ -587,6 +649,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
         }
 
         var vulkan = VulkanBarrierTranslation.AsVulkanTexture(texture);
+
+        if (IsAttachmentOfOpenPass(vulkan))
+        {
+            return;
+        }
+
         vulkan.RequireUsage(TextureUsage.Sampled, "Binding a texture for sampling");
 
         var state = vulkan.StateOf(0, 0);

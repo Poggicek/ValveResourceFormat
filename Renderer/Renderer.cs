@@ -169,6 +169,17 @@ public class Renderer
     /// </summary>
     public bool ForceResolveSceneDepth { get; set; }
 
+    /// <summary>Whether the shadow atlases have been moved out of <see cref="RHI.ResourceState.Undefined"/>.</summary>
+    private bool shadowAtlasesSampleable;
+
+    /// <summary>Whether the barn light atlas was actually written this frame, which decides whether it
+    /// has a depth-target state to transition out of.</summary>
+    private bool barnShadowsRendered;
+
+    /// <summary>Whether the resolved scene colour and depth have been moved out of
+    /// <see cref="RHI.ResourceState.Undefined"/>. Cleared when they are reallocated for a new size.</summary>
+    private bool resolvedSceneTexturesSampleable;
+
     private readonly Shader[] histogramShaders = new Shader[2];
     private readonly StorageBuffer[] histogramBuffers = new StorageBuffer[2];
 
@@ -700,16 +711,25 @@ public class Renderer
             Textures = Textures,
         };
 
-        LoadShaderTextures();
-        UpdatePerViewGpuBuffers(Scene, Camera, DeltaTime, renderContext.CommandList);
-        Scene.SetSceneBuffers(renderContext.CommandList);
-
-        Scene.RenderOpaqueLayer(renderContext);
-        RenderTranslucentLayer(Scene, renderContext);
-
-        if (renderContext.CommandList is { } commandList)
+        try
         {
-            RendererContext.Device?.Submit(commandList);
+            LoadShaderTextures();
+            UpdatePerViewGpuBuffers(Scene, Camera, DeltaTime, renderContext.CommandList);
+            Scene.SetSceneBuffers(renderContext.CommandList);
+
+            EnsureReservedTargetsSampleable(renderContext.CommandList);
+
+            Scene.RenderOpaqueLayer(renderContext);
+            RenderTranslucentLayer(Scene, renderContext);
+        }
+        finally
+        {
+            // See Render(Scene.RenderContext): the one reused list has to come back even from a frame
+            // that threw, or the next acquire reports the leak instead of the cause.
+            if (renderContext.CommandList is { } commandList)
+            {
+                SubmitOwned(commandList);
+            }
         }
     }
 
@@ -749,32 +769,65 @@ public class Renderer
             CommandList = ownedCommandList;
         }
 
-        LoadShaderTextures();
-
-        // Render backfaces into shadow maps
-        GL.FrontFace(FrontFaceDirection.Cw);
-
-        RenderSceneShadows(renderContext);
-        RenderBarnLightShadows(renderContext);
-
-        // The shadow atlases were just written as depth targets and are sampled from the very first
-        // scene pass onwards, so they have to change state in between. This is the right place for it
-        // rather than the bind site: binding runs once per pass, so from the second pass on the belief
-        // that they are still in DepthWrite is false, and a transition asserts the caller's belief
-        // before its early-out. Here it is stated once, where it is true. A redundant transition costs
-        // nothing -- it returns before emitting anything when the state already matches.
-        //
-        // OpenGL says nothing about any of this: sampling a depth attachment it just wrote happens to
-        // work, so the golden suite is silent and only Vulkan objects.
-        TransitionShadowMapsForSampling(renderContext.CommandList);
-
-        GL.FrontFace(FrontFaceDirection.Ccw);
-
-        RenderScenesWithView(renderContext);
-
-        if (ownedCommandList is not null)
+        try
         {
-            RendererContext.Device?.Submit(ownedCommandList);
+            LoadShaderTextures();
+
+            // Render backfaces into shadow maps
+            GL.FrontFace(FrontFaceDirection.Cw);
+
+            // Before any pass, because both atlases are reserved textures and so are bound for sampling at
+            // the top of every pass, starting with the sun shadow pass below. An atlas no pass has ever
+            // filled is still Undefined, which cannot be sampled at all.
+            EnsureReservedTargetsSampleable(renderContext.CommandList);
+
+            RenderSceneShadows(renderContext);
+            RenderBarnLightShadows(renderContext);
+
+            // The shadow atlases were just written as depth targets and are sampled from the very first
+            // scene pass onwards, so they have to change state in between. This is the right place for it
+            // rather than the bind site: binding runs once per pass, so from the second pass on the belief
+            // that they are still in DepthWrite is false, and a transition asserts the caller's belief
+            // before its early-out. Here it is stated once, where it is true. A redundant transition costs
+            // nothing -- it returns before emitting anything when the state already matches.
+            //
+            // OpenGL says nothing about any of this: sampling a depth attachment it just wrote happens to
+            // work, so the golden suite is silent and only Vulkan objects.
+            TransitionShadowMapsForSampling(renderContext.CommandList);
+
+            GL.FrontFace(FrontFaceDirection.Ccw);
+
+            RenderScenesWithView(renderContext);
+        }
+        finally
+        {
+            // In a finally because the device reuses one command list: a frame that throws between
+            // acquiring and submitting leaves it recording, and every later acquire then fails with a
+            // complaint about the previous list rather than about whatever actually went wrong.
+            if (ownedCommandList is not null)
+            {
+                SubmitOwned(ownedCommandList);
+            }
+        }
+    }
+
+    /// <summary>Hands a command list back, without letting a failure here bury the reason for it.</summary>
+    /// <param name="commandList">The list to submit.</param>
+    /// <remarks>
+    /// A frame that threw part way through can leave a render pass open, which submitting refuses. That
+    /// refusal is a consequence of the original failure, so it is logged rather than thrown: raising it
+    /// from a <see langword="finally"/> would replace the exception that explains the frame with one
+    /// that only describes the clean-up.
+    /// </remarks>
+    private void SubmitOwned(RHI.ICommandList commandList)
+    {
+        try
+        {
+            RendererContext.Device?.Submit(commandList);
+        }
+        catch (InvalidOperationException e)
+        {
+            RendererContext.Logger.LogWarning(e, "The frame's command list could not be submitted.");
         }
     }
 
@@ -1050,11 +1103,67 @@ public class Renderer
             return;
         }
 
-        foreach (var depth in new[] { ShadowDepthBuffer?.Depth, BarnLightShadowBuffer?.Depth })
+        // The sun atlas is written every frame; the barn atlas only when there is a shadow caster to
+        // put in it. Claiming DepthWrite for one that no pass opened would be a false statement about
+        // its current state, and the belief is checked, so it is asked only for what was written.
+        if (ShadowDepthBuffer?.Depth?.RhiTexture is { } sun)
         {
-            if (depth?.RhiTexture is { } texture)
+            commandList.Barrier(new RHI.TextureBarrier(sun, RHI.ResourceState.DepthWrite, RHI.ResourceState.ShaderRead));
+        }
+
+        if (barnShadowsRendered && BarnLightShadowBuffer?.Depth?.RhiTexture is { } barn)
+        {
+            commandList.Barrier(new RHI.TextureBarrier(barn, RHI.ResourceState.DepthWrite, RHI.ResourceState.ShaderRead));
+        }
+
+        barnShadowsRendered = false;
+    }
+
+    /// <summary>
+    /// Makes the render targets that are also reserved textures legal to sample, before any pass runs.
+    /// </summary>
+    /// <param name="commandList">The list to record into, or <see langword="null"/> when drawing through
+    /// OpenGL, which needs none of this.</param>
+    /// <remarks>
+    /// <para>
+    /// A freshly created texture is in <see cref="RHI.ResourceState.Undefined"/> and cannot be sampled at
+    /// all. These four are reserved textures, so every pass binds them at its top whether or not anything
+    /// has filled them &#8212; and each is filled only conditionally. The barn atlas needs a barn light
+    /// that casts; the resolved scene colour and depth need a material that reads them. A scene with
+    /// neither leaves them untouched for the whole frame while every pass still binds them.
+    /// </para>
+    /// <para>
+    /// One transition out of Undefined makes them bindable. Their contents are meaningless until
+    /// something writes them, which is equally true on OpenGL &#8212; the difference is only that
+    /// sampling an undefined image is an error on Vulkan rather than a read of whatever was there.
+    /// </para>
+    /// </remarks>
+    private void EnsureReservedTargetsSampleable(RHI.ICommandList? commandList)
+    {
+        if (commandList is null)
+        {
+            return;
+        }
+
+        if (!shadowAtlasesSampleable)
+        {
+            MakeSampleable(ShadowDepthBuffer?.Depth);
+            MakeSampleable(BarnLightShadowBuffer?.Depth);
+            shadowAtlasesSampleable = true;
+        }
+
+        if (!resolvedSceneTexturesSampleable)
+        {
+            MakeSampleable(ResolvedSceneColor);
+            MakeSampleable(ResolvedSceneDepth);
+            resolvedSceneTexturesSampleable = true;
+        }
+
+        void MakeSampleable(RenderTexture? target)
+        {
+            if (target?.RhiTexture is { } texture)
             {
-                commandList.Barrier(new RHI.TextureBarrier(texture, RHI.ResourceState.DepthWrite, RHI.ResourceState.ShaderRead));
+                commandList.Barrier(new RHI.TextureBarrier(texture, RHI.ResourceState.Undefined, RHI.ResourceState.ShaderRead));
             }
         }
     }
@@ -1118,6 +1227,10 @@ public class Renderer
 
         using var _ = new GLDebugGroup("Barn Light Shadows");
         Debug.Assert(BarnLightShadowBuffer != null);
+
+        // Past the two early returns, so the atlas really is written this frame and has a depth-target
+        // state for TransitionShadowMapsForSampling to move it out of.
+        barnShadowsRendered = true;
 
         // The barn shadow atlas uses forward depth, unlike the reverse-Z main view.
         using (RendererContext.RenderState.Scope(depthFunc: Comparison.FartherEqual, slopeScaledDepthBias: 2f))
@@ -1330,6 +1443,11 @@ public class Renderer
             Textures.RemoveAll(static t => t.Slot == ReservedTextureSlots.SceneColor || t.Slot == ReservedTextureSlots.SceneDepth);
             Textures.Add(new(ReservedTextureSlots.SceneColor, "g_tSceneColor", ResolvedSceneColor));
             Textures.Add(new(ReservedTextureSlots.SceneDepth, "g_tSceneDepth", ResolvedSceneDepth));
+
+            // New images, so back to Undefined. Both callers write them immediately after this, which
+            // covers the rest of this frame; the flag is what makes the next one start from a state it
+            // can be sampled in even if nothing writes them again.
+            resolvedSceneTexturesSampleable = false;
         }
     }
 

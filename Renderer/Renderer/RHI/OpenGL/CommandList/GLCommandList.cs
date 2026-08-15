@@ -310,6 +310,11 @@ public sealed class GLCommandList : ICommandList
         ObjectDisposedException.ThrowIf(disposed, this);
         ArgumentNullException.ThrowIfNull(texture);
 
+        if (IsAttachmentOfOpenPass(texture))
+        {
+            return;
+        }
+
         var unit = descriptorSet switch
         {
             DescriptorSets.ReservedTextures => binding,
@@ -1187,6 +1192,47 @@ public sealed class GLCommandList : ICommandList
     }
 
     private static int HandleOf(ITexture texture) => AsGLTexture(texture).Handle;
+
+    /// <summary>
+    /// Returns <see langword="true"/> when a texture is an attachment of the render pass that is open.
+    /// </summary>
+    /// <param name="texture">The texture about to be bound for sampling.</param>
+    /// <remarks>
+    /// <para>
+    /// Binding an attachment of the open pass for sampling is a feedback loop: the same image would be
+    /// written by the pass and read by the shaders in it, with no defined ordering between the two. It is
+    /// a hazard on every backend, and illegal on Vulkan, where an image has one layout at a time and
+    /// cannot be both a depth target and a sampled texture.
+    /// </para>
+    /// <para>
+    /// The renderer reaches this through the shadow passes.
+    /// <see cref="MeshBatchRenderer.Render"/> binds every reserved texture at the top of each pass, and
+    /// the shadow atlases are reserved textures, so the sun shadow pass binds the very attachment it is
+    /// writing. Nothing samples it &#8212; the depth-only shader has no use for a shadow map &#8212; so
+    /// the bind is dropped rather than made an error. The samples that do read a shadow atlas happen in
+    /// later passes, where it is no longer an attachment and the transition to
+    /// <see cref="ResourceState.ShaderRead"/> has already run.
+    /// </para>
+    /// </remarks>
+    private bool IsAttachmentOfOpenPass(ITexture texture)
+    {
+        if (!inRenderPass)
+        {
+            return false;
+        }
+
+        var handle = AsGLTexture(texture).Handle;
+
+        foreach (var attachment in passColorAttachments)
+        {
+            if (AsGLTexture(attachment.Texture).Handle == handle)
+            {
+                return true;
+            }
+        }
+
+        return passDepthAttachment is { } depth && AsGLTexture(depth.Texture).Handle == handle;
+    }
 
     private static GLTexture AsGLTexture(ITexture texture)
     {
