@@ -757,8 +757,26 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
+        /// <summary>
+        /// Reports an OpenGL compile or link failure, mapped back to the shader file and line the author
+        /// wrote wherever one of the driver patterns matched.
+        /// </summary>
+        /// <remarks>
+        /// An empty info log is substituted here for the same reason <see cref="ThrowSpirvError"/> does it:
+        /// a failure whose body is blank says nothing at all, and the throw carries the only text anyone
+        /// sees. The driver is within its rights to fail without a message, and one case reliably does &#8212;
+        /// a <c>glCompileShader</c> issued with no current context reports failure and logs nothing, which
+        /// is what the golden suite's Vulkan run sees when it constructs the OpenGL harness for fidelity.
+        /// That case previously threw a message ending in a colon with nothing after it, and cost two rounds
+        /// of investigation.
+        /// </remarks>
         private static void ThrowShaderError(string info, string shaderFile, ReadOnlySpan<char> originalShaderName, string errorType, ParsedShaderData parsedData)
         {
+            if (string.IsNullOrWhiteSpace(info))
+            {
+                info = "The OpenGL driver reported the failure without a message. A compile or link that fails with an empty info log is what a GL call issued with no current context looks like.";
+            }
+
             // Attempt to parse error message to get the line number so we can print the actual line
             var errorMatch = NvidiaGlslError().Match(info);
 

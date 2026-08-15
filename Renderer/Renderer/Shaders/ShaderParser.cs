@@ -48,6 +48,12 @@ namespace ValveResourceFormat.Renderer.Shaders
         [GeneratedRegex("^#extension .+$")]
         private static partial Regex RegexExtension();
 
+        // A plain object-like define with an integer body, such as "#define MAX_TEXTURE_LAYERS 5". Only kept
+        // so that an array uniform whose length is spelled as a macro can still be packed; the line itself is
+        // left in the source for the GLSL preprocessor exactly as before.
+        [GeneratedRegex(@"^#define (?<Name>[A-Za-z_][A-Za-z0-9_]*)[ \t]+(?<Value>[0-9]+)[ \t]*(?://.*)?$")]
+        private static partial Regex RegexIntegerDefine();
+
         [GeneratedRegex("^#define (?<From>(?:g|F)_[A-Za-z0-9_]+) (?<To>[A-Za-z_][A-Za-z0-9_]*)$")]
         private static partial Regex RegexUniformAlias();
 
@@ -116,6 +122,37 @@ namespace ValveResourceFormat.Renderer.Shaders
         private static bool IsPackableUniformName(string name)
             => !VulkanGlsl.IsPushConstant(name) && !UnpackableUniformNames.Contains(name);
 
+        /// <summary>
+        /// Resolves the element count of a uniform declaration's array suffix.
+        /// </summary>
+        /// <param name="array">The <c>Array</c> group of a <see cref="RegexUniform"/> match. An unsuccessful
+        /// group means the declaration is not an array, which succeeds with a length of zero.</param>
+        /// <param name="integerDefines">The integer object-like macros seen so far in this translation unit,
+        /// since the sources spell their array lengths as macros rather than as literals.</param>
+        /// <param name="length">The resolved element count, or zero when the declaration is not an array.</param>
+        /// <returns><see langword="false"/> when the length is not a literal and not a macro this parse has
+        /// seen, in which case the declaration is left loose rather than packed at a guessed size.</returns>
+        private static bool TryGetArrayLength(Group array, Dictionary<string, int> integerDefines, out int length)
+        {
+            length = 0;
+
+            if (!array.Success)
+            {
+                return true;
+            }
+
+            var text = array.Value.Trim('[', ']').Trim();
+
+            if (!int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out length)
+            && !integerDefines.TryGetValue(text, out length))
+            {
+                length = 0;
+                return false;
+            }
+
+            return length > 0;
+        }
+
         private readonly StringBuilder builder = new(1024);
 
         /// <summary>Clears the internal <see cref="StringBuilder"/> so it is ready for the next preprocessing pass.</summary>
@@ -141,6 +178,10 @@ namespace ValveResourceFormat.Renderer.Shaders
             var declaredAttributes = new HashSet<string>(StringComparer.Ordinal);
 
             var uniformAliases = new Dictionary<string, string>(0);
+
+            // Scoped to one stage's translation unit, includes and all, which is the same scope the GLSL
+            // preprocessor gives the macros it collects.
+            var integerDefines = new Dictionary<string, int>(StringComparer.Ordinal);
 
             void AppendLineNumber(int a, int b)
             {
@@ -244,6 +285,17 @@ namespace ValveResourceFormat.Renderer.Shaders
                             AppendLineNumber(lineNum, currentSourceFileNumber);
 
                             continue;
+                        }
+
+                        // Recorded, never consumed: the line still reaches the compiler. An array uniform's
+                        // length is spelled as one of these, and the packed layout needs the number here
+                        // rather than after the GLSL preprocessor has run.
+                        var integerDefine = RegexIntegerDefine().Match(line);
+
+                        if (integerDefine.Success)
+                        {
+                            integerDefines[integerDefine.Groups["Name"].Value] =
+                                int.Parse(integerDefine.Groups["Value"].Value, CultureInfo.InvariantCulture);
                         }
 
                         // Defines
@@ -356,14 +408,14 @@ namespace ValveResourceFormat.Renderer.Shaders
                                 parsedData.SamplerUserConfigUniforms.Add(uniformName);
                             }
 
-                            if (!match.Groups["Array"].Success
-                            && IsPackableUniformName(uniformName)
-                            && GlobalsLayout.TryGetType(uniformType, out var constantType))
+                            if (IsPackableUniformName(uniformName)
+                            && GlobalsLayout.TryGetType(uniformType, out var constantType)
+                            && TryGetArrayLength(match.Groups["Array"], integerDefines, out var arrayLength))
                             {
                                 var defaultGroup = match.Groups["Default"];
 
                                 parsedData.GlobalsDeclarations.Add(new GlobalsDeclaration(uniformName, constantType,
-                                    defaultGroup.Success ? defaultGroup.Value : null, match.Groups["SrgbRead"].Success));
+                                    defaultGroup.Success ? defaultGroup.Value : null, match.Groups["SrgbRead"].Success, arrayLength));
 
                                 builder.Append("// :VrfPacked ");
                                 builder.Append(line);

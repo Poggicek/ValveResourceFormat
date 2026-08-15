@@ -133,16 +133,30 @@ namespace ValveResourceFormat.Renderer
             ], inputSignature, vbib.IndexBuffers.Count > 0 ? gpuVbib.IndexBuffers[0] : 0, meshName);
         }
 
+        /// <remarks>
+        /// A zero handle is not registered. It is what every buffer of a mesh allocated on a non-OpenGL
+        /// device reports, so registering them would collapse the whole mesh &#8212; in fact every mesh in
+        /// the process &#8212; onto one entry that answers with whichever buffer was uploaded last. That is
+        /// not a lookup miss, it is a confident wrong answer, and the draw would bind an index buffer where
+        /// a vertex buffer belongs. Draw call bindings carry their own <see cref="RHI.IBuffer"/> for
+        /// precisely this reason; see <see cref="VertexDrawBuffer.RhiBuffer"/>.
+        /// </remarks>
         private void RegisterRhiBuffers(GPUMeshBuffers gpuVbib)
         {
             for (var i = 0; i < gpuVbib.VertexBuffers.Length; i++)
             {
-                rhiBufferLocators[gpuVbib.VertexBuffers[i]] = new BufferLocator(gpuVbib, false, i);
+                if (gpuVbib.VertexBuffers[i] != 0)
+                {
+                    rhiBufferLocators[gpuVbib.VertexBuffers[i]] = new BufferLocator(gpuVbib, false, i);
+                }
             }
 
             for (var i = 0; i < gpuVbib.IndexBuffers.Length; i++)
             {
-                rhiBufferLocators[gpuVbib.IndexBuffers[i]] = new BufferLocator(gpuVbib, true, i);
+                if (gpuVbib.IndexBuffers[i] != 0)
+                {
+                    rhiBufferLocators[gpuVbib.IndexBuffers[i]] = new BufferLocator(gpuVbib, true, i);
+                }
             }
         }
 
@@ -201,15 +215,21 @@ namespace ValveResourceFormat.Renderer
 
         /// <summary>Resolves a draw call's vertex buffer binding to a correctly sized <see cref="RHI.IBuffer"/>.</summary>
         /// <param name="buffer">The binding to resolve.</param>
-        /// <returns>A non-owning view of the same OpenGL object.</returns>
-        /// <exception cref="ArgumentException">The handle was not uploaded through this cache.</exception>
-        public RHI.IBuffer GetRhiBuffer(in VertexDrawBuffer buffer) => GetRhiBuffer(buffer.Handle);
+        /// <returns>The buffer the binding names.</returns>
+        /// <exception cref="ArgumentException">The binding carries no buffer and its handle was not
+        /// uploaded through this cache.</exception>
+        /// <remarks>A binding that carries its own <see cref="VertexDrawBuffer.RhiBuffer"/> answers from
+        /// that and never consults <see cref="VertexDrawBuffer.Handle"/>. Only a raw OpenGL buffer the renderer still owns
+        /// itself takes the handle path, and only an OpenGL device has such a buffer.</remarks>
+        public RHI.IBuffer GetRhiBuffer(in VertexDrawBuffer buffer) => buffer.RhiBuffer ?? GetRhiBuffer(buffer.Handle);
 
         /// <summary>Resolves a draw call's index buffer binding to a correctly sized <see cref="RHI.IBuffer"/>.</summary>
         /// <param name="buffer">The binding to resolve.</param>
-        /// <returns>A non-owning view of the same OpenGL object.</returns>
-        /// <exception cref="ArgumentException">The handle was not uploaded through this cache.</exception>
-        public RHI.IBuffer GetRhiBuffer(in IndexDrawBuffer buffer) => GetRhiBuffer(buffer.Handle);
+        /// <returns>The buffer the binding names.</returns>
+        /// <exception cref="ArgumentException">The binding carries no buffer and its handle was not
+        /// uploaded through this cache.</exception>
+        /// <remarks>See <see cref="GetRhiBuffer(in VertexDrawBuffer)"/>.</remarks>
+        public RHI.IBuffer GetRhiBuffer(in IndexDrawBuffer buffer) => buffer.RhiBuffer ?? GetRhiBuffer(buffer.Handle);
 
         /// <summary>
         /// Translates an OpenGL index element type to the RHI's, and converts a draw call's byte-offset

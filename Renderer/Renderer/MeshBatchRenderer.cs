@@ -390,7 +390,7 @@ namespace ValveResourceFormat.Renderer
                 commandList.BindVertexBuffer(binding, meshBuffers.GetRhiBuffer(vertexBuffers[binding]));
             }
 
-            if (call.IndexBuffer.Handle != 0)
+            if (call.IndexBuffer.HasBuffer)
             {
                 var (indexType, _) = GPUMeshBufferCache.DescribeIndexedDraw(call);
                 commandList.BindIndexBuffer(meshBuffers.GetRhiBuffer(call.IndexBuffer), indexType);
@@ -430,9 +430,11 @@ namespace ValveResourceFormat.Renderer
                 }
             }
 
+            // Named as an RHI buffer rather than as a handle: this is only ever reached from the recording
+            // path, and asking for the handle would create an OpenGL buffer on whatever device is live.
             return [.. call.VertexBuffers, new VertexDrawBuffer
             {
-                Handle = call.MeshBuffers.VectorOneVertexBuffer,
+                RhiBuffer = call.MeshBuffers.VectorOneRhiBuffer,
                 ElementSizeInBytes = 0,
                 InputLayoutFields = DefaultColorLayout,
             }];

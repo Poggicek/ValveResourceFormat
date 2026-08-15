@@ -111,8 +111,18 @@ namespace ValveResourceFormat.Renderer
     /// </summary>
     public readonly struct IndexDrawBuffer
     {
-        /// <summary>Gets the OpenGL buffer object handle.</summary>
+        /// <summary>Gets the OpenGL buffer object handle, or 0 when the buffer was not allocated on an
+        /// OpenGL device.</summary>
         public int Handle { get; init; }
+
+        /// <summary>Gets the buffer this binding names, as the RHI models it.</summary>
+        /// <remarks>See <see cref="VertexDrawBuffer.RhiBuffer"/>: a handle does not identify a buffer on
+        /// any backend but OpenGL, so the binding carries the buffer itself.</remarks>
+        public RHI.IBuffer? RhiBuffer { get; init; }
+
+        /// <summary>Gets a value indicating whether this binding names a buffer at all, which
+        /// non-indexed geometry does not.</summary>
+        public bool HasBuffer => RhiBuffer is not null || Handle != 0;
 
         /// <summary>Gets the byte offset within the buffer.</summary>
         public uint Offset { get; init; }
@@ -123,8 +133,26 @@ namespace ValveResourceFormat.Renderer
     /// </summary>
     public readonly struct VertexDrawBuffer
     {
-        /// <summary>Gets the OpenGL buffer object handle.</summary>
+        /// <summary>Gets the OpenGL buffer object handle, or 0 when the buffer was not allocated on an
+        /// OpenGL device.</summary>
         public int Handle { get; init; }
+
+        /// <summary>Gets the buffer this binding names, as the RHI models it.</summary>
+        /// <remarks>
+        /// <para>
+        /// The binding carries the buffer rather than looking it up from <see cref="Handle"/>, because a
+        /// handle only identifies a buffer on OpenGL. <see cref="GPUMeshBuffers"/> allocates through
+        /// <see cref="RHI.IDevice.CreateBuffer"/>, and on any backend but OpenGL there is no GL name inside
+        /// the result to report: every <see cref="Handle"/> in the mesh reads 0. A lookup keyed on that
+        /// does not merely fail, it silently resolves every vertex and index buffer in the process to
+        /// whichever one was registered last.
+        /// </para>
+        /// <para>
+        /// <see langword="null"/> for a binding that names a raw OpenGL buffer the renderer still owns
+        /// itself; <see cref="GPUMeshBufferCache.GetRhiBuffer(int)"/> is what resolves those.
+        /// </para>
+        /// </remarks>
+        public RHI.IBuffer? RhiBuffer { get; init; }
 
         /// <summary>Gets the index of this buffer within the mesh's vertex buffer list (0 for single-buffer geometry).</summary>
         public int BufferIndex { get; init; }

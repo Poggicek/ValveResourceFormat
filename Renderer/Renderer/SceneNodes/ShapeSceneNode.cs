@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Renderer.RHI;
 using ValveResourceFormat.Renderer.RHI.OpenGL;
@@ -41,10 +42,11 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         /// <summary>Gets the vertex array state for this shape.</summary>
         protected int vao { get; private set; }
 
-        // Non-owning RHI views of the buffers built in Init, so the draw can be recorded through a
-        // command list before buffer allocation itself moves onto IDevice.
-        private GLBuffer? vertexRhiBuffer;
-        private GLBuffer? indexRhiBuffer;
+        // This shape's geometry as the RHI models it. On OpenGL these are non-owning views of the loose
+        // buffer objects Init makes, so that path is unchanged; on any other backend the device owns them
+        // and there are no loose objects at all.
+        private IBuffer? vertexRhiBuffer;
+        private IBuffer? indexRhiBuffer;
 
         // Built once on first RHI draw rather than in a static initializer, so a layout the contract has
         // no format for throws at the draw that needs it instead of as a type initializer failure.
@@ -120,11 +122,18 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         {
             indexCount = inds.Count;
 
-            GL.CreateBuffers(1, out int vboHandle);
-            GL.CreateBuffers(1, out int iboHandle);
-
             var vertexSizeBytes = verts.Count * SimpleVertexNormal.InputLayout.Stride;
             var indexSizeBytes = inds.Count * sizeof(int);
+            var device = Scene.RendererContext.Device;
+
+            if (device is not null && device.Backend != RhiBackend.OpenGL)
+            {
+                InitThroughDevice(device, verts, inds, vertexSizeBytes, indexSizeBytes);
+                return;
+            }
+
+            GL.CreateBuffers(1, out int vboHandle);
+            GL.CreateBuffers(1, out int iboHandle);
 
             GL.NamedBufferData(vboHandle, vertexSizeBytes, ListAccessors<SimpleVertexNormal>.GetBackingArray(verts), BufferUsageHint.StaticDraw);
             GL.NamedBufferData(iboHandle, indexSizeBytes, ListAccessors<int>.GetBackingArray(inds), BufferUsageHint.StaticDraw);
@@ -141,6 +150,36 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             GL.ObjectLabel(ObjectLabelIdentifier.Buffer, vboHandle, vaoLabel.Length, vaoLabel);
             GL.ObjectLabel(ObjectLabelIdentifier.Buffer, iboHandle, vaoLabel.Length, vaoLabel);
 #endif
+        }
+
+        /// <summary>
+        /// Allocates this shape's geometry through the device rather than as loose OpenGL objects.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// A separate branch rather than one unified path, because the OpenGL one must stay exactly the
+        /// calls it has always been: <c>glNamedBufferData</c> on a mutable store plus a vertex array, none
+        /// of which <see cref="IDevice.CreateBuffer"/> would reproduce call for call. The two are not
+        /// equivalent to fold together, and the OpenGL rendering is the oracle the Vulkan one is checked
+        /// against.
+        /// </para>
+        /// <para>
+        /// No vertex array is built here. On a non-OpenGL device the draw is always recorded through a
+        /// command list, which takes its vertex layout from the pipeline, and <c>vao</c> is never read;
+        /// building one would be a direct OpenGL call on a device that has no OpenGL in it.
+        /// </para>
+        /// </remarks>
+        private void InitThroughDevice(IDevice device, List<SimpleVertexNormal> verts, List<int> inds, int vertexSizeBytes, int indexSizeBytes)
+        {
+            vertexRhiBuffer = device.CreateBuffer(new BufferDesc(
+                vertexSizeBytes, BufferUsage.Vertex | BufferUsage.CopyDestination, BufferMemory.DeviceLocal, nameof(ShapeSceneNode)));
+            indexRhiBuffer = device.CreateBuffer(new BufferDesc(
+                indexSizeBytes, BufferUsage.Index | BufferUsage.CopyDestination, BufferMemory.DeviceLocal, nameof(ShapeSceneNode)));
+
+            device.UploadBuffer(vertexRhiBuffer, 0,
+                MemoryMarshal.AsBytes(ListAccessors<SimpleVertexNormal>.GetBackingArray(verts).AsSpan(0, verts.Count)));
+            device.UploadBuffer(indexRhiBuffer, 0,
+                MemoryMarshal.AsBytes(ListAccessors<int>.GetBackingArray(inds).AsSpan(0, inds.Count)));
         }
 
         /// <summary>Appends two triangles forming a quad face from four vertex indices.</summary>

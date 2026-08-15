@@ -67,7 +67,10 @@ public readonly record struct GlobalsMember(string Name, GlobalsType Type, int O
 /// <param name="Type">The declared GLSL type.</param>
 /// <param name="Initializer">The default value expression, or <see langword="null"/> when the declaration has none.</param>
 /// <param name="SrgbRead">Whether the declaration is annotated with <c>// SrgbRead(true)</c>.</param>
-public readonly record struct GlobalsDeclaration(string Name, GlobalsType Type, string? Initializer, bool SrgbRead);
+/// <param name="ArrayLength">The element count when the declaration is an array, or zero when it is not.
+/// An array is packed as one block member and reached element by element; see
+/// <see cref="GlobalsLayout.ElementName"/>.</param>
+public readonly record struct GlobalsDeclaration(string Name, GlobalsType Type, string? Initializer, bool SrgbRead, int ArrayLength = 0);
 
 /// <summary>
 /// The std140 layout of a shader's loose global uniforms after they have been packed into a single
@@ -92,7 +95,10 @@ public sealed class GlobalsLayout
     private readonly Dictionary<string, Matrix4x4> matrixDefaults = [];
     private readonly byte[] defaultBytes;
 
-    /// <summary>Gets the packed members by uniform name.</summary>
+    /// <summary>
+    /// Gets the packed members by uniform name. An array contributes one entry per element, keyed by the
+    /// bracketed name <see cref="ElementName"/> builds, rather than a single entry for the whole array.
+    /// </summary>
     public IReadOnlyDictionary<string, GlobalsMember> Members => members;
 
     /// <summary>Gets the size of the constant buffer in bytes, zero when there is nothing to pack.</summary>
@@ -150,6 +156,12 @@ public sealed class GlobalsLayout
                     $"Uniform '{declaration.Name}' is declared as both '{GetGlslName(existing.Type)}' and '{GetGlslName(declaration.Type)}'");
             }
 
+            if (existing.ArrayLength != declaration.ArrayLength)
+            {
+                throw new ShaderLoader.ShaderCompilerException(
+                    $"Uniform '{declaration.Name}' is declared with {DescribeLength(existing.ArrayLength)} and {DescribeLength(declaration.ArrayLength)}");
+            }
+
             var srgbRead = existing.SrgbRead || declaration.SrgbRead;
 
             if (declaration.Initializer == null)
@@ -176,6 +188,24 @@ public sealed class GlobalsLayout
         return merged.Count == 0 ? Empty : new GlobalsLayout([.. merged.Values]);
     }
 
+    private static string DescribeLength(int arrayLength)
+        => arrayLength == 0 ? "no array length" : $"an array length of {arrayLength.ToString(CultureInfo.InvariantCulture)}";
+
+    /// <summary>
+    /// Returns the name one element of a packed array is reached under, which is the name the shader
+    /// sources and the renderer's call sites already spell it as.
+    /// </summary>
+    /// <param name="name">The array uniform name.</param>
+    /// <param name="index">The zero based element index.</param>
+    /// <remarks>
+    /// An array is one member of the block in GLSL but as many entries in <see cref="Members"/> as it has
+    /// elements, because every setter here writes one member's worth of bytes at one offset. Naming those
+    /// entries the way GL names an array element is what lets <c>shader.SetUniform1("uLayerBlend[2]", x)</c>
+    /// keep working once the array moves into the block.
+    /// </remarks>
+    public static string ElementName(string name, int index)
+        => string.Create(CultureInfo.InvariantCulture, $"{name}[{index}]");
+
     private GlobalsLayout(List<GlobalsDeclaration> declarations)
     {
         if (declarations.Count == 0)
@@ -186,10 +216,19 @@ public sealed class GlobalsLayout
 
         declarations.Sort(static (a, b) => string.CompareOrdinal(a.Name, b.Name));
 
-        List<GlobalsDeclaration> matrices = [], quads = [], triples = [], pairs = [], scalars = [];
+        List<GlobalsDeclaration> arrays = [], matrices = [], quads = [], triples = [], pairs = [], scalars = [];
 
         foreach (var declaration in declarations)
         {
+            // Arrays are their own bucket rather than one sized by element type. std140 rounds every
+            // element of an array up to a vec4, so an array of scalars packs nothing like a scalar does
+            // and cannot share the holes the buckets below are arranged to fill.
+            if (declaration.ArrayLength > 0)
+            {
+                arrays.Add(declaration);
+                continue;
+            }
+
             var bucket = GetComponentCount(declaration.Type) switch
             {
                 16 => matrices,
@@ -220,6 +259,44 @@ public sealed class GlobalsLayout
             builder.Append(' ');
             builder.Append(declaration.Name);
             builder.Append(";\n");
+        }
+
+        void PlaceArray(GlobalsDeclaration declaration)
+        {
+            if (!string.IsNullOrEmpty(declaration.Initializer))
+            {
+                throw new ShaderLoader.ShaderCompilerException(
+                    $"Array uniform '{declaration.Name}' has a default value, which the packed layout cannot carry. Write its elements from the renderer instead.");
+            }
+
+            var stride = GetArrayStride(declaration.Type);
+
+            offset = Align(offset, 16);
+
+            for (var index = 0; index < declaration.ArrayLength; index++)
+            {
+                var elementName = ElementName(declaration.Name, index);
+
+                members.Add(elementName, new GlobalsMember(elementName, declaration.Type, offset + (index * stride)));
+            }
+
+            offset += declaration.ArrayLength * stride;
+
+            builder.Append("    ");
+            builder.Append(GetGlslName(declaration.Type));
+            builder.Append(' ');
+            builder.Append(declaration.Name);
+            builder.Append('[');
+            builder.Append(declaration.ArrayLength.ToString(CultureInfo.InvariantCulture));
+            builder.Append("];\n");
+        }
+
+        // First, and deliberately: an array starts on 16 and occupies a whole number of 16 byte slots, so
+        // placing the arrays ahead of everything else leaves the packing of a shader that has none exactly
+        // as it was.
+        foreach (var declaration in arrays)
+        {
+            PlaceArray(declaration);
         }
 
         foreach (var declaration in matrices)
@@ -271,7 +348,12 @@ public sealed class GlobalsLayout
 
         foreach (var declaration in declarations)
         {
-            WriteDefault(declaration);
+            // An array is rejected above if it carries an initializer, so its elements start at the zero
+            // the buffer is already filled with.
+            if (declaration.ArrayLength == 0)
+            {
+                WriteDefault(declaration);
+            }
         }
     }
 
@@ -464,6 +546,12 @@ public sealed class GlobalsLayout
         2 => 8,
         _ => 16,
     };
+
+    /// <summary>
+    /// Returns the byte distance between two elements of an array of the given type under std140, which
+    /// rounds every element up to the size of a vec4 whatever the element type is.
+    /// </summary>
+    private static int GetArrayStride(GlobalsType type) => Align(GetComponentCount(type) * sizeof(float), 16);
 
     /// <summary>Returns the GLSL keyword for the given type.</summary>
     internal static string GetGlslName(GlobalsType type) => type switch

@@ -598,10 +598,24 @@ public class Renderer
     /// Holds an open render pass so it can be closed with <c>using</c>. The default value holds nothing
     /// and closes nothing, which is what every helper returns while the renderer is not recording.
     /// </summary>
-    private readonly struct RhiPass(RHI.ICommandList? commandList) : IDisposable
+    /// <remarks>
+    /// <b>Disposing twice is a no-op.</b> Two of the scene passes have to be closed part way through
+    /// <see cref="RenderScenesWithView"/>, because a transfer or a dispatch follows them and neither is
+    /// valid inside a pass -- but they must also be closed when the frame throws before reaching that
+    /// point, or the list is left recording and refuses to submit. That means the same guard is closed
+    /// explicitly on the way through and again while unwinding, so the second close has to do nothing
+    /// rather than end a pass that is no longer open.
+    /// </remarks>
+    private struct RhiPass(RHI.ICommandList? commandList) : IDisposable
     {
-        /// <summary>Ends the pass, if one was opened.</summary>
-        public void Dispose() => commandList?.EndRenderPass();
+        private RHI.ICommandList? openPass = commandList;
+
+        /// <summary>Ends the pass, if one is still open.</summary>
+        public void Dispose()
+        {
+            openPass?.EndRenderPass();
+            openPass = null;
+        }
     }
 
     /// <summary>
@@ -874,209 +888,231 @@ public class Renderer
 
         UpdatePerViewGpuBuffers(Scene, renderContext.Camera, DeltaTime, renderContext.CommandList);
 
-        // The opaque half. Ends before the framebuffer grab, which copies and dispatches compute, and
-        // neither is valid inside a pass.
-        var opaquePass = BeginPass(in renderContext, "Scene Opaque");
-
-        using (new GLDebugGroup("Viewmodel Opaque"))
-        {
-            var mainCamera = renderContext.Camera;
-
-            ViewmodelCamera.CopyFrom(mainCamera);
-            ViewmodelCamera.FieldOfView = ComputeViewmodelFov();
-            ViewmodelCamera.CreateProjectionMatrix();
-            ViewmodelCamera.RecalculateMatrices();
-
-            DepthRange.Viewmodel.Apply();
-
-            ViewmodelCamera.SetViewConstants(ViewBuffer.Data);
-            Scene.SetFogConstants(ViewBuffer.Data);
-
-            var viewmodelTileRemap = ViewmodelCamera.GetPixelRemapTo(mainCamera, ViewBuffer.Data.ViewportSize);
-            Scene.LightBinner.SetPixelRemap(viewmodelTileRemap);
-
-            BindUniformBuffer(renderContext.CommandList, ViewBuffer);
-            ViewBuffer.Update();
-            Scene.SetSceneBuffers(renderContext.CommandList);
-
-            renderContext.Camera = ViewmodelCamera;
-            renderContext.Scene = Scene;
-            Scene.RenderViewmodelOpaqueLayer(renderContext);
-            renderContext.Camera = mainCamera;
-
-            DepthRange.Scene.Apply();
-
-            mainCamera.SetViewConstants(ViewBuffer.Data);
-            Scene.SetFogConstants(ViewBuffer.Data);
-            Scene.LightBinner.SetPixelRemap(ViewConstants.PixelRemapIdentity);
-            BindUniformBuffer(renderContext.CommandList, ViewBuffer);
-            ViewBuffer.Update();
-        }
-
-        Scene.SetSceneBuffers(renderContext.CommandList);
-
-        using (new GLDebugGroup("Main Scene Opaque Render"))
-        {
-            renderContext.Scene = Scene;
-            Scene.RenderOpaqueLayer(renderContext, isStandardPass ? depthOnlyShader : null);
-        }
+        // Both scene passes are closed explicitly further down, where the work that cannot sit inside a
+        // pass begins. Held here so the finally below can also close whichever is still open when a draw
+        // throws: the device reuses one command list and refuses to submit it with a pass open, so a
+        // leaked pass costs the whole frame's recording and reports itself as the *next* acquire failing.
+        var opaquePass = default(RhiPass);
 
         // Opened inside the block below, once the copies that have to sit between the two passes are done.
         var translucentPass = default(RhiPass);
 
-        //using (new GLDebugGroup("Sky Render"))
+        try
         {
-            DepthRange.Sky.Apply();
+            // The opaque half. Ends before the framebuffer grab, which copies and dispatches compute, and
+            // neither is valid inside a pass.
+            opaquePass = BeginPass(in renderContext, "Scene Opaque");
 
-            renderContext.ReplacementShader?.SetUniform1AllVariants("isSkybox", 1u);
-            var skyboxScene = SkyboxScene;
-            var render3DSkybox = ShowSkybox && skyboxScene != null;
-            var (copyColor, copyDepth) = (Scene.WantsSceneColor, Scene.WantsSceneDepth);
-            copyDepth |= ForceResolveSceneDepth;
-            Postprocess.HasOutlineObjects = Scene.HasOutlineObjects;
-
-            if (render3DSkybox)
+            using (new GLDebugGroup("Viewmodel Opaque"))
             {
-                Debug.Assert(skyboxScene is not null); // analyzer is failing here
+                var mainCamera = renderContext.Camera;
 
-                // The skybox is a different Scene with its own lighting buffers, but not a different
-                // frame: it draws into the same pass through the same renderContext below, so it records
-                // into that context's list rather than one of its own.
-                skyboxScene.SetSceneBuffers(renderContext.CommandList);
-                renderContext.Scene = skyboxScene;
+                ViewmodelCamera.CopyFrom(mainCamera);
+                ViewmodelCamera.FieldOfView = ComputeViewmodelFov();
+                ViewmodelCamera.CreateProjectionMatrix();
+                ViewmodelCamera.RecalculateMatrices();
 
-                copyColor |= skyboxScene.WantsSceneColor;
-                copyDepth |= skyboxScene.WantsSceneDepth;
-                Postprocess.HasOutlineObjects |= skyboxScene.HasOutlineObjects;
+                DepthRange.Viewmodel.Apply();
 
-                using var _ = new GLDebugGroup("3D Sky Scene");
-                skyboxScene.RenderOpaqueLayer(renderContext);
+                ViewmodelCamera.SetViewConstants(ViewBuffer.Data);
+                Scene.SetFogConstants(ViewBuffer.Data);
+
+                var viewmodelTileRemap = ViewmodelCamera.GetPixelRemapTo(mainCamera, ViewBuffer.Data.ViewportSize);
+                Scene.LightBinner.SetPixelRemap(viewmodelTileRemap);
+
+                BindUniformBuffer(renderContext.CommandList, ViewBuffer);
+                ViewBuffer.Update();
+                Scene.SetSceneBuffers(renderContext.CommandList);
+
+                renderContext.Camera = ViewmodelCamera;
+                renderContext.Scene = Scene;
+                Scene.RenderViewmodelOpaqueLayer(renderContext);
+                renderContext.Camera = mainCamera;
+
+                DepthRange.Scene.Apply();
+
+                mainCamera.SetViewConstants(ViewBuffer.Data);
+                Scene.SetFogConstants(ViewBuffer.Data);
+                Scene.LightBinner.SetPixelRemap(ViewConstants.PixelRemapIdentity);
+                BindUniformBuffer(renderContext.CommandList, ViewBuffer);
+                ViewBuffer.Update();
             }
 
-            if (!isWireframe)
+            Scene.SetSceneBuffers(renderContext.CommandList);
+
+            using (new GLDebugGroup("Main Scene Opaque Render"))
             {
-                using (new GLDebugGroup("2D Sky Render"))
+                renderContext.Scene = Scene;
+                Scene.RenderOpaqueLayer(renderContext, isStandardPass ? depthOnlyShader : null);
+            }
+
+            //using (new GLDebugGroup("Sky Render"))
+            {
+                DepthRange.Sky.Apply();
+
+                renderContext.ReplacementShader?.SetUniform1AllVariants("isSkybox", 1u);
+                var skyboxScene = SkyboxScene;
+                var render3DSkybox = ShowSkybox && skyboxScene != null;
+                var (copyColor, copyDepth) = (Scene.WantsSceneColor, Scene.WantsSceneDepth);
+                copyDepth |= ForceResolveSceneDepth;
+                Postprocess.HasOutlineObjects = Scene.HasOutlineObjects;
+
+                if (render3DSkybox)
                 {
-                    Skybox2D?.Render();
+                    Debug.Assert(skyboxScene is not null); // analyzer is failing here
+
+                    // The skybox is a different Scene with its own lighting buffers, but not a different
+                    // frame: it draws into the same pass through the same renderContext below, so it records
+                    // into that context's list rather than one of its own.
+                    skyboxScene.SetSceneBuffers(renderContext.CommandList);
+                    renderContext.Scene = skyboxScene;
+
+                    copyColor |= skyboxScene.WantsSceneColor;
+                    copyDepth |= skyboxScene.WantsSceneDepth;
+                    Postprocess.HasOutlineObjects |= skyboxScene.HasOutlineObjects;
+
+                    using var _ = new GLDebugGroup("3D Sky Scene");
+                    skyboxScene.RenderOpaqueLayer(renderContext);
+                }
+
+                if (!isWireframe)
+                {
+                    using (new GLDebugGroup("2D Sky Render"))
+                    {
+                        Skybox2D?.Render();
+                    }
+                }
+
+                copyColor |= computeFramebufferLuminance;
+
+                // Everything below copies or dispatches, so the opaque pass has to close first even when
+                // nothing ends up being copied.
+                opaquePass.Dispose();
+
+                if (isMainFramebuffer)
+                {
+                    var generateDepthPyramid = Scene.EnableOcclusionCulling
+                        && Scene.DrawMeshletsIndirect
+                        && LockedCullFrustum == null
+                        && !DisableAllCulling
+                        && Uptime >= OcclusionCullWarmupSeconds;
+
+                    copyDepth |= generateDepthPyramid;
+                    Scene.DepthPyramidValid = !DisableAllCulling && (generateDepthPyramid || LockedCullFrustum != null);
+
+                    GrabFramebufferCopy(renderContext.Framebuffer, copyColor, copyDepth, renderContext.CommandList);
+
+                    if (generateDepthPyramid)
+                    {
+                        Debug.Assert(ResolvedSceneColor != null && ResolvedSceneDepth != null);
+                        EnsureDepthPyramidSize(renderContext.Framebuffer.Width, renderContext.Framebuffer.Height);
+                        Scene.GenerateDepthPyramid(ResolvedSceneDepth);
+                        Scene.DepthPyramidViewProjection = Camera.ViewProjectionMatrix;
+                        Scene.DepthPyramidValid = true;
+                    }
+                }
+
+                // The translucent half, loading rather than clearing so the opaque results it composites
+                // over survive.
+                translucentPass = BeginPass(in renderContext, "Scene Translucent", keepContents: true);
+
+                if (render3DSkybox)
+                {
+                    Debug.Assert(skyboxScene is not null); // analyzer is failing here
+
+                    using (new GLDebugGroup("3D Sky Scene Translucent Render"))
+                    {
+                        RenderTranslucentLayer(skyboxScene, renderContext);
+                    }
+
+                    // Back to main scene.
+                    Scene.SetSceneBuffers(renderContext.CommandList);
+                    renderContext.Scene = Scene;
+                }
+
+                renderContext.ReplacementShader?.SetUniform1AllVariants("isSkybox", 0u);
+                DepthRange.Scene.Apply();
+            }
+
+            using (new GLDebugGroup("Main Scene Translucent Render"))
+            {
+                RenderTranslucentLayer(Scene, renderContext);
+            }
+
+            using (new GLDebugGroup("Viewmodel Translucent"))
+            {
+                var mainCamera = renderContext.Camera;
+
+                DepthRange.Viewmodel.Apply();
+
+                ViewmodelCamera.SetViewConstants(ViewBuffer.Data);
+                Scene.SetFogConstants(ViewBuffer.Data);
+                Scene.LightBinner.SetPixelRemap(
+                    ViewmodelCamera.GetPixelRemapTo(mainCamera, ViewBuffer.Data.ViewportSize));
+                ViewBuffer.BindBufferBase();
+                ViewBuffer.Update();
+
+                renderContext.Camera = ViewmodelCamera;
+                Scene.RenderViewmodelTranslucentLayer(renderContext);
+                renderContext.Camera = mainCamera;
+
+                DepthRange.Scene.Apply();
+
+                mainCamera.SetViewConstants(ViewBuffer.Data);
+                Scene.SetFogConstants(ViewBuffer.Data);
+                Scene.LightBinner.SetPixelRemap(ViewConstants.PixelRemapIdentity);
+                ViewBuffer.BindBufferBase();
+                ViewBuffer.Update();
+            }
+
+            // Closed before the luminance histogram below, which dispatches compute.
+            translucentPass.Dispose();
+
+            wireframeScope.Dispose();
+
+            if (isStandardPass)
+            {
+                if (computeFramebufferLuminance)
+                {
+                    ComputeAverageLuminance(renderContext);
+                }
+
+                // The overlays that draw on top of the finished scene, in a pass of their own because the
+                // histogram above had to run outside one.
+                using var overlayPass = BeginPass(in renderContext, "Scene Overlays", keepContents: true);
+
+                if (Postprocess.HasOutlineObjects)
+                {
+                    RenderOutlineLayer(renderContext);
+                }
+
+                var overlayBatch = ValveResourceFormat.Renderer.LightTilesOverlay.BatchFor(ViewBuffer!.Data.RenderMode);
+
+                if (overlayBatch != ValveResourceFormat.Renderer.LightTilesOverlay.Batch.None)
+                {
+                    var (tileBase, words) = Scene.LightBinner.GetOverlayRegion(
+                        overlayBatch == ValveResourceFormat.Renderer.LightTilesOverlay.Batch.EnvMaps);
+
+                    LightTilesOverlay.Render(Scene.LightBinner.CullBits, tileBase, words);
                 }
             }
-
-            copyColor |= computeFramebufferLuminance;
-
-            // Everything below copies or dispatches, so the opaque pass has to close first even when
-            // nothing ends up being copied.
+            else
+            {
+                PerfStats.Active.ResumeTriangleCounter();
+            }
+        }
+        finally
+        {
+            // Whichever of the two is still open, in the order they nest. Both are closed on the way
+            // through as well, since the work that follows each cannot sit inside a pass; closing an
+            // already-closed one does nothing. Without this a draw that throws leaves the pass open, the
+            // list refuses to submit, and the next acquire reports the leak instead of the draw.
+            translucentPass.Dispose();
             opaquePass.Dispose();
 
-            if (isMainFramebuffer)
-            {
-                var generateDepthPyramid = Scene.EnableOcclusionCulling
-                    && Scene.DrawMeshletsIndirect
-                    && LockedCullFrustum == null
-                    && !DisableAllCulling
-                    && Uptime >= OcclusionCullWarmupSeconds;
-
-                copyDepth |= generateDepthPyramid;
-                Scene.DepthPyramidValid = !DisableAllCulling && (generateDepthPyramid || LockedCullFrustum != null);
-
-                GrabFramebufferCopy(renderContext.Framebuffer, copyColor, copyDepth, renderContext.CommandList);
-
-                if (generateDepthPyramid)
-                {
-                    Debug.Assert(ResolvedSceneColor != null && ResolvedSceneDepth != null);
-                    EnsureDepthPyramidSize(renderContext.Framebuffer.Width, renderContext.Framebuffer.Height);
-                    Scene.GenerateDepthPyramid(ResolvedSceneDepth);
-                    Scene.DepthPyramidViewProjection = Camera.ViewProjectionMatrix;
-                    Scene.DepthPyramidValid = true;
-                }
-            }
-
-            // The translucent half, loading rather than clearing so the opaque results it composites
-            // over survive.
-            translucentPass = BeginPass(in renderContext, "Scene Translucent", keepContents: true);
-
-            if (render3DSkybox)
-            {
-                Debug.Assert(skyboxScene is not null); // analyzer is failing here
-
-                using (new GLDebugGroup("3D Sky Scene Translucent Render"))
-                {
-                    RenderTranslucentLayer(skyboxScene, renderContext);
-                }
-
-                // Back to main scene.
-                Scene.SetSceneBuffers(renderContext.CommandList);
-                renderContext.Scene = Scene;
-            }
-
-            renderContext.ReplacementShader?.SetUniform1AllVariants("isSkybox", 0u);
-            DepthRange.Scene.Apply();
-        }
-
-        using (new GLDebugGroup("Main Scene Translucent Render"))
-        {
-            RenderTranslucentLayer(Scene, renderContext);
-        }
-
-        using (new GLDebugGroup("Viewmodel Translucent"))
-        {
-            var mainCamera = renderContext.Camera;
-
-            DepthRange.Viewmodel.Apply();
-
-            ViewmodelCamera.SetViewConstants(ViewBuffer.Data);
-            Scene.SetFogConstants(ViewBuffer.Data);
-            Scene.LightBinner.SetPixelRemap(
-                ViewmodelCamera.GetPixelRemapTo(mainCamera, ViewBuffer.Data.ViewportSize));
-            ViewBuffer.BindBufferBase();
-            ViewBuffer.Update();
-
-            renderContext.Camera = ViewmodelCamera;
-            Scene.RenderViewmodelTranslucentLayer(renderContext);
-            renderContext.Camera = mainCamera;
-
-            DepthRange.Scene.Apply();
-
-            mainCamera.SetViewConstants(ViewBuffer.Data);
-            Scene.SetFogConstants(ViewBuffer.Data);
-            Scene.LightBinner.SetPixelRemap(ViewConstants.PixelRemapIdentity);
-            ViewBuffer.BindBufferBase();
-            ViewBuffer.Update();
-        }
-
-        // Closed before the luminance histogram below, which dispatches compute.
-        translucentPass.Dispose();
-
-        wireframeScope.Dispose();
-
-        if (isStandardPass)
-        {
-            if (computeFramebufferLuminance)
-            {
-                ComputeAverageLuminance(renderContext);
-            }
-
-            // The overlays that draw on top of the finished scene, in a pass of their own because the
-            // histogram above had to run outside one.
-            using var overlayPass = BeginPass(in renderContext, "Scene Overlays", keepContents: true);
-
-            if (Postprocess.HasOutlineObjects)
-            {
-                RenderOutlineLayer(renderContext);
-            }
-
-            var overlayBatch = ValveResourceFormat.Renderer.LightTilesOverlay.BatchFor(ViewBuffer!.Data.RenderMode);
-
-            if (overlayBatch != ValveResourceFormat.Renderer.LightTilesOverlay.Batch.None)
-            {
-                var (tileBase, words) = Scene.LightBinner.GetOverlayRegion(
-                    overlayBatch == ValveResourceFormat.Renderer.LightTilesOverlay.Batch.EnvMaps);
-
-                LightTilesOverlay.Render(Scene.LightBinner.CullBits, tileBase, words);
-            }
-        }
-        else
-        {
-            PerfStats.Active.ResumeTriangleCounter();
+            // Restored here for the same reason: post-processing must not inherit wireframe, and a frame
+            // that threw would otherwise leave the tracker's baseline holding it.
+            wireframeScope.Dispose();
         }
     }
 
@@ -1510,12 +1546,30 @@ public class Renderer
         EnsureResolvedTextureSize(inputFramebuffer.Width, inputFramebuffer.Height);
 
         var commandList = outputFramebuffer.Color is null ? null : AcquireCommandList("Post Process");
+        var recorded = false;
 
-        Postprocess.Render(inputFramebuffer, outputFramebuffer, ResolvedSceneColor!, Camera, flipY, commandList);
-
-        if (commandList is not null)
+        try
         {
-            RendererContext.Device?.Submit(commandList);
+            Postprocess.Render(inputFramebuffer, outputFramebuffer, ResolvedSceneColor!, Camera, flipY, commandList);
+            recorded = true;
+        }
+        finally
+        {
+            // The list has to come back even from a chain that threw, for the same reason the scene's
+            // does: the device reuses one, so leaving it recording means the next acquire reports the
+            // leak rather than the stage that actually failed.
+            if (commandList is not null)
+            {
+                if (recorded)
+                {
+                    // Nothing to bury, so a refused submission is the finding and is raised.
+                    RendererContext.Device?.Submit(commandList);
+                }
+                else
+                {
+                    SubmitOwned(commandList);
+                }
+            }
         }
     }
 

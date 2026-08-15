@@ -777,13 +777,25 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <param name="count">Number of vec4 elements to upload.</param>
         /// <param name="value">Flat array of float values (count * 4 elements).</param>
         /// <remarks>
-        /// Not routed, because <see cref="GlobalsLayout"/> cannot pack an array and so an array uniform is
-        /// always loose. That is why <c>dof2</c> still declares one outside a block and still fails to
-        /// compile for Vulkan even though its name is correctly prefixed: the fix is array support in the
-        /// globals block, not anything at this call site.
+        /// Routed element by element when the array is packed, for the same reason the scalar setters are:
+        /// a packed uniform has no GL location, so writing one by location reaches nothing at all. Not every
+        /// array is packed &#8212; <c>dof2</c> spells its length before the name rather than after it, which
+        /// <see cref="ShaderParser"/> does not recognise as an array &#8212; so both paths stay live.
         /// </remarks>
         public void SetUniform4Array(string name, int count, float[] value)
         {
+            ArgumentNullException.ThrowIfNull(value);
+
+            if (IsPacked(GlobalsLayout.ElementName(name, 0)))
+            {
+                for (var i = 0; i < count; i++)
+                {
+                    Default.SetUniform(GlobalsLayout.ElementName(name, i), new Vector4(value[i * 4], value[(i * 4) + 1], value[(i * 4) + 2], value[(i * 4) + 3]));
+                }
+
+                return;
+            }
+
             var uniformLocation = GetUniformLocation(name);
             if (uniformLocation > -1)
             {

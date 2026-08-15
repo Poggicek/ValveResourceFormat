@@ -235,6 +235,45 @@ namespace ValveResourceFormat.Renderer.PostProcess
         /// <param name="texture">The texture to bind.</param>
         /// <param name="format">The format the OpenGL path declares the image with.</param>
         /// <param name="layered">Whether every layer of a volume or array texture is bound at once.</param>
+        /// <remarks>
+        /// <para>
+        /// <b>The transition is part of the bind, not something the caller adds.</b> A storage image
+        /// descriptor may only name <c>General</c>, so a texture that has not been moved there is refused
+        /// by <see cref="ICommandList.BindStorageTexture"/> outright rather than bound in a layout the
+        /// descriptor is not allowed to see. Every recorded storage-image bind in the chain goes through
+        /// this helper, so doing it here is what makes it impossible for one site to forget &#8212; and
+        /// forgetting is invisible on the oracle, because <c>glBindImageTexture</c> needs no equivalent.
+        /// </para>
+        /// <para>
+        /// <b>Why <see cref="ResourceState.ShaderWrite"/> rather than
+        /// <see cref="ResourceState.ShaderReadWrite"/>.</b> Both expand to <c>General</c>, so both satisfy
+        /// the descriptor; they differ in access mask alone. Every compute pass the chain binds through
+        /// here declares its image <c>writeonly</c> &#8212; <c>msaa_resolve</c> and <c>depth_resolve</c> at
+        /// binding 1, <c>combine_luts</c> at binding 0 &#8212; and the OpenGL path says the same thing with
+        /// <see cref="TextureAccess.WriteOnly"/>. Naming the write alone keeps the destination access mask
+        /// tight and, more usefully, leaves the texture in exactly the state
+        /// <see cref="ShaderWriteBarrier"/> already claims to be transitioning it out of. A pass that
+        /// genuinely loads as well as stores would need <see cref="ResourceState.ShaderReadWrite"/> here;
+        /// none currently does.
+        /// </para>
+        /// <para>
+        /// <b>Why the transition claims to come from <see cref="ResourceState.Undefined"/>.</b> The
+        /// dispatch overwrites every texel it is sized for, so nothing in the texture is carried into it,
+        /// and a source of <see cref="ResourceState.Undefined"/> is the one claim that stays true on the
+        /// first frame and on every frame after it &#8212; a target that has never been touched really is
+        /// undefined, and one holding last frame's result is not carrying it forward either. The barrier's
+        /// real <c>oldLayout</c> never comes from here in any case: the Vulkan backend fills it from the
+        /// layout it tracks, so the transition is correct whichever of the two the texture is actually in.
+        /// </para>
+        /// <para>
+        /// <b>Nothing reaches OpenGL.</b> <c>GlBarrierTranslation</c> emits bits only for a transition
+        /// <i>out of</i> an incoherent write, and neither <see cref="ResourceState.Undefined"/> nor
+        /// <see cref="ResourceState.ShaderRead"/> is one, so this translates to zero bits and
+        /// <c>glMemoryBarrier</c> is not called at all. That is a property of the translation rather than
+        /// something the golden images could show: they cannot distinguish a right barrier from a missing
+        /// one here, which is why it is argued from the code.
+        /// </para>
+        /// </remarks>
         internal static void BindStorageImage(ICommandList? commandList, int binding, RenderTexture texture,
             SizedInternalFormat format, bool layered = false)
         {
@@ -243,6 +282,10 @@ namespace ValveResourceFormat.Renderer.PostProcess
                 GL.BindImageTexture(binding, texture.Handle, 0, layered, 0, TextureAccess.WriteOnly, format);
                 return;
             }
+
+            var barrier = new TextureBarrier(texture.RhiTexture, ResourceState.Undefined, ResourceState.ShaderWrite);
+
+            commandList.Barrier(in barrier);
 
             commandList.BindStorageTexture(binding, texture.RhiTexture);
         }

@@ -416,6 +416,7 @@ namespace ValveResourceFormat.Renderer
                 var indexBuffer = new IndexDrawBuffer
                 {
                     Handle = gpuVbib.IndexBuffers[(int)bufferIndex],
+                    RhiBuffer = gpuVbib.RhiIndexBuffer((int)bufferIndex),
                     Offset = indexBindOffset
                 };
                 drawCall.IndexBuffer = indexBuffer;
@@ -491,6 +492,7 @@ namespace ValveResourceFormat.Renderer
                     var vertexBuffer = new VertexDrawBuffer
                     {
                         Handle = gpuVbib.VertexBuffers[(int)bufferIndex],
+                        RhiBuffer = gpuVbib.RhiVertexBuffer((int)bufferIndex),
                         BufferIndex = (int)bufferIndex,
                         Offset = vertexBindOffset,
                         ElementSizeInBytes = vertexBufferVbib.ElementSizeInBytes,
@@ -577,6 +579,7 @@ namespace ValveResourceFormat.Renderer
                     new VertexDrawBuffer()
                     {
                         Handle = gpuVbib.VertexBuffers[0],
+                        RhiBuffer = gpuVbib.RhiVertexBuffer(0),
                         ElementSizeInBytes = vb.ElementSizeInBytes,
                         InputLayoutFields = vb.InputLayoutFields,
                     }
@@ -585,6 +588,7 @@ namespace ValveResourceFormat.Renderer
                 IndexBuffer = new IndexDrawBuffer()
                 {
                     Handle = gpuVbib.IndexBuffers[0],
+                    RhiBuffer = gpuVbib.RhiIndexBuffer(0),
                 }
             };
 

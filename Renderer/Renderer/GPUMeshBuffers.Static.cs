@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 namespace ValveResourceFormat.Renderer;
 
@@ -71,6 +72,47 @@ public partial class GPUMeshBufferCache
             }
 
             return vectorOneVertexBuffer;
+        }
+    }
+
+    private RHI.IBuffer? vectorOneRhiBuffer;
+
+    /// <summary>Gets <see cref="VectorOneVertexBuffer"/> as an <see cref="RHI.IBuffer"/>, for the draw
+    /// recording path that binds it as the default COLOR stream.</summary>
+    /// <remarks>
+    /// On OpenGL this is the same object <see cref="VectorOneVertexBuffer"/> already registers, so the
+    /// buffer is created by exactly the calls it always was. On any other backend the handle route does
+    /// not exist at all: there is no OpenGL buffer to make and none to wrap, so the buffer is allocated
+    /// through the device and <see cref="VectorOneVertexBuffer"/> is never touched. Going through the
+    /// handle there would be two faults at once &#8212; a direct GL call on a device that is not OpenGL,
+    /// and a <c>GLBuffer</c> handed to a backend that cannot bind one.
+    /// </remarks>
+    public RHI.IBuffer VectorOneRhiBuffer
+    {
+        get
+        {
+            if (vectorOneRhiBuffer is not null)
+            {
+                return vectorOneRhiBuffer;
+            }
+
+            const int SizeInBytes = 4 * sizeof(float);
+            var device = RendererContext.Device;
+
+            if (device is null || device.Backend == RHI.RhiBackend.OpenGL)
+            {
+                return vectorOneRhiBuffer = standaloneRhiBuffers[VectorOneVertexBuffer];
+            }
+
+            var buffer = device.CreateBuffer(new RHI.BufferDesc(
+                SizeInBytes,
+                RHI.BufferUsage.Vertex | RHI.BufferUsage.CopyDestination,
+                RHI.BufferMemory.DeviceLocal,
+                nameof(VectorOneVertexBuffer)));
+
+            device.UploadBuffer(buffer, 0, MemoryMarshal.AsBytes<float>([1f, 1f, 1f, 1f]));
+
+            return vectorOneRhiBuffer = buffer;
         }
     }
 }
