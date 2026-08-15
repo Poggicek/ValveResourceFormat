@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using GUI.Utils;
 using ValveResourceFormat.Renderer;
@@ -25,7 +26,13 @@ namespace GUI
         [STAThread]
         internal static void Main(string[] args)
         {
+            // First thing that happens, so that everything below is captured. Anything that managed to
+            // log before this (static initializers) is buffered by FileLog and drained here.
+            FileLog.Install();
+
             AppDomain.CurrentDomain.UnhandledException += UnhandledException;
+            AppDomain.CurrentDomain.ProcessExit += static (_, _) => FileLog.Shutdown();
+            TaskScheduler.UnobservedTaskException += UnobservedTaskException;
             Application.ThreadException += ThreadException;
 
             // Set invariant culture so we have consistent localization (e.g. dots do not get encoded as commas)
@@ -60,7 +67,14 @@ namespace GUI
                 throw new InvalidDataException("Failed to find version number");
             }
 
+            FileLog.WriteDiagnostic(Log.Category.INFO, nameof(Program),
+                $"Source 2 Viewer {ProductVersion} on {RuntimeInformation.OSDescription} ({RuntimeInformation.OSArchitecture})");
+
             MainForm = new MainForm(args);
+
+            // The console tab takes over Console.Out/Error in MainForm.OnLoad, so the tee that copies
+            // those writes into the file can only be wrapped around it once the form is up.
+            MainForm.Shown += static (_, _) => FileLog.AttachConsoleRedirect();
 
             try
             {
@@ -73,6 +87,7 @@ namespace GUI
                 // used them and are destroyed exactly once, here, after every window is gone. Skipped
                 // entirely when nothing ever asked for Vulkan.
                 GUI.Controls.VulkanPresentSession.Shutdown();
+                FileLog.Shutdown();
             }
         }
 
@@ -83,7 +98,19 @@ namespace GUI
 
         private static void UnhandledException(object sender, UnhandledExceptionEventArgs ex)
         {
+            // Written before anything else runs: this fires for background threads too (the render thread
+            // creates the Vulkan device on its own), and the process is usually about to die.
+            FileLog.WriteDiagnostic(Log.Category.ERROR, nameof(Program),
+                $"Unhandled exception on thread '{Thread.CurrentThread.Name ?? "unnamed"}' (managed id {Environment.CurrentManagedThreadId}), terminating: {ex.IsTerminating}{Environment.NewLine}{ex.ExceptionObject}");
+
             ShowError((Exception)ex.ExceptionObject);
+        }
+
+        private static void UnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+        {
+            // File only, and deliberately not marked observed, so the existing behaviour is unchanged.
+            FileLog.WriteDiagnostic(Log.Category.ERROR, nameof(Program),
+                $"Unobserved task exception{Environment.NewLine}{e.Exception}");
         }
 
         public static void ShowError(Exception exception)

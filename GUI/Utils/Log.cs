@@ -23,6 +23,8 @@ internal static class Log
 
     public static void Debug(string component, string message)
     {
+        FileLog.Write(Category.DEBUG, component, message);
+
         if (console == null)
         {
             WriteToConsole(component, message);
@@ -38,6 +40,8 @@ internal static class Log
 
     public static void Info(string component, string message)
     {
+        FileLog.Write(Category.INFO, component, message);
+
         if (console == null)
         {
             WriteToConsole(component, message);
@@ -49,6 +53,8 @@ internal static class Log
 
     public static void Warn(string component, string message)
     {
+        FileLog.Write(Category.WARN, component, message);
+
         if (console == null)
         {
             WriteToConsole(component, message);
@@ -60,6 +66,8 @@ internal static class Log
 
     public static void Error(string component, string message)
     {
+        FileLog.Write(Category.ERROR, component, message);
+
         if (console == null)
         {
             WriteToConsole(component, message);
