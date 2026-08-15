@@ -7,6 +7,7 @@ using GUI.Utils;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
 using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.Vulkan;
 using ValveResourceFormat.Renderer.RHI.Vulkan.Core;
 using ValveResourceFormat.Renderer.RHI.Vulkan.Present;
 using Windows.Win32;
@@ -120,7 +121,16 @@ public sealed class VulkanPresentSession
                 EnableSynchronizationValidation = ShouldUseValidation(),
             };
 
-            var device = VulkanPresentDevice.Acquire(OnRhiMessage, options);
+            // The viewer reports an interface problem rather than failing the pipeline: a shader whose
+            // declarations disagree with the layout is a bug worth logging, but not one that should stop
+            // a user opening a file. The golden harness turns it into a hard failure instead.
+            var pipelineOptions = new VulkanPipelineOptions
+            {
+                MessageCallback = OnRhiMessage,
+                TreatInterfaceProblemsAsErrors = false,
+            };
+
+            var device = VulkanPresentDevice.Acquire(OnRhiMessage, options, pipelineOptions);
 
             try
             {
@@ -628,21 +638,32 @@ public sealed partial class VulkanControl : Control
 
         device.BeginFrame();
 
+        uint imageIndex;
+        bool recorded;
+
         try
         {
-            return AcquireRenderPresent(device);
+            recorded = AcquireAndRecord(device, out imageIndex);
         }
         finally
         {
-            // Unconditional. A frame that opened and did not signal the timeline leaves the ring
-            // waiting on a serial nothing will ever reach; EndFrame submits the empty signalling
-            // command buffer for exactly the case where the acquire failed and nothing else did.
+            // Unconditional, and this is where the frame reaches the queue: EndFrame submits the whole
+            // frame as one batch carrying the acquire wait and the present signal. A frame that opened
+            // and recorded nothing leaves the ring waiting on a serial nothing would ever reach, which
+            // is what the base class's empty signalling submission is for.
             device.EndFrame();
         }
+
+        // Only now, because vkQueuePresentKHR waits on a binary semaphore and a wait may not be
+        // submitted before the submission that signals it. Presenting inside the recording step would
+        // queue a wait on a semaphore whose signalling batch had not been handed over yet.
+        return recorded && Present(imageIndex);
     }
 
-    private unsafe bool AcquireRenderPresent(VulkanPresentDevice device)
+    private unsafe bool AcquireAndRecord(VulkanPresentDevice device, out uint acquiredImageIndex)
     {
+        acquiredImageIndex = 0;
+
         Debug.Assert(session is not null);
 
         var frameIndex = device.FrameIndex;
@@ -685,13 +706,17 @@ public sealed partial class VulkanControl : Control
         // from Undefined and the first barrier discards whatever the presentation engine left.
         backbuffer.OverrideTrackedState(ResourceState.Undefined);
 
-        var commandBuffer = device.BeginFrameCommands($"{nameof(VulkanControl)} frame {device.CurrentFrameSerial}");
+        // A real command list from the device, not a raw command buffer off the pool. That is what
+        // makes a windowed frame the same kind of frame the offscreen path records: whatever draws
+        // here gets the device's recorder, its descriptor binder and its pipelines.
+        var commands = device.BeginCommandList($"{nameof(VulkanControl)} frame {device.CurrentFrameSerial}");
+        var commandBuffer = ((VulkanCommandList)commands).Handle;
 
         var callback = RenderFrame;
 
         if (callback is not null)
         {
-            var frame = new VulkanPresentFrame(backbuffer, commandBuffer, frameIndex);
+            var frame = new VulkanPresentFrame(backbuffer, commands, commandBuffer, frameIndex);
 
             // A throwing callback must not take the frame with it. The acquire semaphore has already
             // been signalled by the presentation engine, and the only thing that can unsignal it is a
@@ -717,10 +742,24 @@ public sealed partial class VulkanControl : Control
 
         var signalSemaphore = renderFinishedSemaphores[imageIndex];
 
-        device.SubmitFrameCommands(commandBuffer, acquireSemaphore, signalSemaphore);
-        imageFrameSerials[imageIndex] = device.CurrentFrameSerial;
+        // Named before the submit, so the frame's one batch carries the acquire wait and the present
+        // signal rather than needing a second submission beside it.
+        device.SetPresentSemaphores(acquireSemaphore, signalSemaphore);
+        device.Submit(commands);
 
+        imageFrameSerials[imageIndex] = device.CurrentFrameSerial;
+        acquiredImageIndex = imageIndex;
+
+        return true;
+    }
+
+    private unsafe bool Present(uint imageIndex)
+    {
+        Debug.Assert(session is not null);
+
+        var signalSemaphore = renderFinishedSemaphores[imageIndex];
         var localSwapchain = swapchain;
+        var index = imageIndex;
 
         var presentInfo = new PresentInfoKHR
         {
@@ -729,7 +768,7 @@ public sealed partial class VulkanControl : Control
             PWaitSemaphores = &signalSemaphore,
             SwapchainCount = 1,
             PSwapchains = &localSwapchain,
-            PImageIndices = &imageIndex,
+            PImageIndices = &index,
         };
 
         var present = session.SwapchainApi.QueuePresent(session.PresentQueue, in presentInfo);

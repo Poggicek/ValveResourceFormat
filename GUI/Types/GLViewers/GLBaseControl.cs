@@ -11,6 +11,7 @@ using OpenTK.Windowing.Desktop;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.Input;
 using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.Vulkan.Present;
 using Windows.Win32;
 using GLRecordingDevice = ValveResourceFormat.Renderer.RHI.OpenGL.GLRecordingDevice;
 
@@ -75,6 +76,15 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
     private int MaxSamples;
     protected int NumSamples => Math.Max(1, Math.Min(Settings.Config.AntiAliasingSamples, MaxSamples));
+
+    /// <summary>The shared Vulkan session this viewer holds a reference to, or null on OpenGL.</summary>
+    private VulkanPresentSession? VulkanSession;
+
+    /// <summary>The swapchain surface this viewer presents through, or null on OpenGL.</summary>
+    private VulkanControl? VulkanSurface;
+
+    /// <summary>Whether this viewer's device is the Vulkan one.</summary>
+    public bool UsingVulkan => Device?.Backend == RhiBackend.Vulkan;
 
     private bool FirstPaint = true;
     public long LastUpdate { get; protected set; }
@@ -163,6 +173,21 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
         UiControl.GLControlContainer.Controls.Add(GLControl);
         GLControl.AttachNativeWindow(GLNativeWindow!);
+
+        if (UsingVulkan)
+        {
+            // In front of the GL surface rather than instead of it. The GL control keeps the GLFW
+            // window the shared render loop tests for and the HWND the input filter keys on, so the
+            // threading and input models are untouched by the backend; only the pixels come from
+            // somewhere else.
+            VulkanSurface = new VulkanControl(glLock, VulkanSession)
+            {
+                Dock = DockStyle.Fill,
+            };
+
+            UiControl.GLControlContainer.Controls.Add(VulkanSurface);
+            VulkanSurface.BringToFront();
+        }
 
 #if DEBUG
         ShaderHotReload.SetSynchronizingObject(GLControl);
@@ -439,7 +464,26 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
         // Before the native window, which owns the GL context the device's resources live in.
         RendererContext.Device = null;
-        Device?.Dispose();
+
+        if (VulkanSession is not null)
+        {
+            // The surface goes first: its teardown waits for the device to go idle and destroys the
+            // swapchain and surface, which must happen while the device is still alive. Normally it has
+            // already gone with UiControl, and disposing a WinForms control twice is a no-op.
+            VulkanSurface?.Dispose();
+            VulkanSurface = null;
+
+            // The device is shared and process-lifetime, so a closing tab drops a reference rather than
+            // destroying it. Disposing it here would take every other Vulkan tab down and unload the
+            // loader with it; VulkanPresentSession.Shutdown at application exit is where it goes away.
+            VulkanSession = null;
+            VulkanPresentSession.Release();
+        }
+        else
+        {
+            Device?.Dispose();
+        }
+
         Device = null;
 
         NativeWindowFactory.Destroy(GLNativeWindow);
@@ -780,7 +824,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         // Constructing the device enables debug output and installs the message callback, so the
         // severity filtering above is configured first. The device reads the current context's limits,
         // which is why this cannot move out of the MakeCurrent scope.
-        Device = new GLRecordingDevice(RendererContext, OnRhiMessage);
+        Device = CreateDevice();
         RendererContext.Device = Device;
 
         GLEnvironment.Initialize(VrfGuiContext.Logger);
@@ -811,7 +855,69 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
         MainFramebuffer.ClearMask |= ClearBufferMask.StencilBufferBit;
 
+        if (UsingVulkan)
+        {
+            // Scene loading is the largest remaining body of direct OpenGL, so on a Vulkan device it is
+            // expected to fail. Contained here so that it fails once, by name, into the log, and leaves
+            // the viewer presenting an empty window rather than taking the tab down with it.
+            try
+            {
+                OnGLLoad();
+            }
+            catch (Exception exception)
+            {
+                Log.Error(nameof(GLBaseControl),
+                    $"Loading this scene on the Vulkan backend failed. The renderer still issues direct OpenGL calls that a Vulkan device cannot serve; the window will present but stay empty. {exception.Message}");
+            }
+
+            return;
+        }
+
         OnGLLoad();
+    }
+
+    /// <summary>
+    /// Creates the device this viewer records through, honouring the requested backend.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>OpenGL is the default and stays the parity oracle.</b> Requesting Vulkan is not a promise that
+    /// a scene will appear: the renderer still makes a large number of direct OpenGL calls that no
+    /// Vulkan device can serve, and until those are gone a Vulkan viewer presents a cleared window. What
+    /// this does guarantee is that asking for Vulkan gets a real, complete Vulkan device, and that
+    /// failing to get one is reported by name and falls back rather than crashing.
+    /// </para>
+    /// <para>
+    /// The GLFW window and its context are created either way. They are what the shared render loop,
+    /// the input plumbing and every remaining direct OpenGL call still run on, so removing them is the
+    /// last step of the port rather than the first.
+    /// </para>
+    /// </remarks>
+    private IDevice CreateDevice()
+    {
+        if (RhiBackendSelection.Requested != RhiBackend.Vulkan)
+        {
+            RhiBackendSelection.MarkActive(RhiBackend.OpenGL);
+            return new GLRecordingDevice(RendererContext, OnRhiMessage);
+        }
+
+        try
+        {
+            var session = VulkanPresentSession.Acquire();
+            VulkanSession = session;
+
+            Log.Info(nameof(GLBaseControl),
+                $"Vulkan backend selected on {session.PresentDevice.Core.Adapter.Name}. Scene rendering is not ported yet; the window will present but stay empty.");
+
+            return session.PresentDevice;
+        }
+        catch (Exception exception)
+        {
+            Log.Error(nameof(GLBaseControl), $"Vulkan was requested but could not be brought up, falling back to OpenGL: {exception.Message}");
+            RhiBackendSelection.FallBackToOpenGL(exception.Message);
+
+            return new GLRecordingDevice(RendererContext, OnRhiMessage);
+        }
     }
 
     protected virtual void OnGLLoad()
@@ -851,6 +957,17 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         {
             Log.Debug(nameof(GLBaseControl), "Attempted to draw onto destroyed GL Native Window.");
             RenderLoopThread.UnsetCurrentGLControl(this);
+            return;
+        }
+
+        if (VulkanSurface is not null)
+        {
+            // Acquire, record, present. No context to make current and no buffers to swap: the
+            // swapchain is the surface, and the frame is one submission the device batches.
+            Paused = isPaused;
+            LastUpdate = Stopwatch.GetTimestamp();
+
+            VulkanSurface.DrawFrame();
             return;
         }
 

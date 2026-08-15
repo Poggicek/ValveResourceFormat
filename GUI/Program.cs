@@ -62,7 +62,18 @@ namespace GUI
 
             MainForm = new MainForm(args);
 
-            Application.Run(MainForm);
+            try
+            {
+                Application.Run(MainForm);
+            }
+            finally
+            {
+                // The Vulkan instance and device are process-lifetime: the loader wrappers under them
+                // share the loaded vulkan-1 module, so they deliberately outlive the last viewer that
+                // used them and are destroyed exactly once, here, after every window is gone. Skipped
+                // entirely when nothing ever asked for Vulkan.
+                GUI.Controls.VulkanPresentSession.Shutdown();
+            }
         }
 
         private static void ThreadException(object sender, ThreadExceptionEventArgs e)

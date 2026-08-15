@@ -6,34 +6,40 @@ using VkSemaphore = Silk.NET.Vulkan.Semaphore;
 namespace ValveResourceFormat.Renderer.RHI.Vulkan.Present;
 
 /// <summary>
-/// The <see cref="VulkanDevice"/> a windowed viewer renders and presents through.
+/// The device a windowed viewer renders and presents through: everything
+/// <see cref="VulkanPipelineDevice"/> can do, plus a surface, a swapchain and a present.
 /// </summary>
 /// <remarks>
 /// <para>
-/// This is the real device, not a swapchain-shaped stand-in. It adds exactly three things the resource
-/// device cannot supply on its own, all of them consequences of presenting: the instance and device
-/// extensions a surface needs, a submission that can wait on an acquire semaphore and signal a present
-/// semaphore, and a lock making the single queue safe to share between several windows.
+/// <b>It sits at the end of the device chain rather than beside it.</b> It derived from
+/// <see cref="VulkanDevice"/> while the recording and pipeline layers were still being written, which
+/// left the windowed path able to present but unable to record a command list or create a pipeline
+/// &#8212; the mirror image of the hole the offscreen path had, and equally fatal. Deriving from
+/// <see cref="VulkanPipelineDevice"/> means a viewer window gets the one device in the backend with no
+/// member left throwing.
 /// </para>
 /// <para>
 /// <b>The instance and device are process-lifetime.</b> <see cref="VulkanInstance.Dispose"/> calls
 /// <c>Vk.Dispose</c>, which unloads the shared <c>vulkan-1</c> module; a second device created after
 /// that access-violates inside the loader. So this type is reference counted and only
-/// <see cref="Shutdown"/> destroys anything, which is how a real device behaves anyway &#8212; nothing in a
-/// viewer wants the GPU device torn down because the last tab closed.
+/// <see cref="Shutdown"/> destroys anything, which is how a real device behaves anyway &#8212; nothing
+/// in a viewer wants the GPU device torn down because the last tab closed.
 /// </para>
 /// <para>
-/// <b>The presented image is not named by a render pass.</b> Per the contract, getting a frame onto the
-/// screen is a backend-specific step outside the RHI. On Vulkan that step is acquire, render into the
-/// acquired image, present &#8212; and because a swapchain image is a real <c>VkImage</c>, it is surfaced as
-/// a <see cref="VulkanSwapchainTexture"/> and rendered into directly, with none of the full-screen blit
-/// the OpenGL backend is forced to pay.
+/// <b>The frame is still one submission.</b> <see cref="VulkanRecordingDevice"/> batches a frame's
+/// command lists into a single <c>vkQueueSubmit2</c> that signals the timeline once, for reasons its own
+/// remarks set out. A presented frame needs that same batch to additionally wait on the acquire
+/// semaphore and signal the semaphore the present waits on, because a swapchain image may not be
+/// written before the presentation engine has released it and the present has nothing else to wait on.
+/// So this overrides the batching rather than adding a second submission beside it: two submissions
+/// would reintroduce exactly the ordering hazard the batching exists to remove, since submissions to one
+/// queue are ordered when they start and not when they finish.
 /// </para>
 /// <para>
 /// Not thread safe beyond <see cref="SubmissionLock"/>, like the rest of the backend.
 /// </para>
 /// </remarks>
-public sealed class VulkanPresentDevice : VulkanDevice
+public sealed class VulkanPresentDevice : VulkanPipelineDevice
 {
     /// <summary><c>VK_KHR_surface</c>, the instance extension every platform surface builds on.</summary>
     public const string SurfaceExtensionName = "VK_KHR_surface";
@@ -47,6 +53,11 @@ public sealed class VulkanPresentDevice : VulkanDevice
     private static readonly Lock SharedLock = new();
     private static VulkanPresentDevice? Shared;
     private static int ReferenceCount;
+
+    private readonly List<CommandBuffer> FrameCommandBuffers = [];
+
+    private VkSemaphore FrameWaitSemaphore;
+    private VkSemaphore FramePresentSemaphore;
 
     /// <summary>
     /// Gets the lock serialising queue submission, presentation and the frame ring.
@@ -73,8 +84,13 @@ public sealed class VulkanPresentDevice : VulkanDevice
     /// <summary>Gets the number of warning-severity messages caused by this application's use of the API.</summary>
     public int ValidationWarningCount => Core.Instance.ValidationWarningCount;
 
-    private VulkanPresentDevice(VulkanCoreDevice core)
-        : base(core, ownsCore: true)
+    /// <summary>Gets the number of command lists queued for the frame being recorded.</summary>
+    public int PendingCommandListCount => FrameCommandBuffers.Count;
+
+    // The core is built in the base call rather than in the body so that its ownership transfer is
+    // visible to analysis, which is the same shape VulkanPipelineDevice's own public constructor uses.
+    private VulkanPresentDevice(VulkanCoreOptions coreOptions, VulkanPipelineOptions? pipelineOptions)
+        : base(new VulkanCoreDevice(coreOptions), ownsCore: true, pipelineOptions)
     {
     }
 
@@ -86,6 +102,9 @@ public sealed class VulkanPresentDevice : VulkanDevice
     /// installs its messenger during <c>vkCreateInstance</c> and the instance already exists.</param>
     /// <param name="options">Extra core creation parameters, or <see langword="null"/> for the defaults.
     /// Its extension lists are extended with the surface and swapchain extensions rather than replaced.</param>
+    /// <param name="pipelineOptions">Pipeline layer parameters, or <see langword="null"/> for the
+    /// defaults. Its <see cref="VulkanPipelineOptions.MessageCallback"/> is filled in from
+    /// <paramref name="messageCallback"/> when it has none.</param>
     /// <returns>The shared device.</returns>
     /// <exception cref="VulkanException">No suitable device exists, or creation failed.</exception>
     /// <remarks>
@@ -96,7 +115,10 @@ public sealed class VulkanPresentDevice : VulkanDevice
     /// performs once the surface exists; a device that fails it reports so and the viewer falls back to
     /// OpenGL. On Win32 every graphics queue family supports presentation in practice.
     /// </remarks>
-    public static VulkanPresentDevice Acquire(RhiMessageCallback? messageCallback = null, VulkanCoreOptions? options = null)
+    public static VulkanPresentDevice Acquire(
+        RhiMessageCallback? messageCallback = null,
+        VulkanCoreOptions? options = null,
+        VulkanPipelineOptions? pipelineOptions = null)
     {
         using var _ = SharedLock.EnterScope();
 
@@ -111,7 +133,14 @@ public sealed class VulkanPresentDevice : VulkanDevice
                 DeviceExtensions = Combine(baseOptions.DeviceExtensions, SwapchainExtensionName),
             };
 
-            Shared = new VulkanPresentDevice(new VulkanCoreDevice(effective));
+            var pipelines = pipelineOptions ?? new VulkanPipelineOptions();
+
+            if (pipelines.MessageCallback is null)
+            {
+                pipelines = pipelines with { MessageCallback = messageCallback };
+            }
+
+            Shared = new VulkanPresentDevice(effective, pipelines);
         }
 
         ReferenceCount++;
@@ -135,7 +164,6 @@ public sealed class VulkanPresentDevice : VulkanDevice
     }
 
     /// <summary>Gets the shared device if one has been created, without creating one.</summary>
-    /// <returns>The shared device, or <see langword="null"/>.</returns>
     public static VulkanPresentDevice? Current
     {
         get
@@ -185,56 +213,108 @@ public sealed class VulkanPresentDevice : VulkanDevice
         return outstanding;
     }
 
-    /// <summary>Takes a command buffer from the current frame's pool, ready to record into.</summary>
-    /// <param name="name">Debug name for the recorded work.</param>
-    /// <returns>A command buffer already in the recording state.</returns>
-    /// <exception cref="InvalidOperationException">No frame is open.</exception>
-    public CommandBuffer BeginFrameCommands(string name) => Core.FrameRing.CurrentPool.Acquire(name);
-
     /// <summary>
-    /// Ends and submits the frame's command buffer, waiting on the image the presentation engine handed
-    /// over and signalling both the semaphore the present will wait on and the frame timeline.
+    /// Names the semaphores the frame being recorded must synchronise its present against.
     /// </summary>
-    /// <param name="commandBuffer">The command buffer to end and submit.</param>
-    /// <param name="waitSemaphore">The binary semaphore <c>vkAcquireNextImageKHR</c> signals, or a
-    /// default handle to wait on nothing.</param>
-    /// <param name="signalSemaphore">The binary semaphore <c>vkQueuePresentKHR</c> will wait on, or a
-    /// default handle to signal nothing.</param>
-    /// <exception cref="VulkanException">Ending or submitting the command buffer failed.</exception>
-    /// <remarks>
-    /// <para>
-    /// <b>This is the frame's terminal submission and the only one that may signal the timeline.</b>
-    /// <see cref="VulkanFrameRing"/> records the frame's serial against its slot on
-    /// <c>EndFrame</c> and the next pass through the ring waits for that serial, so a frame that ends
-    /// without signalling deadlocks the ring; and signalling one timeline value twice is a validation
-    /// error, so a command list submitted earlier in the same frame must not signal it either.
-    /// <see cref="VulkanDevice.NotifyFrameSignalled"/> is called here, which is what stops
-    /// <see cref="VulkanDevice.EndFrame"/> from adding the empty signalling submission it would
-    /// otherwise need.
-    /// </para>
-    /// <para>
-    /// The acquire semaphore is waited at <c>ALL_COMMANDS</c> rather than at the one stage that happens
-    /// to touch the image today. The renderer draws into the acquired image directly, so the first thing
-    /// to read or write it is whatever the frame callback records, and naming a narrower stage here
-    /// would silently become wrong the moment that changes.
-    /// </para>
-    /// </remarks>
-    public unsafe void SubmitFrameCommands(CommandBuffer commandBuffer, VkSemaphore waitSemaphore, VkSemaphore signalSemaphore)
+    /// <param name="waitOnAcquire">The binary semaphore <c>vkAcquireNextImageKHR</c> signals, or a
+    /// default handle when this frame presents nothing.</param>
+    /// <param name="signalForPresent">The binary semaphore <c>vkQueuePresentKHR</c> will wait on, or a
+    /// default handle when this frame presents nothing.</param>
+    /// <exception cref="InvalidOperationException">The frame's work has already been submitted.</exception>
+    /// <remarks>Call after acquiring and before <see cref="EndFrame"/>. Both are folded into the frame's
+    /// single batch, so nothing here costs an extra submission.</remarks>
+    public void SetPresentSemaphores(VkSemaphore waitOnAcquire, VkSemaphore signalForPresent)
+    {
+        FrameWaitSemaphore = waitOnAcquire;
+        FramePresentSemaphore = signalForPresent;
+    }
+
+    /// <inheritdoc/>
+    public override void BeginFrame()
     {
         using var _ = SubmissionLock.EnterScope();
 
-        Core.Api.EndCommandBuffer(commandBuffer).Check("vkEndCommandBuffer");
+        base.BeginFrame();
 
-        var commandInfo = new CommandBufferSubmitInfo
+        FrameCommandBuffers.Clear();
+        FrameWaitSemaphore = default;
+        FramePresentSemaphore = default;
+    }
+
+    /// <inheritdoc/>
+    /// <exception cref="ArgumentException"><paramref name="commandList"/> is not a Vulkan command list.</exception>
+    /// <exception cref="InvalidOperationException">A render pass is still open on it.</exception>
+    /// <remarks>
+    /// Ends the command buffer and queues it for the frame's batch, exactly as
+    /// <see cref="VulkanRecordingDevice.Submit"/> does, but into this class's list so that
+    /// <see cref="EndFrame"/> can add the acquire wait and the present signal to the batch.
+    /// <b>This duplicates three lines of the base class</b> and would not need to if
+    /// <see cref="VulkanRecordingDevice"/> exposed its batch as a protected virtual taking the command
+    /// buffers and the semaphores; that seam, and the span overload of
+    /// <see cref="VulkanCoreDevice.SubmitAndSignal"/> underneath it, are the right home for this.
+    /// </remarks>
+    public override void Submit(ICommandList commandList)
+    {
+        ArgumentNullException.ThrowIfNull(commandList);
+
+        if (commandList is not VulkanCommandList list)
         {
-            SType = StructureType.CommandBufferSubmitInfo,
-            CommandBuffer = commandBuffer,
-        };
+            throw new ArgumentException(
+                $"Expected a {nameof(VulkanCommandList)} from {nameof(BeginCommandList)}, got {commandList.GetType().Name}.",
+                nameof(commandList));
+        }
 
+        list.End();
+        Core.Api.EndCommandBuffer(list.Handle).Check("vkEndCommandBuffer");
+
+        FrameCommandBuffers.Add(list.Handle);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>Hands the frame's command buffers to the queue as one batch that waits on the acquire
+    /// semaphore, signals the present semaphore and signals the frame timeline, then reports the signal
+    /// so no empty signalling submission is added. A frame that submitted nothing &#8212; an acquire that
+    /// reported the swapchain out of date, say &#8212; falls through to the base class, whose empty
+    /// submission keeps the frame ring honest.</remarks>
+    public override void EndFrame()
+    {
+        using var _ = SubmissionLock.EnterScope();
+
+        if (FrameCommandBuffers.Count > 0)
+        {
+            SubmitFrameBatch();
+            FrameCommandBuffers.Clear();
+
+            NotifyFrameSignalled();
+        }
+
+        FrameWaitSemaphore = default;
+        FramePresentSemaphore = default;
+
+        base.EndFrame();
+    }
+
+    private unsafe void SubmitFrameBatch()
+    {
+        var commands = new CommandBufferSubmitInfo[FrameCommandBuffers.Count];
+
+        for (var i = 0; i < commands.Length; i++)
+        {
+            commands[i] = new CommandBufferSubmitInfo
+            {
+                SType = StructureType.CommandBufferSubmitInfo,
+                CommandBuffer = FrameCommandBuffers[i],
+            };
+        }
+
+        // The acquire semaphore is waited at ALL_COMMANDS rather than at the one stage that happens to
+        // touch the image today. The frame renders into the acquired image directly, so the first thing
+        // to read or write it is whatever the renderer recorded, and naming a narrower stage here would
+        // silently become wrong the moment that changes.
         var wait = new SemaphoreSubmitInfo
         {
             SType = StructureType.SemaphoreSubmitInfo,
-            Semaphore = waitSemaphore,
+            Semaphore = FrameWaitSemaphore,
             StageMask = PipelineStageFlags2.AllCommandsBit,
         };
 
@@ -244,12 +324,12 @@ public sealed class VulkanPresentDevice : VulkanDevice
         var signals = stackalloc SemaphoreSubmitInfo[2];
         var signalCount = 0u;
 
-        if (signalSemaphore.Handle != 0)
+        if (FramePresentSemaphore.Handle != 0)
         {
             signals[signalCount++] = new SemaphoreSubmitInfo
             {
                 SType = StructureType.SemaphoreSubmitInfo,
-                Semaphore = signalSemaphore,
+                Semaphore = FramePresentSemaphore,
                 StageMask = PipelineStageFlags2.AllCommandsBit,
             };
         }
@@ -262,20 +342,21 @@ public sealed class VulkanPresentDevice : VulkanDevice
             StageMask = PipelineStageFlags2.AllCommandsBit,
         };
 
-        var submit = new SubmitInfo2
+        fixed (CommandBufferSubmitInfo* commandPointer = commands)
         {
-            SType = StructureType.SubmitInfo2,
-            WaitSemaphoreInfoCount = waitSemaphore.Handle != 0 ? 1u : 0u,
-            PWaitSemaphoreInfos = waitSemaphore.Handle != 0 ? &wait : null,
-            CommandBufferInfoCount = 1,
-            PCommandBufferInfos = &commandInfo,
-            SignalSemaphoreInfoCount = signalCount,
-            PSignalSemaphoreInfos = signals,
-        };
+            var submit = new SubmitInfo2
+            {
+                SType = StructureType.SubmitInfo2,
+                WaitSemaphoreInfoCount = FrameWaitSemaphore.Handle != 0 ? 1u : 0u,
+                PWaitSemaphoreInfos = FrameWaitSemaphore.Handle != 0 ? &wait : null,
+                CommandBufferInfoCount = (uint)commands.Length,
+                PCommandBufferInfos = commandPointer,
+                SignalSemaphoreInfoCount = signalCount,
+                PSignalSemaphoreInfos = signals,
+            };
 
-        Core.Api.QueueSubmit2(Core.GraphicsQueue, 1, &submit, default).Check("vkQueueSubmit2");
-
-        NotifyFrameSignalled();
+            Core.Api.QueueSubmit2(Core.GraphicsQueue, 1, &submit, default).Check("vkQueueSubmit2");
+        }
     }
 
     /// <summary>Blocks until the GPU has finished a frame.</summary>
@@ -293,25 +374,12 @@ public sealed class VulkanPresentDevice : VulkanDevice
     }
 
     /// <inheritdoc/>
-    public override void BeginFrame()
-    {
-        using var _ = SubmissionLock.EnterScope();
-        base.BeginFrame();
-    }
-
-    /// <inheritdoc/>
-    public override void EndFrame()
-    {
-        using var _ = SubmissionLock.EnterScope();
-        base.EndFrame();
-    }
-
-    /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
             using var _ = SubmissionLock.EnterScope();
+            FrameCommandBuffers.Clear();
             base.Dispose(disposing);
             return;
         }
