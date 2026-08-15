@@ -19,7 +19,7 @@ namespace Tests.Renderer.Golden
     /// deriving from a backend device; forwarding the interface can observe all of it, and the renderer
     /// only ever holds an <see cref="IDevice"/>.
     /// </remarks>
-    internal sealed class RhiDeviceCensus(IDevice inner) : IDevice
+    internal sealed class RhiDeviceCensus(IDevice inner) : IDevice, ValveResourceFormat.Renderer.IDeviceDecorator, ValveResourceFormat.Renderer.Shaders.Spirv.ISpirvModuleRegistry
     {
         private readonly ConcurrentDictionary<string, int> Counts = new(StringComparer.Ordinal);
 
@@ -60,6 +60,19 @@ namespace Tests.Renderer.Golden
         }
 
         /// <inheritdoc/>
+        /// <summary>
+        /// Forwards module registration to the decorated device. A decorator hides the concrete type,
+        /// which is why the shader loader asks whether a device can register rather than what it is;
+        /// without this forward every module would silently take the unreflected path.
+        /// </summary>
+        public void RegisterModuleInterface(IShaderModule shaderModule, ReadOnlySpan<byte> spirv)
+        {
+            if (Inner is ValveResourceFormat.Renderer.Shaders.Spirv.ISpirvModuleRegistry registry)
+            {
+                registry.RegisterModuleInterface(shaderModule, spirv);
+            }
+        }
+
         public RhiBackend Backend => Inner.Backend;
 
         /// <inheritdoc/>

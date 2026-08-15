@@ -113,7 +113,7 @@ public sealed record VulkanPipelineOptions
 /// this device keeps the single-thread rule.
 /// </para>
 /// </remarks>
-public class VulkanPipelineDevice : VulkanRecordingDevice
+public class VulkanPipelineDevice : VulkanRecordingDevice, Shaders.Spirv.ISpirvModuleRegistry
 {
     private readonly ConcurrentDictionary<PipelineCacheKey, Lazy<VulkanGraphicsPipeline>> GraphicsPipelines
         = new(VulkanPipelineKey.Comparer.Instance);
@@ -270,24 +270,24 @@ public class VulkanPipelineDevice : VulkanRecordingDevice
     }
 
     /// <summary>Records a module's SPIR-V interface.</summary>
-    /// <param name="module">The module the code was compiled into.</param>
+    /// <param name="shaderModule">The module the code was compiled into.</param>
     /// <param name="spirv">The SPIR-V the module was created from.</param>
-    /// <exception cref="ArgumentNullException"><paramref name="module"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="shaderModule"/> is <see langword="null"/>.</exception>
     /// <exception cref="InvalidSpirvException">The code is not SPIR-V this backend can reflect.</exception>
     /// <remarks>For a module created through <see cref="IDevice.CreateShaderModule"/>, which the contract
     /// makes non-virtual and which therefore cannot record this itself.</remarks>
-    public void RegisterModuleInterface(IShaderModule module, ReadOnlySpan<byte> spirv)
+    public void RegisterModuleInterface(IShaderModule shaderModule, ReadOnlySpan<byte> spirv)
     {
-        ArgumentNullException.ThrowIfNull(module);
+        ArgumentNullException.ThrowIfNull(shaderModule);
 
-        if (Reflections.ContainsKey(module.ContentHash))
+        if (Reflections.ContainsKey(shaderModule.ContentHash))
         {
             return;
         }
 
         var reflection = SpirvReflection.Reflect(spirv);
 
-        if (Reflections.TryAdd(module.ContentHash, reflection))
+        if (Reflections.TryAdd(shaderModule.ContentHash, reflection))
         {
             Stats.Count(VulkanPipelineCounter.ShaderModulesReflected);
         }

@@ -634,15 +634,24 @@ namespace ValveResourceFormat.Renderer.World
         /// Single white layer, used to keep the cookie texture units complete in scenes without cookies.
         /// Matches layer 0 of a real atlas, which barn lights without a cookie index into.
         /// </summary>
-        private static RenderTexture CreateDefaultCookieAtlas()
+        private RenderTexture CreateDefaultCookieAtlas()
         {
-            var atlas = new RenderTexture(TextureTarget.Texture2DArray, 1, 1, 1, 1) { RhiFormat = RhiFormat.R8G8B8A8_SRgb };
-            GL.TextureStorage3D(atlas.Handle, 1, SizedInternalFormat.Srgb8Alpha8, 1, 1, 1);
-            GL.TextureSubImage3D(atlas.Handle, 0, 0, 0, 0, 1, 1, 1, PixelFormat.Rgba, PixelType.UnsignedByte, new byte[] { 255, 255, 255, 255 });
+            var atlas = new RenderTexture(
+                TextureTarget.Texture2DArray,
+                RhiFormat.R8G8B8A8_SRgb,
+                1,
+                1,
+                1,
+                1,
+                "EmptyCookieAtlas",
+                device: scene.RendererContext.Device);
 
-#if DEBUG
-            atlas.SetLabel("EmptyCookieAtlas");
-#endif
+            atlas.Upload(0, 0, [255, 255, 255, 255]);
+
+            // Published for sampling: this is bound at a reserved slot on every frame that has no cookie
+            // atlas of its own, so without this it is still in CopyDestination when the first draw samples
+            // it and the bind is refused.
+            atlas.TransitionTo(ResourceState.ShaderRead, ResourceState.CopyDestination);
 
             return atlas;
         }

@@ -49,7 +49,7 @@ namespace Tests.Renderer.Golden
     /// instead of reporting it.
     /// </para>
     /// </remarks>
-    internal sealed class VulkanGoldenDevice : VulkanRecordingDevice
+    internal sealed class VulkanGoldenDevice : VulkanRecordingDevice, ValveResourceFormat.Renderer.Shaders.Spirv.ISpirvModuleRegistry
     {
         private readonly VulkanPipelineDevice Pipelines;
         private readonly VulkanDescriptorBinder DescriptorBinder;
@@ -221,6 +221,15 @@ namespace Tests.Renderer.Golden
             => Pipelines.CreateGraphicsPipeline(desc);
 
         /// <inheritdoc/>
+        /// <summary>
+        /// Records a module's SPIR-V interface with the pipeline device, so a pipeline layout can be
+        /// derived from it. Forwarded rather than inherited because this type composes the pipeline
+        /// device rather than deriving from it, which is exactly why the shader loader asks for the
+        /// capability rather than testing for the concrete type.
+        /// </summary>
+        public void RegisterModuleInterface(IShaderModule shaderModule, ReadOnlySpan<byte> spirv)
+            => Pipelines.RegisterModuleInterface(shaderModule, spirv);
+
         public override IComputePipeline CreateComputePipeline(in ComputePipelineDesc desc)
             => Pipelines.CreateComputePipeline(in desc);
 

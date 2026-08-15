@@ -170,6 +170,18 @@ namespace ValveResourceFormat.Renderer.PostProcess
                 return;
             }
 
+            // On a backend that compiled real modules, use those. ModuleFor hands back an OpenGL
+            // stand-in naming a linked program, which the pipeline device has never seen and cannot
+            // derive a layout from -- and it did so on both backends, so every compute pipeline here
+            // was reaching Vulkan with a module it could not use.
+            var compiled = shader.RendererContext.ShaderLoader.GetShaderModules(shader);
+
+            if (compiled is not null && compiled.TryGetValue(ShaderProgramType.Compute, out var compiledModule))
+            {
+                commandList.BindPipeline(commandList.Device.CreateComputePipeline(new ComputePipelineDesc(compiledModule, shader.Name)));
+                return;
+            }
+
             // Disposed straight away: the module only names an already linked program, the pipeline does
             // not keep it, and releasing it releases nothing.
             using var module = GLRendererDevice.ModuleFor(shader, ShaderStage.Compute);

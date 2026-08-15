@@ -25,12 +25,27 @@ namespace ValveResourceFormat.Renderer;
 /// the most recently constructed one. On OpenGL that is harmless: every GL entry point acts on whichever
 /// context is current on the calling thread, so holding the "wrong" <c>GLDevice</c> still allocates in
 /// the right place. On Vulkan it would not be harmless, which is the concrete reason the explicit
-/// parameter has to win the race against multi-viewer Vulkan. <see cref="Current"/> is read at each
-/// allocation rather than captured, so a resource never outlives its lookup.
+/// parameter has to win the race against multi-viewer Vulkan. <see cref="RendererDevice.Current"/> is
+/// read at each allocation rather than captured, so a resource never outlives its lookup.
 /// </para>
 /// </remarks>
 public static class RendererDevice
 {
+    /// <summary>Follows a chain of <see cref="IDeviceDecorator"/> wrappers to the device underneath.</summary>
+    /// <param name="device">The device to unwrap, which may be <see langword="null"/> or not a decorator.</param>
+    /// <returns>The innermost device, or <see langword="null"/> when <paramref name="device"/> was.</returns>
+    /// <remarks>Loops rather than recursing once, so a device wrapped twice &#8212; a census over a
+    /// recorder, say &#8212; still resolves.</remarks>
+    public static IDevice? Unwrap(IDevice? device)
+    {
+        while (device is IDeviceDecorator decorator)
+        {
+            device = decorator.Inner;
+        }
+
+        return device;
+    }
+
     // Weak, because this must not be what keeps a closed viewer's context alive. Most recent last.
     private static readonly List<WeakReference<RendererContext>> Published = [];
 
@@ -117,4 +132,27 @@ public static class RendererDevice
 
         return resolved is null || resolved.Backend == RhiBackend.OpenGL;
     }
+}
+
+/// <summary>
+/// Implemented by an <see cref="IDevice"/> that wraps another one and forwards to it.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Almost nothing needs this: the RHI is an interface precisely so callers do not care which device is
+/// underneath. The exception is work that has no expression in the contract and must reach the concrete
+/// backend &#8212; publishing an uploaded texture for sampling is the one that exists today, because the
+/// barrier has to ride the backend's own load-time command buffer rather than a frame's command list.
+/// </para>
+/// <para>
+/// A decorator that does not implement this is invisible to <see cref="RendererDevice.Unwrap"/>, and
+/// anything looking for the concrete device behind it will quietly decide there isn't one. That failure
+/// is silent, which is why the interface is a single property with no behaviour: implementing it should
+/// never be a decision.
+/// </para>
+/// </remarks>
+public interface IDeviceDecorator
+{
+    /// <summary>Gets the device this one forwards to.</summary>
+    IDevice Inner { get; }
 }

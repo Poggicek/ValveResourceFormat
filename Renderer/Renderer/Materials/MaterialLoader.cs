@@ -526,6 +526,10 @@ namespace ValveResourceFormat.Renderer.Materials
             tex.SetParameter(TextureParameterName.TextureWrapT, (int)clampModeT);
             tex.SetParameter(TextureParameterName.TextureWrapR, (int)clampModeU);
 
+            // Published for sampling now that every mip and layer is uploaded. One call covers the whole
+            // texture and batches into a single barrier, which is why it is here rather than in the loop.
+            tex.TransitionTo(RHI.ResourceState.ShaderRead, RHI.ResourceState.CopyDestination);
+
             return tex;
         }
 
@@ -679,6 +683,7 @@ namespace ValveResourceFormat.Renderer.Materials
                 DefaultVolume.SetWrapMode(TextureWrapMode.ClampToEdge);
 
                 DefaultVolume.Upload(0, 0, WhiteTexel);
+                DefaultVolume.TransitionTo(RHI.ResourceState.ShaderRead, RHI.ResourceState.CopyDestination);
             }
 
             return DefaultVolume;
@@ -718,6 +723,7 @@ namespace ValveResourceFormat.Renderer.Materials
             {
                 var pixels = new ReadOnlySpan<byte>((void*)bitmap.GetPixels(), bitmap.ByteCount);
                 texture.Upload(0, 0, pixels);
+                texture.TransitionTo(RHI.ResourceState.ShaderRead, RHI.ResourceState.CopyDestination);
             }
 
             return texture;
@@ -754,6 +760,7 @@ namespace ValveResourceFormat.Renderer.Materials
             texture.SetWrapMode(TextureWrapMode.ClampToEdge);
 
             texture.Upload(0, 0, texels);
+            texture.TransitionTo(RHI.ResourceState.ShaderRead, RHI.ResourceState.CopyDestination);
 
             return texture;
         }
@@ -825,6 +832,7 @@ namespace ValveResourceFormat.Renderer.Materials
             texture.Reflectivity = color32.ToLinearColor();
 
             texture.Upload(0, 0, color);
+            texture.TransitionTo(RHI.ResourceState.ShaderRead, RHI.ResourceState.CopyDestination);
 
             return texture;
         }

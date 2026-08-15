@@ -486,6 +486,64 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// pipeline layout cannot be derived from that alone.
         /// </para>
         /// </remarks>
+        /// <summary>
+        /// Finds whatever will record a module's SPIR-V interface for this device, or
+        /// <see langword="null"/> when nothing will.
+        /// </summary>
+        /// <remarks>
+        /// The device is asked whether it can register, rather than what it is, because that is the only
+        /// probe that survives being wrapped or composed — and both happen: the golden harness decorates
+        /// its device to count calls, and composes one that forwards pipeline creation. A concrete type
+        /// test was tried and could never succeed through either.
+        /// </remarks>
+        private static ISpirvModuleRegistry? ResolveModuleRegistry(IDevice device)
+            => device as ISpirvModuleRegistry;
+
+        private bool WarnedAboutMissingRegistry;
+
+        /// <summary>
+        /// Creates one stage's module and records its interface, so a pipeline can later derive a layout
+        /// from it.
+        /// </summary>
+        /// <remarks>
+        /// Creation goes through <see cref="IDevice.CreateShaderModule"/> in both cases rather than
+        /// through the pipeline device's combined call, so the device the renderer was handed is the
+        /// device that owns the module. Registration is then a separate step, which is exactly the case
+        /// the pipeline layer documents that second entry point for.
+        /// </remarks>
+        private IShaderModule CreateModule(IDevice device, ISpirvModuleRegistry? registry, ReadOnlySpan<byte> spirv, ShaderStage stage, string debugName)
+        {
+            var module = device.CreateShaderModule(spirv, stage, debugName);
+
+            if (registry != null)
+            {
+                try
+                {
+                    registry.RegisterModuleInterface(module, spirv);
+                }
+                catch
+                {
+                    module.Dispose();
+                    throw;
+                }
+
+                return module;
+            }
+
+            // Warn once rather than per module: without this the only symptom is a pipeline refusing to
+            // be built much later, naming a call site that did nothing wrong.
+            if (!WarnedAboutMissingRegistry)
+            {
+                WarnedAboutMissingRegistry = true;
+
+                RendererContext.Logger.LogError(
+                    "{Device} does not expose {Registry}, so no shader module's SPIR-V interface can be recorded and every pipeline built from one will refuse to be created. The device must implement {Registry}, forwarding to the pipeline device it wraps or composes.",
+                    device.GetType().Name, nameof(ISpirvModuleRegistry), nameof(ISpirvModuleRegistry));
+            }
+
+            return module;
+        }
+
         private Shader CompileSpirvShader(string shaderName, string shaderFileName, ParsedShaderData parsedData, IReadOnlyDictionary<string, byte> arguments)
         {
             var device = RendererContext.Device
@@ -495,6 +553,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             var headerText = BuildHeader(parsedData, shaderName, arguments);
             var sourceMap = new SpirvSourceMap(parsedData.SourceFiles);
             var describedFile = string.Concat(shaderFileName, GetArgumentDescription(arguments));
+            var registry = ResolveModuleRegistry(device);
 
             var modules = new Dictionary<ShaderProgramType, IShaderModule>(sources.Count);
 
@@ -518,12 +577,7 @@ namespace ValveResourceFormat.Renderer.Shaders
                         ThrowSpirvError(result, describedFile, shaderName, "Failed to set up shader", parsedData);
                     }
 
-                    // CreateReflectedShaderModule records the interface a pipeline layout is derived
-                    // from. Falling back to CreateShaderModule keeps a non-pipeline device usable, and
-                    // the pipeline device says plainly which call was missed if one ever reaches it.
-                    modules[stage] = device is VulkanPipelineDevice pipelineDevice
-                        ? pipelineDevice.CreateReflectedShaderModule(result.Spirv.Span, rhiStage, debugName)
-                        : device.CreateShaderModule(result.Spirv.Span, rhiStage, debugName);
+                    modules[stage] = CreateModule(device, registry, result.Spirv.Span, rhiStage, debugName);
                 }
             }
             catch

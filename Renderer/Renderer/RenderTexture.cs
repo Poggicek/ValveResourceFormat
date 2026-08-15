@@ -419,6 +419,56 @@ namespace ValveResourceFormat.Renderer
             ((GLTexture)RhiTexture).Upload(mipLevel, arrayLayer, data);
         }
 
+        /// <summary>
+        /// Moves every mip level and layer of this texture into <paramref name="state"/>, so it can be used
+        /// for something other than being copied into.
+        /// </summary>
+        /// <param name="state">The state to move to, normally <see cref="ResourceState.ShaderRead"/>.</param>
+        /// <param name="expectedCurrentState">What the caller believes the current state is, checked by an
+        /// assertion in debug builds, or <see langword="null"/> to assert nothing.</param>
+        /// <remarks>
+        /// <para>
+        /// <b>Every uploaded texture needs this.</b> <see cref="IDevice.UploadTexture"/> leaves its
+        /// destination in <see cref="ResourceState.CopyDestination"/> and deliberately does not guess what
+        /// comes next, because the guess would be wrong for every storage image and render target. A
+        /// texture still in <see cref="ResourceState.CopyDestination"/> cannot be sampled.
+        /// </para>
+        /// <para>
+        /// <b>Why the barrier goes on the upload path's command buffer.</b> A transition has to be
+        /// recorded somewhere, and uploads happen at load time outside any frame. Taking a command list
+        /// through <see cref="IDevice.BeginCommandList"/> and submitting it here would signal the frame
+        /// timeline from outside a frame, which is what the upload context exists to avoid: it owns a pool
+        /// and a fence of its own precisely so load-time work does not touch the frame ring. So this rides
+        /// the same batch as the staging copy that just ran, and is flushed with it when the next frame
+        /// opens. No extra submission, and the barrier cannot be separated from the copy it publishes.
+        /// </para>
+        /// <para>
+        /// This is not the inference the upload path refuses to make. The upload does not guess; the caller
+        /// states what the texture is for, which is the division the contract asks for.
+        /// </para>
+        /// <para>
+        /// Redundant calls are free. The backend transitions from its own tracked state and returns without
+        /// emitting anything when the texture is already there, so a defensive call before use costs
+        /// nothing and is better than reasoning about whether one is needed.
+        /// </para>
+        /// </remarks>
+        public void TransitionTo(ResourceState state, ResourceState? expectedCurrentState = null)
+        {
+            // OpenGL has no image layouts, and its command list drops the barriers that would express one,
+            // so there is nothing to record. The call still belongs at the call site: it is what makes the
+            // same code correct on Vulkan.
+            // Unwrapped, because the device a caller holds may be a decorator forwarding to the real one:
+            // the golden suite's census is exactly that, and without this the transition silently does
+            // nothing under it while working everywhere else.
+            if (RendererDevice.Unwrap(Device) is not RHI.Vulkan.VulkanDevice vulkanDevice
+                || rhiTexture is not RHI.Vulkan.VulkanTexture vulkanTexture)
+            {
+                return;
+            }
+
+            vulkanTexture.TransitionTo(vulkanDevice.Uploads.BeginBatch(), state, expectedCurrentState);
+        }
+
         /// <summary>Sets the wrap mode for all relevant texture dimensions.</summary>
         /// <param name="wrap">The wrap mode to apply.</param>
         public void SetWrapMode(TextureWrapMode wrap)
