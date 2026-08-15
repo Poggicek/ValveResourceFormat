@@ -1,6 +1,7 @@
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using ValveResourceFormat.Renderer.RHI.Vulkan.Core;
+using ValveResourceFormat.Renderer.RHI.Vulkan.Descriptors;
 using ValveResourceFormat.Renderer.Shaders.Spirv;
 
 namespace ValveResourceFormat.Renderer.RHI.Vulkan;
@@ -59,6 +60,16 @@ public sealed unsafe class VulkanComputePipeline : IComputePipeline, IVulkanPipe
     /// from the module instead of assumed.</remarks>
     public PushConstantRange? PushConstants => Layout.PushConstants;
 
+    /// <inheritdoc/>
+    /// <remarks>Computed once here from the same reflection the layout was built from. Compute is where
+    /// the hazard bites hardest: <c>depth_pyramid.comp</c> and <c>histogram.comp</c> reach three index
+    /// spaces at once, and a dispatch that missed one has no rasterizer between it and the device.</remarks>
+    public int UsedDescriptorSets { get; }
+
+    /// <inheritdoc/>
+    /// <remarks>Always zero. A compute pipeline fetches no vertices.</remarks>
+    public uint UsedVertexBindings => 0;
+
     /// <summary>Gets one message per interface problem found while building this pipeline. Empty when
     /// the shader conforms to the contract's descriptor set scheme.</summary>
     public IReadOnlyList<string> Problems => Layout.Problems;
@@ -108,6 +119,7 @@ public sealed unsafe class VulkanComputePipeline : IComputePipeline, IVulkanPipe
         Name = description.Name ?? string.Empty;
         Layout = layout;
         WorkgroupSize = reflection.WorkgroupSize ?? (1, 1, 1);
+        UsedDescriptorSets = VulkanDescriptorSetUsage.MaskFor(reflection);
 
         var entryPoint = SilkMarshal.StringToPtr(reflection.EntryPoint);
 

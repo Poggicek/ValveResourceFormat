@@ -72,6 +72,7 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
 
     private PipelineLayout LastLayout;
     private PipelineBindPoint LastBindPoint;
+    private int BoundSets;
     private bool Disposed;
 
     private long FlushCount;
@@ -94,6 +95,11 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
 
     /// <summary>Gets the allocator the per-draw sets come from.</summary>
     public VulkanDescriptorAllocator DescriptorAllocator => Allocator;
+
+    /// <inheritdoc/>
+    /// <remarks>Accumulated by <see cref="Flush"/> in the same pass that decides what to bind, so it is
+    /// the loop's own answer rather than a second opinion about it.</remarks>
+    public int BoundDescriptorSets => BoundSets;
 
     /// <summary>Creates a binder that owns its allocator.</summary>
     /// <param name="api">The Vulkan entry points.</param>
@@ -170,6 +176,7 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
         // Nothing is bound on a command buffer that has just begun, whatever was bound on the last one.
         LastLayout = default;
         LastBindPoint = default;
+        BoundSets = 0;
         Writer.Discard();
     }
 
@@ -234,6 +241,7 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
         var resolved = ResolveFor(layout);
         var written = 0;
         var toBind = 0;
+        var bound = 0;
 
         Span<DescriptorSet> handles = stackalloc DescriptorSet[DescriptorSets.Count];
         Span<int> indices = stackalloc int[DescriptorSets.Count];
@@ -281,7 +289,13 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
                 toBind++;
                 state.Bound = true;
             }
+
+            // Every set that reaches here holds bindings and is now bound for this layout and bind point,
+            // which is exactly what the draw-time guard needs to compare a pipeline's used sets against.
+            bound |= 1 << set;
         }
+
+        BoundSets = bound;
 
         if (written == 0 && toBind == 0)
         {

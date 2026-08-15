@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using Silk.NET.Vulkan;
+using ValveResourceFormat.Renderer.RHI.Vulkan.Descriptors;
 
 namespace ValveResourceFormat.Renderer.RHI.Vulkan;
 
@@ -67,6 +68,11 @@ public sealed unsafe class VulkanCommandList : ICommandList
     // outlive its deferred destruction.
     private bool IndexBufferBound;
 
+    // One bit per vertex buffer binding filled on the current command buffer, for the same reason and
+    // held the same way. Vertex bindings survive a pipeline change, so this is reset per command buffer
+    // rather than per pipeline.
+    private uint VertexBuffersBound;
+
     private bool Recording;
     private bool InRenderPass;
     private int PassHeight;
@@ -127,6 +133,7 @@ public sealed unsafe class VulkanCommandList : ICommandList
         Pipeline = null;
         PipelineIsGraphics = false;
         IndexBufferBound = false;
+        VertexBuffersBound = 0;
 
         InRenderPass = false;
         PassHeight = 0;
@@ -175,6 +182,7 @@ public sealed unsafe class VulkanCommandList : ICommandList
         Pipeline = null;
         PipelineIsGraphics = false;
         IndexBufferBound = false;
+        VertexBuffersBound = 0;
     }
 
     // ---- render passes ----
@@ -564,6 +572,11 @@ public sealed unsafe class VulkanCommandList : ICommandList
         var offset = (ulong)offsetInBytes;
 
         Api.CmdBindVertexBuffers(Command, (uint)binding, 1, &handle, &offset);
+
+        if (binding < 32)
+        {
+            VertexBuffersBound |= 1u << binding;
+        }
     }
 
     /// <inheritdoc/>
@@ -1224,6 +1237,9 @@ public sealed unsafe class VulkanCommandList : ICommandList
         }
 
         Binder?.Flush(Command, PipelineBindPoint.Graphics, Pipeline.Layout);
+
+        EnsureCompletelyBound();
+        EnsureVertexBuffers();
     }
 
     private void BeginDispatch()
@@ -1237,7 +1253,64 @@ public sealed unsafe class VulkanCommandList : ICommandList
         }
 
         Binder?.Flush(Command, PipelineBindPoint.Compute, Pipeline.Layout);
+
+        EnsureCompletelyBound();
     }
+
+    /// <summary>
+    /// Refuses to record a draw or dispatch whose pipeline uses a descriptor set nothing has bound.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Here rather than at <see cref="BindPipeline(IGraphicsPipeline)"/>, because a per-bind check
+    /// would be wrong and not merely cheaper.</b> The contract's binding calls are immediate-mode and
+    /// legitimately follow the pipeline they belong to &#8212; bind pipeline, bind this material's
+    /// textures, draw &#8212; so a pipeline whose sets are unbound at bind time is the normal case, not a
+    /// fault. Only at the draw is the answer knowable.
+    /// </para>
+    /// <para>
+    /// <b>And it costs nothing to be here.</b> Both masks are precomputed integers: the pipeline's is
+    /// built once at creation from reflection, the binder's is accumulated by the flush that just ran.
+    /// The check is an <c>and</c> against a constant-time value, which is not what a 36-scene suite would
+    /// notice.
+    /// </para>
+    /// <para>
+    /// A list with no binder reports nothing bound, which is the truth: its binding calls refuse, so a
+    /// pipeline that uses any set can never have been satisfied on it.
+    /// </para>
+    /// </remarks>
+    private void EnsureCompletelyBound()
+        => VulkanDescriptorSetUsage.EnsureBound(
+            PipelineName,
+            Pipeline!.UsedDescriptorSets,
+            Binder?.BoundDescriptorSets ?? VulkanDescriptorSetUsage.NoSets);
+
+    /// <summary>
+    /// Refuses to record a draw whose pipeline fetches from a vertex binding nothing filled.
+    /// </summary>
+    /// <remarks>The neighbouring hazard, taken at the same seam because it is the same shape: fetching
+    /// from a binding with no buffer is undefined the way an unbound descriptor set is, and it costs one
+    /// more integer compare to catch. See <see cref="IVulkanPipeline.UsedVertexBindings"/> for why only
+    /// bindings an attribute reads are counted.</remarks>
+    private void EnsureVertexBuffers()
+    {
+        var missing = Pipeline!.UsedVertexBindings & ~VertexBuffersBound;
+
+        if (missing == 0)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(string.Create(CultureInfo.InvariantCulture,
+            $"Pipeline '{PipelineName}' fetches vertex attributes from binding {BitOperations.TrailingZeroCount(missing)}, which no {nameof(BindVertexBuffer)} filled on this command list. Drawing would fetch from a null buffer, which is undefined behaviour that reaches the GPU."));
+    }
+
+    /// <summary>The bound pipeline's debug name, or a placeholder when it carries none.</summary>
+    private string PipelineName => Pipeline switch
+    {
+        IRhiResource named when !string.IsNullOrEmpty(named.Name) => named.Name,
+        _ => "<unnamed>",
+    };
 
     private void EnsureIndexBuffer()
     {

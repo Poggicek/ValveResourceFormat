@@ -2,6 +2,7 @@ using System.Globalization;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using ValveResourceFormat.Renderer.RHI.Vulkan.Core;
+using ValveResourceFormat.Renderer.RHI.Vulkan.Descriptors;
 using ValveResourceFormat.Renderer.Shaders.Spirv;
 
 namespace ValveResourceFormat.Renderer.RHI.Vulkan;
@@ -71,6 +72,14 @@ public sealed unsafe class VulkanGraphicsPipeline : IGraphicsPipeline, IVulkanPi
     /// a command list writes against is the one the shaders actually declare.</remarks>
     public PushConstantRange? PushConstants => Layout.PushConstants;
 
+    /// <inheritdoc/>
+    /// <remarks>Computed once here from the same reflections the layout was built from, so the draw-time
+    /// guard in <see cref="VulkanCommandList"/> compares two integers instead of walking descriptors.</remarks>
+    public int UsedDescriptorSets { get; }
+
+    /// <inheritdoc/>
+    public uint UsedVertexBindings { get; }
+
     /// <summary>Gets the key this pipeline is cached under.</summary>
     public PipelineCacheKey CacheKey { get; }
 
@@ -122,6 +131,9 @@ public sealed unsafe class VulkanGraphicsPipeline : IGraphicsPipeline, IVulkanPi
         Layout = layout;
         CacheKey = cacheKey;
 
+        UsedDescriptorSets = VulkanDescriptorSetUsage.MaskFor(reflections);
+        UsedVertexBindings = FetchedVertexBindings(description.VertexInput);
+
         var problems = new List<string>(layout.Problems);
         problems.AddRange(CheckVertexInterface(description, reflections));
         Problems = problems;
@@ -151,6 +163,36 @@ public sealed unsafe class VulkanGraphicsPipeline : IGraphicsPipeline, IVulkanPi
         }
 
         debugNames.SetName(ObjectType.Pipeline, PipelineHandle.Handle, description.Name);
+    }
+
+    /// <summary>
+    /// The vertex buffer bindings an attribute actually fetches from, as a bit mask.
+    /// </summary>
+    /// <remarks>
+    /// Taken from the attributes rather than from <see cref="VertexInputDesc.Bindings"/>, because a
+    /// binding no attribute reads is described to Vulkan but never fetched, and demanding a buffer for it
+    /// would refuse a draw the device would have run. A pipeline that generates its vertices from
+    /// <c>gl_VertexIndex</c> &#8212; every fullscreen pass &#8212; has no attributes and so requires
+    /// nothing.
+    /// </remarks>
+    private static uint FetchedVertexBindings(in VertexInputDesc input)
+    {
+        var mask = 0u;
+
+        if (input.Attributes is null)
+        {
+            return mask;
+        }
+
+        foreach (var attribute in input.Attributes)
+        {
+            if (attribute.Binding is >= 0 and < 32)
+            {
+                mask |= 1u << attribute.Binding;
+            }
+        }
+
+        return mask;
     }
 
     private void Create(

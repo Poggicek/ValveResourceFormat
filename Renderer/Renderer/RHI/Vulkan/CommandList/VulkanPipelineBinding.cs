@@ -38,6 +38,30 @@ public interface IVulkanPipeline
     /// uses none. Its <see cref="PushConstantRange.Stages"/> is what
     /// <see cref="ICommandList.SetPushConstants{T}"/> names in <c>vkCmdPushConstants</c>.</summary>
     PushConstantRange? PushConstants { get; }
+
+    /// <summary>
+    /// Gets the descriptor sets this pipeline's shaders declare, as one bit per set index.
+    /// </summary>
+    /// <remarks>
+    /// Precomputed by <see cref="Descriptors.VulkanDescriptorSetUsage.MaskFor(IReadOnlyList{Shaders.Spirv.SpirvReflectionResult})"/>
+    /// when the pipeline is built, so recording a draw costs an <c>and</c> rather than a walk over
+    /// reflection. It lives on the pipeline and not on <see cref="VulkanPipelineLayout"/> because layouts
+    /// are shared: every layout declares all <see cref="DescriptorSets.Count"/> sets, so two shaders
+    /// touching different subsets land on one layout object and the layout cannot tell them apart.
+    /// </remarks>
+    int UsedDescriptorSets { get; }
+
+    /// <summary>
+    /// Gets the vertex buffer bindings this pipeline fetches from, as one bit per binding index, or zero
+    /// for a compute pipeline and for a graphics pipeline that generates its vertices.
+    /// </summary>
+    /// <remarks>
+    /// The neighbouring hazard to <see cref="UsedDescriptorSets"/>, checked at the same seam: a draw whose
+    /// pipeline declares a vertex binding nothing filled fetches from a null buffer, which is undefined the
+    /// same way and fails the same way. Bindings at or past 32 are left out; the Vulkan floor for
+    /// <c>maxVertexInputBindings</c> is 16 and nothing here comes close.
+    /// </remarks>
+    uint UsedVertexBindings { get; }
 }
 
 /// <summary>
@@ -104,4 +128,16 @@ public interface IVulkanDescriptorBinder
     /// <param name="bindPoint">The bound pipeline's bind point.</param>
     /// <param name="layout">The bound pipeline's layout.</param>
     void Flush(CommandBuffer commandBuffer, PipelineBindPoint bindPoint, PipelineLayout layout);
+
+    /// <summary>
+    /// Gets the descriptor sets that are bound on the command buffer for the layout and bind point of the
+    /// last <see cref="Flush"/>, as one bit per set index.
+    /// </summary>
+    /// <remarks>
+    /// The other half of the guard <see cref="IVulkanPipeline.UsedDescriptorSets"/> is the first half of.
+    /// Read immediately after a flush, when it is exactly the set of indices <c>vkCmdBindDescriptorSets</c>
+    /// has covered: a flush binds every set it holds bindings for, and a layout or bind point change
+    /// clears the lot before rebinding. Zero on a binder that has just been reset.
+    /// </remarks>
+    int BoundDescriptorSets { get; }
 }
