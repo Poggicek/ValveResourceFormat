@@ -383,6 +383,14 @@ namespace Tests.Renderer.Golden
             stages.Add(Run("shader-link", context.ShaderLoader.LinkLoadedShaders));
 
             GLCallTrap.CurrentStage = "frame";
+
+            // The frame boundary is the presentation layer's, which offscreen is this harness --
+            // Renderer.AcquireCommandList says so, and the windowed control does the same. Without it
+            // the first BeginCommandList of every scene throws "no frame is open" and every scene
+            // reports that instead of whatever would really have stopped it, which hides the causes
+            // this run exists to enumerate.
+            stages.Add(Run("frame-begin", () => DeviceCensus!.BeginFrame()));
+
             stages.Add(Run("frame-update", () =>
             {
                 var target = Require(renderer);
@@ -409,6 +417,8 @@ namespace Tests.Renderer.Golden
             }));
 
             stages.Add(Run("postprocess-render", () => Require(renderer).PostprocessRender(sceneFramebuffer!, captureFramebuffer!)));
+
+            stages.Add(Run("frame-end", () => DeviceCensus!.EndFrame()));
 
             GLCallTrap.CurrentStage = "readback";
             stages.Add(Run("readback", () =>
