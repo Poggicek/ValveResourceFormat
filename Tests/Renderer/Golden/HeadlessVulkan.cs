@@ -1,7 +1,9 @@
 ﻿using System.Collections.Concurrent;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Threading;
 using Microsoft.Extensions.Logging.Abstractions;
 using OpenTK.Graphics.OpenGL;
@@ -493,7 +495,7 @@ namespace Tests.Renderer.Golden
             stages.Add(Run("frame-end", () => DeviceCensus!.EndFrame()));
 
             GLCallTrap.CurrentStage = "readback";
-            stages.Add(Run("readback", () => image = ReadCapture(captureFramebuffer, sceneFramebuffer)));
+            stages.Add(Run("readback", () => image = ReadCapture(captureFramebuffer, sceneFramebuffer, renderer)));
 
             GLCallTrap.CurrentStage = "(none)";
             captured = image;
@@ -571,7 +573,8 @@ namespace Tests.Renderer.Golden
         /// </remarks>
         /// <exception cref="GoldenRenderException">There is no device or no capture target, or the copy
         /// came back empty.</exception>
-        private static SKBitmap ReadCapture(Framebuffer? captureFramebuffer, Framebuffer? sceneFramebuffer)
+        private static SKBitmap ReadCapture(Framebuffer? captureFramebuffer, Framebuffer? sceneFramebuffer,
+            ValveResourceFormat.Renderer.Renderer? renderer)
         {
             var device = Device
                 ?? throw new GoldenRenderException("No Vulkan device was created, so nothing can be read back.");
@@ -611,6 +614,7 @@ namespace Tests.Renderer.Golden
                 // capture zero means the frame ran and the tonemap pass is what failed to write.
                 var scene = ProbeForNonZero(device, sceneFramebuffer?.Color, "the scene colour target");
                 var depth = ProbeSceneDepth(device, sceneFramebuffer);
+                var view = ProbeViewConstants(device, renderer);
 
                 throw new GoldenRenderException(
                     "The readback copy completed and the capture target was entirely zero, so nothing was drawn into it. "
@@ -618,7 +622,8 @@ namespace Tests.Renderer.Golden
                     + "ICommandList.CopyTextureToBuffer, and the device self-test reported at the top of this file proves "
                     + "that path returns the pixels it was given." + Environment.NewLine
                     + "  " + scene + Environment.NewLine
-                    + "  " + depth);
+                    + "  " + depth + Environment.NewLine
+                    + "  " + view);
             }
 
             var bitmap = new SKBitmap(width, height, SKColorType.Bgra8888, SKAlphaType.Opaque);
@@ -675,6 +680,96 @@ namespace Tests.Renderer.Golden
             finally
             {
                 view?.Delete();
+            }
+        }
+
+        /// <summary>
+        /// Reads the view constant block out of device memory and reports the world-to-clip matrix the
+        /// vertex stage was actually handed.
+        /// </summary>
+        /// <param name="device">The device to copy through.</param>
+        /// <param name="renderer">The renderer whose view buffer to read, or <see langword="null"/>.</param>
+        /// <returns>One sentence, suitable for appending to a failure message.</returns>
+        /// <remarks>
+        /// <para>
+        /// The counterpart of <see cref="ProbeForNonZero"/> on the buffer side, and the instrument that
+        /// separates the two ways a frame can record every draw correctly and still rasterise nothing.
+        /// A projection that reached the device as zeroes collapses every vertex to <c>w = 0</c> and clips
+        /// the lot; a projection that is right says the vertex positions are wrong for some other reason,
+        /// and that is worth as much as the positive result. Neither can be told from the image, from the
+        /// validation layer, or from the command transcript, all three of which look identical either way.
+        /// </para>
+        /// <para>
+        /// Through <see cref="ICommandList.CopyBuffer"/> into <see cref="BufferMemory.HostReadback"/>,
+        /// which is the same shape the texture probe uses and needs the uniform buffer to declare
+        /// <see cref="BufferUsage.CopySource"/>; <c>Buffer.RhiUsage</c> says why it does.
+        /// </para>
+        /// <para>Deliberately never throws, for the reason <see cref="ProbeForNonZero"/> gives.</para>
+        /// </remarks>
+        private static string ProbeViewConstants(IDevice device, ValveResourceFormat.Renderer.Renderer? renderer)
+        {
+            if (renderer?.ViewBuffer is not { } viewBuffer)
+            {
+                return "the renderer has no view constant buffer, so it could not be probed.";
+            }
+
+            try
+            {
+                var source = viewBuffer.RhiBuffer;
+                var sizeInBytes = source.SizeInBytes;
+
+                using var readback = device.CreateBuffer(new BufferDesc(sizeInBytes,
+                    BufferUsage.CopyDestination, BufferMemory.HostReadback, "GoldenVulkanBufferProbe"));
+
+                device.BeginFrame();
+
+                var commandList = device.BeginCommandList("GoldenBufferProbe");
+                commandList.CopyBuffer(source, 0, readback, 0, sizeInBytes);
+
+                device.Submit(commandList);
+                device.EndFrame();
+                device.WaitIdle();
+
+                var values = MemoryMarshal.Cast<byte, float>(readback.MappedData[..sizeInBytes]);
+
+                // WorldToProjection is the first member of ViewConstants and the one every vertex shader
+                // multiplies by, so it is the sixteen floats that decide whether anything can be on screen.
+                var rows = new string[4];
+
+                for (var row = 0; row < 4; row++)
+                {
+                    var cells = new string[4];
+
+                    for (var column = 0; column < 4; column++)
+                    {
+                        cells[column] = values[(row * 4) + column].ToString("0.####", CultureInfo.InvariantCulture);
+                    }
+
+                    rows[row] = "[" + string.Join(", ", cells) + "]";
+                }
+
+                var zeroes = 0;
+
+                for (var i = 0; i < 16; i++)
+                {
+                    if (values[i] == 0f)
+                    {
+                        zeroes++;
+                    }
+                }
+
+                var verdict = zeroes == 16
+                    ? "entirely zero, so every vertex collapses to w = 0 and is clipped"
+                    : "not zero, so the vertex stage was given a real projection and the geometry is wrong for another reason";
+
+                return $"ViewConstants.WorldToProjection read back off the device is {verdict}: "
+                    + string.Join(" ", rows);
+            }
+#pragma warning disable CA1031 // A probe on a failure path must not replace the failure it is describing.
+            catch (Exception e)
+#pragma warning restore CA1031
+            {
+                return $"the view constant buffer could not be probed: {e.GetType().Name}: {Condense(e.Message)}";
             }
         }
 

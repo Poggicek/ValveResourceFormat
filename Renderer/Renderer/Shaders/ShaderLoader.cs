@@ -104,6 +104,12 @@ namespace ValveResourceFormat.Renderer.Shaders
         public bool UseSpirvPath => RendererContext.Device?.Backend == RhiBackend.Vulkan;
 
         /// <summary>
+        /// The environment variable naming a directory to write every compiled stage's preprocessed Vulkan
+        /// GLSL and SPIR-V into. Unset writes nothing, which is the normal case.
+        /// </summary>
+        public const string SpirvDumpVariable = "VRF_DUMP_SPIRV";
+
+        /// <summary>
         /// Gets the dialect this loader preprocesses into: Vulkan GLSL whenever the device is Vulkan,
         /// otherwise whatever <see cref="Flavour"/> selects.
         /// </summary>
@@ -583,6 +589,19 @@ namespace ValveResourceFormat.Renderer.Shaders
                         ThrowSpirvError(result, describedFile, shaderName, "Failed to set up shader", parsedData);
                     }
 
+                    // Set VRF_DUMP_SPIRV to a directory to write every stage's fully preprocessed Vulkan
+                    // GLSL and its SPIR-V there. This is the only point in the process where the source the
+                    // compiler actually saw and the words it produced are both in hand -- IShaderModule
+                    // keeps a handle and a hash -- so a question about what a shader was compiled to cannot
+                    // be answered anywhere else. It is what settled "is the vertex stage emitting a real
+                    // gl_Position", which no census, no validation layer and no image could answer.
+                    if (Environment.GetEnvironmentVariable(SpirvDumpVariable) is { Length: > 0 } dumpDirectory)
+                    {
+                        Directory.CreateDirectory(dumpDirectory);
+                        File.WriteAllText(Path.Combine(dumpDirectory, debugName + ".glsl"), headerText + source);
+                        File.WriteAllBytes(Path.Combine(dumpDirectory, debugName + ".spv"), result.Spirv.ToArray());
+                    }
+
                     reflected.Add(SpirvReflection.Reflect(result.Spirv.Span));
                     modules[stage] = CreateModule(device, registry, result.Spirv.Span, rhiStage, debugName);
                 }
@@ -702,6 +721,17 @@ namespace ValveResourceFormat.Renderer.Shaders
 
             header.Append("#extension GL_KHR_shader_subgroup_arithmetic : enable\n");
             header.Append("#extension GL_KHR_shader_subgroup_vote : enable\n");
+
+            // Which backend the source is being compiled for, so that the handful of constructs OpenGL
+            // allows and Vulkan has no equivalent of can be written twice in one file. Always defined, and
+            // to a value rather than by presence, so a source can test it with plain #if and a typo in the
+            // name reads as OpenGL rather than as a compile error on both paths.
+            //
+            // Use it sparingly: two spellings of a shader are two shaders, and the OpenGL run is the oracle
+            // the Vulkan one is measured against, so anything behind this is by definition unverified. The
+            // case it exists for is common/msaa.slang, where the OpenGL construct is not merely different
+            // on Vulkan but has no legal form at all.
+            header.Append(CultureInfo.InvariantCulture, $"#define VRF_VULKAN {(parsedData.Flavour == ShaderFlavour.Vulkan ? 1 : 0)}\n");
 
             foreach (var extension in parsedData.Extensions)
             {

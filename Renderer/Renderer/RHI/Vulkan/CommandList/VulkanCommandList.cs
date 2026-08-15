@@ -738,6 +738,12 @@ public sealed unsafe class VulkanCommandList : ICommandList
         var (offset, size) = Range(vulkan, offsetInBytes, sizeInBytes);
 
         RequireBinder(nameof(BindStorageBuffer)).BindStorageBuffer(binding, vulkan.Handle, offset, size);
+
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(BindStorageBuffer), string.Create(CultureInfo.InvariantCulture,
+                $"binding {binding} '{vulkan.Name}' offset {offset} size {size} of {vulkan.SizeInBytes}"));
+        }
     }
 
     /// <inheritdoc/>
@@ -885,6 +891,17 @@ public sealed unsafe class VulkanCommandList : ICommandList
             (uint)offsetInBytes,
             (uint)size,
             &value);
+
+        // Censused because its absence is invisible everywhere else. Push constants have no descriptor,
+        // no binding and no validation error attached to never being written -- a draw that reads an
+        // unwritten block simply gets whatever the command buffer holds. This block carries the
+        // object-to-world transform, so "no push before the draw" is the difference between geometry and
+        // a blank frame, and the transcript is the only place that difference can be seen.
+        if (VulkanCommandCensus.IsEnabled)
+        {
+            VulkanCommandCensus.Note(nameof(SetPushConstants), string.Create(CultureInfo.InvariantCulture,
+                $"{size} bytes at {offsetInBytes} into '{PipelineName}'"));
+        }
     }
 
     // ---- draws ----

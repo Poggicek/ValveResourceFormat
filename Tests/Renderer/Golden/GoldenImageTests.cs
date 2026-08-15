@@ -188,6 +188,7 @@ namespace Tests.Renderer.Golden
                 Assert.Fail($"Scene '{scene.Name}' did not render on the Vulkan device. "
                     + $"First blocker: {blocker?.Name} ({blocker?.Failure?.GetType().Name}).{Environment.NewLine}"
                     + $"{outcome.Describe()}"
+                    + DescribeCapturedImage(scene, actual)
                     + (ValidationGate.Collected.Count == 0
                         ? string.Empty
                         : $"{Environment.NewLine}  Vulkan validation also reported:{Environment.NewLine}{ValidationGate.Describe()}"));
@@ -218,6 +219,55 @@ namespace Tests.Renderer.Golden
                 + $"  {diff.Describe(scene.Tolerance)}{Environment.NewLine}"
                 + $"  Device: {GoldenBackend.DeviceDescription}{Environment.NewLine}"
                 + $"  Expected, actual and diff PNGs written to: {artifactDirectory}");
+        }
+
+        /// <summary>
+        /// Says what a Vulkan scene put on screen even though some stage of it failed, and writes the
+        /// pixels next to the other failure artifacts.
+        /// </summary>
+        /// <param name="scene">The scene that was attempted.</param>
+        /// <param name="actual">The captured frame, or <see langword="null"/> when there was none.</param>
+        /// <returns>Lines to append to the failure message, or empty when nothing was captured.</returns>
+        /// <remarks>
+        /// A scene can produce an image and still be reported as not rendered: a stage the port has yet to
+        /// reach fails, every later stage runs anyway, and the readback at the end returns real pixels. That
+        /// image was being discarded, which is the wrong thing to throw away -- the whole point of the
+        /// second backend is the diff against the OpenGL baseline, and "how far off is it" is the only
+        /// measure of progress once frames stop coming back blank. Written and measured here, so a run says
+        /// so without anyone having to add instrumentation again.
+        /// </remarks>
+        private static string DescribeCapturedImage(GoldenScene scene, SKBitmap? actual)
+        {
+            if (actual == null)
+            {
+                return string.Empty;
+            }
+
+            var baselinePath = GoldenImageStore.FindBaseline(scene.Name);
+
+            if (baselinePath == null)
+            {
+                var directory = GoldenImageStore.WriteFailureArtifacts(scene.Name, expected: null, actual);
+
+                return $"{Environment.NewLine}  It did capture an image, written to {directory}. There is no "
+                    + "OpenGL baseline to compare it against.";
+            }
+
+            using var expected = GoldenImageStore.LoadBaseline(baselinePath);
+
+            if (expected.Width != actual.Width || expected.Height != actual.Height)
+            {
+                var mismatched = GoldenImageStore.WriteFailureArtifacts(scene.Name, expected: null, actual);
+
+                return $"{Environment.NewLine}  It did capture a {actual.Width}x{actual.Height} image, but the "
+                    + $"baseline is {expected.Width}x{expected.Height}. Written to {mismatched}.";
+            }
+
+            var diff = ImageDiff.Compare(expected, actual, scene.Tolerance);
+            var artifacts = GoldenImageStore.WriteFailureArtifacts(scene.Name, expected, actual);
+
+            return $"{Environment.NewLine}  It did capture an image: {diff.Describe(scene.Tolerance)}"
+                + $"{Environment.NewLine}  Expected, actual and diff PNGs written to: {artifacts}";
         }
 
         /// <summary>

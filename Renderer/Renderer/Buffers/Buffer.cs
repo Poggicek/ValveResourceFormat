@@ -167,12 +167,21 @@ namespace ValveResourceFormat.Renderer.Buffers
         }
 
         /// <summary>Gets every use this buffer is put to, as the RHI models them.</summary>
-        /// <remarks>OpenGL decides what a buffer is from the target it is bound to, so this is derived
+        /// <remarks>
+        /// <para>OpenGL decides what a buffer is from the target it is bound to, so this is derived
         /// from <see cref="Target"/>. Vulkan needs it stated at creation, which is what
-        /// <see cref="BufferDesc.Usage"/> is for.</remarks>
+        /// <see cref="BufferDesc.Usage"/> is for.</para>
+        /// <para>A uniform buffer declares <see cref="BufferUsage.CopySource"/> as well, which nothing in
+        /// the renderer uses and which the diagnostics do: a uniform block is device local, so the only
+        /// way to see what a draw actually multiplied by is to copy it into host memory and look. Without
+        /// the flag that copy is invalid, and a frame whose view constants never reached the device is
+        /// indistinguishable from one whose geometry is elsewhere &#8212; both read back as a blank image.
+        /// The bit costs nothing: it is a Vulkan creation flag with no OpenGL counterpart and no effect on
+        /// how the buffer is bound or written.</para>
+        /// </remarks>
         protected virtual BufferUsage RhiUsage => Target switch
         {
-            BufferTarget.UniformBuffer => BufferUsage.Uniform | BufferUsage.CopyDestination,
+            BufferTarget.UniformBuffer => BufferUsage.Uniform | BufferUsage.CopySource | BufferUsage.CopyDestination,
             BufferTarget.ShaderStorageBuffer => BufferUsage.Storage | BufferUsage.CopySource | BufferUsage.CopyDestination,
             BufferTarget.ArrayBuffer => BufferUsage.Vertex | BufferUsage.CopyDestination,
             BufferTarget.ElementArrayBuffer => BufferUsage.Index | BufferUsage.CopyDestination,

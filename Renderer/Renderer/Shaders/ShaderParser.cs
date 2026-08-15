@@ -832,9 +832,15 @@ namespace ValveResourceFormat.Renderer.Shaders
         [GeneratedRegex(@"^layout\s*\(\s*(?<Qualifiers>[^)]*)\)\s*uniform\s+(?<Rest>[^;]*\b[iu]?image[0-9A-Za-z]*\s+[A-Za-z_][A-Za-z0-9_]*\s*;)", RegexOptions.Multiline)]
         private static partial Regex RegexImageDeclaration();
 
-        // uniform sampler2D g_tFoo; and the macro typed sampler of texture_decode. A sampler may place itself with
-        // a layout qualifier on either side of the uniform keyword, and several of the compute shaders do.
-        [GeneratedRegex(@"^(?:layout\s*\(\s*(?<Qualifiers>[^)]*)\)\s*)?uniform\s+(?:layout\s*\(\s*(?<InnerQualifiers>[^)]*)\)\s*)?(?<Type>[iu]?sampler[0-9A-Za-z]*|TEXTURE_TYPE)\s+(?<Name>[A-Za-z_][A-Za-z0-9_]*)\s*;", RegexOptions.Multiline)]
+        // uniform sampler2D g_tFoo; and the macro typed samplers of texture_decode and common/msaa.slang. A
+        // sampler may place itself with a layout qualifier on either side of the uniform keyword, and several
+        // of the compute shaders do.
+        //
+        // The macro spellings have to be listed here because decoration is textual and runs before the
+        // preprocessor: a declaration this regex does not recognise keeps whatever set it was written with,
+        // which for a sampler means set 0 and a pipeline that refuses to be created. That is the failure a
+        // macro-typed sampler produces, and it says nothing about macros, so the names are named.
+        [GeneratedRegex(@"^(?:layout\s*\(\s*(?<Qualifiers>[^)]*)\)\s*)?uniform\s+(?:layout\s*\(\s*(?<InnerQualifiers>[^)]*)\)\s*)?(?<Type>[iu]?sampler[0-9A-Za-z]*|TEXTURE_TYPE|VrfMsaaSampler)\s+(?<Name>[A-Za-z_][A-Za-z0-9_]*)\s*;", RegexOptions.Multiline)]
         private static partial Regex RegexSamplerDeclaration();
 
         // Picks the binding out of a layout qualifier list, leaving whatever else it carries

@@ -755,8 +755,9 @@ public static unsafe class VulkanPipelineSmokeTest
         api.CmdBeginRendering(command, &rendering);
 
         // The negative height the contract fixes the Y-flip as. It is what makes VulkanPipelineOptions
-        // default FrontFace to Clockwise, so setting it here is part of testing that pairing rather than
-        // an incidental detail.
+        // default FrontFace to CounterClockwise, so setting it here is part of testing that pairing
+        // rather than an incidental detail. This test does not check pixels, so it cannot catch the
+        // pairing being wrong -- that took a golden scene rendering entirely empty.
         var viewport = new Viewport
         {
             X = 0,

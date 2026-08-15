@@ -58,15 +58,30 @@ public sealed record VulkanPipelineOptions
 
     /// <summary>Gets which triangle winding is front facing.</summary>
     /// <remarks>
-    /// <see cref="FrontFace.Clockwise"/>, not counter-clockwise, and the difference is not cosmetic.
-    /// The renderer never calls <c>glFrontFace</c>, so OpenGL classifies with its counter-clockwise
-    /// default; the contract fixes the Y-flip as a negative-height viewport, which reverses the sign of
-    /// the area Vulkan classifies by, so the equivalent setting here is the opposite one. Change this
-    /// only alongside the viewport the command list sets, and change both together: a mismatch culls
-    /// exactly the wrong half of every mesh and looks like inside-out geometry rather than like a
-    /// pipeline bug.
+    /// <para>
+    /// <see cref="FrontFace.CounterClockwise"/>, the same winding OpenGL calls front, because the
+    /// negative-height viewport has already put framebuffer space the way round OpenGL's window space
+    /// is. Two inversions compose here and only counting both gives the right answer:
+    /// </para>
+    /// <list type="number">
+    /// <item><description>Vulkan's framebuffer Y points down where OpenGL's window Y points up, so with a
+    /// positive-height viewport the signed area of a triangle has the opposite sign in the two APIs and
+    /// OpenGL's counter-clockwise front would indeed be <see cref="FrontFace.Clockwise"/>
+    /// here.</description></item>
+    /// <item><description>The contract does not use a positive-height viewport. <c>FlipViewport</c>
+    /// submits a negative height, which inverts that axis a second time, and the sign of the area goes
+    /// back to matching OpenGL's.</description></item>
+    /// </list>
+    /// <para>
+    /// Change this only alongside the viewport the command list sets, and change both together. Getting
+    /// it backwards does not error and does not look like a pipeline bug: it culls exactly the triangles
+    /// that should have been drawn. On a closed mesh that means <b>every</b> triangle, so a whole scene
+    /// renders as an empty frame with no validation message, no exception and a depth buffer still
+    /// holding its clear value &#8212; which is how this stood for a full wave, diagnosed as everything
+    /// from a zeroed projection to a missing upload before culling was measured directly.
+    /// </para>
     /// </remarks>
-    public FrontFace FrontFace { get; init; } = FrontFace.Clockwise;
+    public FrontFace FrontFace { get; init; } = FrontFace.CounterClockwise;
 }
 
 /// <summary>

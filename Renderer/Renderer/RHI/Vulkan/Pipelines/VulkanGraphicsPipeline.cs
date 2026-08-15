@@ -103,7 +103,7 @@ public sealed unsafe class VulkanGraphicsPipeline : IGraphicsPipeline, IVulkanPi
     /// <param name="allowNonSolidFill">Whether the device enabled <c>fillModeNonSolid</c>.</param>
     /// <param name="frontFace">Which winding is front facing. See
     /// <see cref="VulkanRenderStateTranslation"/> before changing it from
-    /// <see cref="FrontFace.Clockwise"/>.</param>
+    /// <see cref="FrontFace.CounterClockwise"/>.</param>
     /// <exception cref="ArgumentNullException">A required argument is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException">The description names a shader module this backend did not create.</exception>
     /// <exception cref="VulkanException">The driver rejected the pipeline.</exception>
@@ -117,7 +117,7 @@ public sealed unsafe class VulkanGraphicsPipeline : IGraphicsPipeline, IVulkanPi
         in PipelineCacheKey cacheKey,
         IReadOnlyList<SpirvReflectionResult> reflections,
         bool allowNonSolidFill,
-        FrontFace frontFace = FrontFace.Clockwise)
+        FrontFace frontFace = FrontFace.CounterClockwise)
     {
         ArgumentNullException.ThrowIfNull(api);
         ArgumentNullException.ThrowIfNull(debugNames);

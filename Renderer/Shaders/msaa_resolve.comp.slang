@@ -9,16 +9,18 @@ layout (local_size_x = 8, local_size_y = 8) in;
 
 #define D_MSAA_SAMPLES 1
 
+#include "common/msaa.slang"
+
 uniform bool g_bFlipY = false;
 
-layout(binding = 0) uniform sampler2DMS g_tSourceMsaa;
+layout(binding = 0) uniform VrfMsaaSampler g_tSourceMsaa;
 layout(binding = 1, rgba16f) uniform writeonly image2D g_tDest;
 
 #if D_DOF == 1
 uniform mat4 g_invViewProjMatrix;
 uniform vec4 g_vLensPlane;
 uniform vec4 g_vNearFarScaleBias;
-uniform sampler2DMS g_tSceneDepthMsaa; // bound above the reserved slots, this is a per draw input
+uniform VrfMsaaSampler g_tSceneDepthMsaa; // bound above the reserved slots, this is a per draw input
 #endif
 
 void main()
@@ -30,7 +32,7 @@ void main()
         return;
 
     ivec2 sampleCoord = coord;
-    sampleCoord.y = g_bFlipY ? textureSize(g_tSourceMsaa).y - sampleCoord.y - 1 : sampleCoord.y;
+    sampleCoord.y = g_bFlipY ? VrfMsaaSize(g_tSourceMsaa).y - sampleCoord.y - 1 : sampleCoord.y;
 
     float invNumSamples = 1.0 / float(D_MSAA_SAMPLES);
     vec3 resolved = vec3(0.0);
@@ -46,7 +48,7 @@ void main()
 
     for (int i = 0; i < D_MSAA_SAMPLES; i++)
     {
-        vec4 texel = texelFetch(g_tSourceMsaa, sampleCoord, i);
+        vec4 texel = VrfMsaaFetch(g_tSourceMsaa, sampleCoord, i);
         // Flush NaN/+Inf to 0; clamp(NaN/+Inf, ...) otherwise returns 65504 (white) on NVIDIA and blows up bloom.
         // The range test catches both and survives the fast-math no-NaN folding that would defeat isnan().
         bvec3 valid = lessThanEqual(texel.rgb, vec3(65504.0));
@@ -55,7 +57,7 @@ void main()
         resolved += s * (invNumSamples / (max(s.r, max(s.g, s.b)) + 1.0));
 
 #if D_DOF == 1
-        lowestDepth = min(texelFetch(g_tSceneDepthMsaa, sampleCoord, i).x, lowestDepth);
+        lowestDepth = min(VrfMsaaFetch(g_tSceneDepthMsaa, sampleCoord, i).x, lowestDepth);
 #else
         outputAlpha += texel.a * invNumSamples;
 #endif

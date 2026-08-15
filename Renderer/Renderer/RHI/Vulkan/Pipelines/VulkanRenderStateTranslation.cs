@@ -16,14 +16,16 @@ namespace ValveResourceFormat.Renderer.RHI.Vulkan;
 /// from. Every field of <see cref="RenderState"/> that differs between two draws is a second pipeline.
 /// </para>
 /// <para>
-/// <b>Winding is inverted relative to OpenGL, deliberately.</b> The contract fixes the Y-flip as a
-/// negative-height viewport. That flips one axis of framebuffer space, which reverses the sign of the
-/// signed area Vulkan classifies facing by, so the OpenGL default of counter-clockwise-front becomes
-/// <see cref="FrontFace.Clockwise"/> here. Getting this backwards does not error: it culls exactly the
-/// triangles that should have been drawn and draws the ones that should have been culled, which reads
-/// as inside-out geometry rather than as a bug in the pipeline layer. See
-/// <see cref="VulkanPipelineOptions.FrontFace"/> if the presentation layer ever chooses a positive
-/// height instead.
+/// <b>Winding matches OpenGL, because two inversions compose.</b> Vulkan's framebuffer Y points down
+/// where OpenGL's window Y points up, which alone would make the OpenGL default of
+/// counter-clockwise-front into <see cref="FrontFace.Clockwise"/> here. But the contract fixes the
+/// Y-flip as a negative-height viewport, which inverts that axis a second time and puts the sign of the
+/// area back where OpenGL has it, so the setting is <see cref="FrontFace.CounterClockwise"/>. Counting
+/// only the first inversion is a mistake this file made and it is not a cosmetic one: the wrong winding
+/// culls exactly the triangles that should have been drawn, which on a closed mesh is all of them, and
+/// the result is an empty frame with no validation message and a depth buffer still at its clear value.
+/// See <see cref="VulkanPipelineOptions.FrontFace"/> if the presentation layer ever chooses a positive
+/// height instead, in which case this flips back.
 /// </para>
 /// </remarks>
 public static class VulkanRenderStateTranslation
@@ -138,12 +140,12 @@ public static class VulkanRenderStateTranslation
     /// <param name="allowNonSolidFill">Whether the device enabled <c>fillModeNonSolid</c>. Wireframe is
     /// silently downgraded to solid when it did not, rather than failing pipeline creation.</param>
     /// <param name="frontFace">Which winding is front facing. See the class remarks before changing it
-    /// from <see cref="FrontFace.Clockwise"/>.</param>
+    /// from <see cref="FrontFace.CounterClockwise"/>.</param>
     /// <returns>The state.</returns>
     public static PipelineRasterizationStateCreateInfo ToRasterizationState(
         in RasterizerStateDesc rasterizer,
         bool allowNonSolidFill,
-        FrontFace frontFace = FrontFace.Clockwise)
+        FrontFace frontFace = FrontFace.CounterClockwise)
     {
         // GL's PolygonOffsetClamp(factor, units, clamp) is (slope scaled, constant, clamp), which is the
         // same triple Vulkan takes; only the field names differ.

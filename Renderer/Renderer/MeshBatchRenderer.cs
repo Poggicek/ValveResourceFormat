@@ -160,6 +160,21 @@ namespace ValveResourceFormat.Renderer
             public RhiFormat[] ColorFormats;
             public RhiFormat DepthFormat;
             public int SampleCount;
+
+            /// <summary>
+            /// :DrawPushConstantParity - the per-draw block, carried across the batch so that
+            /// <see cref="ICommandList.SetPushConstants{T}"/> replaces the loose
+            /// <c>glProgramUniform</c> writes rather than being a second copy of them.
+            /// </summary>
+            /// <remarks>
+            /// One block for the whole batch, refilled per draw. The OpenGL backend diffs it field by field
+            /// against what the program already holds, so a field that did not change between two draws
+            /// still costs no call and the recorded path issues the same GL calls the direct path does. The
+            /// Vulkan backend pushes all 92 bytes, which is why <c>Draw</c> writes every field on every
+            /// draw: a field left alone would carry the previous draw's value on that backend while
+            /// costing nothing on this one, and the oracle could never see the difference.
+            /// </remarks>
+            public DrawPushConstants PushConstants;
         }
 
         /// <summary>
@@ -561,12 +576,25 @@ namespace ValveResourceFormat.Renderer
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static void Draw(Shader shader, ref Uniforms uniforms, ref Config config, BatchRequest request)
         {
+            // The per-draw block, filled here in full and pushed once just before the draw. Every field is
+            // written on every draw rather than only where its OpenGL twin is: a loose uniform a draw does
+            // not touch keeps the value the program object already holds, whereas the block is a single
+            // range that is pushed whole, so a field left unwritten would carry the previous draw's value
+            // into this one. See :DrawPushConstantParity.
+            ref var constants = ref config.PushConstants;
+
+            constants.MeshId = (uint)request.Mesh.MeshIndex;
+            constants.ShaderId = request.Call.Material.Shader.NameHash;
+            constants.ShaderProgramId = (uint)request.Call.Material.Shader.Program;
+
             if (uniforms.MeshId != -1)
             {
                 GL.ProgramUniform1((uint)shader.Program, uniforms.MeshId, (uint)request.Mesh.MeshIndex);
                 GL.ProgramUniform1((uint)shader.Program, uniforms.ShaderId, request.Call.Material.Shader.NameHash);
                 GL.ProgramUniform1((uint)shader.Program, uniforms.ShaderProgramId, (uint)request.Call.Material.Shader.Program);
             }
+
+            constants.SetAnimationData(false);
 
             if (uniforms.AnimationData != -1)
             {
@@ -602,8 +630,30 @@ namespace ValveResourceFormat.Renderer
                     }
                 }
 
+                constants.SetAnimationData(bAnimated, (int)boneStart, (int)numBones);
+
                 GL.ProgramUniform3((uint)shader.Program, uniforms.AnimationData, bAnimated ? 1u : 0u, boneStart, numBones);
             }
+
+            // Ahead of the indirect branch, which returns without reaching the writes further down. An
+            // indirect aggregate draws instanced and reads its transform and tint out of the object buffer
+            // instead, but the block is pushed whole either way, so these have to hold this draw's values
+            // rather than the last non-indirect draw's.
+            var morphComposite = request.Mesh.FlexStateManager?.MorphComposite;
+
+            constants.MorphVertexIdOffset = morphComposite != null ? request.Call.VertexIdOffset : -1;
+            constants.MorphCompositeTextureSize = morphComposite != null
+                ? new Vector2(morphComposite.CompositeTexture.Width, morphComposite.CompositeTexture.Height)
+                : Vector2.Zero;
+
+            constants.SetTransform(request.Node.Transform);
+
+            // Content can author out-of-range tints (e.g. renderamt above 255 baked into the draw call
+            // alpha); the packed byte color can only represent [0, 1].
+            var fragmentTint = (request.Node is SceneAggregate.Fragment tinted) ? tinted.Tint : Vector4.One;
+
+            constants.Tint = Color32.FromVector4Clamped(
+                request.Mesh.Tint * request.Call.TintColor * fragmentTint).PackedValue;
 
             if (config.IndirectDraw)
             {
@@ -614,6 +664,9 @@ namespace ValveResourceFormat.Renderer
                     {
                         GL.ProgramUniform1((uint)shader.Program, uniforms.IsInstancing, 1);
                     }
+
+                    constants.IsInstancing = 1;
+                    config.CommandList?.SetPushConstants(in constants);
 
                     PerfStats.Active.CountIndirectDraw(agg.IndirectDrawCount);
 
@@ -675,7 +728,6 @@ namespace ValveResourceFormat.Renderer
 
             if (uniforms.MorphVertexIdOffset != -1)
             {
-                var morphComposite = request.Mesh.FlexStateManager?.MorphComposite;
                 if (morphComposite != null)
                 {
                     BindReservedTexture(config.CommandList, ReservedTextureSlots.MorphCompositeTexture, morphComposite.CompositeTexture);
@@ -689,17 +741,17 @@ namespace ValveResourceFormat.Renderer
             {
                 var transform = request.Node.Transform.To3x4();
                 GL.ProgramUniformMatrix3x4(shader.Program, uniforms.Transform, false, ref transform);
+
+                // The two spellings of the same 3x4, and the block has to agree with the loose uniform for
+                // the recorded OpenGL path to issue identical calls. GLEnvironment.To3x4 and
+                // DrawPushConstants.SetTransform drop the same column in the same order; this is where that
+                // stops being a coincidence.
+                Debug.Assert(constants.TransformRow0 == new Vector4(transform.Row0.X, transform.Row0.Y, transform.Row0.Z, transform.Row0.W));
             }
 
             if (uniforms.Tint > -1)
             {
-                var instanceTint = (request.Node is SceneAggregate.Fragment fragment) ? fragment.Tint : Vector4.One;
-
-                // Content can author out-of-range tints (e.g. renderamt above 255 baked into the draw call
-                // alpha); the packed byte color can only represent [0, 1].
-                var tint = Color32.FromVector4Clamped(request.Mesh.Tint * request.Call.TintColor * instanceTint);
-
-                GL.ProgramUniform1((uint)shader.Program, uniforms.Tint, tint.PackedValue);
+                GL.ProgramUniform1((uint)shader.Program, uniforms.Tint, constants.Tint);
             }
 
             var instanceCount = 1;
@@ -708,6 +760,8 @@ namespace ValveResourceFormat.Renderer
             {
                 instanceCount = aggregate.InstanceTransforms.Count;
             }
+
+            constants.IsInstancing = instanceCount > 1 ? 1 : 0;
 
             if (uniforms.IsInstancing > -1)
             {
@@ -718,6 +772,15 @@ namespace ValveResourceFormat.Renderer
 
             if (config.CommandList != null)
             {
+                // Last, so the block a draw executes with is the one filled for it. Without this the
+                // object-to-world transform never reaches a Vulkan draw at all -- push constants start
+                // undefined, the shaders read a zero mat3x4 out of the block, every vertex collapses onto
+                // the world origin, and a frame that records the right draws in the right passes rasterises
+                // nothing. That failure has no error attached to it: validation is silent, the pass still
+                // clears, and the depth buffer stays at the value it was cleared to. See
+                // :DrawPushConstantParity.
+                config.CommandList.SetPushConstants(in constants);
+
                 // StartIndex is a byte offset because that is the pointer glDrawElements takes, while
                 // firstIndex is an element count. DescribeIndexedDraw converts it, and returns the index
                 // type with it so the two cannot be applied by halves.
