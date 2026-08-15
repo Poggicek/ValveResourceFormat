@@ -252,7 +252,9 @@ namespace Tests.Renderer.Golden
         /// Lights the scene the way the viewers do when the asset carries no lighting of its own: the
         /// renderer's own embedded sky cubemap as the image based light, plus the default sun.
         /// </summary>
-        private static void LoadDefaultLighting(Scene scene)
+        /// <remarks>Shared with <see cref="HeadlessVulkan"/>, so the two backends light a scene from the
+        /// same call rather than from two copies that could drift apart.</remarks>
+        internal static void LoadDefaultLighting(Scene scene)
         {
             const string resourceName = "Renderer.Resources.sky_furnace.vtex_c";
 
