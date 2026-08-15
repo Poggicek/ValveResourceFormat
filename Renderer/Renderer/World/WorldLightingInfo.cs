@@ -4,6 +4,8 @@ using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Renderer.Buffers;
+using ValveResourceFormat.Renderer.RHI;
+using ValveResourceFormat.Renderer.RHI.OpenGL;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 
 namespace ValveResourceFormat.Renderer.World
@@ -37,7 +39,7 @@ namespace ValveResourceFormat.Renderer.World
     /// <summary>
     /// Scene lighting data including lightmaps, reflection probes, and shadow maps.
     /// </summary>
-    public class WorldLightingInfo(Scene scene)
+    public class WorldLightingInfo(Scene scene) : IDisposable
     {
         /// <summary>Gets the lightmap textures indexed by uniform name.</summary>
         public Dictionary<string, RenderTexture> Lightmaps { get; } = [];
@@ -110,11 +112,12 @@ namespace ValveResourceFormat.Renderer.World
         private StorageBuffer? BarnLightStorageBuffer;
         private RenderTexture? BarnLightCookieAtlas { get; set; }
         private RenderTexture? DefaultCookieAtlas;
-        private int CookieSamplerClampBorder;
-        private int CookieSamplerWrap;
+        private GLSampler? CookieSamplerClampBorder;
+        private GLSampler? CookieSamplerWrap;
 
         /// <summary>Binds the scene's lightmap, light probe atlas, and barn light cookie textures to their reserved units.</summary>
-        public void BindLightmapTextures()
+        /// <param name="commandList">The command list to record into, or <see langword="null"/> to bind through OpenGL directly.</param>
+        public void BindLightmapTextures(ICommandList? commandList)
         {
             foreach (var (name, texture) in Lightmaps)
             {
@@ -124,54 +127,53 @@ namespace ValveResourceFormat.Renderer.World
                     continue;
                 }
 
-                GL.BindTextureUnit((int)lightmapSlot, texture.Handle);
+                BindReservedTexture(commandList, lightmapSlot, texture);
             }
 
             if (LightProbeType == LightProbeType.ProbeAtlas && LightProbes.Count > 0)
             {
-                BindProbeTexture("g_tLPV_Irradiance", LightProbes[0].Irradiance);
-                BindProbeTexture("g_tLPV_Shadows", LightProbes[0].DirectLightShadows);
+                BindProbeTexture(commandList, "g_tLPV_Irradiance", LightProbes[0].Irradiance);
+                BindProbeTexture(commandList, "g_tLPV_Shadows", LightProbes[0].DirectLightShadows);
             }
 
             // Always bind something, even when the scene has no cookies: the cookie samplers are 2D arrays,
             // and leaving their reserved units empty makes shaders sample an incomplete texture.
             var cookieAtlas = BarnLightCookieAtlas ?? (DefaultCookieAtlas ??= CreateDefaultCookieAtlas());
 
-            if (CookieSamplerClampBorder == 0)
+            if (CookieSamplerClampBorder == null)
             {
                 CreateCookieSamplers();
             }
 
-            GL.BindTextureUnit((int)ReservedTextureSlots.LightCookieTexture, cookieAtlas.Handle);
-            GL.BindSampler((int)ReservedTextureSlots.LightCookieTexture, CookieSamplerClampBorder);
-
-            GL.BindTextureUnit((int)ReservedTextureSlots.LightCookieTextureWrap, cookieAtlas.Handle);
-            GL.BindSampler((int)ReservedTextureSlots.LightCookieTextureWrap, CookieSamplerWrap);
+            BindCookieAtlas(commandList, ReservedTextureSlots.LightCookieTexture, cookieAtlas, CookieSamplerClampBorder!);
+            BindCookieAtlas(commandList, ReservedTextureSlots.LightCookieTextureWrap, cookieAtlas, CookieSamplerWrap!);
         }
 
         /// <summary>Binds the per-draw light probe volume textures. Individual-probe scenes only.</summary>
-        public void BindInstanceLightProbeTextures(SceneLightProbe lightProbe)
+        /// <param name="commandList">The command list to record into, or <see langword="null"/> to bind through OpenGL directly.</param>
+        /// <param name="lightProbe">The probe volume the node being drawn is bound to.</param>
+        public void BindInstanceLightProbeTextures(ICommandList? commandList, SceneLightProbe lightProbe)
         {
             if (LightProbeType != LightProbeType.IndividualProbes)
             {
                 return;
             }
 
-            BindProbeTexture("g_tLPV_Irradiance", lightProbe.Irradiance);
+            BindProbeTexture(commandList, "g_tLPV_Irradiance", lightProbe.Irradiance);
 
             if (LightmapGameVersionNumber == 1)
             {
-                BindProbeTexture("g_tLPV_Indices", lightProbe.DirectLightIndices);
-                BindProbeTexture("g_tLPV_Scalars", lightProbe.DirectLightScalars);
+                BindProbeTexture(commandList, "g_tLPV_Indices", lightProbe.DirectLightIndices);
+                BindProbeTexture(commandList, "g_tLPV_Scalars", lightProbe.DirectLightScalars);
             }
             else if (LightmapGameVersionNumber >= 2)
             {
-                BindProbeTexture("g_tLPV_Shadows", lightProbe.DirectLightShadows);
+                BindProbeTexture(commandList, "g_tLPV_Shadows", lightProbe.DirectLightShadows);
             }
         }
 
         /// <summary>Binds a light probe volume texture to the unit its sampler reads.</summary>
-        private static void BindProbeTexture(string samplerName, RenderTexture? texture)
+        private static void BindProbeTexture(ICommandList? commandList, string samplerName, RenderTexture? texture)
         {
             if (texture == null)
             {
@@ -179,7 +181,49 @@ namespace ValveResourceFormat.Renderer.World
             }
 
             var slot = MaterialLoader.ReservedTextureSlotByName[samplerName];
+            BindReservedTexture(commandList, slot, texture);
+        }
+
+        /// <summary>
+        /// Binds a scene-wide texture to its reserved slot, recording when there is a command list.
+        /// </summary>
+        /// <remarks>
+        /// Deliberately not routed through <see cref="Shader.BindTexture"/>: these units are bound once for
+        /// a whole pass rather than for one program, so there is no shader to ask for a binding and no
+        /// sampler uniform to aim. A reserved sampler's unit is settled for every program at link time by
+        /// <see cref="GLSamplerBindings.PointReservedSamplersAtUnits"/>, which is what makes a
+        /// shaderless bind correct here and would make asking a single shader wrong &#8212; a program that
+        /// does not declare the sampler would silently skip a texture the next program does read.
+        /// </remarks>
+        private static void BindReservedTexture(ICommandList? commandList, ReservedTextureSlots slot, RenderTexture texture)
+        {
+            if (commandList != null)
+            {
+                commandList.BindTexture(DescriptorSets.ReservedTextures, (int)slot, texture.RhiTexture);
+                return;
+            }
+
             GL.BindTextureUnit((int)slot, texture.Handle);
+        }
+
+        /// <summary>
+        /// Binds the cookie atlas to one of its two reserved units, under the wrap mode that unit samples with.
+        /// </summary>
+        /// <remarks>
+        /// The one reserved bind that carries a sampler of its own. The atlas is a single texture read
+        /// through two units that differ only in wrapping, which is exactly what a sampler object is for
+        /// and why the sampler cannot be left as the texture's own state.
+        /// </remarks>
+        private static void BindCookieAtlas(ICommandList? commandList, ReservedTextureSlots slot, RenderTexture atlas, GLSampler sampler)
+        {
+            if (commandList != null)
+            {
+                commandList.BindTexture(DescriptorSets.ReservedTextures, (int)slot, atlas.RhiTexture, sampler);
+                return;
+            }
+
+            GL.BindTextureUnit((int)slot, atlas.Handle);
+            GL.BindSampler((int)slot, sampler.Handle);
         }
 
         /// <summary>
@@ -592,7 +636,7 @@ namespace ValveResourceFormat.Renderer.World
         /// </summary>
         private static RenderTexture CreateDefaultCookieAtlas()
         {
-            var atlas = new RenderTexture(TextureTarget.Texture2DArray, 1, 1, 1, 1);
+            var atlas = new RenderTexture(TextureTarget.Texture2DArray, 1, 1, 1, 1) { RhiFormat = RhiFormat.R8G8B8A8_SRgb };
             GL.TextureStorage3D(atlas.Handle, 1, SizedInternalFormat.Srgb8Alpha8, 1, 1, 1);
             GL.TextureSubImage3D(atlas.Handle, 0, 0, 0, 0, 1, 1, 1, PixelFormat.Rgba, PixelType.UnsignedByte, new byte[] { 255, 255, 255, 255 });
 
@@ -603,6 +647,13 @@ namespace ValveResourceFormat.Renderer.World
             return atlas;
         }
 
+        /// <remarks>
+        /// Stays on OpenGL, unlike the binds that consume the atlas. Each cookie is blitted into an
+        /// individual array layer, and <see cref="ICommandList.BlitTexture"/> cannot express that: its
+        /// transfer framebuffer always attaches layer 0, so every cookie would land on the same slice.
+        /// Closing it needs either a layer parameter on the contract or a draw-based atlas fill, and the
+        /// contract is frozen.
+        /// </remarks>
         private static RenderTexture BuildCookieAtlas(List<RenderTexture> textures)
         {
             var atlasSize = 512;
@@ -613,7 +664,7 @@ namespace ValveResourceFormat.Renderer.World
 
             var numLayers = textures.Count + 1;
 
-            var atlas = new RenderTexture(TextureTarget.Texture2DArray, atlasSize, atlasSize, numLayers, 1);
+            var atlas = new RenderTexture(TextureTarget.Texture2DArray, atlasSize, atlasSize, numLayers, 1) { RhiFormat = RhiFormat.R8G8B8A8_SRgb };
             GL.TextureStorage3D(atlas.Handle, 1, SizedInternalFormat.Srgb8Alpha8, atlasSize, atlasSize, numLayers);
 
             GL.CreateFramebuffers(1, out int readFbo);
@@ -642,17 +693,36 @@ namespace ValveResourceFormat.Renderer.World
             return atlas;
         }
 
+        /// <summary>
+        /// Creates the two samplers the cookie atlas is read through, as RHI objects.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Built as <see cref="GLSampler"/> rather than through <see cref="IDevice.CreateSampler"/> for the
+        /// same reason <see cref="MaterialLoader"/>'s samplers are: one object then serves both paths, the
+        /// recorded bind taking the <see cref="ISampler"/> and the OpenGL bind taking its
+        /// <see cref="GLSampler.Handle"/>, so the two cannot describe different filtering. Creating them
+        /// through a device would need a device this type has no route to, and would leave the OpenGL path
+        /// reaching into the object for its handle anyway.
+        /// </para>
+        /// <para>
+        /// <see cref="MipFilterMode.None"/> reproduces the plain <c>GL_LINEAR</c> minification these
+        /// samplers were created with; the defaults supply the linear magnification and repeating W that
+        /// the hand-written versions left at OpenGL's own defaults.
+        /// </para>
+        /// </remarks>
         private void CreateCookieSamplers()
         {
-            GL.CreateSamplers(1, out CookieSamplerClampBorder);
-            GL.SamplerParameter(CookieSamplerClampBorder, SamplerParameterName.TextureWrapS, (int)TextureWrapMode.ClampToBorder);
-            GL.SamplerParameter(CookieSamplerClampBorder, SamplerParameterName.TextureWrapT, (int)TextureWrapMode.ClampToBorder);
-            GL.SamplerParameter(CookieSamplerClampBorder, SamplerParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+            CookieSamplerClampBorder = new GLSampler(
+                new SamplerDesc(
+                    MipFilter: MipFilterMode.None,
+                    AddressU: AddressMode.ClampToBorder,
+                    AddressV: AddressMode.ClampToBorder),
+                "LightCookieSamplerClampBorder");
 
-            GL.CreateSamplers(1, out CookieSamplerWrap);
-            GL.SamplerParameter(CookieSamplerWrap, SamplerParameterName.TextureWrapS, (int)TextureWrapMode.Repeat);
-            GL.SamplerParameter(CookieSamplerWrap, SamplerParameterName.TextureWrapT, (int)TextureWrapMode.Repeat);
-            GL.SamplerParameter(CookieSamplerWrap, SamplerParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+            CookieSamplerWrap = new GLSampler(
+                new SamplerDesc(MipFilter: MipFilterMode.None),
+                "LightCookieSamplerWrap");
         }
 
         /// <summary>Allocates the GPU storage buffer used to pass barn light data to shaders.</summary>
@@ -663,6 +733,15 @@ namespace ValveResourceFormat.Renderer.World
         }
 
         /// <summary>Binds the barn light storage buffer to its reserved shader slot.</summary>
+        /// <remarks>
+        /// The one binding entry point here still on OpenGL, and deliberately so. Its only caller is
+        /// <see cref="Scene.SetSceneBuffers"/>, which takes no command list because all five callers of
+        /// that method live in <c>Renderer.cs</c>. Threading one down to here would add a branch no caller can
+        /// reach and the golden suite cannot check, which is the false green this port avoids; it closes
+        /// when <c>Renderer.cs</c> passes <c>renderContext.CommandList</c> into
+        /// <see cref="Scene.SetSceneBuffers"/>, alongside the lighting, envmap, probe and light binner
+        /// buffers that are unported for exactly the same reason.
+        /// </remarks>
         public void BindBarnLightBuffer()
         {
             BarnLightStorageBuffer?.BindBufferBase();
@@ -686,16 +765,30 @@ namespace ValveResourceFormat.Renderer.World
             DefaultCookieAtlas?.Delete();
             DefaultCookieAtlas = null;
 
-            if (CookieSamplerClampBorder != 0)
-            {
-                GL.DeleteSampler(CookieSamplerClampBorder);
-                CookieSamplerClampBorder = 0;
-            }
+            CookieSamplerClampBorder?.Dispose();
+            CookieSamplerClampBorder = null;
 
-            if (CookieSamplerWrap != 0)
+            CookieSamplerWrap?.Dispose();
+            CookieSamplerWrap = null;
+        }
+
+        /// <inheritdoc/>
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>Releases the GPU resources this lighting info owns.</summary>
+        /// <param name="disposing"><see langword="true"/> when called from <see cref="Dispose()"/>.</param>
+        /// <remarks>All of them are the barn light ones, so this is <see cref="DisposeBarnLights"/>. The
+        /// interface exists because the cookie samplers are now <see cref="ISampler"/> objects rather than
+        /// loose OpenGL names, and a type holding those has to be disposable.</remarks>
+        protected virtual void Dispose(bool disposing)
+        {
+            if (disposing)
             {
-                GL.DeleteSampler(CookieSamplerWrap);
-                CookieSamplerWrap = 0;
+                DisposeBarnLights();
             }
         }
     }

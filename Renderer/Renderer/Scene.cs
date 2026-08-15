@@ -2038,7 +2038,7 @@ namespace ValveResourceFormat.Renderer
                 lightingBuffer?.Dispose();
                 lpvBuffer?.Dispose();
                 envMapBuffer?.Dispose();
-                LightingInfo.DisposeBarnLights();
+                LightingInfo.Dispose();
             }
         }
     }

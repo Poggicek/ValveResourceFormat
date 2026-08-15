@@ -464,12 +464,12 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             }
 
             // todo: batch tube draws and call this less often
-            scene.LightingInfo.BindLightmapTextures();
+            scene.LightingInfo.BindLightmapTextures(commandList);
 
             if (lightProbe is not null)
             {
                 shader.SetUniform1("uLightProbeIndex", (uint)lightProbe.ShaderIndex);
-                scene.LightingInfo.BindInstanceLightProbeTextures(lightProbe);
+                scene.LightingInfo.BindInstanceLightProbeTextures(commandList, lightProbe);
             }
 
             PerfStats.Active.Count(Counter.ParticleDraw);

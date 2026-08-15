@@ -113,12 +113,14 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Binds the scene-wide textures to their reserved texture units for this pass.</summary>
         private static void BindReservedTextures(Scene.RenderContext context)
         {
+            var commandList = context.CommandList;
+
             foreach (var (slot, _, texture) in context.Textures)
             {
-                GL.BindTextureUnit((int)slot, texture.Handle);
+                BindReservedTexture(commandList, slot, texture);
             }
 
-            context.Scene.LightingInfo.BindLightmapTextures();
+            context.Scene.LightingInfo.BindLightmapTextures(commandList);
         }
 
         private ref struct Uniforms
@@ -160,9 +162,25 @@ namespace ValveResourceFormat.Renderer
             public int SampleCount;
         }
 
-        /// <summary>Binds a per-draw texture over its reserved unit.</summary>
-        private static void BindInstanceTexture(ReservedTextureSlots slot, RenderTexture texture)
+        /// <summary>
+        /// Binds a texture to its reserved unit, recording when there is a command list.
+        /// </summary>
+        /// <remarks>
+        /// Not routed through <see cref="Shader.BindTexture"/>, because a reserved unit is bound for
+        /// whatever draws next rather than for one program: the pass-wide binds have no shader to ask, and
+        /// the per-draw ones are already gated on the bound shader declaring the sampler. Either way the
+        /// unit is settled for every program at link time by
+        /// <see cref="GLSamplerBindings.PointReservedSamplersAtUnits"/>, so no sampler uniform is written
+        /// here on either path.
+        /// </remarks>
+        private static void BindReservedTexture(ICommandList? commandList, ReservedTextureSlots slot, RenderTexture texture)
         {
+            if (commandList != null)
+            {
+                commandList.BindTexture(DescriptorSets.ReservedTextures, (int)slot, texture.RhiTexture);
+                return;
+            }
+
             GL.BindTextureUnit((int)slot, texture.Handle);
         }
 
@@ -562,13 +580,13 @@ namespace ValveResourceFormat.Renderer
             if (config.NeedsCubemapBinding && uniforms.EnvmapTexture != -1 && request.Node.EnvMaps.Count > 0)
             {
                 var envmap = request.Node.EnvMaps[0];
-                BindInstanceTexture(ReservedTextureSlots.EnvironmentMap, envmap.EnvMapTexture);
+                BindReservedTexture(config.CommandList, ReservedTextureSlots.EnvironmentMap, envmap.EnvMapTexture);
             }
 
             if (config.LightProbeType == LightProbeType.IndividualProbes && uniforms.LPVIrradianceTexture != -1
                 && request.Node.LightProbeBinding is { } lightProbe)
             {
-                request.Node.Scene.LightingInfo.BindInstanceLightProbeTextures(lightProbe);
+                request.Node.Scene.LightingInfo.BindInstanceLightProbeTextures(config.CommandList, lightProbe);
             }
 
             if (uniforms.MorphVertexIdOffset != -1)
@@ -576,7 +594,7 @@ namespace ValveResourceFormat.Renderer
                 var morphComposite = request.Mesh.FlexStateManager?.MorphComposite;
                 if (morphComposite != null)
                 {
-                    BindInstanceTexture(ReservedTextureSlots.MorphCompositeTexture, morphComposite.CompositeTexture);
+                    BindReservedTexture(config.CommandList, ReservedTextureSlots.MorphCompositeTexture, morphComposite.CompositeTexture);
                     GL.ProgramUniform2(shader.Program, uniforms.MorphCompositeTextureSize, (float)morphComposite.CompositeTexture.Width, morphComposite.CompositeTexture.Height);
                 }
 
