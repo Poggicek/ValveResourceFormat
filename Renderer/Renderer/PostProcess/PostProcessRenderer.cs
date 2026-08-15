@@ -252,6 +252,87 @@ namespace ValveResourceFormat.Renderer.PostProcess
         }
 
         /// <summary>
+        /// Makes a render target readable by the sampling that comes next.
+        /// </summary>
+        /// <param name="commandList">The list to record into, or <see langword="null"/> for the OpenGL path.</param>
+        /// <param name="color">A colour attachment about to be sampled, or <see langword="null"/>.</param>
+        /// <param name="depth">A depth attachment about to be sampled, or <see langword="null"/>.</param>
+        /// <remarks>
+        /// <para>
+        /// Every caller here samples an attachment its own render pass has just written, and a render pass
+        /// leaves its attachments in <see cref="ResourceState.ColorTarget"/> and
+        /// <see cref="ResourceState.DepthWrite"/>. Sampling from there is invalid on Vulkan, where a
+        /// texture has one layout at a time; OpenGL sorts the same sequence out by itself, which is why
+        /// this is invisible to the OpenGL oracle and only the Vulkan backend objects.
+        /// </para>
+        /// <para>
+        /// Nothing is issued on the OpenGL path, and that is not the usual "the backend ignores it":
+        /// <c>glMemoryBarrier</c> orders <em>incoherent</em> access, which an attachment write is not, so
+        /// there is no bit that would apply. Compare <see cref="ShaderWriteBarrier"/>, which does issue
+        /// one, because an image store is incoherent.
+        /// </para>
+        /// <para>
+        /// Both transitions go in one call, as the contract asks: separate calls cost separate pipeline
+        /// stalls. Only what is actually sampled is transitioned, because moving a texture out of a state
+        /// it was never in is a validation error rather than a no-op.
+        /// </para>
+        /// </remarks>
+        internal static void AttachmentReadBarrier(ICommandList? commandList, RenderTexture? color, RenderTexture? depth = null)
+        {
+            if (commandList == null)
+            {
+                return;
+            }
+
+            TextureBarrier[] barriers = (color, depth) switch
+            {
+                (not null, not null) =>
+                [
+                    new(color.RhiTexture, ResourceState.ColorTarget, ResourceState.ShaderRead),
+                    new(depth.RhiTexture, ResourceState.DepthWrite, ResourceState.ShaderRead),
+                ],
+                (not null, null) => [new(color.RhiTexture, ResourceState.ColorTarget, ResourceState.ShaderRead)],
+                (null, not null) => [new(depth.RhiTexture, ResourceState.DepthWrite, ResourceState.ShaderRead)],
+                _ => [],
+            };
+
+            if (barriers.Length > 0)
+            {
+                commandList.Barrier([], barriers);
+            }
+        }
+
+        /// <summary>
+        /// Makes some mip levels of a render target readable while others stay rendered into.
+        /// </summary>
+        /// <param name="commandList">The list to record into, or <see langword="null"/> for the OpenGL path.</param>
+        /// <param name="color">The colour attachment whose levels are about to be sampled.</param>
+        /// <param name="baseMipLevel">First level being sampled.</param>
+        /// <param name="mipLevelCount">How many levels are being sampled.</param>
+        /// <remarks>
+        /// For the bloom upsample, which samples one level of its accumulation texture while rendering
+        /// into the next one up. Naming the range matters for a second reason beyond precision: a barrier
+        /// covering the whole object also asserts the caller's belief about the current state, and a
+        /// texture that is deliberately half sampled and half rendered into has no single state for that
+        /// belief to match. The transition itself may still be widened to the whole image by a backend
+        /// that tracks layout per object, which is safe because a layout change preserves contents.
+        /// </remarks>
+        internal static void AttachmentMipReadBarrier(ICommandList? commandList, RenderTexture? color, int baseMipLevel, int mipLevelCount)
+        {
+            if (commandList == null || color == null)
+            {
+                return;
+            }
+
+            TextureBarrier[] barriers =
+            [
+                new(color.RhiTexture, ResourceState.ColorTarget, ResourceState.ShaderRead, baseMipLevel, mipLevelCount),
+            ];
+
+            commandList.Barrier([], barriers);
+        }
+
+        /// <summary>
         /// Makes the image stores of a finished compute pass visible to the sampling and image loads that
         /// read them next.
         /// </summary>
@@ -372,6 +453,11 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
             var groupsX = (destColor.Width + 7) / 8;
             var groupsY = (destColor.Height + 7) / 8;
+
+            // The scene pass closed immediately before this runs, so both attachments are still in their
+            // target states. Transitioned together rather than inside the two blocks below, so the pair
+            // costs one stall instead of two.
+            AttachmentReadBarrier(commandList, resolveColor ? source.Color : null, resolveDepth ? source.Depth : null);
 
             if (resolveColor)
             {
@@ -535,6 +621,12 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
                 msaaResolveShader.Use();
                 BindComputePipeline(commandList, msaaResolveShader);
+
+                // The last thing to touch this framebuffer was the translucent or overlay pass, so its
+                // attachments are in their target states again even if the mid-frame grab already read
+                // them once. Depth is only transitioned when the depth-of-field path actually samples it.
+                AttachmentReadBarrier(commandList, colorBufferRead.Color, DOF.Enabled ? colorBufferRead.Depth : null);
+
                 BindTexture(commandList, msaaResolveShader, 0, "g_tSourceMsaa", colorBufferRead.Color);
                 BindStorageImage(commandList, 1, resolveTarget, SizedInternalFormat.Rgba16f);
                 msaaResolveShader.SetUniform("g_bFlipY", flipY);

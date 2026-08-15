@@ -218,6 +218,11 @@ public class BloomRenderer
 
             upsampleShader.Use();
 
+            // Only the coarser level being sampled is made readable, before the pass claims the finer one
+            // as its target. The two levels are in different states for the length of this pass, which is
+            // exactly what the mip range is for.
+            PostProcessRenderer.AttachmentMipReadBarrier(commandList, Accumulation.Color, i, 1);
+
             // The pass renders into one mip of the same texture it samples, which is why it loads rather
             // than clears: the merge composites the coarser level onto what is already in the finer one.
             using var upsamplePass = PostProcessRenderer.BeginPass(commandList, Accumulation, "Bloom Upsample", i - 1);
@@ -251,6 +256,10 @@ public class BloomRenderer
         }
 
         Accumulation.AttachColorMipLevel(0);
+
+        // The last upsample rendered into level zero, and the tonemap samples this result next. The
+        // coarser levels were made readable as the loop went and are left alone.
+        PostProcessRenderer.AttachmentMipReadBarrier(commandList, Accumulation.Color, 0, 1);
     }
 
     /// <summary>
@@ -280,6 +289,11 @@ public class BloomRenderer
         }
 
         shader.Use();
+
+        // The source was rendered into by the previous step of the ping-pong, so it is still a colour
+        // target. Transitioned before the destination's pass opens, since the two are different textures
+        // and the destination's own transition happens there.
+        PostProcessRenderer.AttachmentReadBarrier(commandList, ping.Color);
 
         using var pass = PostProcessRenderer.BeginPass(commandList, pong, "Bloom Blit", destMipLevel, clear);
 

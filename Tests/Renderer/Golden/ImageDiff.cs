@@ -75,6 +75,15 @@ namespace Tests.Renderer.Golden
         /// <para>So the maximum is deliberately not the instrument here; the mean and the affected fraction
         /// are, and both are held tight. A regression that actually broke the counter, the legend or the
         /// pass ordering moves a large share of the image and fails on those two immediately.</para>
+        ///
+        /// <para><b>Re-measured, and left where it is.</b> A recording run once reported 35/36 and could
+        /// not be reproduced, which put this budget under suspicion. It is not the cause: over further
+        /// runs in catalog order the scene measured max pinned at 135/255 against 160, mean 0.05-0.06/255
+        /// against 0.5, and 64 to 88 deviant pixels against a budget of 384 -- the same numbers recorded
+        /// above, with the mean and fraction the tight instruments and 4x to 8x of room in each. What did
+        /// reproduce is that the scene's image depends on what ran before it; see
+        /// <c>:OverdrawSceneOrderDependence</c> in <c>GoldenSceneCatalog</c>, which is where a one-off
+        /// should be looked for first.</para>
         /// </summary>
         public static ImageTolerance CountingRace { get; } = new(160.0 / 255.0, 0.5 / 255.0, 0.005, 8.0 / 255.0);
 

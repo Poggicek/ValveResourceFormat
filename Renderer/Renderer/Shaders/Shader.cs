@@ -640,9 +640,28 @@ namespace ValveResourceFormat.Renderer.Shaders
             return Uniforms.TryGetValue(paramName, out var uniform) && uniform.Type == ActiveUniformType.Bool;
         }
 
+        /// <summary>
+        /// Gets a value indicating whether a uniform is packed into the globals block rather than being a
+        /// loose one with a GL location of its own.
+        /// </summary>
+        /// <param name="name">The uniform name.</param>
+        /// <remarks>
+        /// The numbered setters below write by GL location, and a packed uniform has none, so writing one
+        /// that way reaches nothing at all. They route through <see cref="RenderMaterial.SetUniform(string, float)"/>
+        /// instead when this holds, which is the same path the unnumbered
+        /// <see cref="SetUniform(string, float)"/> overloads take.
+        /// </remarks>
+        private bool IsPacked(string name) => GlobalsLayout.Members.ContainsKey(name);
+
         /// <summary>Sets a scalar float uniform on this program.</summary>
         public void SetUniform1(string name, float value)
         {
+            if (IsPacked(name))
+            {
+                Default.SetUniform(name, value);
+                return;
+            }
+
             var uniformLocation = GetUniformLocation(name);
             if (uniformLocation > -1)
             {
@@ -653,6 +672,12 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <summary>Sets a scalar integer uniform on this program.</summary>
         public void SetUniform1(string name, int value)
         {
+            if (IsPacked(name))
+            {
+                Default.SetUniform(name, (long)value);
+                return;
+            }
+
             var uniformLocation = GetUniformLocation(name);
             if (uniformLocation > -1)
             {
@@ -666,6 +691,12 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <summary>Sets a scalar unsigned integer uniform on this program.</summary>
         public void SetUniform1(string name, uint value)
         {
+            if (IsPacked(name))
+            {
+                Default.SetUniform(name, (long)value);
+                return;
+            }
+
             var uniformLocation = GetUniformLocation(name);
             if (uniformLocation > -1)
             {
@@ -676,6 +707,12 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <summary>Sets a two-component float vector uniform on this program.</summary>
         public void SetUniform2(string name, Vector2 value)
         {
+            if (IsPacked(name))
+            {
+                Default.SetUniform(name, value);
+                return;
+            }
+
             var uniformLocation = GetUniformLocation(name);
             if (uniformLocation > -1)
             {
@@ -686,6 +723,12 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <summary>Sets a three-component float vector uniform on this program.</summary>
         public void SetUniform3(string name, Vector3 value)
         {
+            if (IsPacked(name))
+            {
+                Default.SetUniform(name, value);
+                return;
+            }
+
             var uniformLocation = GetUniformLocation(name);
             if (uniformLocation > -1)
             {
@@ -696,6 +739,12 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <summary>Sets a four-component float vector uniform on this program.</summary>
         public void SetUniform4(string name, Vector4 value)
         {
+            if (IsPacked(name))
+            {
+                Default.SetUniform(name, value);
+                return;
+            }
+
             var uniformLocation = GetUniformLocation(name);
             if (uniformLocation > -1)
             {
@@ -727,6 +776,12 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <param name="name">The uniform array name.</param>
         /// <param name="count">Number of vec4 elements to upload.</param>
         /// <param name="value">Flat array of float values (count * 4 elements).</param>
+        /// <remarks>
+        /// Not routed, because <see cref="GlobalsLayout"/> cannot pack an array and so an array uniform is
+        /// always loose. That is why <c>dof2</c> still declares one outside a block and still fails to
+        /// compile for Vulkan even though its name is correctly prefixed: the fix is array support in the
+        /// globals block, not anything at this call site.
+        /// </remarks>
         public void SetUniform4Array(string name, int count, float[] value)
         {
             var uniformLocation = GetUniformLocation(name);
@@ -753,6 +808,13 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <param name="transpose">Whether to transpose the matrix before uploading.</param>
         public void SetUniform4x4(string name, Matrix4x4 value, bool transpose = false)
         {
+            if (IsPacked(name))
+            {
+                // The routed path has no transpose flag, so the transpose happens here instead.
+                Default.SetUniform(name, transpose ? Matrix4x4.Transpose(value) : value);
+                return;
+            }
+
             var uniformLocation = GetUniformLocation(name);
             if (uniformLocation > -1)
             {

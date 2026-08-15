@@ -605,6 +605,28 @@ namespace Tests.Renderer.Golden
                 //
                 // Deliberately overlapping geometry, since a heat map of a scene with no overdraw in it is
                 // a uniform image that would not notice the counter being wrong.
+                //
+                // :OverdrawSceneOrderDependence - do not debug this scene by running it on its own, and do
+                // not widen its tolerance on what you see when you do. Run alone it fails its baseline by
+                // max 195/255, mean 2.38/255 and 4.15% of pixels -- 40x its budget -- and does so
+                // identically on every run, so it is not the counting race. Run in catalog order it lands
+                // at max 135/255, mean 0.05-0.06/255 and 0.08-0.11% of pixels, comfortably inside
+                // ImageTolerance.CountingRace, which was re-measured over the runs that established this.
+                //
+                // The dependence goes both ways, and the other direction is the serious one: forcing this
+                // scene to run first and leaving every other scene in catalog order takes the suite from
+                // 36/36 to 27/36. shadow_sun_cascade, postprocess_bloom_dof_tonemap and six of the
+                // texture_* scenes all move, several of them by more than 20% of their pixels, and the
+                // texture scenes move in identical pairs -- bc7 with bc6h_hdr, rgba8888 with rgba16f --
+                // which reads as them rendering each other's content rather than as noise.
+                //
+                // So the scenes in this catalog are not independent: this one leaves global state behind,
+                // and the baselines encode the order below. Most likely QuadOverdraw.Prepare's
+                // glBindImageTexture on units 3 and 4, which nothing ever unbinds and which outlive the
+                // Renderer that caused them, but that is a hypothesis and the fix would live in
+                // Renderer/QuadOverdraw.cs rather than here. Recorded rather than fixed because a fix
+                // moves baselines, and which order is the correct one to record is a decision this file
+                // cannot make on its own.
                 Name = "overdraw_heatmap",
                 Tolerance = ImageTolerance.CountingRace,
                 RequiredFixtures = [PhysicsAggregate],

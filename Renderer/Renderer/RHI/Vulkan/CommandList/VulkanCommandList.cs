@@ -594,7 +594,7 @@ public sealed unsafe class VulkanCommandList : ICommandList
         if (state is not (ResourceState.ShaderRead or ResourceState.DepthRead or ResourceState.ShaderReadWrite))
         {
             throw new InvalidOperationException(string.Create(CultureInfo.InvariantCulture,
-                $"Texture '{vulkan.Name}' is in {state} and cannot be sampled from there. Transition it to {ResourceState.ShaderRead} with a barrier first; {nameof(IDevice.UploadTexture)} deliberately leaves textures in {ResourceState.CopyDestination} rather than guessing what they are for."));
+                $"Texture '{vulkan.Name}' is in {state} and cannot be sampled from there, at descriptor set {descriptorSet} binding {binding}. Transition it to {ResourceState.ShaderRead} with a barrier first; {nameof(IDevice.UploadTexture)} deliberately leaves textures in {ResourceState.CopyDestination} rather than guessing what they are for."));
         }
 
         var vulkanSampler = sampler switch

@@ -76,8 +76,45 @@ namespace ValveResourceFormat.Renderer.Shaders
                 $"layout (location = {locations[match.Groups["Name"].Value].ToString(CultureInfo.InvariantCulture)}) {match.Value}");
         }
 
+        /// <summary>
+        /// Uniforms that must stay loose even though nothing about their type or name prevents packing.
+        /// </summary>
+        /// <remarks>
+        /// One entry, and it is a call site problem rather than a shader one.
+        /// <c>RenderCables</c> sets this after <c>material.Render(shader)</c> has already bound that
+        /// material's globals buffer, so a routed write would land in the shader's <c>Default</c> buffer,
+        /// which is no longer the one being read, and the value would be silently lost. Packing it is safe
+        /// as soon as that call site moves to <c>material.SetUniform</c>; until then it stays loose and
+        /// <c>particle_cable</c> keeps failing to compile for Vulkan.
+        /// </remarks>
+        private static readonly FrozenSet<string> UnpackableUniformNames =
+            new HashSet<string>(["uLightProbeIndex"], StringComparer.Ordinal).ToFrozenSet(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Gets a value indicating whether a uniform may be packed into the globals block.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Everything is packable except the per-draw push constants and the exceptions above. Vulkan
+        /// forbids a non-opaque uniform outside a block outright, so a uniform that is neither packed nor
+        /// a push constant does not merely lose a value, it stops the shader compiling at all.
+        /// </para>
+        /// <para>
+        /// This deliberately does not test for a <c>g_</c> or <c>F_</c> prefix, which is what it used to
+        /// do. The residue is not a naming convention: <c>quad_overdraw</c> spells its uniform
+        /// <c>bCountQuads</c>, <c>histogram</c> spells its <c>logMinLuminance</c>, and <c>water</c> spells
+        /// its <c>TextureFlow</c>, none of which is going to acquire a prefix just to become legal.
+        /// </para>
+        /// <para>
+        /// Widening this is only safe once the numbered setters route packed names to the globals buffer.
+        /// They write by GL location, and a packed uniform has none, so before that routing existed
+        /// widening this silently stopped feeding every uniform it moved into the block &#8212; measured as
+        /// a 55.8% pixel regression on <c>overdraw_heatmap</c>, whose <c>bCountQuads</c> stuck at its
+        /// default. Do not reverse the two.
+        /// </para>
+        /// </remarks>
         private static bool IsPackableUniformName(string name)
-            => name.StartsWith("g_", StringComparison.Ordinal) || name.StartsWith("F_", StringComparison.Ordinal);
+            => !VulkanGlsl.IsPushConstant(name) && !UnpackableUniformNames.Contains(name);
 
         private readonly StringBuilder builder = new(1024);
 
@@ -659,6 +696,13 @@ namespace ValveResourceFormat.Renderer.Shaders
             ["vTint"] = "uint",
             [InstancingMemberName] = "bool",
         }.ToFrozenDictionary(StringComparer.Ordinal);
+
+        /// <summary>Gets a value indicating whether a uniform is carried by the per-draw push constant block.</summary>
+        /// <param name="name">The uniform name as the shader sources declare it.</param>
+        /// <returns><see langword="true"/> when the block carries it.</returns>
+        /// <remarks>Such a uniform must not be packed into the globals block: it is written per draw by
+        /// GL location on the OpenGL backend, and lifted into <c>layout(push_constant)</c> for Vulkan.</remarks>
+        public static bool IsPushConstant(string name) => PushConstantSourceTypes.ContainsKey(name);
 
         private static readonly FrozenDictionary<string, ReservedTextureSlots> ReservedTextureSlotByName = BuildReservedTextureSlots();
 

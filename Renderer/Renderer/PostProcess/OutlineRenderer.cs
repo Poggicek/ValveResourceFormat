@@ -38,6 +38,11 @@ public class OutlineRenderer(RendererContext rendererContext)
         outlineEdge.SetUniform("g_bFlipY", flipY);
         outlineEdge.SetUniform("g_nNumSamplesMSAA", numSamples);
 
+        // The stencil view aliases the scene's depth-stencil attachment, which the scene pass wrote and
+        // left in DepthWrite. Transitioned as depth because that is the state the image is actually in;
+        // the view is the object the tracking is keyed on, so this narrows to the aspect being sampled.
+        PostProcessRenderer.AttachmentReadBarrier(commandList, color: null, depth: stencil);
+
         PostProcessRenderer.BindTexture(commandList, outlineEdge, 0, "g_tStencilBuffer", stencil);
 
         using var _ = rendererContext.RenderState.Scope(blend: true, srcBlend: BlendFactor.SrcAlpha, dstBlend: BlendFactor.OneMinusSrcAlpha);

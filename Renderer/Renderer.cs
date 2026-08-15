@@ -757,6 +757,17 @@ public class Renderer
         RenderSceneShadows(renderContext);
         RenderBarnLightShadows(renderContext);
 
+        // The shadow atlases were just written as depth targets and are sampled from the very first
+        // scene pass onwards, so they have to change state in between. This is the right place for it
+        // rather than the bind site: binding runs once per pass, so from the second pass on the belief
+        // that they are still in DepthWrite is false, and a transition asserts the caller's belief
+        // before its early-out. Here it is stated once, where it is true. A redundant transition costs
+        // nothing -- it returns before emitting anything when the state already matches.
+        //
+        // OpenGL says nothing about any of this: sampling a depth attachment it just wrote happens to
+        // work, so the golden suite is silent and only Vulkan objects.
+        TransitionShadowMapsForSampling(renderContext.CommandList);
+
         GL.FrontFace(FrontFaceDirection.Ccw);
 
         RenderScenesWithView(renderContext);
@@ -1024,6 +1035,28 @@ public class Renderer
         var fovRatio = RendererContext.FieldOfView / 90f;
 
         return RendererContext.ViewmodelFieldOfView * fovRatio;
+    }
+
+    /// <summary>
+    /// Moves the shadow depth atlases from being written to being sampled, once per frame, after the
+    /// shadow passes and before anything reads them.
+    /// </summary>
+    /// <param name="commandList">The list to record into, or <see langword="null"/> when drawing
+    /// through OpenGL, where depth attachments need no transition.</param>
+    private void TransitionShadowMapsForSampling(RHI.ICommandList? commandList)
+    {
+        if (commandList is null)
+        {
+            return;
+        }
+
+        foreach (var depth in new[] { ShadowDepthBuffer?.Depth, BarnLightShadowBuffer?.Depth })
+        {
+            if (depth?.RhiTexture is { } texture)
+            {
+                commandList.Barrier(new RHI.TextureBarrier(texture, RHI.ResourceState.DepthWrite, RHI.ResourceState.ShaderRead));
+            }
+        }
     }
 
     /// <summary>

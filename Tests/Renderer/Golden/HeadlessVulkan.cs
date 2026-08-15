@@ -8,6 +8,7 @@ using OpenTK.Graphics.OpenGL;
 using SkiaSharp;
 using ValveResourceFormat;
 using ValveResourceFormat.Renderer;
+using ValveResourceFormat.Renderer.RHI;
 using ValveResourceFormat.Renderer.RHI.Vulkan;
 using ValveResourceFormat.Renderer.RHI.Vulkan.Core;
 
@@ -270,7 +271,21 @@ namespace Tests.Renderer.Golden
             GLCallTrap.CurrentStage = "environment";
             stages.Add(Run("gl-environment", () =>
             {
-                GLEnvironment.Initialize(NullLogger.Instance);
+                // GLEnvironment.Initialize is a capability gate over glGetInteger(MAJOR_VERSION). On a
+                // Vulkan device the trap answers 0, so it threw "requires OpenGL 4.6, but you have 0.0" --
+                // the query answering honestly about a context that does not exist, not a blocker in the
+                // port. It also latches, because GpuRendererAndDriver is assigned before the throw, so
+                // only the first scene of a run ever reached it and the report read as a one-scene fault.
+                // Not asked at all on a device that is not OpenGL. The gate belongs behind a backend check
+                // inside GLEnvironment itself, which is not this harness's file to change.
+                if (context.Device is { Backend: RhiBackend.OpenGL })
+                {
+                    GLEnvironment.Initialize(NullLogger.Instance);
+                }
+
+                // Still asked, and still counted. The default render state is real work the renderer needs
+                // and it is still direct OpenGL, so the stage stays "ok*" rather than clean and the report
+                // keeps saying how much of it has yet to move.
                 GLEnvironment.SetDefaultRenderState(context);
             }));
 
@@ -421,32 +436,7 @@ namespace Tests.Renderer.Golden
             stages.Add(Run("frame-end", () => DeviceCensus!.EndFrame()));
 
             GLCallTrap.CurrentStage = "readback";
-            stages.Add(Run("readback", () =>
-            {
-                captureFramebuffer!.Bind(FramebufferTarget.ReadFramebuffer);
-                GL.ReadBuffer(ReadBufferMode.ColorAttachment0);
-
-                var pixels = new byte[GoldenRenderHarness.Width * GoldenRenderHarness.Height * 4];
-                GL.ReadPixels(0, 0, GoldenRenderHarness.Width, GoldenRenderHarness.Height, PixelFormat.Bgra, PixelType.UnsignedByte, pixels);
-
-                if (pixels.All(static value => value == 0))
-                {
-                    throw new GoldenRenderException(
-                        "Readback returned an all-zero image: glReadPixels wrote nothing because there is no OpenGL context behind it. The contract's readback path is ICommandList.CopyTextureToBuffer, which nothing in the harness or the renderer calls yet.");
-                }
-
-                var bitmap = new SKBitmap(GoldenRenderHarness.Width, GoldenRenderHarness.Height, SKColorType.Bgra8888, SKAlphaType.Opaque);
-                var destination = bitmap.GetPixelSpan();
-                var stride = GoldenRenderHarness.Width * 4;
-
-                for (var y = 0; y < GoldenRenderHarness.Height; y++)
-                {
-                    pixels.AsSpan((GoldenRenderHarness.Height - 1 - y) * stride, stride)
-                        .CopyTo(destination.Slice(y * stride, stride));
-                }
-
-                image = bitmap;
-            }));
+            stages.Add(Run("readback", () => image = ReadCapture(captureFramebuffer)));
 
             GLCallTrap.CurrentStage = "(none)";
             captured = image;
@@ -465,6 +455,116 @@ namespace Tests.Renderer.Golden
             renderer?.Dispose();
 
             return stages;
+        }
+
+        /// <summary>
+        /// Copies the capture target back to the CPU through the contract's readback path and turns it
+        /// into the bitmap the golden comparison takes.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <c>glReadPixels</c> stood here and returned an all-zero image for every scene, because a Vulkan
+        /// run has no OpenGL context behind it. <see cref="ICommandList.CopyTextureToBuffer"/> is what the
+        /// contract provides instead -- it is the reason <see cref="BufferMemory.HostReadback"/> exists at
+        /// all -- and the sequence below is the one
+        /// <see cref="VulkanGoldenDevice.ClearAndReadBack"/> already proves against known pixels: copy into
+        /// a host-readable buffer, submit, <see cref="IDevice.WaitIdle"/>, then read
+        /// <see cref="IBuffer.MappedData"/>.
+        /// </para>
+        /// <para>
+        /// <b>The rows are not flipped, and that is the one place this differs from the OpenGL harness.</b>
+        /// <see cref="GoldenRenderHarness"/> flips because OpenGL hands back the bottom row first. Vulkan
+        /// does not: the backend flips Y with a negative viewport height, so clip space +1 lands on image
+        /// row 0, and row 0 is the row a viewer sees at the top. Copying rows straight through therefore
+        /// produces the same orientation the baselines were recorded in. Flipping here as well would undo
+        /// the viewport flip and turn every scene upside down -- which the baseline diff would catch, but
+        /// only once a scene renders, so the reasoning is recorded rather than left to be discovered.
+        /// </para>
+        /// <para>
+        /// <b>Channels are reordered, not reinterpreted.</b> The capture target is
+        /// <see cref="RhiFormat.R8G8B8A8_UNorm"/>, so the copy delivers red first; the baselines are
+        /// <see cref="SKColorType.Bgra8888"/>. Alpha is forced opaque for the same reason the OpenGL
+        /// harness forces it: the capture target has no meaningful alpha and an encoded PNG should not
+        /// depend on what the last shader left there.
+        /// </para>
+        /// <para>
+        /// <b>No explicit barrier.</b> <c>VulkanTexture</c> tracks its own layout per subresource and
+        /// <see cref="ICommandList.CopyTextureToBuffer"/> transitions the source itself from that tracked
+        /// state. A <see cref="TextureBarrier"/> here would have to name a state this harness cannot know
+        /// -- the capture target is left in whichever state the last stage that got as far as touching it
+        /// left it, and on a run where <c>postprocess-render</c> failed nothing touched it at all -- and a
+        /// wrong <see cref="TextureBarrier.Before"/> asserts in Debug and is silently ignored in Release.
+        /// </para>
+        /// <para>
+        /// <b>Through the device rather than the census.</b> <see cref="RhiDeviceCensus"/> answers "what
+        /// did the renderer ask of Vulkan"; this copy is the harness's own work, exactly as the device
+        /// self-test is, and the self-test is already deliberately run before the census is attached.
+        /// Counting a harness submission would also delete a true finding, since the report's
+        /// command-lists-begun-but-never-submitted note is keyed on the census seeing no
+        /// <see cref="IDevice.Submit"/>.
+        /// </para>
+        /// <para>
+        /// <b>The all-zero check is not a check on the copy.</b> Dropping the <see cref="IDevice.Submit"/>
+        /// below was tried, and the readback buffer came back holding the device self-test's clear colour
+        /// rather than zeroes -- host-visible memory is recycled, so a copy that never ran reads as stale
+        /// contents, not as nothing. The guard says the stages above drew nothing into the target; what
+        /// says the copy itself works is <see cref="VulkanGoldenDevice.ClearAndReadBack"/>, which checks
+        /// values it chose.
+        /// </para>
+        /// </remarks>
+        /// <exception cref="GoldenRenderException">There is no device or no capture target, or the copy
+        /// came back empty.</exception>
+        private static SKBitmap ReadCapture(Framebuffer? captureFramebuffer)
+        {
+            var device = Device
+                ?? throw new GoldenRenderException("No Vulkan device was created, so nothing can be read back.");
+
+            var color = captureFramebuffer?.Color
+                ?? throw new GoldenRenderException("The capture target was never created, so there is nothing to read back.");
+
+            var width = GoldenRenderHarness.Width;
+            var height = GoldenRenderHarness.Height;
+            var sizeInBytes = width * height * 4;
+
+            using var readback = device.CreateBuffer(new BufferDesc(sizeInBytes,
+                BufferUsage.CopyDestination, BufferMemory.HostReadback, "GoldenVulkanReadback"));
+
+            device.BeginFrame();
+
+            var commandList = device.BeginCommandList("GoldenReadback");
+
+            commandList.CopyTextureToBuffer(color.RhiTexture, 0, 0, readback);
+
+            device.Submit(commandList);
+            device.EndFrame();
+
+            // The copy has to have completed before the mapping is read, and this device submits once per
+            // frame, so there is no finer-grained fence to wait on than the device itself.
+            device.WaitIdle();
+
+            var pixels = readback.MappedData[..sizeInBytes];
+
+            if (pixels.IndexOfAnyExcept((byte)0) < 0)
+            {
+                throw new GoldenRenderException(
+                    "The readback copy completed and the capture target was entirely zero, so nothing was drawn into it. "
+                    + "This is a statement about the stages above rather than about the readback: the copy goes through "
+                    + "ICommandList.CopyTextureToBuffer, and the device self-test reported at the top of this file proves "
+                    + "that path returns the pixels it was given.");
+            }
+
+            var bitmap = new SKBitmap(width, height, SKColorType.Bgra8888, SKAlphaType.Opaque);
+            var destination = bitmap.GetPixelSpan();
+
+            for (var i = 0; i < sizeInBytes; i += 4)
+            {
+                destination[i + 0] = pixels[i + 2];
+                destination[i + 1] = pixels[i + 1];
+                destination[i + 2] = pixels[i + 0];
+                destination[i + 3] = 255;
+            }
+
+            return bitmap;
         }
 
         /// <summary>

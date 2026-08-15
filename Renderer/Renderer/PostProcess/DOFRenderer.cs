@@ -138,6 +138,11 @@ public class DOFRenderer
             PostProcessRenderer.DrawFullscreenTriangle(commandList, RendererContext, DOF, BlurredResult);
         }
 
+        // Transitioned here rather than at the tonemap that samples it, because this is where the write
+        // happened and the caller cannot tell this result apart from the compute-written one it uses when
+        // depth of field is off, which is already readable.
+        PostProcessRenderer.AttachmentReadBarrier(commandList, BlurredResult.Color);
+
         return BlurredResult.Color!;
     }
 
