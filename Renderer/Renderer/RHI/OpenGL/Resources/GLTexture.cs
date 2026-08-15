@@ -162,7 +162,8 @@ public sealed class GLTexture : ITexture
     public static TextureDimension ToDimension(TextureTarget target) => target switch
     {
         TextureTarget.Texture1D => TextureDimension.Texture1D,
-        TextureTarget.Texture2D or TextureTarget.Texture2DMultisample or TextureTarget.TextureRectangle => TextureDimension.Texture2D,
+        TextureTarget.Texture2D or TextureTarget.TextureRectangle => TextureDimension.Texture2D,
+        TextureTarget.Texture2DMultisample => TextureDimension.Texture2DMultisample,
         TextureTarget.Texture2DArray or TextureTarget.Texture2DMultisampleArray or TextureTarget.Texture1DArray => TextureDimension.Texture2DArray,
         TextureTarget.Texture3D => TextureDimension.Texture3D,
         TextureTarget.TextureCubeMap => TextureDimension.TextureCube,
@@ -170,11 +171,16 @@ public sealed class GLTexture : ITexture
         _ => throw new ArgumentOutOfRangeException(nameof(target), target, "No RHI texture dimension for this OpenGL target."),
     };
 
+    /// <summary>Gets a value indicating whether this texture's storage is multisampled.</summary>
+    /// <remarks>The dimension says so outright; a sample count above one says so for the shapes that have
+    /// no multisample dimension of their own, which is the array case.</remarks>
+    public bool IsMultisampled => Dimension == TextureDimension.Texture2DMultisample || SampleCount > 1;
+
     private void AllocateStorage()
     {
         var layers = GLLayerCount();
 
-        if (SampleCount > 1)
+        if (IsMultisampled)
         {
             // Multisampled storage has no mip chain, and fixed sample locations are required for a
             // texture that is both rendered into and resolved.
@@ -252,7 +258,7 @@ public sealed class GLTexture : ITexture
         ArgumentOutOfRangeException.ThrowIfNegative(arrayLayer);
         ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(arrayLayer, GLLayerCount());
 
-        if (SampleCount > 1)
+        if (IsMultisampled)
         {
             throw new InvalidOperationException($"Texture '{Name}' is multisampled and cannot be uploaded to.");
         }
@@ -393,6 +399,13 @@ public sealed class GLTexture : ITexture
     private static TextureTarget ToGLTarget(TextureDimension dimension, int sampleCount) => dimension switch
     {
         TextureDimension.Texture1D => TextureTarget.Texture1D,
+
+        // The dimension decides, not the count: a multisample target carrying one sample is a real shape
+        // the renderer allocates, and it has its own target here as it does its own dimension.
+        TextureDimension.Texture2DMultisample => TextureTarget.Texture2DMultisample,
+
+        // The count still promotes a plain 2D shape, so a caller that has not moved to the dimension yet
+        // keeps working. There is no multisample-array dimension, so an array only has the count.
         TextureDimension.Texture2D => sampleCount > 1 ? TextureTarget.Texture2DMultisample : TextureTarget.Texture2D,
         TextureDimension.Texture2DArray => sampleCount > 1 ? TextureTarget.Texture2DMultisampleArray : TextureTarget.Texture2DArray,
         TextureDimension.Texture3D => TextureTarget.Texture3D,

@@ -437,10 +437,7 @@ public class Framebuffer
             {
                 Depth.AttachToFramebuffer(this, FramebufferAttachment.DepthStencilAttachment, 0);
 
-                // The stencil aspect travels on the view rather than as a texture parameter. Only OpenGL
-                // lets a texture object carry DepthStencilTextureMode, and the view has one mip, so the
-                // base and max level this used to clamp are already the only ones it has.
-                if (DeviceCanAllocate && Depth.RhiFormat != RhiFormat.Undefined)
+                if (Depth.RhiFormat != RhiFormat.Undefined)
                 {
                     // The stencil aspect travels on the view rather than as a texture parameter. Only
                     // OpenGL lets a texture object carry DepthStencilTextureMode, and the view has one
@@ -450,9 +447,8 @@ public class Framebuffer
                 }
                 else
                 {
-                    // The depth attachment was allocated outside the device, so its RHI description would
-                    // report the wrong sample count and glTextureView would reject the view. See
-                    // DeviceCanAllocate.
+                    // A format the contract has no member for, so there is nothing to describe a view
+                    // with. Only reachable on OpenGL, where the format came from a driver query.
                     Stencil = Depth.CreateView(DepthFormat.InternalFormat);
                     Stencil.SetLabel("FramebufferStencil");
                     Stencil.SetBaseMaxLevel(0, 0);
@@ -464,26 +460,14 @@ public class Framebuffer
     }
 
     /// <summary>
-    /// Gets a value indicating whether this framebuffer's attachments can be described to the device.
-    /// </summary>
-    /// <remarks>
-    /// False for exactly one shape: a multisample target carrying a single sample. A
-    /// <see cref="TextureDesc"/> decides multisample-ness from <see cref="TextureDesc.SampleCount"/>
-    /// being greater than one, so a one-sample multisample texture cannot be described at all, and asking
-    /// for it yields a plain 2D texture that a <c>sampler2DMS</c> then reads as black. The renderer uses
-    /// this shape deliberately &#8212; it exercises the post-process chain's multisample resolve without
-    /// depending on any driver's sample pattern &#8212; so those attachments keep the OpenGL allocation
-    /// rather than being silently allocated as something else.
-    /// </remarks>
-    private bool DeviceCanAllocate => Target != TextureTarget.Texture2DMultisample || NumSamples > 1;
-
-    /// <summary>
     /// Allocates one attachment, through the device when there is one that can express its format.
     /// </summary>
     /// <remarks>
     /// Not <c>new RenderTexture(target, format, ...)</c>, because that constructor always describes its
     /// storage as single-sampled and this is the one place in the renderer that allocates multisampled
-    /// storage. The texture is created from a descriptor carrying the real sample count and wrapped.
+    /// storage. The descriptor built here carries the sample count and, separately,
+    /// <see cref="TextureDimension.Texture2DMultisample"/>: the two are distinct facts, which is what
+    /// lets a multisample target hold a single sample.
     /// </remarks>
     private RenderTexture CreateAttachment(AttachmentFormat format, int width, int height, int numMips, TextureUsage usage, string name)
     {
@@ -504,7 +488,7 @@ public class Framebuffer
         var rhiFormat = ToRhiFormat(format.InternalFormat);
         var device = RendererDevice.Current;
 
-        if (device is not null && rhiFormat != RhiFormat.Undefined && DeviceCanAllocate)
+        if (device is not null && rhiFormat != RhiFormat.Undefined)
         {
             var texture = device.CreateTexture(new TextureDesc(
                 width,
@@ -515,7 +499,7 @@ public class Framebuffer
                 Depth: 1,
                 MipLevels: mipCount,
                 SampleCount: sampleCount,
-                Dimension: TextureDimension.Texture2D));
+                Dimension: multisampled ? TextureDimension.Texture2DMultisample : TextureDimension.Texture2D));
 
             var allocated = new RenderTexture(texture, Target);
 
@@ -527,9 +511,8 @@ public class Framebuffer
 
         if (device is not null && device.Backend != RhiBackend.OpenGL)
         {
-            throw new InvalidOperationException(DeviceCanAllocate
-                ? $"Attachment format {format.InternalFormat} has no {nameof(RhiFormat)} member, so it cannot be allocated on a {device.Backend} device. Add it to {nameof(ToRhiFormat)}, or give the call site a format the contract carries."
-                : $"Framebuffer '{DebugName}' asks for a multisample target with {NumSamples} sample(s), which no {nameof(TextureDesc)} can describe: multisample-ness is decided by {nameof(TextureDesc.SampleCount)} being greater than one. Use a real sample count, or a non-multisample target.");
+            throw new InvalidOperationException(
+                $"Attachment format {format.InternalFormat} has no {nameof(RhiFormat)} member, so it cannot be allocated on a {device.Backend} device. Add it to {nameof(ToRhiFormat)}, or give the call site a format the contract carries.");
         }
 
         // No device at all: the direct OpenGL allocation this replaces, kept for the tools that use the

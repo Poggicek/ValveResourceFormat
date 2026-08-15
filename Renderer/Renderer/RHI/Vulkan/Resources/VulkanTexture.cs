@@ -657,7 +657,9 @@ public sealed unsafe class VulkanTexture : ITexture
     {
         TextureDimension.Texture1D => ImageType.Type1D,
         TextureDimension.Texture3D => ImageType.Type3D,
-        TextureDimension.Texture2D or TextureDimension.Texture2DArray
+        // A multisampled image is a 2D image whose sample count is carried separately. Vulkan keeps the
+        // two facts apart, so the dimension only decides the type here.
+        TextureDimension.Texture2D or TextureDimension.Texture2DMultisample or TextureDimension.Texture2DArray
             or TextureDimension.TextureCube or TextureDimension.TextureCubeArray => ImageType.Type2D,
         _ => throw new ArgumentOutOfRangeException(nameof(dimension), dimension, "Unknown texture dimension."),
     };
@@ -665,7 +667,10 @@ public sealed unsafe class VulkanTexture : ITexture
     private static ImageViewType ToVkViewType(TextureDimension dimension, int arrayLayerCount) => dimension switch
     {
         TextureDimension.Texture1D => ImageViewType.Type1D,
-        TextureDimension.Texture2D => ImageViewType.Type2D,
+
+        // Vulkan has no multisample view type: a view of a multisampled image is a plain 2D view, and the
+        // image's own sample count is what makes it multisampled.
+        TextureDimension.Texture2D or TextureDimension.Texture2DMultisample => ImageViewType.Type2D,
         TextureDimension.Texture2DArray => ImageViewType.Type2DArray,
         TextureDimension.Texture3D => ImageViewType.Type3D,
         TextureDimension.TextureCube => arrayLayerCount == 6 ? ImageViewType.TypeCube : ImageViewType.Type2DArray,
