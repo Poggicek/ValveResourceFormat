@@ -719,7 +719,16 @@ public class Renderer
     /// <param name="name">Debug label for the list and the pass.</param>
     /// <returns>A guard carrying the list, which ends the pass and submits on dispose. Carries no list at
     /// all when the renderer is not recording, so the caller keeps its OpenGL path.</returns>
-    /// <remarks>The attachments load rather than clear: the frame being drawn over is in them.</remarks>
+    /// <remarks>
+    /// <para>The attachments load rather than clear: the frame being drawn over is in them.</para>
+    /// <para>
+    /// The view constants are rebound here because bindings do not outlive the list they were recorded
+    /// on, and the frame's own list has already been submitted by the time a viewer draws over it. An
+    /// overlay shader reading them off the frame's list would find set 0 unbound and be refused at the
+    /// draw. Anything an overlay needs beyond them is still its own to bind, and the draw-time guard
+    /// names it rather than letting the read go undefined.
+    /// </para>
+    /// </remarks>
     public OverlayRecording BeginOverlay(Framebuffer framebuffer, string name)
     {
         ArgumentNullException.ThrowIfNull(framebuffer);
@@ -732,6 +741,11 @@ public class Renderer
         }
 
         commandList.BeginRenderPass(KeepContents(framebuffer.RenderPass(name)));
+
+        if (ViewBuffer is not null)
+        {
+            BindUniformBuffer(commandList, ViewBuffer);
+        }
 
         return new OverlayRecording(this, commandList);
     }
