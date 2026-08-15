@@ -40,6 +40,12 @@ public readonly record struct VulkanDescriptorBinding(
 /// <summary>
 /// Translations between the contract's vocabulary, SPIR-V reflection's vocabulary and Vulkan's.
 /// </summary>
+/// <remarks>
+/// There is deliberately no stage translation here. <see cref="VulkanShaderModule.ToVkStages"/> already
+/// maps <see cref="ShaderStage"/> to <see cref="ShaderStageFlags"/> and is what the push constant path
+/// uses; a second copy in this file was written and removed, because two spellings of the same mask are
+/// two ways for a layout to come out subtly different and stop being shared.
+/// </remarks>
 public static class VulkanDescriptorTypes
 {
     /// <summary>
@@ -62,6 +68,18 @@ public static class VulkanDescriptorTypes
     /// </summary>
     public static int ReservedTextureSlotCount => (int)Materials.ReservedTextureSlots.Last + 1;
 
+    /// <summary>
+    /// Gets the number of storage image bindings the canonical set 4 layout declares.
+    /// </summary>
+    /// <remarks>
+    /// There is no <c>ReservedImageSlots</c> enum to derive this from, because the numbers are OpenGL
+    /// image units chosen per shader rather than a renderer-wide table &#8212; the highest in use today
+    /// is 4, in <c>quad_overdraw.frag</c>. Eight is the count OpenGL 4.6 guarantees for image units, the
+    /// same reasoning that makes <see cref="Buffers.ReservedBufferSlots.Max"/> the width of set 0, so it
+    /// is the widest table a shader could portably have been written against.
+    /// </remarks>
+    public static int StorageImageSlotCount => 8;
+
     /// <summary>Maps a reflected resource kind to its Vulkan descriptor type.</summary>
     /// <param name="kind">What the shader declared.</param>
     /// <returns>The descriptor type to put in the layout.</returns>
@@ -82,31 +100,6 @@ public static class VulkanDescriptorTypes
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind,
             "The reflector could not classify this declaration, so no descriptor type can be chosen for it."),
     };
-
-    /// <summary>Maps contract stages to Vulkan stage flags.</summary>
-    /// <param name="stages">The stages.</param>
-    /// <returns>The equivalent flags.</returns>
-    public static ShaderStageFlags ToStageFlags(ShaderStage stages)
-    {
-        var flags = ShaderStageFlags.None;
-
-        if (stages.HasFlag(ShaderStage.Vertex))
-        {
-            flags |= ShaderStageFlags.VertexBit;
-        }
-
-        if (stages.HasFlag(ShaderStage.Fragment))
-        {
-            flags |= ShaderStageFlags.FragmentBit;
-        }
-
-        if (stages.HasFlag(ShaderStage.Compute))
-        {
-            flags |= ShaderStageFlags.ComputeBit;
-        }
-
-        return flags;
-    }
 
     /// <summary>
     /// Gets the stage mask the shared layouts declare: every stage the renderer compiles for.

@@ -33,7 +33,7 @@ public sealed unsafe class VulkanDescriptorSetLayout : IDisposable
     /// <summary>Gets the layout handle.</summary>
     public DescriptorSetLayout Handle => LayoutHandle;
 
-    /// <summary>Gets which of the contract's four sets this layout describes.</summary>
+    /// <summary>Gets which of the contract's sets this layout describes.</summary>
     public int SetIndex { get; }
 
     /// <summary>Gets the bindings, ordered by binding number.</summary>
@@ -51,12 +51,12 @@ public sealed unsafe class VulkanDescriptorSetLayout : IDisposable
     /// <param name="api">The Vulkan entry points.</param>
     /// <param name="device">The logical device.</param>
     /// <param name="debugNames">Used to name the layout.</param>
-    /// <param name="setIndex">Which of the contract's four sets this describes.</param>
+    /// <param name="setIndex">Which of the contract's sets this describes.</param>
     /// <param name="bindings">The binding table. Need not be sorted; duplicates are rejected.</param>
     /// <param name="name">Debug name.</param>
     /// <exception cref="ArgumentNullException">A required argument is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="setIndex"/> is outside the
-    /// contract's four sets, or a binding has a non-positive count.</exception>
+    /// contract's sets, or a binding has a non-positive count.</exception>
     /// <exception cref="ArgumentException">Two bindings share a binding number.</exception>
     public VulkanDescriptorSetLayout(
         Vk api,

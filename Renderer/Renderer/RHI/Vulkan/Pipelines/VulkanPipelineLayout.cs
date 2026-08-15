@@ -2,17 +2,18 @@ using System.Globalization;
 using System.Threading;
 using Silk.NET.Vulkan;
 using ValveResourceFormat.Renderer.RHI.Vulkan.Core;
+using ValveResourceFormat.Renderer.RHI.Vulkan.Descriptors;
 using ValveResourceFormat.Renderer.Shaders.Spirv;
 
 namespace ValveResourceFormat.Renderer.RHI.Vulkan;
 
 /// <summary>
-/// A <c>VkPipelineLayout</c>: the four descriptor set layouts of the contract's scheme, plus the push
+/// A <c>VkPipelineLayout</c>: the descriptor set layouts of the contract's scheme, plus the push
 /// constant range the shaders declare.
 /// </summary>
 /// <remarks>
 /// <para>
-/// The layout does not own its set layouts. <see cref="VulkanDescriptorSetLayouts"/> does, and shares
+/// The layout does not own its set layouts. <see cref="VulkanDescriptorLayoutCache"/> does, and shares
 /// them between every layout whose bindings match, so disposing a pipeline layout must not destroy them.
 /// </para>
 /// <para>
@@ -51,7 +52,7 @@ public sealed unsafe class VulkanPipelineLayout : IDisposable
     /// <param name="api">The Vulkan entry points.</param>
     /// <param name="device">The logical device.</param>
     /// <param name="debugNames">Used to name the layout.</param>
-    /// <param name="setLayouts">The four descriptor set layouts, indexed by set number.</param>
+    /// <param name="setLayouts">The descriptor set layouts, indexed by set number.</param>
     /// <param name="pushConstants">The push constant range, or <see langword="null"/> for none.</param>
     /// <param name="problems">Diagnostics gathered while the set layouts were built.</param>
     /// <param name="name">Debug name.</param>
@@ -189,7 +190,7 @@ public sealed class VulkanPipelineLayoutCache : IDisposable
     private readonly Device Device;
     private readonly VulkanDebugNames DebugNames;
     private readonly VulkanPipelineStats Stats;
-    private readonly VulkanDescriptorSetLayouts SetLayouts;
+    private readonly VulkanDescriptorLayoutCache SetLayouts;
     private readonly Dictionary<ulong, VulkanPipelineLayout> Cache = [];
     private readonly Lock Gate = new();
 
@@ -208,7 +209,7 @@ public sealed class VulkanPipelineLayoutCache : IDisposable
     }
 
     /// <summary>Gets the descriptor set layout cache the layouts are built from.</summary>
-    public VulkanDescriptorSetLayouts DescriptorSetLayouts => SetLayouts;
+    public VulkanDescriptorLayoutCache DescriptorSetLayouts => SetLayouts;
 
     /// <summary>Initializes the cache.</summary>
     /// <param name="api">The Vulkan entry points.</param>
@@ -222,7 +223,7 @@ public sealed class VulkanPipelineLayoutCache : IDisposable
         Device device,
         VulkanDebugNames debugNames,
         VulkanPipelineStats stats,
-        VulkanDescriptorSetLayouts setLayouts)
+        VulkanDescriptorLayoutCache setLayouts)
     {
         ArgumentNullException.ThrowIfNull(api);
         ArgumentNullException.ThrowIfNull(debugNames);
@@ -251,7 +252,15 @@ public sealed class VulkanPipelineLayoutCache : IDisposable
         ArgumentNullException.ThrowIfNull(reflections);
         ObjectDisposedException.ThrowIf(Disposed, this);
 
-        var setLayouts = SetLayouts.Build(reflections, name, out var problems);
+        var built = VulkanPipelineDescriptorLayouts.Build(SetLayouts, name, reflections);
+        var setLayouts = built.ToHandles();
+        var problems = built.Diagnostics;
+
+        if (built.ConformanceViolationCount > 0)
+        {
+            Stats.Count(VulkanPipelineCounter.DescriptorConformanceViolations, built.ConformanceViolationCount);
+        }
+
         var pushConstants = VulkanPipelineLayout.DerivePushConstants(reflections, maxPushConstantSize, name);
 
         var hash = VulkanPipelineKey.OffsetBasis;

@@ -6,37 +6,48 @@ using ValveResourceFormat.Renderer.Shaders.Spirv;
 namespace ValveResourceFormat.Renderer.RHI.Vulkan.Descriptors;
 
 /// <summary>
-/// The four descriptor set layouts one pipeline layout declares, derived from the SPIR-V its stages
+/// The descriptor set layouts one pipeline layout declares, derived from the SPIR-V its stages
 /// were compiled to.
 /// </summary>
 /// <remarks>
 /// <para>
-/// This is the hand-off to the pipeline layer: <c>vkCreatePipelineLayout</c> wants an array of four
-/// <c>VkDescriptorSetLayout</c> handles in set order, and <see cref="CopyHandlesTo"/> fills it. Nothing
-/// here creates a <c>VkPipelineLayout</c>; that object, its cache and the push constant range on it
-/// belong to the pipeline layer.
+/// This is the hand-off to the pipeline layer: <c>vkCreatePipelineLayout</c> wants an array of
+/// <see cref="DescriptorSets.Count"/> <c>VkDescriptorSetLayout</c> handles in set order, and
+/// <see cref="CopyHandlesTo"/> or <see cref="ToHandles"/> fills it. Nothing here creates a
+/// <c>VkPipelineLayout</c>; that object, its cache and the push constant range on it belong to the
+/// pipeline layer.
 /// </para>
 /// <para>
-/// Sets 0, 1 and 2 normally come back as the shared canonical layouts, so every pipeline built this way
-/// is layout-compatible for them and the renderer can bind the globals once per pass. A set falls back
-/// to a reflected layout only when the shader declares something the canonical table cannot express,
-/// and <see cref="Diagnostics"/> says which and why. See <see cref="StorageImagesDisplaceSet2"/> for the
-/// one case that actually occurs.
+/// Sets 0, 1, 2 and 4 normally come back as the shared canonical layouts, so every pipeline built this
+/// way is layout-compatible for them and the renderer can bind the globals once per pass. A set falls
+/// back to a reflected layout only when the shader declares something the canonical table cannot
+/// express, and <see cref="Diagnostics"/> says which and why. See
+/// <see cref="StorageImagesDisplaceSet2"/> for the one case that occurs today.
 /// </para>
 /// </remarks>
 public sealed class VulkanPipelineDescriptorLayouts
 {
     /// <summary>
-    /// Whether any set fell back from its shared canonical layout to a reflected one.
+    /// Whether set 2 fell back from its shared canonical layout because the shader put a storage image
+    /// in it.
     /// </summary>
     /// <remarks>
-    /// True today only for the compute passes that declare storage images. Those bind at
-    /// <c>layout(binding = 0..4)</c> in OpenGL's <i>image unit</i> namespace, which is a third index
-    /// space alongside texture units and buffer binding points, and the contract's four-set table has no
-    /// room for it: set 2 binding 0 is already <c>g_tBRDFLookup</c> as a combined image sampler. This is
-    /// the same collision the UBO and SSBO ranges have, one namespace further on, and it has no
-    /// equivalent of splitting across sets 0 and 1 available to it. Reflecting set 2 for those pipelines
-    /// is correct but costs them compatibility with the shared set 2, so they must rebind it.
+    /// <para>
+    /// <b>Transitional, and expected to be true until shader emission catches up.</b> Storage images now
+    /// have <see cref="DescriptorSets.StorageImages"/> of their own, which is what this flag being true
+    /// on the old layout argued for. But <c>ShaderParser</c> still decorates them
+    /// <c>layout(set = 2, binding = n)</c>, so reflection still reports set 2 for an image, and a
+    /// pipeline layout <i>must</i> declare what the module decorates &#8212; relocating the binding to
+    /// set 4 here would leave the shader reading set 2 while the layout described set 4, which is the
+    /// silently-wrong-resource failure the whole scheme exists to prevent. So the fallback stays: set 2
+    /// is reflected for those pipelines, they lose compatibility with the shared set 2 and must rebind
+    /// it.
+    /// </para>
+    /// <para>
+    /// Nothing here needs changing when emission moves. An image decorated into set 4 fits the canonical
+    /// set 4 layout, this flag stops being set, and set 2 goes back to being shared, all by the existing
+    /// rule.
+    /// </para>
     /// </remarks>
     public bool StorageImagesDisplaceSet2 { get; }
 
@@ -46,6 +57,16 @@ public sealed class VulkanPipelineDescriptorLayouts
     /// <summary>Gets one message per contract violation or canonical fallback. Empty when the shader
     /// conforms and every set is shared.</summary>
     public ImmutableArray<string> Diagnostics { get; }
+
+    /// <summary>
+    /// Gets how many of <see cref="Diagnostics"/> are conformance violations reported by
+    /// <see cref="SpirvReflection.ValidateDescriptorSets"/>, as opposed to notes about a set falling
+    /// back to a reflected layout.
+    /// </summary>
+    /// <remarks>They are worth separating because they mean different things: a violation is a shader
+    /// that disagrees with the contract and needs fixing, while a fallback is this layer handling a
+    /// disagreement correctly. The violations lead the list.</remarks>
+    public int ConformanceViolationCount { get; }
 
     /// <summary>
     /// Gets the push constant range the stages declare, or <see langword="null"/> when none does.
@@ -58,13 +79,26 @@ public sealed class VulkanPipelineDescriptorLayouts
     private VulkanPipelineDescriptorLayouts(
         ImmutableArray<VulkanDescriptorSetLayout> sets,
         ImmutableArray<string> diagnostics,
+        int conformanceViolationCount,
         PushConstantRange? pushConstants,
         bool storageImagesDisplaceSet2)
     {
         Sets = sets;
         Diagnostics = diagnostics;
+        ConformanceViolationCount = conformanceViolationCount;
         PushConstants = pushConstants;
         StorageImagesDisplaceSet2 = storageImagesDisplaceSet2;
+    }
+
+    /// <summary>Gets the layout handles as a fresh array, in set order.</summary>
+    /// <returns>The handles, ready for <c>vkCreatePipelineLayout</c>.</returns>
+    /// <remarks>For a caller that needs an array it can keep, such as
+    /// <see cref="VulkanPipelineLayout"/>. Prefer <see cref="CopyHandlesTo"/> where a span will do.</remarks>
+    public DescriptorSetLayout[] ToHandles()
+    {
+        var handles = new DescriptorSetLayout[Sets.Length];
+        CopyHandlesTo(handles);
+        return handles;
     }
 
     /// <summary>Copies the layout handles into a span, in set order.</summary>
@@ -92,19 +126,34 @@ public sealed class VulkanPipelineDescriptorLayouts
     /// <param name="name">Debug name for any layout this has to create.</param>
     /// <param name="stages">The reflected modules. A graphics pipeline passes its vertex and fragment
     /// modules, a compute pipeline its single one.</param>
-    /// <returns>The four layouts and what was noticed while building them.</returns>
+    /// <returns>The layouts and what was noticed while building them.</returns>
     /// <exception cref="ArgumentNullException">A required argument is <see langword="null"/>.</exception>
     public static VulkanPipelineDescriptorLayouts Build(
         VulkanDescriptorLayoutCache cache,
         string name,
         params SpirvReflectionResult[] stages)
+        => Build(cache, name, (IReadOnlyList<SpirvReflectionResult>)stages);
+
+    /// <summary>
+    /// Builds the set layouts for a pipeline from the reflection of every stage it uses.
+    /// </summary>
+    /// <param name="cache">Where the layouts come from and where they live.</param>
+    /// <param name="name">Debug name for any layout this has to create.</param>
+    /// <param name="stages">The reflected modules, in any order.</param>
+    /// <returns>The layouts and what was noticed while building them.</returns>
+    /// <exception cref="ArgumentNullException">A required argument is <see langword="null"/>.</exception>
+    /// <remarks>The overload the pipeline layer calls, which already holds its stages as a list.</remarks>
+    public static VulkanPipelineDescriptorLayouts Build(
+        VulkanDescriptorLayoutCache cache,
+        string name,
+        IReadOnlyList<SpirvReflectionResult> stages)
     {
         ArgumentNullException.ThrowIfNull(cache);
         ArgumentNullException.ThrowIfNull(name);
         ArgumentNullException.ThrowIfNull(stages);
 
         var diagnostics = ImmutableArray.CreateBuilder<string>();
-        var merged = MergeStages(stages, diagnostics);
+        var merged = MergeStages(stages, diagnostics, out var conformanceViolations);
 
         var sets = ImmutableArray.CreateBuilder<VulkanDescriptorSetLayout>(DescriptorSets.Count);
         var displaced = false;
@@ -122,10 +171,15 @@ public sealed class VulkanPipelineDescriptorLayouts
                     continue;
                 }
 
-                displaced |= set == DescriptorSets.ReservedTextures;
+                var storageImageInSet2 = set == DescriptorSets.ReservedTextures && HasStorageImage(declared);
+                displaced |= storageImageInSet2;
+
+                var note = storageImageInSet2
+                    ? $" This is the transitional case: storage images have set {DescriptorSets.StorageImages} of their own now, and this shader will stop needing a reflected set 2 once shader emission decorates them there."
+                    : string.Empty;
 
                 diagnostics.Add(string.Create(CultureInfo.InvariantCulture,
-                    $"'{name}' cannot use the shared set {set} layout: {reason} Its set {set} is reflected instead, so it is not layout-compatible with pipelines that use the shared one and must rebind it."));
+                    $"'{name}' cannot use the shared set {set} layout: {reason} Its set {set} is reflected instead, so it is not layout-compatible with pipelines that use the shared one and must rebind it.{note}"));
             }
 
             sets.Add(cache.GetOrCreate(
@@ -137,13 +191,28 @@ public sealed class VulkanPipelineDescriptorLayouts
         return new VulkanPipelineDescriptorLayouts(
             sets.MoveToImmutable(),
             diagnostics.ToImmutable(),
+            conformanceViolations,
             MergePushConstants(stages),
             displaced);
     }
 
+    private static bool HasStorageImage(Dictionary<int, VulkanDescriptorBinding> declared)
+    {
+        foreach (var binding in declared.Values)
+        {
+            if (binding.Type == DescriptorType.StorageImage)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static Dictionary<int, VulkanDescriptorBinding>[] MergeStages(
-        SpirvReflectionResult[] stages,
-        ImmutableArray<string>.Builder diagnostics)
+        IReadOnlyList<SpirvReflectionResult> stages,
+        ImmutableArray<string>.Builder diagnostics,
+        out int conformanceViolations)
     {
         var merged = new Dictionary<int, VulkanDescriptorBinding>[DescriptorSets.Count];
 
@@ -151,6 +220,8 @@ public sealed class VulkanPipelineDescriptorLayouts
         {
             merged[set] = [];
         }
+
+        conformanceViolations = 0;
 
         foreach (var stage in stages)
         {
@@ -162,9 +233,11 @@ public sealed class VulkanPipelineDescriptorLayouts
             // Run the contract conformance check the reflector already provides, so a shader that
             // decorates a storage buffer into set 0 is reported here rather than binding the wrong
             // buffer silently at draw time.
-            diagnostics.AddRange(SpirvReflection.ValidateDescriptorSets(stage));
+            var violations = SpirvReflection.ValidateDescriptorSets(stage);
+            diagnostics.AddRange(violations);
+            conformanceViolations += violations.Length;
 
-            var stageFlags = VulkanDescriptorTypes.ToStageFlags(stage.Stage);
+            var stageFlags = VulkanShaderModule.ToVkStages(stage.Stage);
 
             foreach (var binding in stage.DescriptorBindings)
             {
@@ -250,7 +323,7 @@ public sealed class VulkanPipelineDescriptorLayouts
         return true;
     }
 
-    private static PushConstantRange? MergePushConstants(SpirvReflectionResult[] stages)
+    private static PushConstantRange? MergePushConstants(IReadOnlyList<SpirvReflectionResult> stages)
     {
         var size = 0;
         var stageMask = ShaderStage.None;

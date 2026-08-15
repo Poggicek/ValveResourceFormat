@@ -48,7 +48,7 @@ public interface IVulkanPipeline
 /// <para>
 /// The contract's binding calls are immediate-mode &#8212; bind a texture, bind a buffer, draw &#8212;
 /// which is OpenGL's model, not Vulkan's. Something has to turn a sequence of those into descriptor
-/// sets, and it needs the set layouts the pipeline layer built from the contract's four-set table.
+/// sets, and it needs the set layouts the pipeline layer built from the contract's descriptor set table.
 /// That belongs to the descriptor layer, so the command list calls out to this interface and the
 /// strategy behind it (write-time sets, push descriptors, a cache keyed on the binding state) stays a
 /// decision that layer makes.

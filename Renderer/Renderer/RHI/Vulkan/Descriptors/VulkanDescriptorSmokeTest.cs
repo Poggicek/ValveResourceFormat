@@ -149,7 +149,7 @@ public readonly record struct VulkanDescriptorSmokeTestResult(
 /// The check with the most to say is <c>overlap</c>: it binds buffer <c>A</c> to set 0 binding 0 and a
 /// different buffer <c>B</c> to set 1 binding 0 and reads both back distinctly. That pair of bindings is
 /// <see cref="ReservedBufferSlots.View"/> and <see cref="ReservedBufferSlots.Objects"/>, the collision
-/// the whole four-set scheme exists to make unrepresentable, and it is the one thing here that would be
+/// the whole multi-set scheme exists to make unrepresentable, and it is the one thing here that would be
 /// impossible if the sets had been merged.
 /// </para>
 /// <para>
@@ -253,7 +253,7 @@ public static unsafe class VulkanDescriptorSmokeTest
             errors,
             warnings,
             foreign,
-            cache.Count,
+            cache.LayoutCount,
             allocator.Statistics,
             messages);
     }
@@ -271,7 +271,7 @@ public static unsafe class VulkanDescriptorSmokeTest
         checks.Add(("canonical: set 2 declares every reserved texture slot",
             textures.Bindings.Length == (int)ReservedTextureSlots.Last + 1));
 
-        // The overlap the four-set scheme exists for, stated as a layout fact: binding 0 means a
+        // The overlap sets 0 and 1 exist for, stated as a layout fact: binding 0 means a
         // different thing in each of the two buffer sets, and both are declared.
         checks.Add(("canonical: binding 0 is a uniform buffer in set 0 and a storage buffer in set 1",
             uniforms.TryGetBinding((int)ReservedBufferSlots.View, out var view)
@@ -290,6 +290,41 @@ public static unsafe class VulkanDescriptorSmokeTest
 
         checks.Add(("canonical: set 3 has no canonical layout", cache.Canonical(DescriptorSets.MaterialTextures) is null));
         checks.Add(("canonical: an empty layout declares nothing", cache.Empty(DescriptorSets.MaterialTextures).IsEmpty));
+
+        var images = cache.StorageImages;
+
+        checks.Add(("canonical: set 4 declares the guaranteed image unit count",
+            images.Bindings.Length == VulkanDescriptorTypes.StorageImageSlotCount));
+        checks.Add(("canonical: set 4 holds storage images",
+            images.TryGetBinding(0, out var image) && image.Type == DescriptorType.StorageImage));
+
+        // The reason set 4 exists. Binding 0 is a storage image there and g_tBRDFLookup as a combined
+        // image sampler in set 2, and a shader can declare both at once -- depth_pyramid.comp does.
+        // Before set 4 there was nowhere to put the second one.
+        checks.Add(("canonical: binding 0 is a storage image in set 4 and a sampled texture in set 2",
+            image.Type == DescriptorType.StorageImage && brdf.Type == DescriptorType.CombinedImageSampler));
+
+        checks.Add(("canonical: every set of the contract resolves to a layout",
+            AllSetsResolve(cache)));
+    }
+
+    /// <summary>
+    /// Every set index the contract declares must produce a layout, canonical or empty. A set that
+    /// resolved to nothing would leave a hole in the array <c>vkCreatePipelineLayout</c> is handed.
+    /// </summary>
+    private static bool AllSetsResolve(VulkanDescriptorLayoutCache cache)
+    {
+        for (var set = 0; set < DescriptorSets.Count; set++)
+        {
+            var layout = cache.Canonical(set) ?? cache.Empty(set);
+
+            if (layout.Handle.Handle == 0 || layout.SetIndex != set)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static void CheckDeduplication(VulkanDescriptorLayoutCache cache, List<(string, bool)> checks)
@@ -377,11 +412,13 @@ public static unsafe class VulkanDescriptorSmokeTest
         var graphics = VulkanPipelineDescriptorLayouts.Build(cache, "SmokeTest graphics", vertex, fragment);
 
         checks.Add(("reflect: a conforming pipeline reports no diagnostics", graphics.Diagnostics.Length == 0));
-        checks.Add(("reflect: it declares all four sets", graphics.Sets.Length == DescriptorSets.Count));
-        checks.Add(("reflect: sets 0 to 2 are the shared canonical objects",
+        checks.Add((string.Create(CultureInfo.InvariantCulture, $"reflect: it declares all {DescriptorSets.Count} sets"),
+            graphics.Sets.Length == DescriptorSets.Count));
+        checks.Add(("reflect: sets 0, 1, 2 and 4 are the shared canonical objects",
             ReferenceEquals(graphics.Sets[0], cache.UniformBuffers)
             && ReferenceEquals(graphics.Sets[1], cache.StorageBuffers)
-            && ReferenceEquals(graphics.Sets[2], cache.ReservedTextures)));
+            && ReferenceEquals(graphics.Sets[2], cache.ReservedTextures)
+            && ReferenceEquals(graphics.Sets[DescriptorSets.StorageImages], cache.StorageImages)));
         checks.Add(("reflect: set 3 is reflected, with the material's own numbering",
             graphics.Sets[3].Bindings.Length == 2
             && graphics.Sets[3].Bindings[0].Binding == 0
@@ -408,10 +445,12 @@ public static unsafe class VulkanDescriptorSmokeTest
         checks.Add(("reflect: a shader with no set 3 gets the empty layout there", bare.Sets[3].IsEmpty));
         checks.Add(("reflect: and still shares sets 0 to 2", ReferenceEquals(bare.Sets[2], cache.ReservedTextures)));
 
-        // depth_pyramid.comp: a sampler at binding 0 and storage images at 1 and 2, in OpenGL's image
-        // unit namespace. Set 2 binding 1 is BlueNoise in the reserved table, so the canonical layout
-        // cannot hold this and the pipeline gets a reflected set 2 of its own.
-        var compute = VulkanPipelineDescriptorLayouts.Build(cache, "SmokeTest depth pyramid", new SpirvReflectionResult
+        // depth_pyramid.comp as ShaderParser emits it TODAY: a sampler at binding 0 and storage images
+        // at 1 and 2, all decorated into set 2 because emission has not moved to set 4 yet. Set 2
+        // binding 1 is BlueNoise in the reserved table, so the canonical layout cannot hold this and the
+        // pipeline gets a reflected set 2 of its own. Relocating the images to set 4 here would be
+        // wrong: the module reads set 2, so the layout has to say set 2.
+        var transitional = VulkanPipelineDescriptorLayouts.Build(cache, "SmokeTest depth pyramid (set 2 images)", new SpirvReflectionResult
         {
             Stage = ShaderStage.Compute,
             DescriptorBindings =
@@ -422,10 +461,57 @@ public static unsafe class VulkanDescriptorSmokeTest
             ],
         });
 
-        checks.Add(("reflect: a storage image displaces the shared set 2", compute.StorageImagesDisplaceSet2));
-        checks.Add(("reflect: and says so", compute.Diagnostics.Length == 1));
+        checks.Add(("reflect: a storage image still decorated into set 2 displaces the shared set 2",
+            transitional.StorageImagesDisplaceSet2));
+        checks.Add(("reflect: and says so, naming the transition",
+            transitional.Diagnostics.Length - transitional.ConformanceViolationCount == 1
+            && transitional.Diagnostics[^1].Contains("transitional", StringComparison.Ordinal)));
         checks.Add(("reflect: the displaced set 2 is reflected, not shared",
-            !ReferenceEquals(compute.Sets[2], cache.ReservedTextures) && compute.Sets[2].Bindings.Length == 3));
+            !ReferenceEquals(transitional.Sets[2], cache.ReservedTextures) && transitional.Sets[2].Bindings.Length == 3));
+        checks.Add(("reflect: a displaced set 2 does not disturb the other sets",
+            ReferenceEquals(transitional.Sets[0], cache.UniformBuffers)
+            && ReferenceEquals(transitional.Sets[DescriptorSets.StorageImages], cache.StorageImages)));
+
+        // The same shader once ShaderParser decorates its images into set 4. Nothing in this layer
+        // changes for that to work, which is the property worth pinning: set 2 goes back to shared and
+        // the images land in the canonical set 4.
+        var target = VulkanPipelineDescriptorLayouts.Build(cache, "SmokeTest depth pyramid (set 4 images)", new SpirvReflectionResult
+        {
+            Stage = ShaderStage.Compute,
+            DescriptorBindings =
+            [
+                new("g_tSourceDepthNpot", DescriptorSets.ReservedTextures, 0, SpirvResourceKind.CombinedImageSampler, 1, 0),
+                new("g_tSourceDepth", DescriptorSets.StorageImages, 1, SpirvResourceKind.StorageImage, 1, 0),
+                new("g_tDestDepth", DescriptorSets.StorageImages, 2, SpirvResourceKind.StorageImage, 1, 0),
+            ],
+        });
+
+        checks.Add(("reflect: images decorated into set 4 displace nothing", !target.StorageImagesDisplaceSet2));
+        checks.Add(("reflect: every set is then shared, set 2 included",
+            ReferenceEquals(target.Sets[2], cache.ReservedTextures)
+            && ReferenceEquals(target.Sets[DescriptorSets.StorageImages], cache.StorageImages)));
+
+        // Stated as "this layer added nothing of its own" rather than "there are no diagnostics",
+        // because SpirvReflection.ValidateDescriptorSets has not learned set 4 yet and still reports a
+        // correctly placed storage image as belonging in set 2 or 3. Splitting the count is what lets
+        // this assert the right thing today and keep asserting it once that is fixed.
+        checks.Add(("reflect: a set 4 image needs no fallback from this layer",
+            target.Diagnostics.Length == target.ConformanceViolationCount));
+
+        // An image unit past what OpenGL guarantees has no canonical slot, so it falls back rather than
+        // being silently dropped or clamped.
+        var wideImage = VulkanPipelineDescriptorLayouts.Build(cache, "SmokeTest wide image unit", new SpirvReflectionResult
+        {
+            Stage = ShaderStage.Compute,
+            DescriptorBindings =
+            [
+                new("g_tFar", DescriptorSets.StorageImages, VulkanDescriptorTypes.StorageImageSlotCount, SpirvResourceKind.StorageImage, 1, 0),
+            ],
+        });
+
+        checks.Add(("reflect: an image unit past the canonical width falls back with a diagnostic",
+            !ReferenceEquals(wideImage.Sets[DescriptorSets.StorageImages], cache.StorageImages)
+            && wideImage.Diagnostics.Length - wideImage.ConformanceViolationCount == 1));
 
         // The reflector's own contract check has to reach the diagnostics, or a shader that decorates a
         // storage buffer into set 0 would build a layout that binds the wrong buffer without a word.

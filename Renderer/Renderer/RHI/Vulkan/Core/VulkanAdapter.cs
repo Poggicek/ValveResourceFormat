@@ -282,6 +282,17 @@ public sealed unsafe class VulkanAdapter
             return null;
         }
 
+        // The contract declares five descriptor sets and Vulkan's guaranteed floor is four, so this is
+        // a real limit rather than a formality. A device at the floor would create every pipeline
+        // successfully and then be unable to bind all of their sets, which surfaces at the first draw
+        // as a resource that is simply absent -- so it is rejected here, where the reason can be said
+        // plainly, rather than diagnosed later from a black image.
+        if (properties2.Properties.Limits.MaxBoundDescriptorSets < DescriptorSets.Count)
+        {
+            rejection = $"{name} binds at most {properties2.Properties.Limits.MaxBoundDescriptorSets} descriptor sets, {DescriptorSets.Count} are required";
+            return null;
+        }
+
         var features13 = new PhysicalDeviceVulkan13Features
         {
             SType = StructureType.PhysicalDeviceVulkan13Features,

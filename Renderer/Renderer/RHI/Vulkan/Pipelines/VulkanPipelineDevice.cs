@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Silk.NET.Vulkan;
 using ValveResourceFormat.Renderer.RHI.Vulkan.Core;
+using ValveResourceFormat.Renderer.RHI.Vulkan.Descriptors;
 using ValveResourceFormat.Renderer.Shaders.Spirv;
 
 namespace ValveResourceFormat.Renderer.RHI.Vulkan;
@@ -23,8 +24,10 @@ public sealed record VulkanPipelineOptions
     /// a benchmark that must measure cold compilation.</summary>
     public bool EnableDiskCache { get; init; } = true;
 
-    /// <summary>Gets a value indicating whether sets 0 to 2 declare the whole reserved slot range rather
-    /// than only what each shader touches. See <see cref="VulkanDescriptorSetLayouts"/>.</summary>
+    /// <summary>Gets a value indicating whether the reserved sets declare their whole slot range rather
+    /// than only what each shader touches. See <see cref="VulkanDescriptorLayoutCache"/>.</summary>
+    /// <remarks>Ignored on a device whose limits cannot hold them; see
+    /// <see cref="VulkanDescriptorLayoutCache.CanonicalLayoutsFit"/>.</remarks>
     public bool UseReservedTemplate { get; init; } = true;
 
     /// <summary>Gets how many pipelines may be compiled at once by <see cref="VulkanPipelineDevice.WarmAsync"/>.
@@ -108,7 +111,7 @@ public class VulkanPipelineDevice : VulkanDevice
     public VulkanPipelineStats Stats { get; } = new();
 
     /// <summary>Gets the descriptor set layout cache.</summary>
-    public VulkanDescriptorSetLayouts DescriptorSetLayouts { get; }
+    public VulkanDescriptorLayoutCache DescriptorSetLayouts { get; }
 
     /// <summary>Gets the pipeline layout cache.</summary>
     public VulkanPipelineLayoutCache PipelineLayouts { get; }
@@ -162,7 +165,7 @@ public class VulkanPipelineDevice : VulkanDevice
         var template = options.UseReservedTemplate;
         var limits = core.Adapter.Properties.Limits;
 
-        if (template && !VulkanDescriptorSetLayouts.TemplateFits(in limits))
+        if (template && !VulkanDescriptorLayoutCache.CanonicalLayoutsFit(in limits))
         {
             template = false;
 
@@ -170,7 +173,26 @@ public class VulkanPipelineDevice : VulkanDevice
                 $"'{core.Adapter.Name}' cannot hold the reserved descriptor template within its per-stage descriptor limits, so set layouts will be built from each shader's own declarations. Pipelines will not be layout compatible for the global sets.");
         }
 
-        DescriptorSetLayouts = new VulkanDescriptorSetLayouts(core.Api, core.Handle, core.DebugNames, Stats, template);
+        // Vulkan's floor for maxBoundDescriptorSets is four and the contract now needs five, so a device
+        // at the floor cannot bind the scheme at all. Reported rather than thrown, because the pipeline
+        // layer is not where a device is chosen and a caller may only be reflecting layouts.
+        if (limits.MaxBoundDescriptorSets < DescriptorSets.Count)
+        {
+            MessageCallback?.Invoke(RhiMessageSeverity.Error,
+                $"'{core.Adapter.Name}' binds at most {limits.MaxBoundDescriptorSets} descriptor sets, and the contract's scheme needs {DescriptorSets.Count}. Pipelines will be created but cannot have all their sets bound.");
+        }
+
+        var stats = Stats;
+
+        DescriptorSetLayouts = new VulkanDescriptorLayoutCache(
+            core.Api,
+            core.Handle,
+            core.DebugNames,
+            template,
+            created => stats.Count(created
+                ? VulkanPipelineCounter.DescriptorSetLayoutsCreated
+                : VulkanPipelineCounter.DescriptorSetLayoutCacheHits));
+
         PipelineLayouts = new VulkanPipelineLayoutCache(core.Api, core.Handle, core.DebugNames, Stats, DescriptorSetLayouts);
 
         var path = options.EnableDiskCache

@@ -863,9 +863,12 @@ public static unsafe class VulkanPipelineSmokeTest
     private static void ProvokeOversizedPushConstants(VulkanPipelineDevice device)
     {
         var core = device.Core;
-        var empty = device.DescriptorSetLayouts.GetOrCreate([], "Provocation empty set");
         var layouts = new DescriptorSetLayout[DescriptorSets.Count];
-        Array.Fill(layouts, empty);
+
+        for (var set = 0; set < layouts.Length; set++)
+        {
+            layouts[set] = device.DescriptorSetLayouts.Empty(set).Handle;
+        }
 
         var range = new PushConstantRange(0, device.Limits.MaxPushConstantSize + 4, ShaderStage.AllGraphics);
 

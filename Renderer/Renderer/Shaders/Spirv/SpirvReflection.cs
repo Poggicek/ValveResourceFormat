@@ -603,6 +603,21 @@ public static class SpirvReflection
                 continue;
             }
 
+            // A storage image is a third index space, not a texture: binding it addresses image units,
+            // which OpenGL keeps separate from texture units and Vulkan does not. Set 4 is where the
+            // contract puts them. Set 2 is still accepted because shader emission has not moved yet,
+            // and rejecting it would fail every compute pipeline before the emission change lands.
+            if (binding.Kind == SpirvResourceKind.StorageImage)
+            {
+                if (binding.Set is not (DescriptorSets.StorageImages or DescriptorSets.ReservedTextures))
+                {
+                    problems.Add(string.Create(CultureInfo.InvariantCulture,
+                        $"{where} is a storage image and belongs in set {DescriptorSets.StorageImages}."));
+                }
+
+                continue;
+            }
+
             if (expected < 0 && binding.Set is not (DescriptorSets.ReservedTextures or DescriptorSets.MaterialTextures))
             {
                 problems.Add(string.Create(CultureInfo.InvariantCulture,
