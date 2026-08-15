@@ -814,13 +814,19 @@ namespace ValveResourceFormat.Renderer.Shaders
             return slotByName.ToFrozenDictionary(StringComparer.Ordinal);
         }
 
-        // A uniform block. Matched on its packing qualifier, which every one of ours carries.
-        [GeneratedRegex(@"^layout\s*\(\s*(?<Qualifiers>[^)]*\bstd140\b[^)]*)\)", RegexOptions.Multiline)]
-        private static partial Regex RegexUniformBlockLayout();
-
-        // A shader storage block, likewise.
-        [GeneratedRegex(@"^layout\s*\(\s*(?<Qualifiers>[^)]*\bstd430\b[^)]*)\)", RegexOptions.Multiline)]
-        private static partial Regex RegexStorageBlockLayout();
+        // An interface block. Recognised by its packing qualifier, which every one of ours carries, and
+        // sorted into a set by the storage qualifier that follows it.
+        //
+        // The two are independent, and reading the packing qualifier as though it named the set was wrong:
+        // std140 and std430 describe memory layout, while uniform and buffer decide whether the block is a
+        // UBO or an SSBO. GLSL allows std140 on a buffer block, and histogram.comp declares
+        // 'layout(binding = 3, std140) buffer Luminance', which the packing test put in the uniform buffer
+        // set. Nothing errors when that happens: the pipeline reads a descriptor from set 0 that the RHI
+        // never writes, while the storage buffer it did write into set 1 is never read.
+        [GeneratedRegex(
+            @"^layout\s*\(\s*(?<Qualifiers>[^)]*\b(?:std140|std430)\b[^)]*)\)\s*(?<Memory>(?:(?:readonly|writeonly|coherent|volatile|restrict)\s+)*)(?<Storage>uniform|buffer)\b",
+            RegexOptions.Multiline)]
+        private static partial Regex RegexInterfaceBlockLayout();
 
         // layout(binding = n, rgba8) uniform writeonly image2D name;
         [GeneratedRegex(@"^layout\s*\(\s*(?<Qualifiers>[^)]*)\)\s*uniform\s+(?<Rest>[^;]*\b[iu]?image[0-9A-Za-z]*\s+[A-Za-z_][A-Za-z0-9_]*\s*;)", RegexOptions.Multiline)]
@@ -902,8 +908,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             source = RegexImageDeclaration().Replace(source,
                 match => $"layout(set = {StorageImageSet}, {match.Groups["Qualifiers"].Value}) uniform {match.Groups["Rest"].Value}");
 
-            source = RegexUniformBlockLayout().Replace(source, match => $"layout(set = {UniformBufferSet}, {match.Groups["Qualifiers"].Value})");
-            source = RegexStorageBlockLayout().Replace(source, match => $"layout(set = {StorageBufferSet}, {match.Groups["Qualifiers"].Value})");
+            source = RegexInterfaceBlockLayout().Replace(source, DecorateInterfaceBlock);
 
             source = RegexLooseUniform().Replace(source, match => RewriteLooseUniform(match, parsedData));
 
@@ -991,6 +996,24 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
 
             return source;
+        }
+
+        /// <summary>
+        /// Puts one interface block into the set its storage qualifier calls for, keeping the qualifiers it
+        /// already carries, including its binding.
+        /// </summary>
+        /// <remarks>
+        /// A <c>buffer</c> block goes to <see cref="StorageBufferSet"/> and a <c>uniform</c> block to
+        /// <see cref="UniformBufferSet"/>, whichever packing qualifier identified it as a block. Those two
+        /// index spaces overlap by design in <see cref="ReservedBufferSlots"/>, so the set is the only thing
+        /// keeping a UBO and an SSBO at the same binding number apart on Vulkan.
+        /// </remarks>
+        private static string DecorateInterfaceBlock(Match match)
+        {
+            var storage = match.Groups["Storage"].Value;
+            var set = storage == "buffer" ? StorageBufferSet : UniformBufferSet;
+
+            return $"layout(set = {set}, {match.Groups["Qualifiers"].Value}) {match.Groups["Memory"].Value}{storage}";
         }
 
         private static string DecorateSampler(Match match, ParsedShaderData parsedData)
