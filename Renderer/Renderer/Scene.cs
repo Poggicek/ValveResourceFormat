@@ -723,17 +723,81 @@ namespace ValveResourceFormat.Renderer
         }
 
         /// <summary>Updates the lighting buffer, then binds the lighting, environment map, light probe, and barn light buffers to their reserved GPU binding slots.</summary>
-        public void SetSceneBuffers()
+        /// <param name="commandList">The command list to record into, or <see langword="null"/> to bind through OpenGL directly.</param>
+        /// <remarks>
+        /// <para>
+        /// One unit on purpose: every buffer the shading pass reads for lighting is bound here, so a caller
+        /// cannot leave half of them on one path and half on the other.
+        /// </para>
+        /// <para>
+        /// <b>The golden suite cannot check any of these binds, and that is a property of OpenGL rather
+        /// than of the fixtures.</b> The uniform buffers are already bound by
+        /// <see cref="Buffers.UniformBuffer{T}"/>'s constructor, and an OpenGL buffer binding is global and
+        /// survives until something overwrites that slot, so re-binding here is a no-op no matter where it
+        /// points. The storage buffers are read only by barn light and tiled cull shading, which no golden
+        /// scene exercises. Both were confirmed by probe: misdirecting either bind reddens nothing, while
+        /// making it throw fails 35 of 36 scenes, so the path is reached and simply cannot be observed.
+        /// These binds become load bearing on Vulkan, where descriptor state does not persist across
+        /// command buffers, so treat the green suite as evidence of no regression and not of correctness.
+        /// </para>
+        /// </remarks>
+        public void SetSceneBuffers(RHI.ICommandList? commandList)
         {
             Debug.Assert(lightingBuffer is not null && envMapBuffer is not null && lpvBuffer is not null);
 
             lightingBuffer.Update();
-            lightingBuffer.BindBufferBase();
-            envMapBuffer.BindBufferBase();
-            lpvBuffer.BindBufferBase();
-            LightingInfo.BindBarnLightBuffer();
+            BindUniformBuffer(commandList, lightingBuffer);
+            BindUniformBuffer(commandList, envMapBuffer);
+            BindUniformBuffer(commandList, lpvBuffer);
+            LightingInfo.BindBarnLightBuffer(commandList);
 
-            LightBinner.Bind();
+            LightBinner.Bind(commandList);
+        }
+
+        /// <summary>
+        /// Binds a uniform buffer to its own reserved slot, recording when there is a command list.
+        /// </summary>
+        /// <param name="commandList">The command list to record into, or <see langword="null"/> for OpenGL.</param>
+        /// <param name="buffer">The buffer to bind, at its own <see cref="Buffers.Buffer.BindingPoint"/>.</param>
+        /// <remarks>
+        /// <see cref="RHI.ICommandList.BindUniformBuffer"/> records a <c>glBindBufferRange</c> over the whole
+        /// buffer, which is what <c>glBindBufferBase</c> is defined to mean, so the two paths bind the same
+        /// range. See <see cref="BindStorageBuffer"/> for the one case where that equivalence breaks.
+        /// </remarks>
+        internal static void BindUniformBuffer(RHI.ICommandList? commandList, Buffers.Buffer buffer)
+        {
+            if (commandList is null)
+            {
+                buffer.BindBufferBase();
+                return;
+            }
+
+            commandList.BindUniformBuffer(buffer.BindingPoint, buffer.RhiBuffer);
+        }
+
+        /// <summary>
+        /// Binds a storage buffer to its own reserved slot, recording when there is a command list.
+        /// </summary>
+        /// <param name="commandList">The command list to record into, or <see langword="null"/> for OpenGL.</param>
+        /// <param name="buffer">The buffer to bind, at its own <see cref="Buffers.Buffer.BindingPoint"/>.</param>
+        /// <remarks>
+        /// A zero-sized buffer is the one case where the base and range binds are not equivalent:
+        /// <c>glBindBufferBase</c> accepts one and <c>glBindBufferRange</c> rejects it with
+        /// <c>GL_INVALID_VALUE</c>, and Vulkan will not create one at all. Nothing reaching here allocates
+        /// empty any more &#8212; <see cref="LightBinner"/> was the one that could &#8212; so this asserts
+        /// rather than branching, to keep a future empty allocation from being silently absorbed.
+        /// </remarks>
+        internal static void BindStorageBuffer(RHI.ICommandList? commandList, Buffers.Buffer buffer)
+        {
+            if (commandList is null)
+            {
+                buffer.BindBufferBase();
+                return;
+            }
+
+            Debug.Assert(buffer.Size > 0, $"Storage buffer '{buffer.Name}' is empty, which glBindBufferRange rejects.");
+
+            commandList.BindStorageBuffer(buffer.BindingPoint, buffer.RhiBuffer);
         }
 
         private readonly List<SceneNode> CullResults = [];

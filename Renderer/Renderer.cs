@@ -471,7 +471,7 @@ public class Renderer
         scene.LightBinner.Update(ViewBuffer.Data, cullWidth, cullHeight, tileCullEnabled);
         SkyboxScene?.LightBinner.Update(ViewBuffer.Data, cullWidth, cullHeight, tileCullEnabled);
 
-        ViewBuffer.BindBufferBase();
+        BindUniformBuffer(commandList, ViewBuffer);
         ViewBuffer.Update();
 
         // A locked cull frustum leaves the indirect buffers untouched, freezing the cull state. Disabled
@@ -702,7 +702,7 @@ public class Renderer
 
         LoadShaderTextures();
         UpdatePerViewGpuBuffers(Scene, Camera, DeltaTime, renderContext.CommandList);
-        Scene.SetSceneBuffers();
+        Scene.SetSceneBuffers(renderContext.CommandList);
 
         Scene.RenderOpaqueLayer(renderContext);
         RenderTranslucentLayer(Scene, renderContext);
@@ -831,9 +831,9 @@ public class Renderer
             var viewmodelTileRemap = ViewmodelCamera.GetPixelRemapTo(mainCamera, ViewBuffer.Data.ViewportSize);
             Scene.LightBinner.SetPixelRemap(viewmodelTileRemap);
 
-            ViewBuffer.BindBufferBase();
+            BindUniformBuffer(renderContext.CommandList, ViewBuffer);
             ViewBuffer.Update();
-            Scene.SetSceneBuffers();
+            Scene.SetSceneBuffers(renderContext.CommandList);
 
             renderContext.Camera = ViewmodelCamera;
             renderContext.Scene = Scene;
@@ -845,11 +845,11 @@ public class Renderer
             mainCamera.SetViewConstants(ViewBuffer.Data);
             Scene.SetFogConstants(ViewBuffer.Data);
             Scene.LightBinner.SetPixelRemap(ViewConstants.PixelRemapIdentity);
-            ViewBuffer.BindBufferBase();
+            BindUniformBuffer(renderContext.CommandList, ViewBuffer);
             ViewBuffer.Update();
         }
 
-        Scene.SetSceneBuffers();
+        Scene.SetSceneBuffers(renderContext.CommandList);
 
         using (new GLDebugGroup("Main Scene Opaque Render"))
         {
@@ -875,7 +875,10 @@ public class Renderer
             {
                 Debug.Assert(skyboxScene is not null); // analyzer is failing here
 
-                skyboxScene.SetSceneBuffers();
+                // The skybox is a different Scene with its own lighting buffers, but not a different
+                // frame: it draws into the same pass through the same renderContext below, so it records
+                // into that context's list rather than one of its own.
+                skyboxScene.SetSceneBuffers(renderContext.CommandList);
                 renderContext.Scene = skyboxScene;
 
                 copyColor |= skyboxScene.WantsSceneColor;
@@ -937,7 +940,7 @@ public class Renderer
                 }
 
                 // Back to main scene.
-                Scene.SetSceneBuffers();
+                Scene.SetSceneBuffers(renderContext.CommandList);
                 renderContext.Scene = Scene;
             }
 
@@ -1040,7 +1043,13 @@ public class Renderer
         GL.Viewport(0, 0, ShadowDepthBuffer.Width, ShadowDepthBuffer.Height);
         ShadowDepthBuffer.Bind(FramebufferTarget.Framebuffer);
         GL.DepthRange(0, 1);
-        GL.Clear(ClearBufferMask.DepthBufferBit);
+
+        // The pass opened below clears depth through its load op, so this is the OpenGL path's clear only.
+        // Left in place when recording it would be a raw clear outside any pass, which Vulkan rejects.
+        if (renderContext.CommandList is null)
+        {
+            GL.Clear(ClearBufferMask.DepthBufferBit);
+        }
 
         renderContext.Framebuffer = ShadowDepthBuffer;
         renderContext.Scene = Scene;
@@ -1102,6 +1111,12 @@ public class Renderer
             GL.Enable(EnableCap.ScissorTest);
             GL.Viewport(0, 0, BarnLightShadowBuffer.Width, BarnLightShadowBuffer.Height);
             GL.Scissor(0, 0, BarnLightShadowBuffer.Width, BarnLightShadowBuffer.Height);
+
+            // Not gated on the command list the way the sun atlas clear above is, deliberately: no golden
+            // scene reaches this method at all, so removing the redundant clear here would be an untested
+            // edit to unreached code. The pass opened above does clear depth to 1 through its load op, so
+            // the same `if (renderContext.CommandList is null)` guard applies once a fixture with barn
+            // light shadow casters exists to check it.
             GL.Clear(ClearBufferMask.DepthBufferBit);
 
             foreach (var caster in Scene.LightingInfo.ShadowMapper.ShadowCasters)
@@ -1199,6 +1214,20 @@ public class Renderer
         }
 
         commandList.BindStorageBuffer(buffer.BindingPoint, buffer.RhiBuffer);
+    }
+
+    /// <summary>Binds a uniform buffer to its reserved slot, through the command list when recording.</summary>
+    /// <remarks>The scene-wide equivalent is <see cref="Scene.BindUniformBuffer"/>; this one exists so the
+    /// view buffer, which belongs to the renderer rather than to any scene, binds the same way.</remarks>
+    private static void BindUniformBuffer(RHI.ICommandList? commandList, Buffers.Buffer buffer)
+    {
+        if (commandList is null)
+        {
+            buffer.BindBufferBase();
+            return;
+        }
+
+        commandList.BindUniformBuffer(buffer.BindingPoint, buffer.RhiBuffer);
     }
 
     /// <summary>Orders a histogram pass's storage writes against whatever reads them next.</summary>

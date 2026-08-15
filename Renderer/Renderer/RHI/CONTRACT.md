@@ -192,6 +192,23 @@ That is not a defect in those sites so much as an ordering artifact, and the gol
 surfaced it: with the flag on, every drawing scene fails identically. Turn the flag on once the scene
 passes are wrapped and the material path produces pipelines, and let the suite say whether it worked.
 
+## Depth range belongs to the viewport, and the renderer's layer scheme has to follow
+
+`SetViewport` carries `minDepth`/`maxDepth`, and there is deliberately no separate depth-range call.
+That matches Vulkan, where viewport *is* the depth range and nothing else sets it.
+
+The renderer does not work that way yet. It layers the frame by calling `glDepthRange` independently
+of `glViewport` — `DepthRange.Scene` (0.95–0.05), `Viewmodel` (1.0–0.95), `Sky` (0.05–0). Those are
+separate calls today, and `BeginRenderPass` sets the viewport to the full attachment with the default
+0–1 range, so **any recorded `SetViewport` silently discards the layer's range**. On OpenGL the
+symptom is nothing at all, because the raw `glDepthRange` calls still run alongside; on Vulkan the
+three layers collapse into one and the viewmodel and sky sort against the scene incorrectly.
+
+The contract is right here and the renderer is what has to change: each depth layer must re-issue
+`SetViewport` with its own min and max rather than calling a depth-range setter. That is a structural
+change to the layer scheme, not a mechanical port, which is why `Renderer.cs`'s viewport and
+depth-range calls are still raw OpenGL — porting them piecemeal would trip exactly this.
+
 ## `GLDebugGroup` is not a debug marker — do not port it to `DebugScope`
 
 `IDevice.DebugScope` and `ICommandList.DebugScope` exist for *marker* usage. `GLDebugGroup` is not

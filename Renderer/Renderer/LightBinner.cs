@@ -112,13 +112,17 @@ public sealed class LightBinner(Scene scene) : IDisposable
         : (Constants.LightTileBase, Constants.LightCullWords);
 
     /// <summary>Binds this scene's masks and their layout for the shading pass.</summary>
-    public void Bind()
+    /// <param name="commandList">The command list to record into, or <see langword="null"/> to bind through OpenGL directly.</param>
+    public void Bind(RHI.ICommandList? commandList)
     {
-        CullBits?.BindBufferBase();
+        if (CullBits != null)
+        {
+            Scene.BindStorageBuffer(commandList, CullBits);
+        }
 
         if (ConstantsGpu != null)
         {
-            ConstantsGpu.BindBufferBase();
+            Scene.BindUniformBuffer(commandList, ConstantsGpu);
             ConstantsGpu.Update();
         }
     }
@@ -265,7 +269,19 @@ public sealed class LightBinner(Scene scene) : IDisposable
         if (CullBits == null || CullBitsWords < Feeder.TotalWords)
         {
             CullBits?.Delete();
-            CullBitsWords = Feeder.TotalWords;
+
+            // Never zero. A scene with no barn lights and no env maps lays out no words at all: both
+            // batches round to zero masks, so every stride is zero and the feeder's cursor never advances.
+            // An empty allocation is not bindable through the RHI - glBindBufferRange rejects a zero size
+            // where glBindBufferBase accepts it, and vkCreateBuffer rejects one outright - so the
+            // degenerate case is removed here rather than special-cased at every bind. Nothing reads the
+            // spare word: with no items, both batches publish a stride of zero and the shading pass
+            // iterates nothing.
+            //
+            // Defensive rather than demonstrated: every golden scene carries at least one env map, so the
+            // suite never lays out zero words. CalculateEnvironmentMaps returning early on an empty list
+            // is what makes it reachable off the suite. Scene.BindStorageBuffer asserts on the case.
+            CullBitsWords = Math.Max(1, Feeder.TotalWords);
             CullBits = StorageBuffer.Allocate<uint>(
                 ReservedBufferSlots.CullBits, CullBitsWords, BufferUsageHint.DynamicDraw);
 

@@ -733,18 +733,17 @@ namespace ValveResourceFormat.Renderer.World
         }
 
         /// <summary>Binds the barn light storage buffer to its reserved shader slot.</summary>
-        /// <remarks>
-        /// The one binding entry point here still on OpenGL, and deliberately so. Its only caller is
-        /// <see cref="Scene.SetSceneBuffers"/>, which takes no command list because all five callers of
-        /// that method live in <c>Renderer.cs</c>. Threading one down to here would add a branch no caller can
-        /// reach and the golden suite cannot check, which is the false green this port avoids; it closes
-        /// when <c>Renderer.cs</c> passes <c>renderContext.CommandList</c> into
-        /// <see cref="Scene.SetSceneBuffers"/>, alongside the lighting, envmap, probe and light binner
-        /// buffers that are unported for exactly the same reason.
-        /// </remarks>
-        public void BindBarnLightBuffer()
+        /// <param name="commandList">The command list to record into, or <see langword="null"/> to bind through OpenGL directly.</param>
+        /// <remarks>Bound as part of <see cref="Scene.SetSceneBuffers"/>, which is where the rest of the
+        /// lighting buffers this shading pass reads are bound, and which supplies the command list.</remarks>
+        public void BindBarnLightBuffer(ICommandList? commandList)
         {
-            BarnLightStorageBuffer?.BindBufferBase();
+            if (BarnLightStorageBuffer is null)
+            {
+                return;
+            }
+
+            Scene.BindStorageBuffer(commandList, BarnLightStorageBuffer);
         }
 
         /// <summary>
