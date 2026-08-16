@@ -473,6 +473,7 @@ namespace ValveResourceFormat.Renderer
         {
             var commandList = config.CommandList!;
             var vertexBuffers = VertexBuffersWithDefaults(call);
+            var vertexInput = DescribeVertexInput(call, vertexBuffers, shader);
 
             // The state the pipeline bakes has to be the state the OpenGL path applies, or the two
             // backends stop being each other's oracle. A material-ignoring replacement shader applies
@@ -485,7 +486,7 @@ namespace ValveResourceFormat.Renderer
                 config.Device!,
                 shader,
                 in state,
-                DescribeVertexInput(call, vertexBuffers),
+                vertexInput,
                 ToTopology(call.PrimitiveType),
                 config.ColorFormats,
                 config.DepthFormat,
@@ -496,11 +497,16 @@ namespace ValveResourceFormat.Renderer
 
             var meshBuffers = call.MeshBuffers;
 
-            for (var binding = 0; binding < vertexBuffers.Length; binding++)
+            // Every binding the pipeline declares, which is one per mesh buffer and then, when the shader
+            // reads inputs this mesh has no stream for, the constant that stands in for them. That one is
+            // always last; see DescribeVertexInput.
+            for (var binding = 0; binding < vertexInput.Bindings.Length; binding++)
             {
                 // Offset zero, matching the vertex array: a draw call's own Offset is folded into the
                 // attribute offsets, not the buffer binding.
-                commandList.BindVertexBuffer(binding, meshBuffers.GetRhiBuffer(vertexBuffers[binding]));
+                commandList.BindVertexBuffer(binding, binding < vertexBuffers.Length
+                    ? meshBuffers.GetRhiBuffer(vertexBuffers[binding])
+                    : meshBuffers.DefaultAttributeRhiBuffer);
             }
 
             if (call.IndexBuffer.HasBuffer)
@@ -554,16 +560,40 @@ namespace ValveResourceFormat.Renderer
         }
 
         /// <summary>
-        /// Describes a draw call's geometry as pipeline vertex input state.
+        /// Describes a draw call's geometry as pipeline vertex input state, completed with a constant for
+        /// every input the shader reads that the mesh has no stream for.
         /// </summary>
+        /// <param name="call">The draw call whose geometry is being described.</param>
+        /// <param name="vertexBuffers">The draw call's buffers, already carrying whatever
+        /// <see cref="VertexBuffersWithDefaults"/> added.</param>
+        /// <param name="shader">The shader being drawn with, which decides which inputs have to exist. It
+        /// may be a replacement rather than the material's own, and <c>error</c> is drawn over arbitrary
+        /// geometry, so this cannot be answered from the material's input signature.</param>
         /// <remarks>
+        /// <para>
         /// :VertexInputParity - mirrors <c>GPUMeshBufferCache.CreateVertexArrayObject</c> attribute for
         /// attribute, because on the recording path this replaces it: the vertex array a draw fetches
         /// through is built from the pipeline's vertex input, not from the mesh's own VAO. It resolves
         /// locations the same way, skips the same attributes, and takes the same first-wins rule for a
         /// location two buffers both claim, which the alias table allows.
+        /// </para>
+        /// <para>
+        /// <b>The completion has no counterpart in the vertex array, and needs none.</b> A location no
+        /// buffer claims is not enabled in the VAO, and OpenGL reads the generic attribute's value there,
+        /// which is <c>(0, 0, 0, 1)</c> and which nothing in the renderer changes. So the constant appended
+        /// here <i>is</i> what OpenGL already does; enabling the same attribute in the VAO would issue extra
+        /// calls to arrive at the identical value. That is the opposite of the missing COLOR stream, whose
+        /// substitute is white and therefore has to be stated on both paths or they disagree.
+        /// </para>
+        /// <para>
+        /// The mesh genuinely lacks these streams: the UV set a shader samples is chosen by
+        /// <c>g_nUVSet1</c> and friends at runtime rather than by a combo, so <c>vTEXCOORD1</c> is read even
+        /// where no mesh in the map has a second UV. Vulkan reads undefined values from a location the
+        /// pipeline does not supply, which is why the pipeline's interface check reports it, and this is
+        /// what stops it being reported by supplying the input rather than by checking less.
+        /// </para>
         /// </remarks>
-        private static VertexInputDesc DescribeVertexInput(DrawCall call, VertexDrawBuffer[] vertexBuffers)
+        private static VertexInputDesc DescribeVertexInput(DrawCall call, VertexDrawBuffer[] vertexBuffers, Shader shader)
         {
             var inputSignature = call.Material.Material.InputSignature;
             var bindings = new VertexBindingDesc[vertexBuffers.Length];
@@ -595,8 +625,65 @@ namespace ValveResourceFormat.Renderer
                 }
             }
 
-            return new VertexInputDesc([.. attributes], bindings);
+            // Null on the OpenGL path, where there is no module to reflect and no completion to make: an
+            // unsupplied attribute already reads the value the constant would have supplied.
+            var declared = shader.SpirvInterface;
+            var unsupplied = (declared?.VertexInputLocations ?? 0) & ~boundLocations;
+
+            if (unsupplied == 0)
+            {
+                return new VertexInputDesc([.. attributes], bindings);
+            }
+
+            var constantBinding = vertexBuffers.Length;
+
+            foreach (var input in declared!.VertexInputs)
+            {
+                for (var column = 0; column < Math.Max(1, input.LocationCount); column++)
+                {
+                    var location = input.Location + column;
+
+                    if (location > MaxVertexInputLocation || (unsupplied & (1 << location)) == 0)
+                    {
+                        continue;
+                    }
+
+                    // Cleared as it is consumed, so two inputs whose location ranges overlap contribute one
+                    // attribute rather than two. A pipeline may not name a location twice.
+                    unsupplied &= ~(1 << location);
+
+                    var (format, offset) = DefaultAttributeFor(input.ComponentType);
+
+                    attributes.Add(new VertexAttributeDesc(location, format, offset, constantBinding));
+                }
+            }
+
+            // Stride zero, which is what makes the buffer's single value apply to every vertex.
+            return new VertexInputDesc([.. attributes], [.. bindings, new VertexBindingDesc(constantBinding, 0)]);
         }
+
+        /// <summary>The highest location the renderer's <see cref="int"/> location bitmasks can hold.</summary>
+        private const int MaxVertexInputLocation = 30;
+
+        /// <summary>
+        /// Where in <c>GPUMeshBufferCache.DefaultAttributeVertexBuffer</c> the default for an input of a
+        /// given scalar type lives, and the format that reads it.
+        /// </summary>
+        /// <remarks>
+        /// The numeric class has to be the shader's. A <c>uvec4</c> input fed from a float format is a
+        /// vertex interface violation on Vulkan rather than a conversion, so an integer input takes the
+        /// integer half of the buffer. Four components regardless of how many the shader declares, which is
+        /// allowed and is what the missing COLOR stream already relies on.
+        /// </remarks>
+        private static (RhiFormat Format, int OffsetInBytes) DefaultAttributeFor(Shaders.Spirv.SpirvComponentType componentType)
+            => componentType switch
+            {
+                Shaders.Spirv.SpirvComponentType.Int
+                    => (RhiFormat.R32G32B32A32_SInt, GPUMeshBufferCache.DefaultAttributeIntegerOffset),
+                Shaders.Spirv.SpirvComponentType.UInt
+                    => (RhiFormat.R32G32B32A32_UInt, GPUMeshBufferCache.DefaultAttributeIntegerOffset),
+                _ => (RhiFormat.R32G32B32A32_SFloat, 0),
+            };
 
         private static PrimitiveTopology ToTopology(PrimitiveType primitiveType) => primitiveType switch
         {

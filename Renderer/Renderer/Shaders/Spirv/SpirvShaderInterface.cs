@@ -68,15 +68,64 @@ public sealed class SpirvShaderInterface
     /// </remarks>
     public ImmutableArray<string> MaterialTextureNames { get; }
 
+    /// <summary>
+    /// Gets every vertex input the shader reads, ordered by location. Empty for a shader with no vertex
+    /// stage.
+    /// </summary>
+    /// <remarks>
+    /// What a mesh's vertex layout is completed against. The renderer's shaders choose their UV set with a
+    /// runtime uniform rather than with a combo, so <c>vTEXCOORD1</c> is read whether or not the mesh has a
+    /// second UV stream, and a shader drawn over arbitrary geometry &#8212; <c>error</c> &#8212; reads
+    /// whatever it reads no matter what the mesh carries. OpenGL answers an unsupplied attribute with
+    /// <c>(0, 0, 0, 1)</c> and Vulkan has no equivalent, so the difference has to be made up by supplying
+    /// the input, which needs this list to know which inputs those are. It has to be the shader's own
+    /// reads: a material's input signature does not cover <c>error</c>, whose material never loads.
+    /// </remarks>
+    public ImmutableArray<SpirvVertexInput> VertexInputs { get; }
+
+    /// <summary>Gets the locations <see cref="VertexInputs"/> occupy, as a bitmask.</summary>
+    /// <remarks>
+    /// Locations 31 and above are absent. The renderer tracks claimed locations in an <see cref="int"/>
+    /// bitmask throughout &#8212; <c>GPUMeshBufferCache.CreateVertexArrayObject</c> and
+    /// <c>MeshBatchRenderer.DescribeVertexInput</c> both do &#8212; and shifting past that would alias a low
+    /// location rather than name a high one. Dropping such a location here leaves it unsupplied, which the
+    /// pipeline's interface check then reports by name; aliasing it would silently point some other
+    /// attribute at the wrong buffer.
+    /// </remarks>
+    public int VertexInputLocations { get; }
+
+    /// <summary>The highest location representable in the renderer's location bitmasks.</summary>
+    private const int MaxLocation = 30;
+
     private readonly FrozenDictionary<string, SpirvDescriptorBinding> ByName;
 
-    private SpirvShaderInterface(ImmutableArray<SpirvDescriptorBinding> descriptors)
+    private SpirvShaderInterface(ImmutableArray<SpirvDescriptorBinding> descriptors, ImmutableArray<SpirvVertexInput> vertexInputs)
     {
         Descriptors = descriptors;
         Textures = [.. descriptors.Where(static d => IsTexture(d.Kind))];
         MaterialTextures = [.. Textures.Where(static d => d.Set == DescriptorSets.MaterialTextures)];
         MaterialTextureNames = [.. MaterialTextures.Where(static d => !MaterialLoader.IsReservedTexture(d.Name)).Select(static d => d.Name)];
         ByName = descriptors.ToFrozenDictionary(static d => d.Name, StringComparer.Ordinal);
+        VertexInputs = vertexInputs;
+
+        var locations = 0;
+
+        foreach (var input in vertexInputs)
+        {
+            // A matrix input takes one location per column, exactly as the pipeline's interface check
+            // expands it. Counted the same way here so the two agree on which locations are read.
+            for (var i = 0; i < Math.Max(1, input.LocationCount); i++)
+            {
+                var location = input.Location + i;
+
+                if (location >= 0 && location <= MaxLocation)
+                {
+                    locations |= 1 << location;
+                }
+            }
+        }
+
+        VertexInputLocations = locations;
     }
 
     /// <summary>Finds the slot within <see cref="DescriptorSets.MaterialTextures"/> a named texture takes.</summary>
@@ -144,11 +193,21 @@ public sealed class SpirvShaderInterface
 
         var merged = new Dictionary<string, SpirvDescriptorBinding>(StringComparer.Ordinal);
 
+        // Only a vertex module reflects any, so this is a concatenation rather than a merge in practice.
+        // Deduplicated by location all the same, because two inputs at one location would each contribute a
+        // completion attribute and a pipeline may not name a location twice.
+        var inputsByLocation = new Dictionary<int, SpirvVertexInput>();
+
         foreach (var stage in stages)
         {
             if (stage == null)
             {
                 continue;
+            }
+
+            foreach (var input in stage.VertexInputs)
+            {
+                inputsByLocation.TryAdd(input.Location, input);
             }
 
             foreach (var binding in stage.DescriptorBindings)
@@ -173,6 +232,9 @@ public sealed class SpirvShaderInterface
                 .OrderBy(static d => d.Set)
                 .ThenBy(static d => d.Binding)
                 .ThenBy(static d => d.Name, StringComparer.Ordinal)
+        ],
+        [
+            .. inputsByLocation.Values.OrderBy(static i => i.Location)
         ]);
     }
 }
