@@ -434,7 +434,18 @@ internal static class Program
                 census.EndFrame();
             }
 
-            say($"frame {frame} recorded");
+            // The frame's exposure feedback, printed per frame rather than once at the end. Auto-exposure
+            // reads a GPU histogram back into AverageLuminance and drives every pixel through
+            // TonemapScalar, so a run whose image is a stop off another run's differs here and nowhere
+            // else -- and a run-to-run difference in a *readback* is the shape a missing fence has.
+            var post = renderer.Postprocess;
+
+            var exposureSettings = post.State.ExposureSettings;
+
+            say($"frame {frame} recorded  autoexposure={exposureSettings.AutoExposureEnabled} "
+                + $"avgluminance={post.AverageLuminance:R} tonemap={post.TonemapScalar:R} "
+                + $"exposure={post.CurrentExposure:R} target={post.TargetExposure:R} "
+                + $"range=[{exposureSettings.ExposureMin:R},{exposureSettings.ExposureMax:R}]");
         }
 
         var bitmap = isVulkan

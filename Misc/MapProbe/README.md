@@ -22,6 +22,14 @@ dotnet run --project Misc/MapProbe -- --diff gl.png vk.png --out diff.png
 `--map` defaults to the first map in the package, so a single-map VPK needs nothing else. `--list` prints
 what a package holds when it has more than one.
 
+**`--backend gl` currently needs `--no-recording` on a map.** As of `3a28aa61d` the OpenGL *recording*
+path — the default — dies with an access violation inside the driver at
+`GLCommandList.DrawIndexed`, reached from `ShapeSceneNode.DrawPicking` and, before that, from
+`RenderCables.DrawTube`. Both are draw sites no golden scene exercises, which is why the gate is green
+and every map is not. The process is killed outright, so there is no image and no exception; measured on
+`de_mirage` and `ar_baggage`, 5 runs each. `--no-recording` takes the renderer's direct OpenGL route and
+renders both.
+
 Two runs, not one: the Vulkan run installs a process-wide OpenGL call trap and pins the Vulkan loader's
 driver selection before its first call, and neither can be undone. Comparing the backends therefore always
 means two processes and a third invocation for the diff.
