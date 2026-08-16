@@ -75,7 +75,13 @@ namespace ValveResourceFormat.Renderer
         TexCoord2,
 
         /// <summary>Layer parameters, or foliage sway parameters.</summary>
-        [VertexAttributeName("vTEXCOORD3", "vFoliageParams", Semantic = "TEXCOORD", SemanticIndex = 3)]
+        /// <remarks>
+        /// Carries no buffer semantic, unlike the texture coordinate slots either side of it. The
+        /// ("TEXCOORD", 3) a slot named after its index would claim belongs to <see cref="LightmapUV"/>,
+        /// which is what every shipped material that names it calls it; see the remarks there. The two
+        /// names this slot answers to reach it through the input signature instead.
+        /// </remarks>
+        [VertexAttributeName("vTEXCOORD3", "vFoliageParams")]
         TexCoord3,
 
         /// <summary>Layer blend color.</summary>
@@ -86,8 +92,26 @@ namespace ValveResourceFormat.Renderer
         [VertexAttributeName("vTEXCOORD5", Semantic = "TEXCOORD", SemanticIndex = 5)]
         TexCoord5,
 
-        /// <summary>Lightmap coordinates. Map compiled, so only the input signature names them.</summary>
-        [VertexAttributeName("vLightmapUV", "vLightmapUVW")]
+        /// <summary>Lightmap coordinates.</summary>
+        /// <remarks>
+        /// <para>
+        /// Buffer semantic ("TEXCOORD", 3), which reads like it should belong to <see cref="TexCoord3"/>
+        /// and does not. Nothing ships a third generic UV set there: of the materials that name that
+        /// element, CS2 calls it <c>vLightmapUV</c> in 19965 of 20095, and Half-Life: Alyx in 3849 of 4079.
+        /// The rest name it <c>vFoliageParams</c> or a sprite card's sequence data, both of which this
+        /// table already resolves by name, so the semantic is only consulted where the name is absent.
+        /// </para>
+        /// <para>
+        /// The semantic matters because a world material need not name the element at all &#8212;
+        /// <c>materials/dev/reflectivity_30.vmat</c> is one, and a material that fails to load is another.
+        /// The mesh still carries the stream and the draw call is still flagged as lit from the lightmap,
+        /// so <c>D_BAKED_LIGHTING_FROM_LIGHTMAP</c> is defined and the shader reads <c>vLightmapUV</c>.
+        /// Without a semantic here that stream landed on <see cref="TexCoord3"/>, where nothing reads it,
+        /// and the lightmap was sampled at whatever an unsupplied attribute yields: (0,0) on OpenGL, and
+        /// on Vulkan a location the vertex input does not supply at all.
+        /// </para>
+        /// </remarks>
+        [VertexAttributeName("vLightmapUV", "vLightmapUVW", Semantic = "TEXCOORD", SemanticIndex = 3)]
         LightmapUV,
 
         /// <summary>Baked per vertex lighting, the second color stream.</summary>
