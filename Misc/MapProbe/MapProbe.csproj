@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>MapProbe</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\ValveResourceFormat\ValveResourceFormat.csproj" />
+    <ProjectReference Include="..\..\Renderer\Renderer.csproj" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
+    <!-- The offscreen GL context the OpenGL side of the probe renders into, as in Tests.csproj. -->
+    <PackageReference Include="OpenTK.Windowing.Desktop" Version="4.9.4" />
+  </ItemGroup>
+
+  <!--
+    The golden suite's backend scaffolding, compiled into this tool from where it already lives rather
+    than copied.
+
+    This is the deliberate coupling, and it is the point of the tool. The probe's whole claim is that a map
+    fails (or renders) *the same way the gate would see it*, so it has to select the Vulkan driver by the
+    same rule, refuse a hardware adapter by the same rule, trap direct OpenGL by the same rule and score an
+    image against the same tolerances. Six copies of that logic drifting away from Tests/ would make every
+    number the probe reports unattributable.
+
+    A ProjectReference to Tests.csproj would be the tidier spelling and is not available: that project is a
+    test host (NUnit, Microsoft.NET.Test.Sdk, EnableNUnitRunner), so referencing it would drag the entire
+    test suite and its runner into a developer tool, and Tests.csproj is not part of this solution. Linking
+    the sources costs nothing at runtime, and none of these six files touches NUnit. They are already
+    framework-neutral infrastructure that happens to live under Tests/.
+
+    If a third consumer ever appears, extract these into a small class library that Tests.csproj and this
+    both reference. With two, the link is cheaper than the project.
+  -->
+  <ItemGroup>
+    <Compile Include="..\..\Tests\Renderer\Golden\SoftwareVulkanIcd.cs" Link="Golden\SoftwareVulkanIcd.cs" />
+    <Compile Include="..\..\Tests\Renderer\Golden\ValidationGate.cs" Link="Golden\ValidationGate.cs" />
+    <Compile Include="..\..\Tests\Renderer\Golden\GLCallTrap.cs" Link="Golden\GLCallTrap.cs" />
+    <Compile Include="..\..\Tests\Renderer\Golden\VulkanGoldenDevice.cs" Link="Golden\VulkanGoldenDevice.cs" />
+    <Compile Include="..\..\Tests\Renderer\Golden\RhiDeviceCensus.cs" Link="Golden\RhiDeviceCensus.cs" />
+    <Compile Include="..\..\Tests\Renderer\Golden\ImageDiff.cs" Link="Golden\ImageDiff.cs" />
+  </ItemGroup>
+
+</Project>

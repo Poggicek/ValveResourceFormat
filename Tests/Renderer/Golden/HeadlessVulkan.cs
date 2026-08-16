@@ -1036,6 +1036,12 @@ namespace Tests.Renderer.Golden
 
                 TraceWriter = new StreamWriter(TracePath, append: false) { AutoFlush = true };
 
+                // The layer's own messages, into the same flushed file as the stages. The stage line says
+                // which pass died; these say what the layer had complained about on the way there, and
+                // ValidationGate.Collected cannot deliver them because Report never runs on a run the
+                // driver kills. See ValidationGate.Sink.
+                ValidationGate.Sink = static (severity, message) => Trace($"  [{severity}] {message}");
+
                 Trace($"Vulkan golden run on {DeviceDescription}.");
                 Trace($"Driver selection ({SoftwareVulkanIcd.EnvironmentVariable}): {SoftwareVulkanIcd.Status}");
                 Trace($"Device self-test: {SelfTestResult}.");
@@ -1350,6 +1356,10 @@ namespace Tests.Renderer.Golden
 
             Trace(string.Empty);
             Trace($"Run finished normally after {CurrentScene}.");
+
+            // Before the writer goes, not after: a late message arriving from a driver thread would
+            // otherwise reach a disposed writer, and ObjectDisposedException is not what Trace catches.
+            ValidationGate.Sink = null;
 
             TraceWriter?.Dispose();
             TraceWriter = null;
