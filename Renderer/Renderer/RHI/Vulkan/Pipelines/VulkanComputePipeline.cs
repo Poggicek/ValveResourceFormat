@@ -67,6 +67,12 @@ public sealed unsafe class VulkanComputePipeline : IComputePipeline, IVulkanPipe
     public int UsedDescriptorSets { get; }
 
     /// <inheritdoc/>
+    /// <remarks>From the same reflection and at the same moment as <see cref="UsedDescriptorSets"/>, and
+    /// for the same reason: the sets a dispatch reaches are canonical ones declaring their whole reserved
+    /// range, so only the module's own declaration says which slots inside them it reads.</remarks>
+    public VulkanDescriptorBindingUsage DeclaredDescriptorBindings { get; }
+
+    /// <inheritdoc/>
     /// <remarks>Always zero. A compute pipeline fetches no vertices.</remarks>
     public uint UsedVertexBindings => 0;
 
@@ -120,6 +126,7 @@ public sealed unsafe class VulkanComputePipeline : IComputePipeline, IVulkanPipe
         Layout = layout;
         WorkgroupSize = reflection.WorkgroupSize ?? (1, 1, 1);
         UsedDescriptorSets = VulkanDescriptorSetUsage.MaskFor(reflection);
+        DeclaredDescriptorBindings = VulkanDescriptorBindingUsage.For(reflection);
 
         var entryPoint = SilkMarshal.StringToPtr(reflection.EntryPoint);
 

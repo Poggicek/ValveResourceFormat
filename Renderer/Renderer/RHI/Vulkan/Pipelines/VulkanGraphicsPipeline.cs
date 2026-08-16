@@ -78,6 +78,11 @@ public sealed unsafe class VulkanGraphicsPipeline : IGraphicsPipeline, IVulkanPi
     public int UsedDescriptorSets { get; }
 
     /// <inheritdoc/>
+    /// <remarks>From the same reflections and at the same moment as <see cref="UsedDescriptorSets"/>,
+    /// because it is the same question asked one level down.</remarks>
+    public VulkanDescriptorBindingUsage DeclaredDescriptorBindings { get; }
+
+    /// <inheritdoc/>
     public uint UsedVertexBindings { get; }
 
     /// <summary>Gets the key this pipeline is cached under.</summary>
@@ -132,6 +137,7 @@ public sealed unsafe class VulkanGraphicsPipeline : IGraphicsPipeline, IVulkanPi
         CacheKey = cacheKey;
 
         UsedDescriptorSets = VulkanDescriptorSetUsage.MaskFor(reflections);
+        DeclaredDescriptorBindings = VulkanDescriptorBindingUsage.For(reflections);
         UsedVertexBindings = FetchedVertexBindings(description.VertexInput);
 
         var problems = new List<string>(layout.Problems);

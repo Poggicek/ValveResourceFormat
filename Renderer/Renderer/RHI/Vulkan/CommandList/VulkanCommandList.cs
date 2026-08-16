@@ -1428,9 +1428,19 @@ public sealed unsafe class VulkanCommandList : ICommandList
     }
 
     /// <summary>
-    /// Refuses to record a draw or dispatch whose pipeline uses a descriptor set nothing has bound.
+    /// Refuses to record a draw or dispatch whose pipeline uses a descriptor set nothing has bound, or a
+    /// binding inside one that nothing has filled.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// <b>Two granularities, because one of them was never enough.</b> The set-granularity check passes as
+    /// soon as anything at all was bound into a set, and every miss found in this port so far got past it:
+    /// a shadow caster drawing with its full material shader while the pass bound only the view constants,
+    /// a shadow map dropped as a feedback loop, a morph composite declared by every
+    /// <c>F_MORPH_SUPPORTED</c> shader and bound only for a mesh that has one. The binding-granularity
+    /// check is what names those, and it can only be made here, because only the pipeline knows which
+    /// slots of a shared canonical set it reads. See <see cref="VulkanDescriptorBindingUsage"/>.
+    /// </para>
     /// <para>
     /// <b>Here rather than at <see cref="BindPipeline(IGraphicsPipeline)"/>, because a per-bind check
     /// would be wrong and not merely cheaper.</b> The contract's binding calls are immediate-mode and
@@ -1450,10 +1460,19 @@ public sealed unsafe class VulkanCommandList : ICommandList
     /// </para>
     /// </remarks>
     private void EnsureCompletelyBound()
-        => VulkanDescriptorSetUsage.EnsureBound(
+    {
+        VulkanDescriptorSetUsage.EnsureBound(
             PipelineName,
             Pipeline!.UsedDescriptorSets,
             Binder?.BoundDescriptorSets ?? VulkanDescriptorSetUsage.NoSets);
+
+        // Coarse first, then fine, so a draw that bound nothing at all is reported as the missing set it
+        // is rather than as a list of every binding in that set.
+        VulkanDescriptorBindingUsage.EnsureBound(
+            PipelineName,
+            Pipeline!.DeclaredDescriptorBindings,
+            Binder is null ? default : Binder.BoundDescriptorBindings);
+    }
 
     /// <summary>
     /// Refuses to record a draw whose pipeline fetches from a vertex binding nothing filled.

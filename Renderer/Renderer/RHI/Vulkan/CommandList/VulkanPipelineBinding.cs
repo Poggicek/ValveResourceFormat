@@ -52,6 +52,20 @@ public interface IVulkanPipeline
     int UsedDescriptorSets { get; }
 
     /// <summary>
+    /// Gets the individual bindings inside each descriptor set this pipeline's shaders declare, as one
+    /// bit per binding number per set.
+    /// </summary>
+    /// <remarks>
+    /// The finer half of <see cref="UsedDescriptorSets"/>, and the one that catches what it cannot: a
+    /// canonical set that <i>was</i> bound with one slot inside it that nothing filled. Precomputed by
+    /// <see cref="Descriptors.VulkanDescriptorBindingUsage.For(IReadOnlyList{Shaders.Spirv.SpirvReflectionResult})"/>
+    /// from the same reflections, and on the pipeline rather than the layout for the same reason: sets 0,
+    /// 1, 2 and 4 are shared canonical layouts declaring their whole reserved range, so the layout is the
+    /// union of every shader that ever used it and only the pipeline knows its own subset.
+    /// </remarks>
+    Descriptors.VulkanDescriptorBindingUsage DeclaredDescriptorBindings { get; }
+
+    /// <summary>
     /// Gets the vertex buffer bindings this pipeline fetches from, as one bit per binding index, or zero
     /// for a compute pipeline and for a graphics pipeline that generates its vertices.
     /// </summary>
@@ -140,4 +154,26 @@ public interface IVulkanDescriptorBinder
     /// clears the lot before rebinding. Zero on a binder that has just been reset.
     /// </remarks>
     int BoundDescriptorSets { get; }
+
+    /// <summary>
+    /// Gets which bindings inside each descriptor set have had something recorded into them on this
+    /// command list, as one bit per binding number per set, in set order.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The other half of the guard <see cref="IVulkanPipeline.DeclaredDescriptorBindings"/> is the first
+    /// half of. It reports accumulated bindings rather than descriptors written into the last set,
+    /// deliberately and correctly: a binding the bound pipeline does not declare is filtered out at
+    /// materialisation and so never written, but the guard only ever reads the bits the pipeline
+    /// <i>does</i> declare, and for those two the accumulated and the written answer are the same.
+    /// </para>
+    /// <para>
+    /// Sticky for the life of the command list, matching what a recorded binding is: the renderer binds
+    /// the reserved globals once per pass and every draw in that pass reads them. Cleared by
+    /// <see cref="Reset"/>. Bindings at or past
+    /// <see cref="Descriptors.VulkanDescriptorBindingUsage.MaskWidth"/> are not tracked; see that type
+    /// for why no canonical set can reach one.
+    /// </para>
+    /// </remarks>
+    ReadOnlySpan<uint> BoundDescriptorBindings { get; }
 }

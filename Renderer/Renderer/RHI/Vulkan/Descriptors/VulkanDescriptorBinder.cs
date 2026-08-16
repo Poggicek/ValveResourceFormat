@@ -75,7 +75,10 @@ public readonly record struct VulkanDescriptorBinderStatistics(
 /// for every set whose layout is <i>reflected</i> rather than canonical: a reflected layout is literally
 /// the declaration of the pipeline's stages, so every binding in it is read by the draw and every one
 /// must have been bound. A canonical layout declares a whole reserved range whether a shader reads it
-/// or not, so no such conclusion can be drawn from it and none is.
+/// or not, so no such conclusion can be drawn from it and none is. What can be concluded about a
+/// canonical set comes from the pipeline instead, and
+/// <see cref="VulkanDescriptorBindingUsage.EnsureBound"/> at the draw is where that lands;
+/// <see cref="BoundDescriptorBindings"/> is this type's half of it.
 /// </para>
 /// <para>
 /// <b>Three kinds of staleness, tracked separately, because they cost differently.</b> A set whose
@@ -109,6 +112,7 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
 
     private readonly SetState[] Sets = new SetState[DescriptorSets.Count];
     private readonly Dictionary<ulong, LayoutPlan> ResolvedLayouts = [];
+    private readonly uint[] RecordedBindings = new uint[DescriptorSets.Count];
 
     private PipelineLayout LastLayout;
     private PipelineBindPoint LastBindPoint;
@@ -142,6 +146,11 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
     /// <remarks>Accumulated by <see cref="Flush"/> in the same pass that decides what to bind, so it is
     /// the loop's own answer rather than a second opinion about it.</remarks>
     public int BoundDescriptorSets => BoundSets;
+
+    /// <inheritdoc/>
+    /// <remarks>Accumulated by <see cref="Record"/> as the bindings arrive rather than recomputed per
+    /// flush, so the draw-time guard reads five integers that were already there.</remarks>
+    public ReadOnlySpan<uint> BoundDescriptorBindings => RecordedBindings;
 
     /// <summary>Creates a binder that owns its allocator.</summary>
     /// <param name="api">The Vulkan entry points.</param>
@@ -214,6 +223,8 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
         {
             state.Clear();
         }
+
+        Array.Clear(RecordedBindings);
 
         // Nothing is bound on a command buffer that has just begun, whatever was bound on the last one.
         LastLayout = default;
@@ -469,8 +480,10 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
     /// </para>
     /// <para>
     /// Only for reflected layouts. A canonical layout declares a whole reserved range whether any shader
-    /// reads it or not, so an unbound binding there says nothing at all; that case is left to the
-    /// set-granularity guard at the draw.
+    /// reads it or not, so an unbound binding there says nothing at all. That case needs the bound
+    /// pipeline's own declaration to say anything, which is a thing this layer is not given, so it is
+    /// checked at the draw by <see cref="VulkanDescriptorBindingUsage.EnsureBound"/> against the masks the
+    /// pipeline carries.
     /// </para>
     /// <para>
     /// Not reached for a set nothing has bound anything into, because the flush skips those before it
@@ -505,6 +518,14 @@ public sealed unsafe class VulkanDescriptorBinder : IVulkanDescriptorBinder, IDi
         ArgumentOutOfRangeException.ThrowIfNegative(binding);
 
         var state = Sets[set];
+
+        // Recorded before the no-change early-out below, so a rebind of the same resource still counts as
+        // this slot having been filled. Bindings past the mask are not tracked; only set 3 numbers that
+        // high and it is checked exactly by EnsureDeclaredBindingsBound instead.
+        if (binding < VulkanDescriptorBindingUsage.MaskWidth)
+        {
+            RecordedBindings[set] |= 1u << binding;
+        }
 
         // A binding rewritten with exactly what it already holds is not a change, and treating it as one
         // would allocate a fresh set for a draw that reads the same descriptors. The renderer rebinds the
