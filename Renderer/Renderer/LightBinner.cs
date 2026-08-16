@@ -113,8 +113,19 @@ public sealed class LightBinner(Scene scene) : IDisposable
 
     /// <summary>Binds this scene's masks and their layout for the shading pass.</summary>
     /// <param name="commandList">The command list to record into, or <see langword="null"/> to bind through OpenGL directly.</param>
+    /// <remarks>
+    /// The buffers are ensured here rather than only in <see cref="Update"/> because a bind can precede
+    /// the first update within a frame: the sun shadow pass binds the scene-wide buffers before
+    /// <c>UpdatePerViewGpuBuffers</c> runs, and a shadow caster drawn with its own material shader
+    /// declares <c>LightCullConstants</c> there. Leaving the buffer uncreated made that a descriptor the
+    /// draw reads and nothing wrote. The layout they are created with is the empty one -- a single
+    /// all-ones mask word -- which is what <see cref="Dispatch"/> would publish for a scene with nothing
+    /// binned anyway, and the first <see cref="Update"/> resizes it to the real one.
+    /// </remarks>
     public void Bind(RHI.ICommandList? commandList)
     {
+        EnsureBuffers();
+
         if (CullBits != null)
         {
             Scene.BindStorageBuffer(commandList, CullBits);

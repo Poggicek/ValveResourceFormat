@@ -172,6 +172,29 @@ public class Renderer
     /// Depth-only framebuffer atlas used for barn light shadow mapping.
     /// </summary>
     public Framebuffer? BarnLightShadowBuffer { get; private set; }
+
+    /// <summary>
+    /// A shadow map nothing ever draws into, bound at
+    /// <see cref="ReservedTextureSlots.ShadowDepthBufferDepth"/> for the duration of the sun shadow pass.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The sun shadow pass writes <see cref="ShadowDepthBuffer"/>, so for that one pass the atlas is an
+    /// attachment and cannot also be a sampled descriptor &#8212; <c>VulkanCommandList.BindTexture</c>
+    /// drops the bind for exactly that reason. That was harmless while every shadow draw used
+    /// <c>depth_only</c>, which has no shadow map to sample. It stopped being harmless once a caster with
+    /// an alpha-tested or vertex-animated material drew there with its own shader, which declares
+    /// <c>g_tShadowDepthBufferDepth</c> and so reads a descriptor nothing wrote.
+    /// </para>
+    /// <para>
+    /// Its contents are never written and are not meant to be. OpenGL samples the real atlas while
+    /// rendering into it, which the spec leaves undefined, so there is no defined value here to match:
+    /// what this supplies is a legally bound, correctly typed <c>sampler2DShadow</c> in place of an
+    /// undefined descriptor read. Published by <see cref="EnsureReservedTargetsSampleable"/> the same way
+    /// a barn atlas no pass filled is.
+    /// </para>
+    /// </remarks>
+    private Framebuffer? emptyShadowDepthBuffer;
     /// <summary>
     /// Resolved (non-MSAA) scene color in rgba16f format, used for refraction, bloom input, and luminance computation.
     /// Filled by <see cref="GrabFramebufferCopy"/>.
@@ -343,6 +366,18 @@ public class Renderer
         GL.ReadBuffer(ReadBufferMode.None);
         BarnLightShadowBuffer.SetShadowDepthSamplerState(true);
         Textures.Add(new(ReservedTextureSlots.BarnLightShadowDepth, "g_tBarnLightShadowDepth", BarnLightShadowBuffer.Depth));
+
+        // Deliberately not in Textures: it stands in for the sun atlas during that atlas's own pass and
+        // nowhere else, so it is bound at the one call site rather than at the top of every pass. Sized
+        // like the barn atlas, because nothing samples a second texel of it that means anything.
+        emptyShadowDepthBuffer = Framebuffer.Prepare("EmptyShadowDepthBuffer", 4, 4, 0, null, Framebuffer.DepthAttachmentFormat.Depth32F);
+        emptyShadowDepthBuffer.Initialize();
+        emptyShadowDepthBuffer.ClearMask = ClearBufferMask.DepthBufferBit;
+        Debug.Assert(emptyShadowDepthBuffer.Depth != null);
+
+        GL.DrawBuffer(DrawBufferMode.None);
+        GL.ReadBuffer(ReadBufferMode.None);
+        emptyShadowDepthBuffer.SetShadowDepthSamplerState();
 
         depthOnlyShader = Scene.RendererContext.ShaderLoader.LoadShader("depth_only");
 
@@ -1329,6 +1364,7 @@ public class Renderer
         {
             MakeSampleable(ShadowDepthBuffer?.Depth);
             MakeSampleable(BarnLightShadowBuffer?.Depth);
+            MakeSampleable(emptyShadowDepthBuffer?.Depth);
             shadowAtlasesSampleable = true;
         }
 
@@ -1394,10 +1430,34 @@ public class Renderer
         // and bone transform buffers in set 1, so both sets have to be filled here or the draw reads
         // descriptor sets nothing ever wrote. OpenGL hides this: its bindings are global and were set
         // when the buffers were constructed, so the shadow pass has always found them already there.
+        //
+        // The whole scene-wide set rather than the view buffer alone, because not every shadow caster
+        // draws with depth_only: Scene.GetDepthOnlyBucket routes an alpha-tested or vertex-animated
+        // material to DepthOnlyBucket.MaterialShader, and RenderOpaqueShadows then draws it with the
+        // material's own shader. That shader is the full shading shader -- csgo_vertexlitgeneric on
+        // de_mirage -- and declares LightingConstants, EnvMapArray, LightProbeVolumeArray and
+        // LightCullConstants in set 0 whether the pass has any use for them or not. A world-only render
+        // never reaches this because no world material lands in that bucket; the props are what make it
+        // reproducible.
         if (renderContext.CommandList is { } shadowList)
         {
             BindUniformBuffer(shadowList, ViewBuffer);
-            Scene.BindGeometryBuffers(shadowList);
+
+            // Binds the geometry buffers too, so it replaces the BindGeometryBuffers call this used to make.
+            Scene.SetSceneBuffers(shadowList);
+
+            // Before the pass opens, because once it has, the atlas this stands in for is an attachment
+            // and MeshBatchRenderer's own bind of it at this slot is dropped. A recorded binding is sticky,
+            // so this one survives that dropped bind and is what the material-shader casters read. See
+            // emptyShadowDepthBuffer.
+            if (emptyShadowDepthBuffer?.Depth is { } emptyShadowDepth)
+            {
+                shadowList.BindTexture(
+                    RHI.DescriptorSets.ReservedTextures,
+                    (int)ReservedTextureSlots.ShadowDepthBufferDepth,
+                    emptyShadowDepth.RhiTexture,
+                    emptyShadowDepth.SamplerFor(shadowList.Device));
+            }
         }
 
         using var shadowPass = BeginPass(in renderContext, "Sun Shadows");

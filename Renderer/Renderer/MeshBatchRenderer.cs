@@ -121,6 +121,23 @@ namespace ValveResourceFormat.Renderer
             }
 
             context.Scene.LightingInfo.BindLightmapTextures(commandList);
+
+            if (commandList != null)
+            {
+                // A floor under the morph composite slot, which is not in Textures because it belongs to a
+                // mesh rather than to the scene. Every shader compiled with F_MORPH_SUPPORTED declares
+                // morphCompositeTexture, and a descriptor set is checked against what a stage declares and
+                // not against what it reaches: the sample in common/morph.slang is dead for a draw whose
+                // mesh has no composite, since morphVertexIdOffset is -1 there, but the descriptor is
+                // still statically used and still has to name an image. Draw binds the real composite over
+                // this for a mesh that has one.
+                //
+                // Recorded only. On OpenGL the unit holds whatever was last bound to it, which is already
+                // a legal bind, so issuing a glBindTextureUnit here would be a call the oracle does not
+                // make; a white texel is the neutral stand-in for a sample that never happens.
+                BindReservedTexture(commandList, ReservedTextureSlots.MorphCompositeTexture,
+                    context.Scene.RendererContext.MaterialLoader.GetDefaultColor());
+            }
         }
 
         private ref struct Uniforms
