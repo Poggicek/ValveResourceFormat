@@ -230,6 +230,11 @@ namespace ValveResourceFormat.Renderer
             // same three things that make the OpenGL path rebind: the shader, the material, and the VAO.
             var rebindPipeline = false;
 
+            // The draw call whose buffers were last bound through the command list, so a change of
+            // geometry can be detected by the buffers themselves rather than by a VAO handle that means
+            // nothing off OpenGL. See the SameGeometry check below.
+            DrawCall? boundGeometry = null;
+
             // Set alongside it whenever the material changes, and consumed after the pipeline bind.
             var rebindMaterialTextures = false;
 
@@ -264,6 +269,9 @@ namespace ValveResourceFormat.Renderer
                         shader = null;
                         material = null;
                         vao = -1;
+
+                        // A custom node records binds of its own, so nothing can be assumed still bound.
+                        boundGeometry = null;
                     }
 
                     continue;
@@ -370,10 +378,23 @@ namespace ValveResourceFormat.Renderer
                         GL.BindVertexArray(vao);
                     }
                 }
+                else if (config.CommandList != null && !SameGeometry(boundGeometry, request.Call))
+                {
+                    // Same VAO, different geometry, which can only happen on a device that is not
+                    // OpenGL: GetVertexArrayObject keys its cache on OpenGL buffer names, and every one
+                    // of those reads 0 there, so every mesh sharing an input signature collapses onto a
+                    // single VAO and the comparison above stops seeing a change. The draw would then run
+                    // against whichever mesh's buffers were bound last. Not a subtle wrongness -- opening
+                    // de_mirage on Vulkan produced vkCmdDrawIndexed reading from index 261405 of a 13500
+                    // byte index buffer, and the software driver died on it.
+                    counters.Count(Counter.VaoChange);
+                    rebindPipeline = true;
+                }
 
                 if (config.CommandList != null && rebindPipeline)
                 {
                     BindPipelineAndGeometry(shader!, material!, request.Call, ref config);
+                    boundGeometry = request.Call;
                     rebindPipeline = false;
                 }
 
@@ -460,6 +481,61 @@ namespace ValveResourceFormat.Renderer
             {
                 commandList.BindTexture(binding.DescriptorSet, binding.Binding, binding.Texture.RhiTexture, material.SamplerFor(binding));
             }
+        }
+
+        /// <summary>
+        /// Says whether two draw calls fetch from exactly the buffers, at the offsets, that
+        /// <see cref="BindPipelineAndGeometry"/> would name for each of them.
+        /// </summary>
+        /// <param name="bound">The draw call whose geometry is currently bound, or <see langword="null"/>
+        /// when nothing is.</param>
+        /// <param name="current">The draw call about to be issued.</param>
+        /// <returns><see langword="true"/> when the bound geometry already serves
+        /// <paramref name="current"/>.</returns>
+        /// <remarks>
+        /// Compared by <see cref="RHI.IBuffer"/> identity rather than by OpenGL name, which is the whole
+        /// point: a name is 0 for every buffer allocated on another backend, and that is what lets
+        /// <see cref="GPUMeshBufferCache.GetVertexArrayObject"/>'s cache hand two unrelated meshes the same
+        /// VAO. The offsets are part of the comparison because a draw call's own offsets are folded into
+        /// the pipeline's vertex input rather than into the buffer binding, so two draws over one buffer at
+        /// different offsets need different pipelines.
+        /// </remarks>
+        private static bool SameGeometry(DrawCall? bound, DrawCall current)
+        {
+            if (bound is null)
+            {
+                return false;
+            }
+
+            if (!ReferenceEquals(bound.IndexBuffer.RhiBuffer, current.IndexBuffer.RhiBuffer)
+                || bound.IndexBuffer.Handle != current.IndexBuffer.Handle
+                || bound.IndexBuffer.Offset != current.IndexBuffer.Offset
+                || bound.IndexType != current.IndexType)
+            {
+                return false;
+            }
+
+            var previous = bound.VertexBuffers;
+            var wanted = current.VertexBuffers;
+
+            if (previous.Length != wanted.Length)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < wanted.Length; i++)
+            {
+                if (!ReferenceEquals(previous[i].RhiBuffer, wanted[i].RhiBuffer)
+                    || previous[i].Handle != wanted[i].Handle
+                    || previous[i].Offset != wanted[i].Offset
+                    || previous[i].ElementSizeInBytes != wanted[i].ElementSizeInBytes
+                    || !ReferenceEquals(previous[i].InputLayoutFields, wanted[i].InputLayoutFields))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         /// <summary>

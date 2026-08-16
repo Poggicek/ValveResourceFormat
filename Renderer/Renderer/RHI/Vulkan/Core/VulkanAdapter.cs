@@ -352,6 +352,14 @@ public sealed unsafe class VulkanAdapter
             missing.Add("drawIndirectFirstInstance");
         }
 
+        // Environment maps are a cube array and the lighting shaders sample it as one, so every module
+        // the renderer compiles declares SampledCubeArray. A device without this cannot create those
+        // modules or a view onto that image, so it cannot draw a lit scene at all.
+        if (!features2.Features.ImageCubeArray)
+        {
+            missing.Add("imageCubeArray");
+        }
+
         if ((subgroup.SupportedOperations & RequiredSubgroupOperations) != RequiredSubgroupOperations)
         {
             missing.Add($"subgroup operations (have {subgroup.SupportedOperations}, need {RequiredSubgroupOperations})");

@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using OpenTK.Graphics.OpenGL;
 using ValveKeyValue;
 using ValveResourceFormat.Renderer.Entities;
+using ValveResourceFormat.Renderer.RHI;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
 using static ValveResourceFormat.ResourceTypes.EntityLump;
@@ -584,12 +585,25 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
 
                 ColorCorrectionLutDimensions = resolution;
 
-                ColorCorrectionLUT = new RenderTexture(TextureTarget.Texture3D, resolution, resolution, resolution, 1);
-                ColorCorrectionLUT.SetLabel(nameof(ColorCorrectionLUT));
+                // Allocated through the device rather than by glTextureStorage3D. Every map carries one of
+                // these, the tonemap pass binds it on every frame, and the two-step OpenGL form left it a
+                // bare GL name -- so the first map opened on Vulkan threw "Expected a VulkanTexture, got
+                // GLTexture" out of the tonemap's BindTexture, which is why no map rendered there at all.
+                // Matches MaterialLoader.GetDefaultVolume, the texture bound at this same slot when a
+                // scene has no LUT of its own.
+                ColorCorrectionLUT = new RenderTexture(TextureTarget.Texture3D, RhiFormat.R8G8B8A8_UNorm,
+                    resolution, resolution, resolution, 1, nameof(ColorCorrectionLUT),
+                    device: Scene.RendererContext.Device);
+
                 ColorCorrectionLUT.SetWrapMode(TextureWrapMode.ClampToEdge);
                 ColorCorrectionLUT.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
-                GL.TextureStorage3D(ColorCorrectionLUT.Handle, 1, SizedInternalFormat.Rgba8, resolution, resolution, resolution);
-                GL.TextureSubImage3D(ColorCorrectionLUT.Handle, 0, 0, 0, 0, resolution, resolution, resolution, PixelFormat.Rgba, PixelType.UnsignedByte, data);
+
+                // A volume texture uploads whole, so the whole cube is one call on either backend.
+                ColorCorrectionLUT.Upload(0, 0, data);
+
+                // Published for sampling: the upload leaves it in CopyDestination on Vulkan and the tonemap
+                // binds it as a sampled image on the very next frame.
+                ColorCorrectionLUT.TransitionTo(ResourceState.ShaderRead, ResourceState.CopyDestination);
             }
         }
     }

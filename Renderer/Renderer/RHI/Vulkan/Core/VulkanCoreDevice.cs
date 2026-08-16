@@ -186,7 +186,29 @@ public sealed unsafe class VulkanCoreDevice : IDisposable
         {
             MultiDrawIndirect = true,
             DrawIndirectFirstInstance = true,
+
+            // Environment lighting is a cube array: the world loader builds one env_cubemap_array image
+            // and common/environment.slang reads it through samplerCubeArray, so the SPIR-V declares the
+            // SampledCubeArray capability. Without the feature enabled, vkCreateImageView refuses the
+            // VK_IMAGE_VIEW_TYPE_CUBE_ARRAY view (VUID-VkImageViewCreateInfo-viewType-01004) and every
+            // module declaring that capability is invalid (VUID-VkShaderModuleCreateInfo-pCode-08740).
+            // Opening de_mirage raised fourteen of those errors and none of them threw; with this enabled
+            // there are none. Measured: the map's image is unchanged either way, so this removes undefined
+            // execution rather than a wrong picture -- which is worth doing on its own terms, since
+            // undefined work submitted by this renderer is what hung a display driver once already.
+            // Required rather than conditional for the same reason multiDrawIndirect is: the shaders
+            // declare it unconditionally, so a device without it cannot run this renderer at all, and
+            // VulkanAdapter.Select rejects one rather than letting it fail here.
+            ImageCubeArray = true,
+
             SamplerAnisotropy = supported.Features.SamplerAnisotropy,
+
+            // Decal and overlay materials set a depth bias clamp of 0.0005 (RenderMaterial's hasDepthBias
+            // path), and a pipeline that states a non-zero clamp without this feature is invalid
+            // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-00754). A map is full of overlays, so
+            // opening one produced that error for every such pipeline. Conditional rather than required:
+            // a device without it can still draw everything else, and the clamp only bounds a bias.
+            DepthBiasClamp = supported.Features.DepthBiasClamp,
 
             // QuadOverdraw performs atomics on storage images from the fragment stage.
             FragmentStoresAndAtomics = supported.Features.FragmentStoresAndAtomics,
