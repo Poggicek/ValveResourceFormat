@@ -798,6 +798,12 @@ public class Renderer
             return default;
         }
 
+        // Before the pass, because a transition is not valid inside one. An overlay samples the reserved
+        // targets like any other draw -- world-space text masks itself against the resolved scene depth --
+        // and a frame that never reached the resolve leaves them where they were created. Prewarming a
+        // world draws its first overlay before any postprocess has run, which is exactly that frame.
+        EnsureReservedTargetsSampleable(commandList);
+
         commandList.BeginRenderPass(KeepContents(framebuffer.RenderPass(name)));
 
         activeDepthRange.Apply(commandList, framebuffer.Width, framebuffer.Height);
