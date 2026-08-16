@@ -449,6 +449,51 @@ namespace ValveResourceFormat.Renderer.PostProcess
         }
 
         /// <summary>
+        /// Makes a resolve destination this frame declined to fill legal for a sampled descriptor to name.
+        /// </summary>
+        /// <param name="commandList">The list to record into, or <see langword="null"/> for the OpenGL path,
+        /// which needs none of this.</param>
+        /// <param name="skipped">The destination that was not resolved, or <see langword="null"/> when it
+        /// was.</param>
+        /// <remarks>
+        /// <para>
+        /// <b>The two resolve destinations are reserved textures, so they are bound whether or not they
+        /// were filled.</b> <c>MeshBatchRenderer.BindReservedTextures</c> walks the whole reserved list at
+        /// the top of every pass, and <c>font_msdf</c> names the depth one unconditionally, so a
+        /// destination this call skipped is still written into a descriptor by the passes that follow it.
+        /// A texture in <see cref="ResourceState.Undefined"/> cannot be named by one at all.
+        /// </para>
+        /// <para>
+        /// <b>It legitimately has no writer.</b> <see cref="ResolveMsaa"/> fills only the half some
+        /// material asked for; the other half holds nothing this frame and is not meant to. Its contents
+        /// are as meaningless on OpenGL, where sampling it reads whatever was last there and no one
+        /// notices. One transition is the whole of what Vulkan needs to say the same thing.
+        /// </para>
+        /// <para>
+        /// <b>Why here and not once at creation.</b> The renderer does make these sampleable, but it does
+        /// it once before the frame's first pass. <c>Renderer.GrabFramebufferCopy</c> runs in the middle of
+        /// a frame and resizes both destinations there, so on the frame the window changes size the pair
+        /// bound by every later pass is a pair created after that guarantee was made. This is the point
+        /// where the new images become reachable, so it is the point that has to settle them.
+        /// </para>
+        /// <para>
+        /// Costs nothing on the frames that change nothing: the source state is the tracked one, and a
+        /// transition into the state a texture is already in returns before emitting a barrier.
+        /// </para>
+        /// </remarks>
+        internal static void SkippedDestinationBarrier(ICommandList? commandList, RenderTexture? skipped)
+        {
+            if (commandList == null || skipped == null)
+            {
+                return;
+            }
+
+            var barrier = new TextureBarrier(skipped.RhiTexture, ResourceState.Undefined, ResourceState.ShaderRead);
+
+            commandList.Barrier(in barrier);
+        }
+
+        /// <summary>
         /// Describes a framebuffer as a render pass that keeps what its attachments already hold.
         /// </summary>
         /// <param name="framebuffer">The framebuffer to render into.</param>
@@ -574,6 +619,11 @@ namespace ValveResourceFormat.Renderer.PostProcess
                 ShaderWriteBarrier(commandList,
                     resolveColor ? destColor : destDepth,
                     resolveColor && resolveDepth ? destDepth : null);
+
+                // And the half that was not written is still bound by every pass after this one, so it has
+                // to be nameable even though nothing filled it. See SkippedDestinationBarrier.
+                SkippedDestinationBarrier(commandList, resolveColor ? null : destColor);
+                SkippedDestinationBarrier(commandList, resolveDepth ? null : destDepth);
             }
         }
 
