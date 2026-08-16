@@ -48,6 +48,7 @@ public sealed unsafe class VulkanTexture : ITexture
 
     private Image ImageHandle;
     private ImageView ViewHandle;
+    private ImageView SampledViewHandle;
     private VulkanAllocation Allocation;
     private bool Disposed;
 
@@ -56,6 +57,58 @@ public sealed unsafe class VulkanTexture : ITexture
 
     /// <summary>Gets the view covering the subresources this object addresses.</summary>
     public ImageView View => ViewHandle;
+
+    /// <summary>
+    /// Gets the view to name in a descriptor that samples this texture, which is <see cref="View"/> for
+    /// everything but a combined depth-stencil format.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>A sampled view may address exactly one aspect.</b>
+    /// <c>VUID-VkDescriptorImageInfo-imageView-01976</c> requires a view of a depth-stencil image to carry
+    /// the depth aspect or the stencil aspect, never both, while a depth-stencil <i>attachment</i> view
+    /// wants both so one attachment can carry the render pass's depth and stencil. Those are opposite
+    /// requirements on the same image, and the only thing that can satisfy both is a second view.
+    /// </para>
+    /// <para>
+    /// OpenGL has no such split, which is why nothing upstream distinguishes them: a depth-stencil texture
+    /// is attached and sampled through the same object, and <c>GL_DEPTH_STENCIL_TEXTURE_MODE</c> picks the
+    /// aspect at sample time. The renderer's depth attachments are sampled by name &#8212;
+    /// <c>g_tSceneDepth</c> and <c>g_tShadowDepthBufferDepth</c> &#8212; so the depth aspect is the one a
+    /// descriptor wants. A view that deliberately addresses the stencil aspect asks for it through
+    /// <see cref="CreateView"/> with <see cref="TextureAspect.Stencil"/>, and that view has a single aspect
+    /// already, so this returns it unchanged.
+    /// </para>
+    /// <para>
+    /// Created on first use and destroyed with the rest, so a texture nobody samples never allocates one.
+    /// </para>
+    /// </remarks>
+    public ImageView SampledView
+    {
+        get
+        {
+            const ImageAspectFlags both = ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit;
+
+            if ((Aspect & both) != both)
+            {
+                return ViewHandle;
+            }
+
+            if (SampledViewHandle.Handle == 0)
+            {
+                SampledViewHandle = CreateVkView(
+                    ToVkViewType(Dimension, LayerCount),
+                    VkFormat,
+                    ImageAspectFlags.DepthBit,
+                    0,
+                    MipLevels,
+                    0,
+                    LayerCount);
+            }
+
+            return SampledViewHandle;
+        }
+    }
 
     /// <summary>Gets the Vulkan format the image was created with.</summary>
     public Format VkFormat { get; }
@@ -773,6 +826,12 @@ public sealed unsafe class VulkanTexture : ITexture
             ViewHandle = default;
         }
 
+        if (SampledViewHandle.Handle != 0)
+        {
+            deletionQueue.Enqueue(frameSerial, SampledViewHandle);
+            SampledViewHandle = default;
+        }
+
         if (OwnsImage && ImageHandle.Handle != 0 && Allocator is not null)
         {
             deletionQueue.Enqueue(frameSerial, ImageHandle, Allocation, Allocator);
@@ -798,6 +857,12 @@ public sealed unsafe class VulkanTexture : ITexture
         {
             Api.DestroyImageView(Device, ViewHandle, null);
             ViewHandle = default;
+        }
+
+        if (SampledViewHandle.Handle != 0)
+        {
+            Api.DestroyImageView(Device, SampledViewHandle, null);
+            SampledViewHandle = default;
         }
 
         if (OwnsImage)

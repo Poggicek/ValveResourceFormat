@@ -290,7 +290,10 @@ public sealed unsafe class VulkanDescriptorWriter
         AddImage(new DescriptorImageInfo
         {
             Sampler = sampler?.Handle ?? default,
-            ImageView = texture.View,
+
+            // SampledView, not View: a descriptor may name only one aspect of a depth-stencil image, while
+            // the attachment view the same texture is rendered through carries both.
+            ImageView = texture.SampledView,
             ImageLayout = VulkanResourceStates.ForImage(ResourceState.ShaderRead, isDepth).Layout,
         });
 

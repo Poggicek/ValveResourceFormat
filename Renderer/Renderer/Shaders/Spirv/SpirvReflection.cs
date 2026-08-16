@@ -76,6 +76,10 @@ public static class SpirvReflection
     private const int ExecutionModeLocalSize = 17;
 
     // Image dimensionality
+    private const int Dim1D = 0;
+    private const int Dim2D = 1;
+    private const int Dim3D = 2;
+    private const int DimCube = 3;
     private const int DimBuffer = 5;
     private const int DimSubpassData = 6;
 
@@ -273,7 +277,8 @@ public static class SpirvReflection
                     (int)binding,
                     kind,
                     count,
-                    blockSize));
+                    blockSize,
+                    ImageShape(elementType)));
             }
 
             return [.. bindings.OrderBy(static b => b.Set).ThenBy(static b => b.Binding)];
@@ -402,6 +407,48 @@ public static class SpirvReflection
                 default:
                     return SpirvResourceKind.Unknown;
             }
+        }
+
+        /// <summary>
+        /// Reads the shape a sampler or image declares, following the same one or two hops to the
+        /// <c>OpTypeImage</c> that <see cref="ClassifyKind"/> takes.
+        /// </summary>
+        /// <param name="typeId">The descriptor's element type.</param>
+        /// <returns>The declared shape, or <see cref="SpirvImageShape.Unknown"/> when the descriptor is
+        /// not an image.</returns>
+        private SpirvImageShape ImageShape(uint typeId)
+        {
+            if (!types.TryGetValue(typeId, out var type))
+            {
+                return SpirvImageShape.Unknown;
+            }
+
+            var imageTypeId = type.Opcode switch
+            {
+                OpTypeSampledImage when type.Operands.Length >= 2 => type.Operands[1],
+                OpTypeImage => typeId,
+                _ => 0u,
+            };
+
+            if (imageTypeId == 0
+                || !types.TryGetValue(imageTypeId, out var image)
+                || image.Opcode != OpTypeImage
+                || image.Operands.Length < 7)
+            {
+                return SpirvImageShape.Unknown;
+            }
+
+            var dim = (int)image.Operands[2];
+            var arrayed = image.Operands[4] != 0;
+
+            return dim switch
+            {
+                Dim1D => SpirvImageShape.Texture1D,
+                Dim2D => arrayed ? SpirvImageShape.Texture2DArray : SpirvImageShape.Texture2D,
+                Dim3D => SpirvImageShape.Texture3D,
+                DimCube => arrayed ? SpirvImageShape.TextureCubeArray : SpirvImageShape.TextureCube,
+                _ => SpirvImageShape.Unknown,
+            };
         }
 
         private SpirvResourceKind ImageKind(uint imageTypeId, bool combined)

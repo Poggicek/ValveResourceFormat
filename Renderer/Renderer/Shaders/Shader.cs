@@ -136,28 +136,76 @@ namespace ValveResourceFormat.Renderer.Shaders
 
             SpirvInterface = declared;
 
-            // MaterialTextureNames already excludes the reserved samplers, which are bound scene-wide
-            // rather than by a material, exactly as StoreUniformLocations excludes them on the OpenGL
-            // path.
-            foreach (var name in declared.MaterialTextureNames)
+            // The descriptors rather than MaterialTextureNames, because the fallback now depends on the
+            // shape each one declares and only the descriptor carries it. Reserved samplers are skipped
+            // here instead of by that property: they are bound scene-wide rather than by a material,
+            // exactly as StoreUniformLocations excludes them on the OpenGL path.
+            foreach (var texture in declared.MaterialTextures)
             {
-                if (Default.Textures.ContainsKey(name))
+                var name = texture.Name;
+
+                if (MaterialLoader.IsReservedTexture(name) || Default.Textures.ContainsKey(name))
                 {
                     continue;
                 }
 
-                Default.Textures[name] = FallbackTextureFor(name);
+                Default.Textures[name] = FallbackTextureFor(name, texture.Shape);
             }
         }
 
         /// <summary>The stand-in a material texture gets when the material does not supply one.</summary>
-        /// <remarks>Shared by the OpenGL and SPIR-V seeding paths so the two cannot pick differently.</remarks>
-        private RenderTexture FallbackTextureFor(string name) => name switch
+        /// <param name="name">The sampler's declared name, which is what picks between the flat stand-ins.</param>
+        /// <param name="shape">The shape the sampler declares, which decides whether a flat stand-in is
+        /// even a legal answer.</param>
+        /// <remarks>
+        /// <para>
+        /// Shared by the OpenGL and SPIR-V seeding paths so the two cannot pick differently.
+        /// </para>
+        /// <para>
+        /// <b>The shape comes first, because a 2D fallback under a <c>sampler3D</c> is not a fallback.</b>
+        /// OpenGL tolerates the mismatch, quietly and driver-specifically: the flat texture goes to the
+        /// unit's <c>GL_TEXTURE_2D</c> binding, the <c>GL_TEXTURE_3D</c> binding stays at zero, and what
+        /// the sampler then reads is nobody's contract. Vulkan has no such tolerance &#8212; a view whose
+        /// type disagrees with the declaration is undefined behaviour and a validation error &#8212; so
+        /// the shape has to be honoured rather than assumed flat.
+        /// </para>
+        /// <para>
+        /// <b>The volume stand-in carries the same texels as the flat one</b>, one slice deep, so that
+        /// what OpenGL sampled through the mismatched binding is what it still samples. See
+        /// <see cref="MaterialLoader.GetErrorVolume"/>: the oracle's behaviour here is not what the
+        /// specification says an incomplete texture returns, and it is the oracle that has to be matched.
+        /// </para>
+        /// </remarks>
+        private RenderTexture FallbackTextureFor(string name, Spirv.SpirvImageShape shape)
         {
-            _ when name.Contains("color", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetErrorTexture(),
-            _ when name.Contains("normal", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetDefaultNormal(),
-            _ when name.Contains("mask", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetDefaultMask(),
-            _ => MaterialLoader.GetErrorTexture(),
+            if (shape == Spirv.SpirvImageShape.Texture3D)
+            {
+                return MaterialLoader.GetErrorVolume();
+            }
+
+            return name switch
+            {
+                _ when name.Contains("color", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetErrorTexture(),
+                _ when name.Contains("normal", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetDefaultNormal(),
+                _ when name.Contains("mask", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetDefaultMask(),
+                _ => MaterialLoader.GetErrorTexture(),
+            };
+        }
+
+        /// <summary>Reads the shape a linked program's sampler uniform declares.</summary>
+        /// <param name="type">The uniform type OpenGL reported.</param>
+        /// <returns>The shape, in the same terms the SPIR-V path reflects, so both seeding paths choose
+        /// the same fallback for the same declaration.</returns>
+        /// <remarks>Only the shapes a fallback distinguishes are named; everything else answers
+        /// <see cref="Spirv.SpirvImageShape.Unknown"/> and falls through to the flat stand-ins, which is
+        /// what the name based choice below assumed of every sampler before.</remarks>
+        private static Spirv.SpirvImageShape ShapeOf(ActiveUniformType type) => type switch
+        {
+            ActiveUniformType.Sampler3D => Spirv.SpirvImageShape.Texture3D,
+            ActiveUniformType.Sampler1D => Spirv.SpirvImageShape.Texture1D,
+            ActiveUniformType.Sampler2D => Spirv.SpirvImageShape.Texture2D,
+            ActiveUniformType.SamplerCube => Spirv.SpirvImageShape.TextureCube,
+            _ => Spirv.SpirvImageShape.Unknown,
         };
 
         private readonly Dictionary<string, (ActiveUniformType Type, int Location, bool SrgbRead)> Uniforms = [];
@@ -472,7 +520,7 @@ namespace ValveResourceFormat.Renderer.Shaders
                         continue;
                     }
 
-                    Default.Textures[name] = FallbackTextureFor(name);
+                    Default.Textures[name] = FallbackTextureFor(name, ShapeOf(type));
                 }
                 else if (isVector && !Default.VectorParams.ContainsKey(name))
                 {

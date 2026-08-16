@@ -31,6 +31,7 @@ namespace ValveResourceFormat.Renderer.Materials
         private RenderTexture? DefaultMask;
         private RenderTexture? DefaultColor;
         private RenderTexture? DefaultVolume;
+        private RenderTexture? ErrorVolume;
         /// <summary>Gets or sets the maximum anisotropy level applied to newly loaded textures when anisotropic filtering is enabled.</summary>
         public static float MaxTextureMaxAnisotropy { get; set; }
 
@@ -640,25 +641,28 @@ namespace ValveResourceFormat.Renderer.Materials
         /// <summary>Returns a lazily created 4×4 checkerboard error texture used as a fallback for missing textures.</summary>
         public RenderTexture GetErrorTexture()
         {
-            if (ErrorTexture == null)
-            {
-                ReadOnlySpan<byte> color1 = [100, 25, 75];
-                ReadOnlySpan<byte> color2 = [0, 127, 0];
-
-                var color = new byte[16 * 3];
-
-                for (var i = 0; i < 16; i++)
-                {
-                    var checkerboardX = i / 4 % 2;
-                    var colorToUse = i % 2 == checkerboardX ? color1 : color2;
-                    var pixel = color.AsSpan(i * 3, 3);
-                    colorToUse.CopyTo(pixel);
-                }
-
-                ErrorTexture = GenerateColorTexture(4, 4, color, RendererContext.Device);
-            }
+            ErrorTexture ??= GenerateColorTexture(4, 4, ErrorCheckerboard(), RendererContext.Device);
 
             return ErrorTexture;
+        }
+
+        /// <summary>The 4×4 checkerboard both error textures are filled with, three bytes per texel.</summary>
+        private static byte[] ErrorCheckerboard()
+        {
+            ReadOnlySpan<byte> color1 = [100, 25, 75];
+            ReadOnlySpan<byte> color2 = [0, 127, 0];
+
+            var color = new byte[16 * 3];
+
+            for (var i = 0; i < 16; i++)
+            {
+                var checkerboardX = i / 4 % 2;
+                var colorToUse = i % 2 == checkerboardX ? color1 : color2;
+                var pixel = color.AsSpan(i * 3, 3);
+                colorToUse.CopyTo(pixel);
+            }
+
+            return color;
         }
 
         private RenderTexture CreateSolidTexture(byte r, byte g, byte b) => GenerateColorTexture(1, 1, [r, g, b], RendererContext.Device);
@@ -692,6 +696,48 @@ namespace ValveResourceFormat.Renderer.Materials
             }
 
             return DefaultVolume;
+        }
+
+        /// <summary>
+        /// Returns a lazily created 4×4×1 checkerboard volume texture: what a <c>sampler3D</c> gets when
+        /// the material supplies nothing.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <b>Why a volume rather than <see cref="GetErrorTexture"/>.</b> A texture's shape belongs to the
+        /// object on OpenGL and to the <i>view</i> on Vulkan, and Vulkan requires a sampled view's type to
+        /// match the <c>Dim</c> the shader declares. Handing the flat checkerboard to a <c>sampler3D</c>
+        /// puts a <c>VK_IMAGE_VIEW_TYPE_2D</c> under a <c>Dim = 3D</c> declaration, which is undefined
+        /// behaviour and a validation error &#8212; the map probe caught it on <c>csgo_foliage.vfx</c>'s
+        /// <c>g_tNoiseMap</c>. A 2D fallback for a 3D sampler is not a fallback.
+        /// </para>
+        /// <para>
+        /// <b>Why the same texels, one slice deep.</b> OpenGL is the oracle and it must not move, so the
+        /// stand-in is chosen to be the smallest possible change to what it sampled rather than a fresh
+        /// opinion about what a missing volume ought to be. Carrying the checkerboard the flat fallback
+        /// already carried, one slice deep, is that: every <c>r</c> coordinate lands on the only slice
+        /// there is, whatever the wrap mode, so the volume is the flat texture with a legal shape bolted
+        /// on. The filtering and wrapping below are <see cref="GenerateColorTexture"/>'s, for the same
+        /// reason. What the driver actually returned through the mismatched binding was never defined, so
+        /// exact parity is not on offer; the golden suite is where that claim gets tested.
+        /// </para>
+        /// <para>
+        /// R8G8B8A8 rather than R8G8B8 for the reason <see cref="GetDefaultVolume"/> gives.
+        /// </para>
+        /// </remarks>
+        public RenderTexture GetErrorVolume()
+        {
+            if (ErrorVolume == null)
+            {
+                ErrorVolume = new RenderTexture(TextureTarget.Texture3D, RHI.RhiFormat.R8G8B8A8_UNorm, 4, 4, 1, 1, "ErrorVolume", device: RendererContext.Device);
+                ErrorVolume.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
+                ErrorVolume.SetWrapMode(TextureWrapMode.Repeat);
+
+                ErrorVolume.Upload(0, 0, WidenToOpaqueRgba(ErrorCheckerboard()));
+                ErrorVolume.TransitionTo(RHI.ResourceState.ShaderRead, RHI.ResourceState.CopyDestination);
+            }
+
+            return ErrorVolume;
         }
 
         private static readonly byte[] WhiteTexel = [255, 255, 255, 255];

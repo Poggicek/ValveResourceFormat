@@ -10,7 +10,7 @@ using ValveResourceFormat.Serialization.VfxEval;
 
 namespace ValveResourceFormat.Renderer.Materials
 {
-    /// <summary>Names the sampler uniforms bound to a <see cref="ReservedTextureSlots"/> member. Names may share a slot when their texture targets differ, since a unit holds one binding per target, or when no shader variant declares both.</summary>
+    /// <summary>Names the sampler uniforms bound to a <see cref="ReservedTextureSlots"/> member. Names may share a slot only when no scene binds two of them at once, because a slot is one Vulkan descriptor.</summary>
     /// <param name="names">The sampler uniform names bound to this slot.</param>
     [AttributeUsage(AttributeTargets.Field)]
     public sealed class SamplerNameAttribute(params string[] names) : Attribute
@@ -33,20 +33,20 @@ namespace ValveResourceFormat.Renderer.Materials
         /// <summary>Fog cube texture for atmospheric fog rendering.</summary>
         [SamplerName("g_tFogCubeTexture")]
         FogCubeTexture,
-        /// <summary>Baked irradiance, from the lightmap or the light probe volume.</summary>
-        [SamplerName("g_tIrradiance", "g_tLPV_Irradiance")]
+        /// <summary>Lightmap irradiance.</summary>
+        [SamplerName("g_tIrradiance")]
         Lightmap1,
         /// <summary>Baked directional irradiance, whole or red split.</summary>
         [SamplerName("g_tDirectionalIrradiance", "g_tDirectionalIrradianceR")]
         Lightmap2,
         /// <summary>Baked direct light indices, or green split directional irradiance.</summary>
-        [SamplerName("g_tDirectLightIndices", "g_tLPV_Indices", "g_tDirectionalIrradianceG")]
+        [SamplerName("g_tDirectLightIndices", "g_tDirectionalIrradianceG")]
         Lightmap3,
         /// <summary>Baked direct light strengths, or blue split directional irradiance.</summary>
-        [SamplerName("g_tDirectLightStrengths", "g_tLPV_Scalars", "g_tDirectionalIrradianceB")]
+        [SamplerName("g_tDirectLightStrengths", "g_tDirectionalIrradianceB")]
         Lightmap4,
-        /// <summary>Baked direct light shadows.</summary>
-        [SamplerName("g_tDirectLightShadows", "g_tLPV_Shadows")]
+        /// <summary>Lightmap direct light shadows.</summary>
+        [SamplerName("g_tDirectLightShadows")]
         Lightmap5,
         /// <summary>Lightmap irradiance debug chart.</summary>
         [SamplerName("g_tIrradianceDebugChart")]
@@ -78,8 +78,32 @@ namespace ValveResourceFormat.Renderer.Materials
         /// <summary>Morph composite texture for vertex animation.</summary>
         [SamplerName("morphCompositeTexture")]
         MorphCompositeTexture,
-        /// <summary>Last reserved slot; equal to <see cref="MorphCompositeTexture"/>.</summary>
-        Last = MorphCompositeTexture,
+
+        // The light probe volume samplers have slots of their own rather than sharing the lightmap's.
+        // A lightmapped scene with probe volumes -- every recent Counter-Strike map -- binds both sets in
+        // the same pass: the lightmap for world geometry and the volume atlas for props. On OpenGL that
+        // was invisible, because a texture unit holds one binding per target and the two sets differ
+        // (GL_TEXTURE_2D_ARRAY against GL_TEXTURE_3D), so each shader sampled the one matching its own
+        // declaration. Vulkan has one descriptor per binding, so the second bind simply overwrote the
+        // first and world geometry sampled the probe atlas through a 2D-array declaration. Sharing a slot
+        // is still allowed for names no scene binds together -- the whole/split directional irradiance
+        // pairs below are alternatives chosen by lightmap version -- but these four are not that.
+
+        /// <summary>Light probe volume irradiance.</summary>
+        [SamplerName("g_tLPV_Irradiance")]
+        LightProbeVolumeIrradiance,
+        /// <summary>Light probe volume direct light indices.</summary>
+        [SamplerName("g_tLPV_Indices")]
+        LightProbeVolumeIndices,
+        /// <summary>Light probe volume direct light strengths.</summary>
+        [SamplerName("g_tLPV_Scalars")]
+        LightProbeVolumeScalars,
+        /// <summary>Light probe volume direct light shadows.</summary>
+        [SamplerName("g_tLPV_Shadows")]
+        LightProbeVolumeShadows,
+
+        /// <summary>Last reserved slot; equal to <see cref="LightProbeVolumeShadows"/>.</summary>
+        Last = LightProbeVolumeShadows,
     }
 
     enum BlendMode

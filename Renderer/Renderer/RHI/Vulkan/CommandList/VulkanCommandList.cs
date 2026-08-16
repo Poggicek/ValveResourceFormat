@@ -802,7 +802,10 @@ public sealed unsafe class VulkanCommandList : ICommandList
         RequireBinder(nameof(BindTexture)).BindSampledImage(
             descriptorSet,
             binding,
-            vulkan.View,
+
+            // SampledView, not View: a descriptor may name only one aspect of a depth-stencil image, while
+            // the attachment view the same texture is rendered through carries both.
+            vulkan.SampledView,
             vulkanSampler.Handle,
             VulkanBarrierTranslation.LayoutOf(vulkan));
     }

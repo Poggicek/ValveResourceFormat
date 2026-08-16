@@ -59,6 +59,43 @@ public enum SpirvComponentType
     Bool,
 }
 
+/// <summary>
+/// The shape a sampler declares, as the <c>Dim</c> and <c>Arrayed</c> operands of its
+/// <c>OpTypeImage</c> give it.
+/// </summary>
+/// <remarks>
+/// <b>This is the thing a bound view has to agree with.</b> Vulkan requires an image view's
+/// <c>viewType</c> to match the shape the shader declares
+/// (<c>VUID-vkCmdDrawIndexed-viewType-07752</c>); OpenGL has no such rule, because a texture object
+/// carries its own target and a sampler that disagrees simply reads an incomplete texture. So the shape
+/// only has to be known on the backend where getting it wrong is illegal, which is why nothing wanted it
+/// before, and why a fallback texture chosen without it is the mistake that produced
+/// <c>VK_IMAGE_VIEW_TYPE_2D</c> under a <c>sampler3D</c>.
+/// </remarks>
+public enum SpirvImageShape
+{
+    /// <summary>Not an image, or a dimensionality this enumeration does not name.</summary>
+    Unknown,
+
+    /// <summary>A one dimensional texture.</summary>
+    Texture1D,
+
+    /// <summary>A two dimensional texture.</summary>
+    Texture2D,
+
+    /// <summary>An array of two dimensional textures.</summary>
+    Texture2DArray,
+
+    /// <summary>A volume texture.</summary>
+    Texture3D,
+
+    /// <summary>A cube map.</summary>
+    TextureCube,
+
+    /// <summary>An array of cube maps.</summary>
+    TextureCubeArray,
+}
+
 /// <summary>One descriptor the shader declares.</summary>
 /// <param name="Name">The declared name, or the block's type name for a buffer block.</param>
 /// <param name="Set">The descriptor set. Must match the scheme in the RHI contract; see
@@ -68,13 +105,16 @@ public enum SpirvComponentType
 /// <param name="Count">Array length, 1 for a plain declaration, 0 for a runtime sized array.</param>
 /// <param name="BlockSizeInBytes">Size of the backing block for a buffer, otherwise 0. A storage
 /// buffer ending in a runtime array reports only its fixed prefix.</param>
+/// <param name="Shape">The dimensionality an image or sampler declares, and
+/// <see cref="SpirvImageShape.Unknown"/> for everything else.</param>
 public readonly record struct SpirvDescriptorBinding(
     string Name,
     int Set,
     int Binding,
     SpirvResourceKind Kind,
     int Count,
-    int BlockSizeInBytes);
+    int BlockSizeInBytes,
+    SpirvImageShape Shape = SpirvImageShape.Unknown);
 
 /// <summary>One vertex shader input.</summary>
 /// <param name="Name">The declared attribute name.</param>
