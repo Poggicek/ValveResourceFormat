@@ -29,8 +29,27 @@ public class Renderer
         public float Far { get; } = Start;
 
         /// <summary>Applies the depth range to the current render state.</summary>
-        public void Apply()
+        /// <param name="commandList">The list to record into, or <see langword="null"/> to set the range
+        /// through OpenGL directly.</param>
+        /// <param name="width">Width of the target being drawn into, in pixels.</param>
+        /// <param name="height">Height of the target being drawn into, in pixels.</param>
+        /// <remarks>
+        /// OpenGL keeps the depth range as a piece of context state of its own, which is why the direct
+        /// path needs nothing but the two values. Vulkan carries it on the viewport and has no separate
+        /// call, so the recorded path has to re-issue the whole viewport &#8212; which is the only reason
+        /// the extent is a parameter here. A recorded range that never reached the viewport is exactly the
+        /// defect this signature exists to prevent: layered depth is what makes the sky sit behind the
+        /// scene and the viewmodel in front of it, and a backend that silently drew everything at the full
+        /// range still produced a plausible image.
+        /// </remarks>
+        public void Apply(RHI.ICommandList? commandList, int width, int height)
         {
+            if (commandList is not null)
+            {
+                commandList.SetViewport(0, 0, width, height, Near, Far);
+                return;
+            }
+
             GL.DepthRange(Near, Far);
         }
 
@@ -42,6 +61,9 @@ public class Renderer
 
         /// <summary>Reserved for the 3D sky, always behind the main scene.</summary>
         public static readonly DepthRange Sky = new(Scene.End, 0f);
+
+        /// <summary>The whole depth buffer, which the shadow atlases draw into unpartitioned.</summary>
+        public static readonly DepthRange Full = new(1f, 0f);
     }
 
     /// <summary>
@@ -168,6 +190,19 @@ public class Renderer
     /// to occlude themselves against geometry. Must be set before <see cref="Render(Scene.RenderContext)"/>.
     /// </summary>
     public bool ForceResolveSceneDepth { get; set; }
+
+    /// <summary>
+    /// The depth range the layer being drawn asked for, remembered so a pass opened after it can put it
+    /// back.
+    /// </summary>
+    /// <remarks>
+    /// OpenGL's depth range is context state and survives everything, so on that path this is only a
+    /// record of what was set. A Vulkan pass carries the viewport, and
+    /// <see cref="RHI.ICommandList.BeginRenderPass"/> opens every one of them at the full range, so
+    /// without restoring it here a range applied before a pass boundary would quietly stop existing part
+    /// way through the frame &#8212; which is what the 3D sky's translucent half draws across.
+    /// </remarks>
+    private DepthRange activeDepthRange = DepthRange.Full;
 
     /// <summary>Whether the shadow atlases have been moved out of <see cref="RHI.ResourceState.Undefined"/>.</summary>
     private bool shadowAtlasesSampleable;
@@ -633,7 +668,7 @@ public class Renderer
     /// not valid inside a pass, and the scene has both in the middle of it: the framebuffer grab and the
     /// depth pyramid sit between the opaque and translucent halves.
     /// </remarks>
-    private static RhiPass BeginPass(in Scene.RenderContext renderContext, string name, bool keepContents = false)
+    private RhiPass BeginPass(in Scene.RenderContext renderContext, string name, bool keepContents = false)
         => BeginPass(renderContext.CommandList, renderContext.Framebuffer, name, keepContents);
 
     /// <summary>
@@ -649,7 +684,9 @@ public class Renderer
     /// with forward depth, so it clears to the opposite end of the range from everything else.
     /// </param>
     /// <returns>A guard that ends the pass.</returns>
-    private static RhiPass BeginPass(RHI.ICommandList? commandList, Framebuffer framebuffer, string name,
+    /// <remarks>A pass opens with the viewport covering the whole attachment at the full depth range, so
+    /// the layer's range is put back straight away. See <see cref="activeDepthRange"/>.</remarks>
+    private RhiPass BeginPass(RHI.ICommandList? commandList, Framebuffer framebuffer, string name,
         bool keepContents = false, float? clearDepth = null)
     {
         if (commandList is null)
@@ -671,7 +708,21 @@ public class Renderer
 
         commandList.BeginRenderPass(desc);
 
+        activeDepthRange.Apply(commandList, framebuffer.Width, framebuffer.Height);
+
         return new RhiPass(commandList);
+    }
+
+    /// <summary>
+    /// Applies a layer's depth range and remembers it as the one a later pass restores.
+    /// </summary>
+    /// <param name="range">The layer's range.</param>
+    /// <param name="renderContext">The pass being drawn, supplying the command list and the extent the
+    /// recorded path re-issues the viewport over.</param>
+    private void ApplyDepthRange(DepthRange range, in Scene.RenderContext renderContext)
+    {
+        activeDepthRange = range;
+        range.Apply(renderContext.CommandList, renderContext.Framebuffer.Width, renderContext.Framebuffer.Height);
     }
 
     /// <summary>
@@ -728,6 +779,13 @@ public class Renderer
     /// draw. Anything an overlay needs beyond them is still its own to bind, and the draw-time guard
     /// names it rather than letting the read go undefined.
     /// </para>
+    /// <para>
+    /// The depth range comes back with them, and for the same kind of reason: an overlay draws over a
+    /// finished frame and is depth tested against the depth that frame wrote, so it has to be in the
+    /// window-space that wrote it. On OpenGL it already is, the range being context state the frame left
+    /// behind; a recorded pass opens at the full range and would put an overlay's depth in a different
+    /// space from the geometry it is being compared against.
+    /// </para>
     /// </remarks>
     public OverlayRecording BeginOverlay(Framebuffer framebuffer, string name)
     {
@@ -741,6 +799,8 @@ public class Renderer
         }
 
         commandList.BeginRenderPass(KeepContents(framebuffer.RenderPass(name)));
+
+        activeDepthRange.Apply(commandList, framebuffer.Width, framebuffer.Height);
 
         if (ViewBuffer is not null)
         {
@@ -988,7 +1048,7 @@ public class Renderer
                 ViewmodelCamera.CreateProjectionMatrix();
                 ViewmodelCamera.RecalculateMatrices();
 
-                DepthRange.Viewmodel.Apply();
+                ApplyDepthRange(DepthRange.Viewmodel, in renderContext);
 
                 ViewmodelCamera.SetViewConstants(ViewBuffer.Data);
                 Scene.SetFogConstants(ViewBuffer.Data);
@@ -1005,7 +1065,7 @@ public class Renderer
                 Scene.RenderViewmodelOpaqueLayer(renderContext);
                 renderContext.Camera = mainCamera;
 
-                DepthRange.Scene.Apply();
+                ApplyDepthRange(DepthRange.Scene, in renderContext);
 
                 mainCamera.SetViewConstants(ViewBuffer.Data);
                 Scene.SetFogConstants(ViewBuffer.Data);
@@ -1024,7 +1084,7 @@ public class Renderer
 
             //using (new GLDebugGroup("Sky Render"))
             {
-                DepthRange.Sky.Apply();
+                ApplyDepthRange(DepthRange.Sky, in renderContext);
 
                 renderContext.ReplacementShader?.SetUniform1AllVariants("isSkybox", 1u);
                 var skyboxScene = SkyboxScene;
@@ -1109,7 +1169,7 @@ public class Renderer
                 }
 
                 renderContext.ReplacementShader?.SetUniform1AllVariants("isSkybox", 0u);
-                DepthRange.Scene.Apply();
+                ApplyDepthRange(DepthRange.Scene, in renderContext);
             }
 
             using (new GLDebugGroup("Main Scene Translucent Render"))
@@ -1121,7 +1181,7 @@ public class Renderer
             {
                 var mainCamera = renderContext.Camera;
 
-                DepthRange.Viewmodel.Apply();
+                ApplyDepthRange(DepthRange.Viewmodel, in renderContext);
 
                 ViewmodelCamera.SetViewConstants(ViewBuffer.Data);
                 Scene.SetFogConstants(ViewBuffer.Data);
@@ -1134,7 +1194,7 @@ public class Renderer
                 Scene.RenderViewmodelTranslucentLayer(renderContext);
                 renderContext.Camera = mainCamera;
 
-                DepthRange.Scene.Apply();
+                ApplyDepthRange(DepthRange.Scene, in renderContext);
 
                 mainCamera.SetViewConstants(ViewBuffer.Data);
                 Scene.SetFogConstants(ViewBuffer.Data);
@@ -1298,6 +1358,12 @@ public class Renderer
 
         GL.Viewport(0, 0, ShadowDepthBuffer.Width, ShadowDepthBuffer.Height);
         ShadowDepthBuffer.Bind(FramebufferTarget.Framebuffer);
+
+        // The atlas is not one of the scene's layers: it takes the whole depth buffer. Tracked as well as
+        // set, so the pass opened below restores this range and not whichever layer the last frame's
+        // scene left behind. Set directly rather than through the command list because there is no pass
+        // open yet to carry a viewport.
+        activeDepthRange = DepthRange.Full;
         GL.DepthRange(0, 1);
 
         // The pass opened below clears depth through its load op, so this is the OpenGL path's clear only.
@@ -1361,6 +1427,8 @@ public class Renderer
         // The barn shadow atlas uses forward depth, unlike the reverse-Z main view.
         using (RendererContext.RenderState.Scope(depthFunc: Comparison.FartherEqual, slopeScaledDepthBias: 2f))
         {
+            // Tracked as well as set, for the reason RenderSceneShadows gives.
+            activeDepthRange = DepthRange.Full;
             GL.DepthRange(0.0, 1.0);
             GL.ClearDepth(1.0);
 

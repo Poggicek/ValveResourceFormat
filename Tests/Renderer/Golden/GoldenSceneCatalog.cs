@@ -144,8 +144,46 @@ namespace Tests.Renderer.Golden
             AddTextureScenes(scenes);
             AddPostProcessScenes(scenes);
             AddDebugModeScenes(scenes);
+            AddGridScene(scenes);
 
             return scenes;
+        }
+
+        /// <summary>
+        /// The viewer's infinite reference grid, with something standing in front of it.
+        ///
+        /// <para>The grid is the only draw in the renderer that computes its own window-space depth, in
+        /// <c>grid.frag</c>, rather than taking the one the pipeline interpolates. That makes it the only
+        /// draw that can end up in a different depth space from the geometry it is tested against, which
+        /// is not hypothetical: a Vulkan frame did exactly that, because the layer depth ranges reached
+        /// the backend as <c>glDepthRange</c> calls it never saw, and the grid drew over every model in
+        /// the viewer.</para>
+        ///
+        /// <para>The slab is raised off the plane rather than laid flat on it, so the grid passes both in
+        /// front of it and behind it in the same image: a grid that ignores depth covers the slab, and one
+        /// written too far back thins out against the horizon. Neither survives the baseline.</para>
+        /// </summary>
+        /// <remarks>
+        /// Appended last, after every other scene, and deliberately. The catalog has a pre-existing order
+        /// sensitivity -- the six texture scenes, <c>shadow_sun_cascade</c>,
+        /// <c>postprocess_bloom_dof_tonemap</c> and <c>overdraw_heatmap</c> all render differently
+        /// depending on what ran before them, which is visible on an untouched checkout by running any one
+        /// of them alone and watching it fail against its own baseline. Inserting a scene ahead of them
+        /// moves nine baselines for reasons that have nothing to do with the scene being added, so a new
+        /// scene goes on the end until that is chased down separately.
+        /// </remarks>
+        private static void AddGridScene(List<GoldenScene> scenes)
+        {
+            scenes.Add(new GoldenScene
+            {
+                Name = "grid_infinite_occlusion",
+                Build = static setup =>
+                {
+                    AddLitGroundPlane(setup, 150f, z: 30f);
+                    setup.PlaceCamera(new Vector3(210, -400, 150), new Vector3(0, 0, 10));
+                    setup.EnableBaseGrid = true;
+                },
+            });
         }
 
         private static void AddModelScenes(List<GoldenScene> scenes)
@@ -794,12 +832,18 @@ namespace Tests.Renderer.Golden
         /// something to fall on, and nothing else in the catalog receives one: the collision hulls draw
         /// through <c>basic_shape</c> and the debug lines are unlit.
         /// </summary>
-        private static void AddLitGroundPlane(GoldenSceneSetup setup, float size)
+        private static void AddLitGroundPlane(GoldenSceneSetup setup, float size, float z = 0f)
         {
             var material = new RenderMaterial(setup.RendererContext.ShaderLoader.LoadShader("complex"));
             material.LoadRenderState();
 
             var ground = MeshSceneNode.CreateMaterialPreviewQuad(setup.Scene, material, new Vector2(size, size));
+
+            if (z != 0f)
+            {
+                ground.Transform = Matrix4x4.CreateTranslation(0f, 0f, z);
+            }
+
             setup.Scene.Add(ground, dynamic: false);
         }
 

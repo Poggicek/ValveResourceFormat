@@ -49,6 +49,11 @@ namespace Tests.Renderer.Golden
         private readonly Framebuffer captureFramebuffer;
         private readonly byte[] readbackBuffer = new byte[Width * Height * 4];
 
+        // Built on the first scene that asks for one and kept for the rest of the run. It holds nothing
+        // scene specific -- the shader, the state tracker and the vertex buffer all come from the shared
+        // context -- so rebuilding it per scene would only allocate another buffer nothing frees.
+        private InfiniteGrid? baseGrid;
+
         private bool disposed;
 
         /// <summary>
@@ -312,6 +317,19 @@ namespace Tests.Renderer.Golden
             if (setup.EnableOcclusionDebug && renderer.Scene.OcclusionDebug is { } occlusionDebug)
             {
                 RecordOverPass(sceneFramebuffer, "GoldenOcclusionDebug", renderer, context => occlusionDebug.Render(context));
+            }
+
+            if (setup.EnableBaseGrid)
+            {
+                // Built on the first frame that wants it and kept, as the viewer keeps one per scene.
+                baseGrid ??= new InfiniteGrid(renderer.Scene);
+
+                // Through BeginOverlay rather than RecordOverPass, because the viewer's grid draw is a
+                // BeginOverlay and the difference is load bearing: it is what rebinds the view constants
+                // and the depth range onto a list of its own. The grid reads both.
+                using var overlay = renderer.BeginOverlay(sceneFramebuffer, "Base Grid");
+
+                baseGrid.Render(overlay.CommandList, sceneFramebuffer);
             }
 
             if (setup.EnableBloomAfterRender)

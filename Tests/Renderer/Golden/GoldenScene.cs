@@ -99,6 +99,20 @@ namespace Tests.Renderer.Golden
         public MorphComposite? MorphComposite { get; set; }
 
         /// <summary>
+        /// Draws the viewer's infinite reference grid over the scene, exactly where
+        /// <c>GLSceneViewer</c> draws it: after the frame is rendered, into the scene framebuffer, through
+        /// an overlay pass of the renderer's own.
+        ///
+        /// <para>The grid is the one renderer feature that computes its own window-space depth, in
+        /// <c>grid.frag</c>, rather than letting the fixed-function pipeline derive it. That makes it the
+        /// only thing in the renderer that can disagree with the depth its geometry was written at, and it
+        /// went unchecked here for as long as no scene built one: it draws only from the viewer, and the
+        /// symptom -- a grid floating over models instead of behind them -- is invisible in every other
+        /// scene.</para>
+        /// </summary>
+        public bool EnableBaseGrid { get; set; }
+
+        /// <summary>
         /// Drives the quad overdraw visualisation the way the viewer's Overdraw render mode does: a depth
         /// prime pass, a counting pass that accumulates per-quad shading cost through image stores, and a
         /// fullscreen resolve into a heat map.

@@ -58,6 +58,7 @@ namespace Tests.Renderer.Golden
         private static RhiDeviceCensus? DeviceCensus;
         private static RendererContext? Context;
         private static FixtureFileLoader? FileLoader;
+        private static InfiniteGrid? BaseGrid;
         private static bool Initialized;
 
         /// <summary>Whether a Vulkan device was created and scenes can be attempted.</summary>
@@ -488,6 +489,21 @@ namespace Tests.Renderer.Golden
                     Scene = target.Scene,
                     Textures = target.Textures,
                 });
+
+                if (setup?.EnableBaseGrid != true)
+                {
+                    return;
+                }
+
+                // The viewer's own grid draw, reproduced here rather than left to the OpenGL harness,
+                // because it is the one draw whose depth the shader computes itself and so the one draw
+                // that can be right on OpenGL and wrong here. Kept for the run: it holds nothing scene
+                // specific.
+                BaseGrid ??= new InfiniteGrid(target.Scene);
+
+                using var overlay = target.BeginOverlay(sceneFramebuffer!, "Base Grid");
+
+                BaseGrid.Render(overlay.CommandList, sceneFramebuffer);
             }
 
             void Resolve()
@@ -1314,6 +1330,10 @@ namespace Tests.Renderer.Golden
             {
                 Invoke(() =>
                 {
+                    // Dropped with the context it was built from: its shader and its buffer belong to
+                    // that context, and a stale one would hand the next run dead handles.
+                    BaseGrid = null;
+
                     Context?.Dispose();
                     Context = null;
 
