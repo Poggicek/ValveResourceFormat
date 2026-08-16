@@ -1,7 +1,9 @@
-using System.IO;
+﻿using System.IO;
 using System.Linq;
+using ValveKeyValue;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.Materials;
+using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.Renderer.Utils;
 using ValveResourceFormat.ResourceTypes;
@@ -35,6 +37,15 @@ namespace Tests.Renderer.Golden
         private const string SecondStandaloneMesh = "ghostanim_bg_ghostanim_lod0.vmesh_c";
         private const string PhysicsAggregate = "juggernaut.vphys_c";
         private const string SecondPhysicsAggregate = "generic_grip.vphys_c";
+        private const string ColorCorrectionPostProcess = "basepostprocess_kv3_v4_uncompressed.vpost_c";
+
+        // Package fixtures, each a whole map plus what it refers to. Named by their packaged paths because
+        // that is how the loader resolves them once the package is mounted, not by a path on disk.
+        private const string AggregateMapPackage = "dota_riverflow_fx.vpk";
+        private const string AggregateMapResource = "maps/prefabs/dota_riverflow_fx.vmap_c";
+        private const string MaterialMapPackage = "small_map_with_material.vpk";
+        private const string MaterialMapResource = "maps/ui/nametag.vmap_c";
+        private const string MaterialMapMaterial = "materials/cs_italy/ground/tile_floor_diamond_1.vmat";
 
         private static List<GoldenScene> Build()
         {
@@ -145,9 +156,301 @@ namespace Tests.Renderer.Golden
             AddPostProcessScenes(scenes);
             AddDebugModeScenes(scenes);
             AddGridScene(scenes);
+            AddMapScenes(scenes);
+            AddColorCorrectionScene(scenes);
 
             return scenes;
         }
+
+        /// <summary>
+        /// A frame graded through a real colour correction LUT.
+        ///
+        /// <para>Only a <c>.vpost</c> produces one, and until now nothing here built a post-process volume
+        /// from one: the two post-process scenes above poke the renderer's stage settings directly, which
+        /// leaves the volume, the LUT it uploads and the slot the tonemap samples it from entirely
+        /// unexercised. That gap has already cost something -- the LUT was allocated as a bare GL name, so
+        /// the tonemap pass threw on the first map opened on Vulkan and no map rendered there at all.</para>
+        ///
+        /// <para>This is the master-volume path, where a single LUT at full weight is bound straight to the
+        /// tonemap. The compute shader that weights several LUTs together is a different path and is still
+        /// uncovered: reaching it needs a second, non-master volume with a collider for the camera to be
+        /// tested against, which nothing in this catalog can build yet.</para>
+        /// </summary>
+        /// <remarks>Appended last, for the order reason documented on <see cref="AddGridScene"/>.</remarks>
+        private static void AddColorCorrectionScene(List<GoldenScene> scenes)
+        {
+            scenes.Add(new GoldenScene
+            {
+                Name = "postprocess_color_correction",
+                Tolerance = ImageTolerance.Accumulating,
+                RequiredFixtures = [PhysicsAggregate, ColorCorrectionPostProcess],
+                Build = static setup =>
+                {
+                    AddPhysics(setup, PhysicsAggregate);
+                    setup.PlaceCamera(new Vector3(60, -90, 45), new Vector3(0, 0, 15));
+
+                    // Pinned rather than adapted, as the other post-process scenes are: auto exposure
+                    // integrates across frames and would make the captured image depend on how many ran.
+                    setup.Renderer.Postprocess.CustomExposure = 2.0f;
+
+                    var resource = setup.LoadFixture(ColorCorrectionPostProcess);
+
+                    if (resource.DataBlock is not PostProcessing postProcessing)
+                    {
+                        throw new GoldenRenderException(
+                            $"'{ColorCorrectionPostProcess}' did not parse as post-processing data.");
+                    }
+
+                    // Master, so it is the base state everywhere rather than something the camera has to be
+                    // inside. A non-master volume is gated on a collider this scene has no way to build.
+                    var volume = new ScenePostProcessVolume(setup.Scene) { IsMaster = true };
+
+                    // The fixture carries a tonemap curve and bloom settings alongside its LUT, and all three
+                    // are deliberately left applied: a volume is how a map delivers them, and separating
+                    // them here would put the renderer in a state a map never puts it in.
+                    volume.LoadPostProcessResource(postProcessing);
+
+                    if (volume.ColorCorrectionLUT == null)
+                    {
+                        throw new GoldenRenderException(
+                            $"'{ColorCorrectionPostProcess}' no longer yields a colour correction LUT, so this "
+                            + "scene would grade nothing and pass anyway.");
+                    }
+
+                    setup.Scene.PostProcessInfo.AddPostProcessVolume(volume);
+                },
+            });
+        }
+
+        /// <summary>
+        /// Maps, and the aggregate draw path maps are the only real source of.
+        ///
+        /// <para>Everything else in this catalog is a scene assembled by hand out of loose resources. A map
+        /// is not that shape: it is a <c>.vmap_c</c> that names a world, which names world nodes, which name
+        /// aggregates and scene objects and an entity lump, and the loader that walks that graph had no
+        /// coverage here at all -- <c>world_static_batch</c> is a grid of <see cref="ModelSceneNode"/>s and
+        /// reaches none of it. Every map-shaped defect this port has had was therefore found by a person
+        /// opening the viewer.</para>
+        ///
+        /// <para><b>Why these fixtures and not a real game map.</b> A map only resolves its references
+        /// inside the search path it shipped in, and the two VPKs below are the only fixtures in the tree
+        /// that carry a map <em>and</em> what it points at. They were already here, kept for the map extract
+        /// tests; nothing is vendored to make these scenes work. A map lifted out of a game install would
+        /// either have to bring its content with it -- which is somebody else's copyright and hundreds of
+        /// megabytes -- or render entirely in error materials, which is what extracting one to a fixture
+        /// directory produces.</para>
+        /// </summary>
+        /// <remarks>
+        /// Appended after <see cref="AddGridScene"/> for the order reason documented there: scenes go on the
+        /// end until the catalog's order sensitivity is chased down separately.
+        /// </remarks>
+        private static void AddMapScenes(List<GoldenScene> scenes)
+        {
+            scenes.Add(new GoldenScene
+            {
+                // A map whose world node carries aggregates. Aggregates are the representation the compiler
+                // emits for merged world geometry, and nothing else in the catalog produces one: a
+                // SceneAggregate holds a single shared mesh and a list of Fragments that each draw one of
+                // its draw calls, with their own bounds, tint and object flags. That is a different draw
+                // submission path from every other scene here.
+                Name = "world_map_aggregates",
+                Tolerance = ImageTolerance.Lit,
+                RequiredFixtures = [AggregateMapPackage],
+                Build = static setup => LoadMap(setup, AggregateMapPackage, AggregateMapResource,
+                    new Vector3(1290f, -5810f, 210f), new Vector3(1460f, -5580f, 40f),
+                    new MapExpectation(Aggregates: 2, Material: null)),
+            });
+
+            scenes.Add(new GoldenScene
+            {
+                // The one scene in the suite that draws an authored material.
+                //
+                // Every other scene renders with the error material, because the loose fixtures cannot
+                // resolve the materials they name (see the note at the top of this file). This map ships its
+                // material and all three of its textures inside the same package, so the whole chain the
+                // rest of the catalog cannot reach -- vmat parse, shader variant selection from real
+                // parameters, the per-material texture set, and the sampler bindings that go with it -- is
+                // under test here and only here.
+                Name = "world_map_material",
+                Tolerance = ImageTolerance.Lit,
+                RequiredFixtures = [MaterialMapPackage],
+                Build = static setup => LoadMap(setup, MaterialMapPackage, MaterialMapResource,
+                    new Vector3(70f, -105f, 65f), new Vector3(0f, 0f, 4f),
+                    new MapExpectation(Aggregates: 0, Material: MaterialMapMaterial)),
+            });
+
+            scenes.Add(new GoldenScene
+            {
+                // The GPU-driven indirect draw path, which neither map above reaches.
+                //
+                // An aggregate is only drawn indirectly when none of its fragments carries a transform of its
+                // own -- SceneAggregate clears CanDrawIndirect the moment one does -- and when its mesh was
+                // compiled with meshlets, since the indirect commands are laid out one per meshlet. Both
+                // aggregates in the prefab map are placed by fragment transform and neither mesh has
+                // meshlets, so both take the ordinary batch path and the whole of Scene's indirect
+                // machinery -- the draw bounds buffer, the meshlet culling buffer, the indirect command
+                // buffer, the culling compute pass and its compaction -- stays untouched by the suite.
+                //
+                // This scene reaches it from the one fixture in the tree that can: the plants aggregate is a
+                // real compiled aggregate model out of a Dota map, carrying three draw calls, their baked
+                // world-space draw bounds and eight meshlets. Only the world node record that would have
+                // placed it is written here, because no fixture map in the repository contains an
+                // untransformed aggregate for it to be read from. That record is data, not behaviour: it
+                // selects which draw calls become fragments and what tint and flags they carry, and every
+                // number the renderer then culls and draws with comes out of the compiled model.
+                Name = "world_aggregate_indirect",
+                Tolerance = ImageTolerance.Lit,
+                RequiredFixtures = [StaticModel],
+                Build = static setup =>
+                {
+                    var aggregate = new SceneAggregate(setup.Scene, LoadModel(setup, StaticModel))
+                    {
+                        Name = StaticModel,
+                        LayerName = "world_layer_base",
+                    };
+
+                    setup.Scene.Add(aggregate, dynamic: false);
+                    aggregate.LoadFragments(AggregatePlacement(aggregate.RenderMesh.DrawCallsOpaque.Count));
+
+                    // The scene's whole reason to exist, asserted rather than assumed. Both conditions are
+                    // one edit away at all times -- a fragment transform appearing in the placement, or a
+                    // fixture swapped for a mesh compiled without meshlets -- and either would silently
+                    // demote this scene to an ordinary batch draw that the catalog already covers twice
+                    // over. It would still render, still match its baseline, and test nothing new.
+                    if (!aggregate.CanDrawIndirect || aggregate.RenderMesh.Meshlets.Count == 0)
+                    {
+                        throw new GoldenRenderException(
+                            $"'{StaticModel}' no longer reaches the indirect draw path: "
+                            + $"CanDrawIndirect={aggregate.CanDrawIndirect}, "
+                            + $"meshlets={aggregate.RenderMesh.Meshlets.Count}.");
+                    }
+
+                    setup.PlaceCamera(new Vector3(60f, -140f, 130f), new Vector3(0f, 20f, 35f));
+                },
+            });
+        }
+
+        /// <summary>
+        /// The world node record that places every draw call of an aggregate mesh as its own fragment,
+        /// untransformed.
+        ///
+        /// <para>Shaped as the CS2-era aggregate scene object, which is the format
+        /// <see cref="SceneAggregate.LoadFragments"/> selects on the presence of <c>m_nDrawCallIndex</c>:
+        /// one entry per fragment naming the draw call it renders, with the per-fragment tint and object
+        /// flags beside it. <c>m_bHasTransform</c> is false throughout and <c>m_fragmentTransforms</c> is
+        /// empty, which is what keeps the aggregate on the indirect path -- the point of the scene.</para>
+        /// </summary>
+        private static KVObject AggregatePlacement(int drawCallCount)
+        {
+            var meshes = KVObject.Array();
+
+            for (var index = 0; index < drawCallCount; index++)
+            {
+                var fragment = KVObject.Collection();
+
+                fragment.Add("m_nDrawCallIndex", index);
+                fragment.Add("m_bHasTransform", false);
+                fragment.Add("m_nLODGroupMask", 0);
+                fragment.Add("m_nLightProbeVolumePrecomputedHandshake", 0);
+
+                // Full brightness. A fragment tint is a byte triple in this format rather than a float one,
+                // and the loader divides it by 255 on the way in.
+                var tint = KVObject.Array();
+                tint.Add(255);
+                tint.Add(255);
+                tint.Add(255);
+                fragment.Add("m_vTintColor", tint);
+
+                // The flag pair every aggregate fragment in the prefab map carries, copied from it rather
+                // than chosen: a model that renders into cubemap captures.
+                fragment.Add("m_objectFlags", (int)(ValveResourceFormat.ObjectTypeFlags.Model | ValveResourceFormat.ObjectTypeFlags.RenderToCubemaps));
+
+                meshes.Add(fragment);
+            }
+
+            var placement = KVObject.Collection();
+
+            placement.Add("m_aggregateMeshes", meshes);
+            placement.Add("m_fragmentTransforms", KVObject.Array());
+
+            return placement;
+        }
+
+        /// <summary>
+        /// Mounts a package fixture and loads a map out of it, the way the world viewer does.
+        ///
+        /// <para>The camera is pinned to world coordinates rather than framed from the loaded bounds, for
+        /// the reason <see cref="GoldenSceneSetup.PlaceCamera"/> gives: a shot derived from bounds rewrites
+        /// itself whenever the geometry does, and then the baseline stops being an oracle for the geometry.
+        /// Maps are authored in world space and do not move, so a fixed camera is the honest choice.</para>
+        /// </summary>
+        private static void LoadMap(GoldenSceneSetup setup, string package, string mapResource,
+            Vector3 cameraPosition, Vector3 lookAt, MapExpectation expectation)
+        {
+            setup.FileLoader!.MountPackage(package);
+
+            var world = ValveResourceFormat.Renderer.World.WorldLoader.LoadMap(mapResource, setup.Scene);
+
+            // What the viewer takes from the loaded world. The skyboxes are the interesting half: a map that
+            // names a sky replaces the renderer's default background with a material of its own, and that
+            // material comes out of the map's own package.
+            if (world.SkyboxScene != null)
+            {
+                setup.Renderer.SkyboxScene = world.SkyboxScene;
+            }
+
+            if (world.Skybox2D != null)
+            {
+                setup.Renderer.Skybox2D = world.Skybox2D;
+            }
+
+            RequireLoaded(setup, expectation);
+
+            setup.PlaceCamera(cameraPosition, lookAt);
+        }
+
+        /// <summary>
+        /// What each map scene is here to draw, checked before the frame is taken.
+        ///
+        /// <para>A map resolves its references out of a mounted package, and a package that failed to mount
+        /// -- or a map whose paths were renamed -- does not throw. The loader logs and moves on, the scene
+        /// builds with fewer nodes than it meant to, a baseline is recorded from whatever survived, and the
+        /// scene passes forever while testing something other than what it claims. These checks are the
+        /// difference between a map scene and a scene-shaped hole.</para>
+        /// </summary>
+        private static void RequireLoaded(GoldenSceneSetup setup, MapExpectation expectation)
+        {
+            var aggregates = setup.Scene.AllNodes.OfType<SceneAggregate>().Count();
+
+            if (aggregates < expectation.Aggregates)
+            {
+                throw new GoldenRenderException(
+                    $"Expected at least {expectation.Aggregates} aggregate(s) from this map, loaded {aggregates}.");
+            }
+
+            if (expectation.Material == null)
+            {
+                return;
+            }
+
+            var materials = setup.Scene.AllNodes.OfType<ModelSceneNode>()
+                .SelectMany(static node => node.RenderableMeshes)
+                .SelectMany(static mesh => mesh.DrawCalls)
+                .Select(static drawCall => drawCall.Material.Material.Name)
+                .ToList();
+
+            if (!materials.Any(name => string.Equals(name, expectation.Material, StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new GoldenRenderException(
+                    $"This map is supposed to draw '{expectation.Material}', which is in its package, but its "
+                    + $"draw calls resolved to: {string.Join(", ", materials.Select(static name => $"'{name}'"))}. "
+                    + "An unresolved material falls back to the error material without failing, so this scene "
+                    + "would otherwise pass while covering nothing it says it covers.");
+            }
+        }
+
+        /// <summary>What a map scene must have loaded to be worth capturing.</summary>
+        private readonly record struct MapExpectation(int Aggregates, string? Material);
 
         /// <summary>
         /// The viewer's infinite reference grid, with something standing in front of it.

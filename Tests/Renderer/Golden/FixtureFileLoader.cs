@@ -18,13 +18,45 @@ namespace Tests.Renderer.Golden
     /// which atlas rectangles it selects and where it writes them -- does not depend on what the atlas
     /// contains. Substituting a texture with strong spatial variation makes that selection <em>visible</em>
     /// in the composited image, which is precisely what an oracle for it needs.</para>
+    ///
+    /// <para>A fixture that is itself a VPK is a different case and needs no stand-in at all. Some of the
+    /// fixtures under <c>Tests/Files</c> are whole packages holding a map and everything it refers to, and
+    /// mounting one through <see cref="MountPackage"/> gives that map a search path in which its references
+    /// really do resolve. See <see cref="GoldenSceneCatalog"/>'s map scenes for what that buys.</para>
     /// </summary>
     internal sealed class FixtureFileLoader : GameFileLoader
     {
         private readonly Dictionary<string, string> substitutions = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> mountedPackages = new(StringComparer.OrdinalIgnoreCase);
 
         public FixtureFileLoader() : base(null, null)
         {
+        }
+
+        /// <summary>
+        /// Adds a VPK fixture to this loader's search paths, so everything inside it resolves by its
+        /// packaged path.
+        ///
+        /// <para>One loader serves every scene in a run, so mounting is idempotent: a scene declares the
+        /// package it needs without having to know whether an earlier scene already asked for it.</para>
+        ///
+        /// <para>Nothing is unmounted between scenes, which means a package mounted by one scene is on the
+        /// search path for every scene after it. That is deliberate -- unmounting would make a scene's
+        /// result depend on the order the catalog happened to run in -- but it does put the burden on the
+        /// package fixtures not to answer a reference some other scene makes. Check that before adding one:
+        /// today neither package holds anything a non-map scene asks for, and a package that did would
+        /// silently change an existing baseline rather than fail.</para>
+        /// </summary>
+        /// <param name="fixtureRelativePath">A <c>.vpk</c> path under <c>Tests/Files</c>.</param>
+        public void MountPackage(string fixtureRelativePath)
+        {
+            if (!mountedPackages.Add(fixtureRelativePath))
+            {
+                return;
+            }
+
+            // Owned by the base loader from here on: it disposes everything in its search list.
+            AddPackageToSearch(GoldenSceneSetup.FixturePath(fixtureRelativePath));
         }
 
         /// <summary>
