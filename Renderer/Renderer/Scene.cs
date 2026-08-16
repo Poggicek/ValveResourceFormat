@@ -212,6 +212,30 @@ namespace ValveResourceFormat.Renderer
         internal bool DrawMeshletsIndirect { get; private set; }
         internal bool CompactMeshletDraws { get; private set; }
 
+        /// <summary>
+        /// Gets a value indicating whether this scene's GPU culling compute passes actually reach the
+        /// device.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <b>They only reach an OpenGL one.</b> <see cref="MeshletCullGpu"/>,
+        /// <see cref="CompactIndirectDraws"/> and <see cref="GenerateDepthPyramid"/> bind through
+        /// <c>glBindBufferBase</c>/<c>glBindImageTexture</c> and dispatch through
+        /// <c>glDispatchCompute</c>, none of which is recorded on an <see cref="RHI.ICommandList"/>. On any
+        /// other backend the buffer binds are skipped by <see cref="Buffers.Buffer.BindBufferBase(int)"/>
+        /// and the dispatches land on nothing that owns this scene's storage, so the passes are not merely
+        /// slower, they produce no writes at all.
+        /// </para>
+        /// <para>
+        /// That is what makes this a correctness gate rather than a performance one. A pass that does not
+        /// run leaves its output buffer holding whatever it was created with, and
+        /// <see cref="CompactedCountsGpu"/> is created with nothing &#8212; it is allocated and never
+        /// uploaded. Feeding that to <c>vkCmdDrawIndexedIndirectCount</c> hands the driver an undefined
+        /// draw count. Read this before taking any path that depends on a compute pass having run.
+        /// </para>
+        /// </remarks>
+        internal bool GpuCullingPassesRun => RendererDevice.IsOpenGL(RendererContext.Device);
+
         /// <summary>Gets all static and dynamic scene nodes in the order they were added.</summary>
         public IEnumerable<SceneNode> AllNodes => staticNodes.Concat(dynamicNodes);
 
@@ -694,16 +718,20 @@ namespace ValveResourceFormat.Renderer
                 SceneMeshletCount = sceneMeshletCount;
 
                 MeshletDataGpu = new StorageBuffer(ReservedBufferSlots.AggregateMeshlets);
-                IndirectDrawsGpu = new StorageBuffer(ReservedBufferSlots.AggregateDraws);
+
+                // The three buffers a draw reads through, rather than only writes as storage: the two
+                // command arrays and the count block. Declared here because a Vulkan buffer's uses are
+                // fixed at creation and an indirect read is one of them; see StorageBuffer.RhiUsage.
+                IndirectDrawsGpu = new StorageBuffer(ReservedBufferSlots.AggregateDraws, indirectArguments: true);
 
                 MeshletDataGpu.Create(meshletDataGpu, BufferUsageHint.StaticDraw);
                 IndirectDrawsGpu.Create(indirectDrawsGpu, BufferUsageHint.DynamicDraw);
 
                 // Create compaction buffers
-                CompactedDrawsGpu = new StorageBuffer(ReservedBufferSlots.CompactedDraws);
+                CompactedDrawsGpu = new StorageBuffer(ReservedBufferSlots.CompactedDraws, indirectArguments: true);
                 CompactedDrawsGpu.Create(indirectDrawsGpu, BufferUsageHint.DynamicDraw);
 
-                CompactedCountsGpu = StorageBuffer.Allocate<uint>(ReservedBufferSlots.CompactedCounts, compactionRequestList.Count / 2, BufferUsageHint.DynamicDraw);
+                CompactedCountsGpu = StorageBuffer.Allocate<uint>(ReservedBufferSlots.CompactedCounts, compactionRequestList.Count / 2, BufferUsageHint.DynamicDraw, indirectArguments: true);
 
                 CompactionRequestsGpu = new StorageBuffer(ReservedBufferSlots.CompactionRequests);
                 CompactionRequestsGpu.Create(compactionRequestList);
@@ -1296,26 +1324,65 @@ namespace ValveResourceFormat.Renderer
                 : DepthOnlyBucket.Specialized;
         }
 
+        /// <summary>
+        /// Decides, for this frame, whether aggregates draw indirectly and whether they draw from the
+        /// compacted command list.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <b>Indirect drawing survives a backend without the compute passes; compaction does not.</b>
+        /// <see cref="IndirectDrawsGpu"/> is uploaded with a complete command per meshlet when the scene is
+        /// built, so a device where <see cref="MeshletCullGpu"/> never runs still draws from valid
+        /// arguments &#8212; it just draws every meshlet, because nothing zeroed the counts of the ones
+        /// outside the frustum. That is a lost optimisation and not a wrong image, since culling only ever
+        /// removes geometry the frame would not have shown.
+        /// </para>
+        /// <para>
+        /// Compaction has no such fallback. <see cref="CompactedCountsGpu"/> is allocated and never
+        /// written by anything but <see cref="CompactIndirectDraws"/>, so without that pass the draw count
+        /// is undefined rather than merely stale. See <see cref="GpuCullingPassesRun"/>.
+        /// </para>
+        /// <para>
+        /// <see cref="GLEnvironment.IndirectCountSupported"/> is read from the OpenGL vendor string and
+        /// answers for the OpenGL path and for nothing else, which is why it used to be the whole
+        /// condition and is now the last term of one. It is left as the only capability check because
+        /// <see cref="GpuCullingPassesRun"/> has already established that this is an OpenGL device; the
+        /// RHI's own <see cref="RHI.IDeviceLimits.SupportsDrawIndirectCount"/> is the answer to ask once a
+        /// backend other than OpenGL can run the compaction pass, and asking it here instead would change
+        /// which OpenGL drivers take the counted path for no gain.
+        /// </para>
+        /// </remarks>
         internal void UpdateIndirectRenderingState()
         {
             CompactMeshletDraws = false;
             DrawMeshletsIndirect = EnableIndirectDraws && SceneMeshletCount > 0 && IndirectDrawsGpu != null;
 
-            if (DrawMeshletsIndirect)
+            if (!DrawMeshletsIndirect)
             {
-                Debug.Assert(IndirectDrawsGpu is not null);
-                Debug.Assert(CompactedDrawsGpu is not null);
+                return;
+            }
 
-                CompactMeshletDraws = GLEnvironment.IndirectCountSupported && EnableCompaction;
-                GL.BindBuffer(BufferTarget.DrawIndirectBuffer, CompactMeshletDraws
-                    ? CompactedDrawsGpu.Handle
-                    : IndirectDrawsGpu.Handle);
+            Debug.Assert(IndirectDrawsGpu is not null);
+            Debug.Assert(CompactedDrawsGpu is not null);
 
-                if (CompactMeshletDraws)
-                {
-                    Debug.Assert(CompactedCountsGpu is not null);
-                    GL.BindBuffer(BufferTarget.ParameterBuffer, CompactedCountsGpu.Handle);
-                }
+            CompactMeshletDraws = EnableCompaction && GpuCullingPassesRun && GLEnvironment.IndirectCountSupported;
+
+            if (!GpuCullingPassesRun)
+            {
+                // The two binds below are OpenGL's way of naming the buffer a later draw reads its
+                // arguments from. A recorded draw is passed the buffer instead, so there is nothing here
+                // to state; binding anyway would only touch the GL context this scene is not drawing on.
+                return;
+            }
+
+            GL.BindBuffer(BufferTarget.DrawIndirectBuffer, CompactMeshletDraws
+                ? CompactedDrawsGpu.Handle
+                : IndirectDrawsGpu.Handle);
+
+            if (CompactMeshletDraws)
+            {
+                Debug.Assert(CompactedCountsGpu is not null);
+                GL.BindBuffer(BufferTarget.ParameterBuffer, CompactedCountsGpu.Handle);
             }
         }
 
@@ -1328,7 +1395,12 @@ namespace ValveResourceFormat.Renderer
         internal bool SetOcclusionUniforms(Shader shader)
         {
             var pyramid = DepthPyramid;
-            var enabled = DepthPyramidValid && pyramid != null;
+
+            // GpuCullingPassesRun as well as the validity flag, because the flag is set by the caller of
+            // GenerateDepthPyramid rather than by the pass itself: on a backend where that pass returns
+            // without writing anything, the pyramid is still marked current and testing against it would
+            // occlude against undefined depth.
+            var enabled = DepthPyramidValid && pyramid != null && GpuCullingPassesRun;
 
             shader.SetUniform("g_bOcclusionCullEnabled", enabled ? 1 : 0);
 
@@ -1361,6 +1433,16 @@ namespace ValveResourceFormat.Renderer
             Debug.Assert(DrawBoundsGpu is not null);
             Debug.Assert(MeshletDataGpu is not null);
             Debug.Assert(IndirectDrawsGpu is not null);
+
+            if (!GpuCullingPassesRun)
+            {
+                // Not ported. Everything below binds and dispatches through OpenGL, so on another backend
+                // it would bind nothing and dispatch against a program this scene's buffers are not
+                // reachable from. Returning here rather than running it is the difference between a pass
+                // that is known not to have run and one that appears to have. UpdateIndirectRenderingState
+                // reads the same condition to keep the draw off the buffers this would have filled.
+                return;
+            }
 
             using var _ = new GLDebugGroup("Cull Meshlet Draws");
 
@@ -1410,6 +1492,14 @@ namespace ValveResourceFormat.Renderer
                 return;
             }
 
+            // Not ported; see MeshletCullGpu. CompactMeshletDraws is already false on such a device, so
+            // this should be unreachable there -- it is a second lock on the buffer whose contents are
+            // undefined until this runs, not a duplicate of that check.
+            if (!GpuCullingPassesRun)
+            {
+                return;
+            }
+
             using var _ = new GLDebugGroup("Compact Meshlet Draws");
 
             CompactionShader.Use();
@@ -1432,6 +1522,14 @@ namespace ValveResourceFormat.Renderer
         public void GenerateDepthPyramid(RenderTexture depthSource)
         {
             if (DepthPyramid == null || DepthPyramidShader == null)
+            {
+                return;
+            }
+
+            // Not ported; see MeshletCullGpu. This one binds storage images through glBindImageTexture,
+            // whose handle is 0 for a texture that is not an OpenGL one, so every dispatch below would
+            // write to whatever image unit 1 and 2 happen to hold.
+            if (!GpuCullingPassesRun)
             {
                 return;
             }

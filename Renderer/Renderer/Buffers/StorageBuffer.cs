@@ -12,12 +12,35 @@ namespace ValveResourceFormat.Renderer.Buffers
     public class StorageBuffer : Buffer
     {
         private bool readback;
+        private readonly bool indirectArguments;
 
         /// <summary>Initializes a new storage buffer bound to the given reserved slot.</summary>
-        public StorageBuffer(ReservedBufferSlots bindingPoint)
+        /// <param name="bindingPoint">The reserved slot to bind the buffer to.</param>
+        /// <param name="indirectArguments">Whether a draw reads its arguments, or its draw count, out of
+        /// this buffer. See <see cref="RhiUsage"/>.</param>
+        public StorageBuffer(ReservedBufferSlots bindingPoint, bool indirectArguments = false)
             : base(BufferTarget.ShaderStorageBuffer, (int)bindingPoint, bindingPoint.ToString())
         {
+            this.indirectArguments = indirectArguments;
         }
+
+        /// <inheritdoc/>
+        /// <remarks>
+        /// A storage buffer that a draw reads its arguments out of is two things at once, and OpenGL lets
+        /// it be both without saying so: the compute pass writes it through
+        /// <c>GL_SHADER_STORAGE_BUFFER</c> and the draw reads it through <c>GL_DRAW_INDIRECT_BUFFER</c>,
+        /// with nothing at creation recording either. Vulkan fixes a buffer's uses at creation, so the
+        /// second one has to be declared here or <c>vkCmdDrawIndexedIndirect</c> is reading a buffer that
+        /// was never made readable that way.
+        /// <para>
+        /// Opt-in rather than blanket, because most of these buffers are only ever storage and a usage flag
+        /// that is always set stops distinguishing anything. It is fixed at construction because
+        /// <see cref="Buffer.EnsureStorage"/> reads it when it allocates.
+        /// </para>
+        /// </remarks>
+        protected override RHI.BufferUsage RhiUsage => indirectArguments
+            ? base.RhiUsage | RHI.BufferUsage.Indirect
+            : base.RhiUsage;
 
         /// <inheritdoc/>
         /// <remarks>A readback buffer is host visible and persistently mapped; everything else this type
@@ -41,10 +64,12 @@ namespace ValveResourceFormat.Renderer.Buffers
         /// <param name="bindingPoint">The reserved slot to bind the buffer to.</param>
         /// <param name="elements">Number of elements to allocate space for.</param>
         /// <param name="usage">The intended usage hint for the buffer.</param>
+        /// <param name="indirectArguments">Whether a draw reads its arguments, or its draw count, out of
+        /// this buffer. See <see cref="RhiUsage"/>.</param>
         /// <returns>The newly allocated <see cref="StorageBuffer"/>.</returns>
-        public static StorageBuffer Allocate<T>(ReservedBufferSlots bindingPoint, int elements, BufferUsageHint usage)
+        public static StorageBuffer Allocate<T>(ReservedBufferSlots bindingPoint, int elements, BufferUsageHint usage, bool indirectArguments = false)
         {
-            var buffer = new StorageBuffer(bindingPoint)
+            var buffer = new StorageBuffer(bindingPoint, indirectArguments)
             {
                 readback = usage == BufferUsageHint.DynamicRead,
             };

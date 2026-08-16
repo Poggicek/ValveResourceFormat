@@ -395,6 +395,41 @@ namespace ValveResourceFormat.Renderer
         }
 
         /// <summary>
+        /// Checks that the buffer a draw is about to read its arguments from is the right shape to be one.
+        /// </summary>
+        /// <param name="arguments">The buffer being handed to the indirect draw.</param>
+        /// <param name="aggregate">The aggregate whose range of it is being drawn.</param>
+        /// <remarks>
+        /// <para>
+        /// <b>Why a check and not a comment.</b> An indirect draw states a buffer, a byte offset and a
+        /// draw count, and the backend takes all three on trust: nothing in
+        /// <c>vkCmdDrawIndexedIndirect</c> can tell a command array from any other buffer of the same size,
+        /// and a wrong one is read as commands anyway. The failure that produces is a hang or a wild draw,
+        /// attributed to the shader rather than to the bind.
+        /// </para>
+        /// <para>
+        /// The arithmetic here only closes if the buffer really is an array of
+        /// <see cref="Buffers.DrawElementsIndirectCommand"/>, because <c>Scene</c> derives both the offset
+        /// and the count from the meshlet index it sized the allocation from. A buffer that arrived here by
+        /// mistake fails it unless it happens to be at least as long, which is what makes this worth more
+        /// than the usage flag: <see cref="RHI.BufferUsage.Indirect"/> says someone intended a buffer to be
+        /// read this way, and this says the one in hand is the one that was meant.
+        /// </para>
+        /// </remarks>
+        [Conditional("DEBUG")]
+        private static void AssertIndirectArgumentsFit(Buffers.StorageBuffer arguments, SceneAggregate aggregate)
+        {
+            var stride = Unsafe.SizeOf<Buffers.DrawElementsIndirectCommand>();
+            var end = aggregate.IndirectDrawByteOffset + (aggregate.IndirectDrawCount * stride);
+
+            Debug.Assert(aggregate.IndirectDrawByteOffset % stride == 0,
+                $"Indirect draw offset {aggregate.IndirectDrawByteOffset} into '{arguments.Name}' is not a whole number of {stride}-byte commands.");
+
+            Debug.Assert(end <= arguments.Size,
+                $"'{arguments.Name}' is {arguments.Size} bytes, but this draw reads {aggregate.IndirectDrawCount} commands ending at {end}. It is not the command array this draw thinks it is.");
+        }
+
+        /// <summary>
         /// Records this material's own textures into <see cref="DescriptorSets.MaterialTextures"/>.
         /// </summary>
         /// <param name="commandList">The command list to record into.</param>
@@ -676,6 +711,7 @@ namespace ValveResourceFormat.Renderer
                         if (config.CommandList != null)
                         {
                             Debug.Assert(scene.CompactedDrawsGpu != null && scene.CompactedCountsGpu != null);
+                            AssertIndirectArgumentsFit(scene.CompactedDrawsGpu, agg);
 
                             config.CommandList.DrawIndexedIndirectCount(
                                 scene.CompactedDrawsGpu.RhiBuffer,
@@ -704,6 +740,7 @@ namespace ValveResourceFormat.Renderer
                         // has no compaction slot and so takes this uncounted path.
                         var arguments = scene.CompactMeshletDraws ? scene.CompactedDrawsGpu : scene.IndirectDrawsGpu;
                         Debug.Assert(arguments != null);
+                        AssertIndirectArgumentsFit(arguments, agg);
 
                         config.CommandList.DrawIndexedIndirect(arguments.RhiBuffer, agg.IndirectDrawByteOffset, agg.IndirectDrawCount, 0);
                         return;
