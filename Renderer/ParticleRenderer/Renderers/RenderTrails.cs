@@ -47,12 +47,16 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         private readonly int vertexBufferHandle;
         private RenderTexture texture;
 
-        // Non-owning RHI views of the two OpenGL buffers this renderer draws from, so the draw can be
-        // recorded through a command list before buffer allocation itself moves onto IDevice. Rebuilt
-        // when the vertex buffer is reallocated to a different size, which glNamedBufferData does every
-        // frame the quad count changes.
+        // Non-owning RHI view of the OpenGL vertex buffer this renderer draws from, so the draw can be
+        // recorded through a command list without the OpenGL path losing the buffer name its vertex array
+        // was built from. Rebuilt when the vertex buffer is reallocated to a different size, which
+        // glNamedBufferData does every frame the quad count changes. OpenGL only.
         private GLBuffer? vertexRhiBuffer;
-        private GLBuffer? quadIndexRhiBuffer;
+
+        // The same buffer on a device that has no OpenGL in it, owned rather than wrapped: there is no
+        // glCreateBuffers name to view, so this is created through IDevice and written through
+        // IDevice.UploadBuffer. Reallocated whenever the quad count changes the size it needs.
+        private IBuffer? deviceVertexBuffer;
 
         // Built once on first RHI draw rather than in a static initializer, so a layout the contract has
         // no format for throws at the draw that needs it instead of as a type initializer failure.
@@ -125,9 +129,12 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             texture = rendererContext.MaterialLoader.GetTexture(textureName ?? DefaultTextureName, srgbRead: true);
 
 #if DEBUG
-            var vaoLabel = $"{nameof(RenderTrails)}: {System.IO.Path.GetFileName(textureName)}";
-            GL.ObjectLabel(ObjectLabelIdentifier.VertexArray, vaoHandle, Math.Min(GLEnvironment.MaxLabelLength, vaoLabel.Length), vaoLabel);
-            GL.ObjectLabel(ObjectLabelIdentifier.Buffer, vertexBufferHandle, Math.Min(GLEnvironment.MaxLabelLength, vaoLabel.Length), vaoLabel);
+            if (RendererDevice.IsOpenGL(rendererContext.Device))
+            {
+                var vaoLabel = $"{nameof(RenderTrails)}: {System.IO.Path.GetFileName(textureName)}";
+                GL.ObjectLabel(ObjectLabelIdentifier.VertexArray, vaoHandle, Math.Min(GLEnvironment.MaxLabelLength, vaoLabel.Length), vaoLabel);
+                GL.ObjectLabel(ObjectLabelIdentifier.Buffer, vertexBufferHandle, Math.Min(GLEnvironment.MaxLabelLength, vaoLabel.Length), vaoLabel);
+            }
 #endif
 
             orientationType = parse.Enum("m_nOrientationType", orientationType);
@@ -177,8 +184,21 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             this.texture = texture;
         }
 
+        /// <summary>
+        /// Creates the OpenGL vertex buffer and the vertex array that reads it.
+        /// </summary>
+        /// <remarks>
+        /// Both are OpenGL-only. On any other backend the storage is allocated at the first draw instead,
+        /// once the frame's quad count says how much is needed, and there is no vertex array at all
+        /// &#8212; the recorded draw takes its layout from the pipeline.
+        /// </remarks>
         private (int Vao, int Buffer) SetupQuadBuffer()
         {
+            if (!RendererDevice.IsOpenGL(rendererContext.Device))
+            {
+                return (0, 0);
+            }
+
             GL.CreateBuffers(1, out int buffer);
 
             var vao = Vertex.InputLayout.CreateVertexArray(nameof(RenderTrails), buffer, rendererContext.MeshBufferCache.QuadIndices.GLHandle);
@@ -189,7 +209,12 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         /// <summary>
         /// Builds one quad per visible trail into the shared vertex buffer, returning how many were written.
         /// </summary>
-        private int UpdateVertices(ParticleCollection particleBag, ParticleSystemRenderState systemRenderState, Camera camera)
+        /// <param name="particleBag">The live particles to build ribbons from.</param>
+        /// <param name="systemRenderState">Render state the number providers are evaluated against.</param>
+        /// <param name="camera">Camera the ribbons are oriented and size-faded against.</param>
+        /// <param name="device">The device the draw will be recorded on, which decides whether the
+        /// vertices go into the OpenGL buffer name or into device-allocated storage.</param>
+        private int UpdateVertices(ParticleCollection particleBag, ParticleSystemRenderState systemRenderState, Camera camera, IDevice? device)
         {
             var headColor = headColorScale.NextVector(systemRenderState);
             var tailColor = tailColorScale.NextVector(systemRenderState);
@@ -389,7 +414,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
                 if (quadCount > 0)
                 {
-                    GL.NamedBufferData(vertexBufferHandle, quadCount * 4 * Vertex.InputLayout.Stride, vertexBuffer.FloatArray, BufferUsageHint.DynamicDraw);
+                    UploadVertices(device, vertexBuffer.FloatArray, quadCount * 4 * Vertex.InputLayout.Stride);
                 }
             }
 
@@ -415,7 +440,9 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 return;
             }
 
-            var quadCount = UpdateVertices(particleBag, systemRenderState, camera);
+            var device = RendererDevice.Resolve(commandList?.Device ?? rendererContext.Device);
+
+            var quadCount = UpdateVertices(particleBag, systemRenderState, camera, device);
 
             if (quadCount == 0)
             {
@@ -441,8 +468,8 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             {
                 // Ribbon quads, two triangles each through the shared quad index buffer.
                 commandList.BindPipeline(PipelineFor(commandList, context!.Value));
-                commandList.BindVertexBuffer(0, VertexRhiBuffer(quadCount * 4 * Vertex.InputLayout.Stride));
-                commandList.BindIndexBuffer(QuadIndexRhiBuffer(), IndexType.UInt16);
+                commandList.BindVertexBuffer(0, VertexStorage(device, quadCount * 4 * Vertex.InputLayout.Stride));
+                commandList.BindIndexBuffer(rendererContext.MeshBufferCache.QuadIndices.GetBuffer(device), IndexType.UInt16);
             }
 
             // Set on both paths: this also points the sampler uniform at its texture unit, which
@@ -450,8 +477,22 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             // pipeline layer, so the two calls stop overlapping once pipelines carry reflection.
             shader.SetTexture(RenderMaterial.TextureUnitStart, "uTexture", texture);
 
-            // Per-material textures are set 3 counting from zero, matching RenderMaterial's numbering.
-            commandList?.BindTexture(DescriptorSets.MaterialTextures, 0, texture.RhiTexture);
+            if (commandList != null)
+            {
+                // The shader's own slot for this sampler, not a counted one: emission numbers every
+                // sampler the source declares and the compiler is free to drop one, so a count can name a
+                // descriptor the shader never reads. Zero only stands in for a shader with no reflected
+                // interface, where it is the unit TextureUnitStart maps to above.
+                var slot = 0;
+
+                if (shader.SpirvInterface is not { } declared || declared.TryGetMaterialTextureSlot("uTexture", out slot))
+                {
+                    // SamplerFor, never RhiSampler: null on OpenGL so the unit keeps sampler 0 and the
+                    // texture's own parameters stay in charge.
+                    commandList.BindTexture(DescriptorSets.MaterialTextures, slot,
+                        texture.RhiTexture, texture.SamplerFor(commandList.Device));
+                }
+            }
 
             // TODO: This formula is a guess but still seems too bright compared to valve particles
             SetSharedUniforms(shader, systemRenderState);
@@ -493,8 +534,59 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 GLRendererDevice.DrawConstants);
         }
 
-        private GLBuffer VertexRhiBuffer(int sizeInBytes)
+        /// <summary>
+        /// Writes this frame's ribbon vertices into the buffer the draw reads, allocating storage first
+        /// when the quad count changed the size it needs.
+        /// </summary>
+        /// <param name="device">The device the draw will be recorded on.</param>
+        /// <param name="floats">The rented scratch array the vertices were built in. Longer than the data,
+        /// because the pool hands out whole buckets.</param>
+        /// <param name="sizeInBytes">How much of <paramref name="floats"/> is this frame's vertices.</param>
+        private void UploadVertices(IDevice? device, float[] floats, int sizeInBytes)
         {
+            if (RendererDevice.IsOpenGL(device))
+            {
+                // Unchanged: a mutable store replaced wholesale every frame, which is what the vertex
+                // array built in SetupQuadBuffer reads through.
+                GL.NamedBufferData(vertexBufferHandle, sizeInBytes, floats, BufferUsageHint.DynamicDraw);
+                return;
+            }
+
+            EnsureDeviceVertexBuffer(device!, sizeInBytes);
+
+            // Staged by the device. A frame's own uploads are flushed before its command lists execute, so
+            // writing here rather than at load time is correct even though this runs mid-frame.
+            device!.UploadBuffer(deviceVertexBuffer!, 0, MemoryMarshal.AsBytes(floats.AsSpan(0, sizeInBytes / sizeof(float))));
+        }
+
+        private void EnsureDeviceVertexBuffer(IDevice device, int sizeInBytes)
+        {
+            if (deviceVertexBuffer is not null && deviceVertexBuffer.SizeInBytes == sizeInBytes)
+            {
+                return;
+            }
+
+            if (deviceVertexBuffer is not null)
+            {
+                // Deferred, not destroyed: a frame still in flight may be reading the old storage.
+                device.DeferredDestroy(deviceVertexBuffer);
+            }
+
+            deviceVertexBuffer = device.CreateBuffer(new BufferDesc(
+                sizeInBytes, BufferUsage.Vertex | BufferUsage.CopyDestination, BufferMemory.DeviceLocal, nameof(RenderTrails)));
+        }
+
+        /// <summary>Gets the buffer the recorded draw reads its vertices from.</summary>
+        /// <param name="device">The device the draw is recorded on.</param>
+        /// <param name="sizeInBytes">This frame's vertex data size.</param>
+        private IBuffer VertexStorage(IDevice? device, int sizeInBytes)
+        {
+            if (!RendererDevice.IsOpenGL(device))
+            {
+                return deviceVertexBuffer ?? throw new InvalidOperationException(
+                    $"{nameof(RenderTrails)} has no vertex storage, so this frame's ribbons were never uploaded.");
+            }
+
             if (vertexRhiBuffer is null || vertexRhiBuffer.SizeInBytes != sizeInBytes)
             {
                 vertexRhiBuffer = GLBuffer.Wrap(vertexBufferHandle, sizeInBytes, BufferUsage.Vertex, BufferMemory.DeviceLocal, nameof(RenderTrails));
@@ -502,14 +594,6 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
             return vertexRhiBuffer;
         }
-
-        private GLBuffer QuadIndexRhiBuffer()
-            => quadIndexRhiBuffer ??= GLBuffer.Wrap(
-                rendererContext.MeshBufferCache.QuadIndices.GLHandle,
-                MaxQuads * 6 * sizeof(ushort),
-                BufferUsage.Index,
-                BufferMemory.DeviceLocal,
-                nameof(QuadIndexBuffer));
 
         public override IEnumerable<string> GetSupportedRenderModes() => shader.RenderModes;
 
@@ -519,6 +603,20 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
         public override void Delete()
         {
+            var device = RendererDevice.Resolve(rendererContext.Device);
+
+            if (!RendererDevice.IsOpenGL(device))
+            {
+                if (deviceVertexBuffer is not null)
+                {
+                    // Deferred rather than disposed: a frame that bound this may still be in flight.
+                    device!.DeferredDestroy(deviceVertexBuffer);
+                    deviceVertexBuffer = null;
+                }
+
+                return;
+            }
+
             VertexArray.Delete(vaoHandle);
             GL.DeleteBuffer(vertexBufferHandle);
         }

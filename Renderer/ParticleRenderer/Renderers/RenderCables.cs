@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Renderer.Particles.Utils;
 using ValveResourceFormat.Renderer.RHI;
@@ -37,6 +38,15 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         // wrote, so this renderer must keep a persistent allocation rather than stream.
         private GLBuffer? vertexRhiBuffer;
         private GLBuffer? indexRhiBuffer;
+
+        // The same two buffers on a device that has no OpenGL in it, owned rather than wrapped: there is
+        // no glCreateBuffers name to view, so these are created through IDevice and written through
+        // IDevice.UploadBuffer. :CableGeometryPersistence applies to these just as strongly -- they are a
+        // private, persistent allocation, so a frame that skips the rebuild redraws what an earlier one
+        // wrote. Reallocated only when a rebuild changes the size, and the old storage is deferred rather
+        // than destroyed because a frame in flight may still be reading it.
+        private IBuffer? deviceVertexBuffer;
+        private IBuffer? deviceIndexBuffer;
 
         // Built once on first RHI draw rather than in a static initializer, so a layout the contract has
         // no format for throws at the draw that needs it instead of as a type initializer failure.
@@ -131,8 +141,22 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             vaoHandle = SetupBuffers();
         }
 
+        /// <summary>
+        /// Creates the OpenGL vertex and index buffers and the vertex array that reads them.
+        /// </summary>
+        /// <remarks>
+        /// All three are OpenGL-only. On any other backend the storage is allocated at the first rebuild
+        /// instead, once the tessellation says how much is needed &#8212; a VkBuffer's size is fixed at
+        /// creation, and a cable's tube size changes with the camera &#8212; and there is no vertex array
+        /// at all, because the recorded draw takes its layout from the pipeline.
+        /// </remarks>
         private int SetupBuffers()
         {
+            if (!RendererDevice.IsOpenGL(scene.RendererContext.Device))
+            {
+                return 0;
+            }
+
             GL.CreateBuffers(1, out vertexBufferHandle);
             GL.CreateBuffers(1, out indexBufferHandle);
 
@@ -250,8 +274,8 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 var stride = CableVertex.InputLayout.Stride;
                 vertexBufferSizeBytes = vertexCount * stride;
                 indexBufferSizeBytes = tubeIndexCount * sizeof(uint);
-                GL.NamedBufferData(vertexBufferHandle, vertexBufferSizeBytes, vertexArray, BufferUsageHint.DynamicDraw);
-                GL.NamedBufferData(indexBufferHandle, indexBufferSizeBytes, indexArray, BufferUsageHint.DynamicDraw);
+                UploadTube(context?.CommandList?.Device ?? scene.RendererContext.Device,
+                    vertexArray, vertexCount, indexArray, tubeIndexCount);
                 indexCount = tubeIndexCount;
             }
             finally
@@ -445,8 +469,8 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 // The tube is tessellated into a triangle list on the CPU, indexed with 32 bit indices
                 // because a max-tessellation tube exceeds what 16 bits can address.
                 commandList.BindPipeline(PipelineFor(commandList, context!.Value));
-                commandList.BindVertexBuffer(0, VertexRhiBuffer());
-                commandList.BindIndexBuffer(IndexRhiBuffer(), IndexType.UInt32);
+                commandList.BindVertexBuffer(0, VertexStorage(commandList.Device));
+                commandList.BindIndexBuffer(IndexStorage(commandList.Device), IndexType.UInt32);
             }
 
             // Sets the material's uniforms and render state on both paths; the texture binds it also does
@@ -517,8 +541,70 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 GLRendererDevice.DrawConstants);
         }
 
-        private GLBuffer VertexRhiBuffer()
+        /// <summary>
+        /// Writes a freshly tessellated tube into the buffers the draw reads, allocating storage first
+        /// when the tessellation changed the sizes it needs.
+        /// </summary>
+        /// <param name="device">The device the draw will be recorded on.</param>
+        /// <param name="vertexArray">The rented array the tube vertices were built in. Longer than the
+        /// data, because the pool hands out whole buckets.</param>
+        /// <param name="vertexCount">How many of <paramref name="vertexArray"/> are this tube's vertices.</param>
+        /// <param name="indexArray">The rented array the tube indices were built in.</param>
+        /// <param name="tubeIndexCount">How many of <paramref name="indexArray"/> are this tube's indices.</param>
+        private void UploadTube(IDevice? device, CableVertex[] vertexArray, int vertexCount, uint[] indexArray, int tubeIndexCount)
         {
+            var resolved = RendererDevice.Resolve(device);
+
+            if (RendererDevice.IsOpenGL(resolved))
+            {
+                // Unchanged, including handing over the whole rented array: glNamedBufferData sizes the
+                // store from the byte count, so the pool's extra capacity past it is never read.
+                GL.NamedBufferData(vertexBufferHandle, vertexBufferSizeBytes, vertexArray, BufferUsageHint.DynamicDraw);
+                GL.NamedBufferData(indexBufferHandle, indexBufferSizeBytes, indexArray, BufferUsageHint.DynamicDraw);
+                return;
+            }
+
+            deviceVertexBuffer = EnsureDeviceBuffer(resolved!, deviceVertexBuffer, vertexBufferSizeBytes, BufferUsage.Vertex);
+            deviceIndexBuffer = EnsureDeviceBuffer(resolved!, deviceIndexBuffer, indexBufferSizeBytes, BufferUsage.Index);
+
+            resolved!.UploadBuffer(deviceVertexBuffer, 0, MemoryMarshal.AsBytes(vertexArray.AsSpan(0, vertexCount)));
+            resolved.UploadBuffer(deviceIndexBuffer, 0, MemoryMarshal.AsBytes(indexArray.AsSpan(0, tubeIndexCount)));
+        }
+
+        /// <summary>
+        /// Returns a device buffer of the wanted size, replacing an existing one that is the wrong size.
+        /// </summary>
+        /// <param name="device">The device to allocate through.</param>
+        /// <param name="existing">The buffer being replaced, or <see langword="null"/>.</param>
+        /// <param name="sizeInBytes">The size the rebuild needs.</param>
+        /// <param name="usage">What the buffer is bound as.</param>
+        private static IBuffer EnsureDeviceBuffer(IDevice device, IBuffer? existing, int sizeInBytes, BufferUsage usage)
+        {
+            if (existing is not null && existing.SizeInBytes == sizeInBytes)
+            {
+                return existing;
+            }
+
+            if (existing is not null)
+            {
+                // Deferred, not destroyed: a frame still in flight may be reading the old tube.
+                device.DeferredDestroy(existing);
+            }
+
+            return device.CreateBuffer(new BufferDesc(
+                sizeInBytes, usage | BufferUsage.CopyDestination, BufferMemory.DeviceLocal, nameof(RenderCables)));
+        }
+
+        /// <summary>Gets the buffer the recorded draw reads its tube vertices from.</summary>
+        /// <param name="device">The device the draw is recorded on.</param>
+        private IBuffer VertexStorage(IDevice? device)
+        {
+            if (!RendererDevice.IsOpenGL(device))
+            {
+                return deviceVertexBuffer ?? throw new InvalidOperationException(
+                    $"{nameof(RenderCables)} has no vertex storage, so its tube was never uploaded.");
+            }
+
             if (vertexRhiBuffer is null || vertexRhiBuffer.SizeInBytes != vertexBufferSizeBytes)
             {
                 vertexRhiBuffer = GLBuffer.Wrap(vertexBufferHandle, vertexBufferSizeBytes, BufferUsage.Vertex, BufferMemory.DeviceLocal, nameof(RenderCables));
@@ -527,8 +613,16 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             return vertexRhiBuffer;
         }
 
-        private GLBuffer IndexRhiBuffer()
+        /// <summary>Gets the buffer the recorded draw reads its tube indices from.</summary>
+        /// <param name="device">The device the draw is recorded on.</param>
+        private IBuffer IndexStorage(IDevice? device)
         {
+            if (!RendererDevice.IsOpenGL(device))
+            {
+                return deviceIndexBuffer ?? throw new InvalidOperationException(
+                    $"{nameof(RenderCables)} has no index storage, so its tube was never uploaded.");
+            }
+
             if (indexRhiBuffer is null || indexRhiBuffer.SizeInBytes != indexBufferSizeBytes)
             {
                 indexRhiBuffer = GLBuffer.Wrap(indexBufferHandle, indexBufferSizeBytes, BufferUsage.Index, BufferMemory.DeviceLocal, nameof(RenderCables));
@@ -541,9 +635,29 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
         public override void Delete()
         {
-            VertexArray.Delete(vaoHandle);
-            GL.DeleteBuffer(vertexBufferHandle);
-            GL.DeleteBuffer(indexBufferHandle);
+            var device = RendererDevice.Resolve(scene.RendererContext.Device);
+
+            if (RendererDevice.IsOpenGL(device))
+            {
+                VertexArray.Delete(vaoHandle);
+                GL.DeleteBuffer(vertexBufferHandle);
+                GL.DeleteBuffer(indexBufferHandle);
+            }
+            else
+            {
+                // Deferred rather than disposed: a frame that bound these may still be in flight.
+                if (deviceVertexBuffer is not null)
+                {
+                    device!.DeferredDestroy(deviceVertexBuffer);
+                    deviceVertexBuffer = null;
+                }
+
+                if (deviceIndexBuffer is not null)
+                {
+                    device!.DeferredDestroy(deviceIndexBuffer);
+                    deviceIndexBuffer = null;
+                }
+            }
 
             if (ownsMaterial)
             {

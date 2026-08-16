@@ -13,7 +13,10 @@ public partial class GPUMeshBufferCache
     {
         get
         {
-            quadIndices ??= new QuadIndexBuffer(65532);
+            // :SharedQuadIndexCount - the count every quad renderer sizes its own view of this against.
+            // The device is named rather than resolved so the buffer is built for the backend this cache's
+            // context actually runs on, which is what decides whether there is an OpenGL name to make.
+            quadIndices ??= new QuadIndexBuffer(65532, RendererContext.Device);
 
             return quadIndices;
         }

@@ -29,19 +29,28 @@ namespace ValveResourceFormat.Renderer
         private readonly HashSet<int> usedRects = [];
         private int morphCount;
         private bool renderTargetInitialized;
-        private int quadIndicesHandle;
 
-        // Non-owning RHI views of the two OpenGL buffers this pass draws from, so the draw can be
-        // recorded through a command list before buffer allocation itself moves onto IDevice.
+        // The one QuadIndexBuffer every quad renderer shares, held rather than its bare GL name so the
+        // recorded draw can ask it for whichever shape the device wants.
+        private readonly QuadIndexBuffer quadIndices;
+
+        // The context this pass was built against, for the device its allocations and its direct OpenGL
+        // calls are decided by.
+        private readonly RendererContext rendererContext;
+
+        // Non-owning RHI view of the OpenGL vertex buffer this pass draws from, so the draw can be
+        // recorded through a command list without the OpenGL path losing the buffer name its vertex array
+        // was built from. Rebuilt when the rect count changes the size. OpenGL only.
         private GLBuffer? vertexRhiBuffer;
-        private GLBuffer? quadIndexRhiBuffer;
+
+        // The same buffer on a device that has no OpenGL in it, owned rather than wrapped: there is no
+        // glCreateBuffers name to view, so it is created through IDevice and written through
+        // IDevice.UploadBuffer, and reallocated whenever the active rect count changes its size.
+        private IBuffer? deviceVertexBuffer;
 
         // Built once on first RHI draw rather than in a static initializer, so a layout the contract has
         // no format for throws at the draw that needs it instead of as a type initializer failure.
         private VertexInputDesc? vertexInputDesc;
-
-        // :SharedQuadIndexCount - the shared index buffer GPUMeshBufferCache allocates, in indices.
-        private const int SharedQuadIndexCount = 65532;
 
         struct MorphCompositeRectData
         {
@@ -65,6 +74,8 @@ namespace ValveResourceFormat.Renderer
             morphAtlas = renderContext.MaterialLoader.LoadTexture(morph.TextureResource);
             shader = renderContext.ShaderLoader.LoadShader("morph_composite");
             renderState = renderContext.RenderState;
+            rendererContext = renderContext;
+            quadIndices = renderContext.MeshBufferCache.QuadIndices;
 
             var width = morph.Data.GetInt32Property("m_nWidth");
             var height = morph.Data.GetInt32Property("m_nHeight");
@@ -118,8 +129,9 @@ namespace ValveResourceFormat.Renderer
         {
             var usedVertexCount = usedRects.Count * 4;
             var vertexSizeBytes = usedVertexCount * MorphRectVertex.InputLayout.Stride;
+            var device = RendererDevice.Resolve(context?.CommandList?.Device ?? rendererContext.Device);
 
-            GL.NamedBufferData(bufferHandle, vertexSizeBytes, allVertices, BufferUsageHint.DynamicDraw);
+            UploadVertices(device, vertexSizeBytes);
 
             if (!renderTargetInitialized)
             {
@@ -169,8 +181,8 @@ namespace ValveResourceFormat.Renderer
                     GLRendererDevice.DrawConstants);
 
                 commandList.BindPipeline(pipeline);
-                commandList.BindVertexBuffer(0, VertexRhiBuffer(vertexSizeBytes));
-                commandList.BindIndexBuffer(QuadIndexRhiBuffer(), IndexType.UInt16);
+                commandList.BindVertexBuffer(0, VertexStorage(device, vertexSizeBytes));
+                commandList.BindIndexBuffer(quadIndices.GetBuffer(device), IndexType.UInt16);
                 // The atlas carries its own sampler state, so it is bound with it rather than with the
                 // device default. On OpenGL sampler 0 defers to the texture's parameters and the two agree;
                 // on Vulkan there is no such fallback, and omitting this samples the atlas with default
@@ -188,8 +200,65 @@ namespace ValveResourceFormat.Renderer
             }
         }
 
-        private GLBuffer VertexRhiBuffer(int sizeInBytes)
+        /// <summary>
+        /// Writes this composite's rect vertices into the buffer the draw reads, allocating storage first
+        /// when the active rect count changed the size it needs.
+        /// </summary>
+        /// <param name="device">The device the draw will be recorded on.</param>
+        /// <param name="sizeInBytes">How much of <see cref="allVertices"/> the active rects occupy.</param>
+        private void UploadVertices(IDevice? device, int sizeInBytes)
         {
+            if (RendererDevice.IsOpenGL(device))
+            {
+                // Unchanged: a mutable store replaced wholesale every composite, which is what the vertex
+                // array built in InitVertexBuffer reads through.
+                GL.NamedBufferData(bufferHandle, sizeInBytes, allVertices, BufferUsageHint.DynamicDraw);
+                return;
+            }
+
+            // A composite with no active morph still records its draw, with an index count of zero, so
+            // there still has to be a buffer to bind. Vulkan has no zero sized buffer, so one rect's
+            // worth stands in; nothing reads it, because no index addresses it.
+            EnsureDeviceVertexBuffer(device!, Math.Max(sizeInBytes, MorphRectVertex.InputLayout.Stride));
+
+            if (sizeInBytes == 0)
+            {
+                return;
+            }
+
+            // Staged by the device. A frame's own uploads are flushed before its command lists execute, so
+            // writing here rather than at load time is correct even though this runs mid-frame.
+            device!.UploadBuffer(deviceVertexBuffer!, 0, MemoryMarshal.AsBytes(allVertices.AsSpan(0, sizeInBytes / MorphRectVertex.InputLayout.Stride)));
+        }
+
+        private void EnsureDeviceVertexBuffer(IDevice device, int sizeInBytes)
+        {
+            if (deviceVertexBuffer is not null && deviceVertexBuffer.SizeInBytes == sizeInBytes)
+            {
+                return;
+            }
+
+            if (deviceVertexBuffer is not null)
+            {
+                // Deferred, not destroyed: a frame still in flight may be reading the old storage.
+                device.DeferredDestroy(deviceVertexBuffer);
+            }
+
+            deviceVertexBuffer = device.CreateBuffer(new BufferDesc(
+                sizeInBytes, BufferUsage.Vertex | BufferUsage.CopyDestination, BufferMemory.DeviceLocal, nameof(MorphComposite)));
+        }
+
+        /// <summary>Gets the buffer the recorded draw reads its rect vertices from.</summary>
+        /// <param name="device">The device the draw is recorded on.</param>
+        /// <param name="sizeInBytes">This composite's vertex data size.</param>
+        private IBuffer VertexStorage(IDevice? device, int sizeInBytes)
+        {
+            if (!RendererDevice.IsOpenGL(device))
+            {
+                return deviceVertexBuffer ?? throw new InvalidOperationException(
+                    $"{nameof(MorphComposite)} has no vertex storage, so its rects were never uploaded.");
+            }
+
             if (vertexRhiBuffer is null || vertexRhiBuffer.SizeInBytes != sizeInBytes)
             {
                 vertexRhiBuffer = GLBuffer.Wrap(bufferHandle, sizeInBytes, BufferUsage.Vertex, BufferMemory.DeviceLocal, nameof(MorphComposite));
@@ -197,14 +266,6 @@ namespace ValveResourceFormat.Renderer
 
             return vertexRhiBuffer;
         }
-
-        private GLBuffer QuadIndexRhiBuffer()
-            => quadIndexRhiBuffer ??= GLBuffer.Wrap(
-                quadIndicesHandle,
-                SharedQuadIndexCount * sizeof(ushort),
-                BufferUsage.Index,
-                BufferMemory.DeviceLocal,
-                nameof(QuadIndexBuffer));
 
         // Mutable because SetVertexMorphValue pokes the current weight into PositionWeights in place.
         [StructLayout(LayoutKind.Sequential)]
@@ -219,12 +280,24 @@ namespace ValveResourceFormat.Renderer
             public static readonly VertexInputLayout InputLayout = VertexInputLayout.FromStruct<MorphRectVertex>();
         }
 
+        /// <summary>
+        /// Creates the OpenGL vertex buffer and the vertex array that reads it.
+        /// </summary>
+        /// <remarks>
+        /// Both are OpenGL-only. On any other backend the storage is allocated at the first composite
+        /// instead, once the active rect count says how much is needed, and there is no vertex array at
+        /// all &#8212; the recorded draw takes its layout from the pipeline.
+        /// </remarks>
         private void InitVertexBuffer(RendererContext renderContext)
         {
+            if (!RendererDevice.IsOpenGL(renderContext.Device))
+            {
+                return;
+            }
+
             GL.CreateBuffers(1, out bufferHandle);
 
-            quadIndicesHandle = renderContext.MeshBufferCache.QuadIndices.GLHandle;
-            vao = MorphRectVertex.InputLayout.CreateVertexArray(nameof(MorphComposite), bufferHandle, quadIndicesHandle);
+            vao = MorphRectVertex.InputLayout.CreateVertexArray(nameof(MorphComposite), bufferHandle, quadIndices.GLHandle);
         }
 
         [MemberNotNull(nameof(allVertices), nameof(morphRects))]
