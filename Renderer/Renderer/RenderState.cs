@@ -233,11 +233,49 @@ namespace ValveResourceFormat.Renderer
     /// (framebuffer clears obey the write masks) must run inside an open scope.
     /// GL state is per context, so each <see cref="RendererContext"/> owns one tracker.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// On a backend that bakes render state into pipeline objects the emitting half of that goes away
+    /// entirely, and only the tracking half is left. See <see cref="Device"/>.
+    /// </para>
+    /// </remarks>
     public class RenderStateTracker
     {
         /// <summary>Gets the state of the innermost enclosing pass. Compose per-draw state by
         /// copying this and overriding fields.</summary>
         public RenderState CurrentPass { get; private set; } = RenderState.Default;
+
+        /// <summary>
+        /// The device this tracker latches state for, or <see langword="null"/> before the presentation
+        /// layer has brought one up. Assigned by <see cref="RendererContext.Device"/>.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The tracker exists because OpenGL render state is free-standing context state that has to be
+        /// pushed with a call per field. Vulkan has no such state: every field of
+        /// <see cref="RenderState"/> is an input to <c>VkGraphicsPipelineCreateInfo</c> and reaches the
+        /// GPU when a pipeline built from <see cref="CurrentPass"/> is bound. The two dynamic states the
+        /// contract does require of every graphics pipeline, viewport and scissor, are not modelled here
+        /// at all, so on a Vulkan device there is no field left for a recorded command to carry &#8212;
+        /// which is why <see cref="Apply"/> records nothing rather than recording an equivalent.
+        /// </para>
+        /// <para>
+        /// A <see langword="null"/> device means the direct OpenGL path, which the thumbnailer and the
+        /// viewer before device creation still take, so it emits as it always did.
+        /// </para>
+        /// </remarks>
+        public RHI.IDevice? Device { get; set; }
+
+        /// <summary>
+        /// Whether applying state means calling OpenGL, as opposed to composing pipeline creation
+        /// parameters that a later <c>PipelineFor</c> will read out of <see cref="CurrentPass"/>.
+        /// </summary>
+        /// <remarks>The OpenGL backend answers <see langword="true"/> whether or not the renderer is
+        /// recording through a command list: a recorded pipeline bind applies its own baked state by
+        /// calling straight back into <see cref="Apply"/> (<c>GLGraphicsPipeline.Bind</c>), and a
+        /// recorded attachment clear obeys the write masks this tracker last pushed
+        /// (<c>GLCommandList.ApplyLoadOps</c>). Neither has a Vulkan counterpart that needs telling.</remarks>
+        private bool AppliesThroughOpenGL => Device is null or { Backend: RHI.RhiBackend.OpenGL };
 
         // Shadow of the last applied state, the diff baseline for Apply().
         // Valid only after the first Apply.
@@ -308,11 +346,30 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Applies a state to GL. Diffs at two levels: one compare per descriptor, then
         /// only the calls whose fields changed within a changed descriptor.</summary>
         /// <param name="state">The state to apply.</param>
+        /// <remarks>
+        /// <para>
+        /// A no-op beyond the counter on a device that is not OpenGL, and deliberately: there is no
+        /// recorded equivalent to emit. Every field this method would push is baked into the pipeline
+        /// object instead, and the pipeline is built from <see cref="CurrentPass"/> at the draw &#8212;
+        /// <c>GLRendererDevice.PipelineFor</c>, reached from every recorded draw site. Recording a
+        /// command here would either duplicate that or contradict it.
+        /// </para>
+        /// <para>
+        /// The applied shadow is left untouched on that path rather than advanced, because it is a
+        /// shadow of what OpenGL was told and OpenGL was told nothing. Advancing it would make the
+        /// change detection claim state had been pushed that never was.
+        /// </para>
+        /// </remarks>
         public void Apply(in RenderState state)
         {
-            var force = !appliedValid;
-
             PerfStats.Active.Count(Counter.RenderStateApply);
+
+            if (!AppliesThroughOpenGL)
+            {
+                return;
+            }
+
+            var force = !appliedValid;
 
             if (force || state.Rasterizer != applied.Rasterizer)
             {

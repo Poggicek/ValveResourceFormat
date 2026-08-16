@@ -43,7 +43,22 @@ public class RendererContext : IDisposable
     /// initialization. Assigned by the presentation layer once a backend has been brought up, since
     /// device creation needs a window and a surface that the renderer does not own.
     /// </summary>
-    public RHI.IDevice? Device { get; set; }
+    /// <remarks>
+    /// Handed to <see cref="RenderState"/> as well as kept here. The tracker's whole job is pushing
+    /// free-standing OpenGL context state, which a backend that bakes the same descriptors into
+    /// pipeline objects does not have, so it has to know which of the two it is talking to.
+    /// </remarks>
+    public RHI.IDevice? Device
+    {
+        get => device;
+        set
+        {
+            device = value;
+            RenderState.Device = value;
+        }
+    }
+
+    private RHI.IDevice? device;
 
     /// <summary>
     /// Maximum texture mip size to load in <see cref="MaterialLoader"/>.
