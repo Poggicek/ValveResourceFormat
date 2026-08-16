@@ -866,7 +866,33 @@ namespace GUI.Types.GLViewers
                 Renderer.PerfStats.Allocations.DisplayAllocations(TextRenderer, Renderer.Camera);
             }
 
-            TextRenderer.Render(Renderer.Camera, Renderer.ResolvedSceneDepth);
+            // Over whatever PresentToScreen just wrote, which is the tonemap's target on Vulkan and the
+            // default framebuffer on OpenGL. The renderer closed its own list long before this, so the
+            // overlay needs one of its own; BeginOverlay hands back nothing at all when the renderer is
+            // not recording, and the text renderer then takes the direct OpenGL route it always has.
+            var textTarget = PresentFramebuffer ?? GLDefaultFramebuffer;
+
+            if (textTarget is null)
+            {
+                TextRenderer.Render(Renderer.Camera, Renderer.ResolvedSceneDepth);
+            }
+            else
+            {
+                using var overlay = Renderer.BeginOverlay(textTarget, "Overlay Text");
+
+                TextRenderer.Render(Renderer.Camera, Renderer.ResolvedSceneDepth,
+                    overlay.CommandList is null
+                        ? null
+                        : new Scene.RenderContext
+                        {
+                            Camera = Renderer.Camera,
+                            Framebuffer = textTarget,
+                            Scene = Scene,
+                            Textures = Renderer.Textures,
+                            CommandList = overlay.CommandList,
+                        });
+            }
+
             Picker?.TriggerEventIfAny();
 
             Renderer.PerfStats.MarkFrameEnd();
