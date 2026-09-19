@@ -1020,10 +1020,13 @@ namespace ValveResourceFormat.Renderer
                 renderLists[RenderPass.Outline].Add(request);
             }
 
+            var readsSceneColor = request.Call.Material.ReadsSceneColor;
+
             // Aggregated geometry is opaque world detail that never samples the scene color, and the refract
             // pass is the one place it cannot go: it has neither the depth prepass nor the indirect draw path.
+            // Water is the exception, it draws there as one plain call.
             var isAggregated = request.Node is SceneAggregate or SceneAggregate.Fragment;
-            var readsSceneColor = !isAggregated && request.Call.Material.ReadsSceneColor;
+            var isRefractingDraw = (readsSceneColor && !isAggregated) || request.Call.Material.IsCs2Water;
 
             if (renderPass == RenderPass.OpaqueAggregate)
             {
@@ -1040,7 +1043,8 @@ namespace ValveResourceFormat.Renderer
                         alphaTestAggregateDraws.Add(request);
                         return;
                     }
-                    else if (EnableDepthPrepass && material.CanPrimeDepth)
+                    // Water reads the resolved depth to find the ground under it, so it must not be in that depth
+                    else if (EnableDepthPrepass && material.CanPrimeDepth && !material.IsCs2Water)
                     {
                         var bucket = GetDepthOnlyBucket(request.Call);
                         depthOnlyDraws[bucket].Add(request);
@@ -1067,7 +1071,7 @@ namespace ValveResourceFormat.Renderer
 
             var isLatePass = renderPass == RenderPass.Translucent;
 
-            if ((readsSceneColor || request.Call.Material.IsCs2Water) && !isViewmodelLayer && renderPass != RenderPass.StaticOverlay)
+            if (isRefractingDraw && !isViewmodelLayer && renderPass != RenderPass.StaticOverlay)
             {
                 queueList = renderLists[request.Call.Material.IsTranslucent
                     ? RenderPass.Water

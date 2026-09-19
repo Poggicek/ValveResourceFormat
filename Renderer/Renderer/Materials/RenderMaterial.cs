@@ -323,6 +323,14 @@ namespace ValveResourceFormat.Renderer.Materials
                 return;
             }
 
+            // Opaque, but it refracts the scene behind it so it has to draw after the framebuffer grab
+            if (ShaderName == "csgo_water.vfx")
+            {
+                DoNotCastShadows = true;
+                IsCs2Water = true;
+                return;
+            }
+
             VertexAnimation = ShaderName == "csgo_foliage.vfx"
                 || IntParams.GetValueOrDefault("F_VERTEX_ANIMATION") > 0
                 || IntParams.GetValueOrDefault("F_FOLIAGE_ANIMATION") > 0

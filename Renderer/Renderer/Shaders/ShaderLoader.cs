@@ -544,6 +544,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             "vr_standard.vfx" => "vr_standard",
             "water_dota.vfx" => "water",
             "csgo_water_fancy.vfx" => "water_csgo",
+            "csgo_water.vfx" => "csgo_water",
             "hero.vfx" or "hero_underlords.vfx" => "dota_hero",
             "multiblend.vfx" => "multiblend",
             "csgo_effects.vfx" => "csgo_effects",
