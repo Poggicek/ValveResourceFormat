@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using ValveResourceFormat.IO;
+using ValveResourceFormat.Renderer.World;
 using ValveResourceFormat.ResourceTypes;
 using Entity = ValveResourceFormat.ResourceTypes.EntityLump.Entity;
 
@@ -47,10 +48,13 @@ public sealed class EntitySystem
     public RendererContext RendererContext { get; }
 
     /// <summary>
-    /// Gets or sets the static collision every entity is simulated against. There is one, from the map
-    /// the player is in; a spawn group placed inside it, such as a 3D sky, brings no collision of its own.
+    /// Gets or sets the static collision of the map the viewer opened, which every entity is simulated
+    /// against. A map streamed in next to it brings its own on its <c>worldspawn</c>, and a 3D sky none.
     /// </summary>
     public Rubikon? PhysicsWorld { get; set; }
+
+    /// <summary>Gets the maps loaded into this world, and the queue of the ones entity I/O asked to load or unload.</summary>
+    public SpawnGroupManager SpawnGroups { get; }
 
     /// <summary>Gets the loader entities use to pull their models and physics.</summary>
     public IFileLoader FileLoader => RendererContext.FileLoader;
@@ -121,7 +125,17 @@ public sealed class EntitySystem
         ArgumentNullException.ThrowIfNull(context);
 
         RendererContext = context;
+        SpawnGroups = new SpawnGroupManager(this);
     }
+
+    /// <summary>
+    /// Turns a name as a map authored it into the name the engine spawns it with. Compiled maps mark their
+    /// names with <c>[PR#]</c>, which a spawn group replaces with its parent name fixup; a map loaded on
+    /// its own or streamed in by an <c>info_spawngroup_load_unload</c> has none, so the marker just goes.
+    /// </summary>
+    /// <param name="name">A targetname, or a name an input or keyvalue refers to one by.</param>
+    /// <returns>The name with its marker fixed up.</returns>
+    public static string FixupName(string name) => EntityLump.RemoveTargetnamePrefix(name);
 
     /// <summary>
     /// Creates the entity for a map entity's keyvalues and puts it in the world. Returns
@@ -134,8 +148,27 @@ public sealed class EntitySystem
     /// <param name="intoScene">Scene the entity's nodes render into.</param>
     /// <returns>The spawned entity, or <see langword="null"/> if the classname is not implemented.</returns>
     public BaseEntity? CreateEntity(Entity data, Matrix4x4 parentTransform, string? layerName, Scene intoScene)
+        => CreateEntity(new EntitySpawnInfo(data, parentTransform, layerName, intoScene));
+
+    /// <summary>
+    /// Creates the entity for a map entity's keyvalues as part of a spawn group, into the spawn group's
+    /// scene. Returns <see langword="null"/> when the classname is not one the entity system implements.
+    /// </summary>
+    /// <param name="data">The entity's keyvalues.</param>
+    /// <param name="parentTransform">Transform of whatever spawned it, the spawn group's placement included.</param>
+    /// <param name="layerName">Visibility layer for its nodes.</param>
+    /// <param name="spawnGroup">The spawn group spawning it, which takes it along when it unloads.</param>
+    /// <returns>The spawned entity, or <see langword="null"/> if the classname is not implemented.</returns>
+    public BaseEntity? CreateEntity(Entity data, Matrix4x4 parentTransform, string? layerName, SpawnGroup spawnGroup)
     {
-        var entity = EntityFactory.Create(this, new EntitySpawnInfo(data, parentTransform, layerName, intoScene));
+        ArgumentNullException.ThrowIfNull(spawnGroup);
+
+        return CreateEntity(new EntitySpawnInfo(data, parentTransform, layerName, spawnGroup.Scene, spawnGroup));
+    }
+
+    private BaseEntity? CreateEntity(EntitySpawnInfo spawnInfo)
+    {
+        var entity = EntityFactory.Create(this, spawnInfo);
 
         if (entity == null)
         {
@@ -198,9 +231,9 @@ public sealed class EntitySystem
     public void AddEntity(BaseEntity entity) => Add(entity);
 
     /// <summary>
-    /// Runs <see cref="BaseEntity.Activate"/> on every entity spawned since the last call. Called once
-    /// per spawn group - the map, and again for its 3D skybox - the way the engine activates each group
-    /// as it finishes spawning.
+    /// Runs <see cref="BaseEntity.Activate"/> on every entity spawned since the last call. Called once the
+    /// map has spawned, its 3D sky included, and again for every map streamed in after it: the engine
+    /// activates each spawn group as it finishes spawning.
     /// </summary>
     public void Activate()
     {
@@ -280,6 +313,18 @@ public sealed class EntitySystem
         }
     }
 
+    /// <summary>Removes every entity a spawn group spawned, for when it unloads.</summary>
+    internal void RemoveEntities(SpawnGroup spawnGroup)
+    {
+        for (var i = 0; i < entities.Count; i++)
+        {
+            if (entities[i].SpawnGroup == spawnGroup)
+            {
+                Remove(entities[i]);
+            }
+        }
+    }
+
     /// <summary>
     /// Tests every trigger volume against the player, opening and closing touch links as they change. Both
     /// sides of a touch hear about it, the way the engine marks a pair of entities as touching.
@@ -317,8 +362,8 @@ public sealed class EntitySystem
                 return;
             }
 
-            // Entities of the 3D sky share coordinates with the map but must not touch it
-            if (entity.Scene != player.Scene)
+            // A 3D sky shares coordinates with the map but is another world group, which must not touch it
+            if (entity.Scene.WorldGroup != player.Scene.WorldGroup)
             {
                 continue;
             }
@@ -348,6 +393,7 @@ public sealed class EntitySystem
 
         entities.Clear();
         parented.Clear();
+        SpawnGroups.Clear();
         World = null;
         Player = null;
         activatedCount = 0;
@@ -364,6 +410,11 @@ public sealed class EntitySystem
     /// </summary>
     public void Update(float frameTime)
     {
+        // The frame boundary, where the engine's spawn group manager acts on what the ticks before it asked
+        // for: loading a map spawns entities and unloading one removes them, neither of which may happen
+        // while a tick walks the list
+        SpawnGroups.ServiceQueue();
+
         if (entities.Count <= 1)
         {
             return;
@@ -616,15 +667,46 @@ public sealed class EntitySystem
                 continue;
             }
 
-            // The authored override wins over whatever the output reports, which is the precedence
-            // CBaseEntityOutput::FireOutput uses: a parameter on the connection replaces the value
-            var parameter = string.IsNullOrEmpty(connection.OverrideParam) || connection.OverrideParam == "(null)"
-                ? value
-                : connection.OverrideParam;
-
             QueueInputByTarget(new EntityIOTarget(connection.TargetName, connection.TargetType),
-                connection.InputName, parameter, activator, source, connection.Delay, connection);
+                connection.InputName, ConnectionParameter(connection, value), activator, source, connection.Delay, connection);
         }
+    }
+
+    /// <summary>
+    /// Fires a single authored connection by hand, as if its output had fired, for testing a map's wiring.
+    /// Neither held back by nor counted against the connection's fire limit, so it can be fired again.
+    /// </summary>
+    /// <param name="connection">The connection to fire.</param>
+    /// <param name="caller">The entity that owns the output, which <c>!self</c> and <c>!caller</c> resolve to.</param>
+    /// <param name="activator">The entity <c>!activator</c> resolves to.</param>
+    public void QueueConnection(EntityLump.Connection connection, BaseEntity? caller, BaseEntity? activator = null)
+    {
+        QueueInputByTarget(new EntityIOTarget(connection.TargetName, connection.TargetType),
+            connection.InputName, ConnectionParameter(connection, null), activator, caller, connection.Delay, null);
+    }
+
+    /// <summary>
+    /// The authored override wins over whatever the output reports, which is the precedence
+    /// <c>CBaseEntityOutput::FireOutput</c> uses: a parameter on the connection replaces the value.
+    /// </summary>
+    private static string? ConnectionParameter(EntityLump.Connection connection, string? value)
+        => string.IsNullOrEmpty(connection.OverrideParam) || connection.OverrideParam == "(null)"
+            ? value
+            : connection.OverrideParam;
+
+    /// <summary>Finds the living entity spawned from a map entity's keyvalues.</summary>
+    /// <returns>The entity, or <see langword="null"/> if its class is not simulated or it was removed.</returns>
+    public BaseEntity? FindByData(Entity data)
+    {
+        foreach (var entity in entities)
+        {
+            if (!entity.IsRemoved && entity.Data == data)
+            {
+                return entity;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -632,6 +714,8 @@ public sealed class EntitySystem
     /// </summary>
     public IEnumerable<BaseEntity> FindAllByTargetName(string pattern)
     {
+        pattern = FixupName(pattern);
+
         foreach (var entity in entities)
         {
             if (Matches(entity, pattern))
@@ -641,10 +725,11 @@ public sealed class EntitySystem
         }
     }
 
+    /// <summary>Whether an entity answers to a name that has already been through <see cref="FixupName"/>.</summary>
     private static bool Matches(BaseEntity entity, string pattern)
         => !entity.IsRemoved
-        && entity.TargetName != null
-        && EntityLump.EntityNameMatches(pattern, entity.TargetName);
+        && entity.Name != null
+        && EntityLump.EntityNameMatches(pattern, entity.Name);
 
     /// <summary>
     /// Delivers everything the clock has reached, and everything those deliveries queue for now.
@@ -785,11 +870,11 @@ public sealed class EntitySystem
         }
 
         var matchedName = false;
+        var name = FixupName(target.Name);
 
         foreach (var entity in entities)
         {
-            if (byName && !entity.IsRemoved && entity.TargetName != null
-                && EntityLump.EntityNameMatches(target.Name, entity.TargetName))
+            if (byName && Matches(entity, name))
             {
                 matchedName = true;
                 yield return entity;

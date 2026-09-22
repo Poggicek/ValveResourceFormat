@@ -30,6 +30,8 @@ public static class EntityFactory
     {
         Register<WorldEntity>("worldspawn", static (system, spawnInfo) => new WorldEntity(system, spawnInfo));
         Register<InfoWorldLayer>("info_world_layer", static (system, spawnInfo) => new InfoWorldLayer(system, spawnInfo));
+        Register<InfoSpawnGroupLandmark>("info_spawngroup_landmark", static (system, spawnInfo) => new InfoSpawnGroupLandmark(system, spawnInfo));
+        Register<InfoSpawnGroupLoadUnload>("info_spawngroup_load_unload", static (system, spawnInfo) => new InfoSpawnGroupLoadUnload(system, spawnInfo));
 
         Register<FuncBrush>("func_brush", static (system, spawnInfo) => new FuncBrush(system, spawnInfo));
         Register<FuncButton>("func_button", static (system, spawnInfo) => new FuncButton(system, spawnInfo));
@@ -92,7 +94,7 @@ public static class EntityFactory
 
     /// <summary>
     /// Creates and spawns the entity for a classname. The entity is fully set up when this returns, but
-    /// is not in the world yet; <see cref="EntitySystem.CreateEntity"/> is what puts it there.
+    /// is not in the world yet; the <c>CreateEntity</c> methods of <see cref="EntitySystem"/> are what put it there.
     /// </summary>
     /// <returns>The spawned entity, or <see langword="null"/> when the classname is not implemented.</returns>
     public static BaseEntity? Create(EntitySystem system, EntitySpawnInfo spawnInfo)

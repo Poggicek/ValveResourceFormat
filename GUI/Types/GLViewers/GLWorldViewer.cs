@@ -726,6 +726,7 @@ namespace GUI.Types.GLViewers
                     entityInfoForm.AddShowInGraphButton(OnShowInGraphButtonClick);
                 }
 
+                entityInfoForm.EntityInfoControl.AddConnectionTriggerButtons(OnEntityInfoTriggerConnection);
                 entityInfoForm.Show();
                 entityInfoForm.EntityInfoControl.OutputsGrid.CellDoubleClick += OnEntityInfoOutputsCellDoubleClick;
                 entityInfoForm.EntityInfoControl.InputsGrid.CellDoubleClick += OnEntityInfoInputsCellDoubleClick;
@@ -820,6 +821,15 @@ namespace GUI.Types.GLViewers
             {
                 entityInfoForm.Text += " (in 3D skybox)";
             }
+            else if (sceneNode.Scene != Scene && sceneNode.Scene.WorldGroup is { } worldGroup)
+            {
+                var spawnGroup = worldGroup.SpawnGroups.FirstOrDefault(group => group.Scene == sceneNode.Scene);
+
+                if (spawnGroup != null)
+                {
+                    entityInfoForm.Text += $" (in spawn group {spawnGroup.MapName})";
+                }
+            }
 
             entityInfoForm.EntityInfoControl.ShowPopulatedTabs();
             entityInfoForm.EntityInfoControl.Show();
@@ -867,7 +877,7 @@ namespace GUI.Types.GLViewers
                 return;
             }
 
-            if (entityInfoForm.EntityInfoControl.InputsGrid.Rows[e.RowIndex].Tag is not EntityLump.Entity sourceEntity)
+            if (entityInfoForm.EntityInfoControl.InputsGrid.Rows[e.RowIndex].Tag is not EntityLump.Connection { SourceEntity: var sourceEntity })
             {
                 return;
             }
@@ -881,6 +891,17 @@ namespace GUI.Types.GLViewers
 
             SelectAndFocusNode(node);
             ShowSceneNodeDetails(node);
+        }
+
+        private void OnEntityInfoTriggerConnection(EntityLump.Connection connection)
+        {
+            // The render thread ticks the world under this lock; queue between ticks, not while it walks the queue
+            using var lockScope = glLock.EnterScope();
+
+            var entitySystem = Renderer.EntitySystem;
+            var caller = entitySystem.FindByData(connection.SourceEntity);
+
+            entitySystem.QueueConnection(connection, caller, entitySystem.Player);
         }
 
         private void OnShowInGraphButtonClick(object? sender, EventArgs e)
@@ -917,8 +938,7 @@ namespace GUI.Types.GLViewers
                 return;
             }
 
-            var isInSkybox = pixelInfo.IsSkybox > 0;
-            var sceneNode = isInSkybox ? SkyboxScene?.Find(pixelInfo.ObjectId) : Scene.Find(pixelInfo.ObjectId);
+            var sceneNode = Renderer.FindScene(pixelInfo.SceneId)?.Find(pixelInfo.ObjectId);
 
             if (sceneNode == null)
             {
@@ -1124,7 +1144,7 @@ namespace GUI.Types.GLViewers
                 physicsGroups.Remove(PhysicsRenderAsOpaque);
             }
 
-            foreach (var physNode in Scene.AllNodes.OfType<PhysSceneNode>())
+            foreach (var physNode in Renderer.Scenes.SelectMany(static scene => scene.AllNodes).OfType<PhysSceneNode>())
             {
                 physNode.Enabled = physicsGroups.Contains(physNode.PhysGroupName);
                 physNode.IsTranslucentRenderMode = renderTranslucent;

@@ -3,6 +3,7 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Blocks;
@@ -112,6 +113,20 @@ namespace ValveResourceFormat.Renderer
 
         /// <summary>Maps this scene's space to where the main camera sees it. Identity, except for a 3D sky.</summary>
         public Matrix4x4 ToViewerWorld { get; internal set; } = Matrix4x4.Identity;
+
+        /// <summary>
+        /// Gets the world group of the spawn group this scene draws, or <see langword="null"/> for a scene no
+        /// map was loaded into. Entities only meet the ones of their own world group.
+        /// </summary>
+        public WorldGroup? WorldGroup { get; internal set; }
+
+        private static uint lastId;
+
+        /// <summary>
+        /// Gets a number no other scene has, which the picking pass writes out so a pick can be traced back
+        /// to the scene it hit.
+        /// </summary>
+        public uint Id { get; } = Interlocked.Increment(ref lastId);
 
         /// <summary>Gets or sets the voxel visibility data.</summary>
         public IWorldVisibility? VoxelVisibility { get; set; }
@@ -390,6 +405,18 @@ namespace ValveResourceFormat.Renderer
         /// </summary>
         public void Clear()
         {
+            DeleteAllNodes();
+
+            RendererContext.MaterialLoader.Clear();
+            RendererContext.MeshBufferCache.Clear();
+        }
+
+        /// <summary>
+        /// Removes and deletes every node, leaving the materials and mesh buffers the renderer context shares
+        /// with other scenes alone. What unloading one spawn group's scene needs.
+        /// </summary>
+        internal void DeleteAllNodes()
+        {
             foreach (var item in dynamicNodes)
             {
                 item.Delete();
@@ -404,9 +431,22 @@ namespace ValveResourceFormat.Renderer
 
             StaticOctree.Clear();
             DynamicOctree.Clear();
+        }
 
-            RendererContext.MaterialLoader.Clear();
-            RendererContext.MeshBufferCache.Clear();
+        /// <summary>
+        /// Takes on the viewer's culling and drawing choices from another scene, for a scene made after the
+        /// viewer set them, such as one a spawn group streamed in.
+        /// </summary>
+        /// <param name="other">The scene to copy from.</param>
+        internal void CopyRenderSettings(Scene other)
+        {
+            ShowToolsMaterials = other.ShowToolsMaterials;
+            EnableDepthPrepass = other.EnableDepthPrepass;
+            EnableOcclusionCulling = other.EnableOcclusionCulling;
+            EnableIndirectDraws = other.EnableIndirectDraws;
+            EnableCompaction = other.EnableCompaction;
+            EnablePvsCulling = other.EnablePvsCulling;
+            enabledLayers = other.enabledLayers == null ? null : [.. other.enabledLayers];
         }
 
         /// <summary>
@@ -2209,6 +2249,12 @@ namespace ValveResourceFormat.Renderer
                 ApplyLayerVisibility(renderer);
             }
         }
+
+        /// <summary>
+        /// Gets the layers <see cref="SetEnabledLayers"/> last enabled, or <see langword="null"/> while every
+        /// layer shows.
+        /// </summary>
+        internal IReadOnlySet<string>? EnabledLayers => enabledLayers;
 
         private void ApplyLayerVisibility(SceneNode node)
         {

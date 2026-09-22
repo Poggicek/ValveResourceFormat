@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using ValveResourceFormat.Renderer.World;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
 using Entity = ValveResourceFormat.ResourceTypes.EntityLump.Entity;
@@ -8,13 +9,15 @@ namespace ValveResourceFormat.Renderer.Entities;
 /// <summary>
 /// Everything <see cref="EntityFactory"/> needs to bring an entity into the world: its keyvalues, the
 /// transform of whatever spawned it, the visibility layer its scene nodes belong to, and the scene those
-/// nodes go into - the map's, or the 3D skybox's, since both are spawn groups of one entity world.
+/// nodes go into - the one of the spawn group that spawned it, since every map is a spawn group of one
+/// entity world.
 /// </summary>
 /// <param name="Data">The entity's keyvalues, as authored in the map.</param>
-/// <param name="ParentTransform">Transform of the spawner (a template, or identity for map entities).</param>
+/// <param name="ParentTransform">Transform of the spawner: a template, or the placement of the entity's spawn group.</param>
 /// <param name="LayerName">Visibility layer for this entity and every node it creates.</param>
 /// <param name="Scene">The scene the entity's nodes render into.</param>
-public readonly record struct EntitySpawnInfo(Entity Data, Matrix4x4 ParentTransform, string? LayerName, Scene Scene);
+/// <param name="SpawnGroup">The spawn group that spawned it, which takes it along when it unloads.</param>
+public readonly record struct EntitySpawnInfo(Entity Data, Matrix4x4 ParentTransform, string? LayerName, Scene Scene, SpawnGroup? SpawnGroup = null);
 
 /// <summary>
 /// The base of the simulated entity hierarchy, Source's <c>CBaseEntity</c>. It carries the origin and
@@ -62,8 +65,20 @@ public abstract class BaseEntity
     /// <summary>Gets the entity's <c>classname</c>.</summary>
     public string Classname { get; }
 
-    /// <summary>Gets the entity's <c>targetname</c>, the name entity I/O addresses it by.</summary>
+    /// <summary>Gets the entity's <c>targetname</c>, as authored.</summary>
     public string? TargetName { get; }
+
+    /// <summary>
+    /// Gets the name entity I/O and lookups address the entity by: <see cref="TargetName"/> as the engine
+    /// spawns it, see <see cref="EntitySystem.FixupName"/>.
+    /// </summary>
+    public string? Name { get; }
+
+    /// <summary>
+    /// Gets the spawn group that spawned the entity, which takes it along when it unloads, or
+    /// <see langword="null"/> for an entity created at runtime.
+    /// </summary>
+    public SpawnGroup? SpawnGroup { get; }
 
     /// <summary>Gets the entity's <c>spawnflags</c>.</summary>
     public uint SpawnFlags { get; }
@@ -254,6 +269,7 @@ public abstract class BaseEntity
     {
         EntitySystem = system;
         Scene = spawnInfo.Scene;
+        SpawnGroup = spawnInfo.SpawnGroup;
         Data = spawnInfo.Data;
         ParentTransform = spawnInfo.ParentTransform;
 
@@ -261,6 +277,7 @@ public abstract class BaseEntity
 
         Classname = data.GetStringProperty("classname") ?? string.Empty;
         TargetName = data.TargetName;
+        Name = TargetName == null ? null : EntitySystem.FixupName(TargetName);
         SpawnFlags = data.GetUInt32Property("spawnflags");
         EntityScale = data.GetVector3Property("scales", Vector3.One);
 
@@ -612,7 +629,7 @@ public abstract class BaseEntity
         if (EntitySystem.Player is not { IsRemoved: false } player
             || !player.Controller.IsActive
             || Collider is not { IsEmpty: false } collider
-            || !IsSolid || IsTrigger || Scene != player.Scene
+            || !IsSolid || IsTrigger || Scene.WorldGroup != player.Scene.WorldGroup
             || !player.TryGetTouchBounds(out var center, out var halfExtents))
         {
             return;

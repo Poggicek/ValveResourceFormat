@@ -70,6 +70,6 @@ uniform uint shaderProgramId;
     out uvec4 outputColor;
     void main()
     {
-        outputColor = uvec4(sceneObjectId, meshId, uint(g_bIsSkybox), 0);
+        outputColor = uvec4(sceneObjectId, meshId, g_nSceneId, 0);
     }
 #endif

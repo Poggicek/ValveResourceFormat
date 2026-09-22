@@ -19,7 +19,7 @@ layout(std140, binding = 0) uniform ViewConstants
     vec3 g_vCameraUpDirWs;
     float g_flTime;
     mat4 g_matWorldToShadow[2]; // one per sun shadow cascade
-    float _viewPadding1;
+    uint g_nSceneId; // written out by the picking pass
     bool g_bIsSkybox;
     float g_flSunShadowBias;
     bool g_bSunShadowsEnabled;

@@ -137,7 +137,7 @@ namespace GUI.Forms
 
         public void AddOutputConnection(Connection connectionData)
         {
-            dataGridOutputs.Rows.Add([
+            var rowIndex = dataGridOutputs.Rows.Add([
                 connectionData.OutputName,
                 connectionData.TargetName,
                 connectionData.InputName,
@@ -145,6 +145,8 @@ namespace GUI.Forms
                 connectionData.Delay,
                 GetStringTimesToFire(connectionData.TimesToFire)
             ]);
+
+            dataGridOutputs.Rows[rowIndex].Tag = connectionData;
         }
 
         public void AddInputConnection(Connection connectionData)
@@ -158,7 +160,54 @@ namespace GUI.Forms
                 GetStringTimesToFire(connectionData.TimesToFire)
             ]);
 
-            dataGridInputs.Rows[rowIndex].Tag = connectionData.SourceEntity;
+            dataGridInputs.Rows[rowIndex].Tag = connectionData;
+        }
+
+        /// <summary>
+        /// Adds a button to every output and input row that fires that row's connection, for viewers with a
+        /// live entity system to fire it in.
+        /// </summary>
+        public void AddConnectionTriggerButtons(Action<Connection> onTrigger)
+        {
+            AddTriggerButtonColumn(dataGridOutputs, onTrigger);
+            AddTriggerButtonColumn(dataGridInputs, onTrigger);
+        }
+
+        private static void AddTriggerButtonColumn(DataGridView dataGrid, Action<Connection> onTrigger)
+        {
+            var column = new DataGridViewButtonColumn
+            {
+                Name = "Trigger",
+                HeaderText = string.Empty,
+                Text = "Trigger",
+                UseColumnTextForButtonValue = true,
+                FlatStyle = FlatStyle.Flat,
+                AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells,
+            };
+
+            dataGrid.Columns.Add(column);
+
+            void OnCellContentClick(object? sender, DataGridViewCellEventArgs e)
+            {
+                if (e.RowIndex < 0 || e.ColumnIndex != column.Index)
+                {
+                    return;
+                }
+
+                if (dataGrid.Rows[e.RowIndex].Tag is Connection connection)
+                {
+                    onTrigger(connection);
+                }
+            }
+
+            void OnDisposed(object? sender, EventArgs e)
+            {
+                dataGrid.CellContentClick -= OnCellContentClick;
+                dataGrid.Disposed -= OnDisposed;
+            }
+
+            dataGrid.CellContentClick += OnCellContentClick;
+            dataGrid.Disposed += OnDisposed;
         }
 
         private static string GetStringTimesToFire(int timesToFire)

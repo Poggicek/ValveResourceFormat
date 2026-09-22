@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Renderer.Entities;
 using ValveResourceFormat.Renderer.PostProcess;
@@ -126,18 +127,40 @@ public class Renderer
         return null;
     }
 
-    /// <summary>The scenes this renderer draws, the map's first and its 3D sky's after it.</summary>
+    /// <summary>
+    /// The scenes this renderer draws: the map's first, then those of every other spawn group that is
+    /// loaded - its 3D sky, and the maps streamed in next to it.
+    /// </summary>
     public IEnumerable<Scene> Scenes
     {
         get
         {
             yield return Scene;
 
-            if (SkyboxScene is { } skyboxScene)
+            foreach (var spawnGroup in EntitySystem.SpawnGroups.SpawnGroups)
             {
-                yield return skyboxScene;
+                if (spawnGroup.IsLoaded && spawnGroup.Scene != Scene)
+                {
+                    yield return spawnGroup.Scene;
+                }
             }
         }
+    }
+
+    /// <summary>Finds the scene a pick landed in, from the scene id the picking pass wrote out.</summary>
+    /// <param name="sceneId">The <see cref="Scene.Id"/> read back with the pick.</param>
+    /// <returns>The scene, or <see langword="null"/> when it is no longer drawn.</returns>
+    public Scene? FindScene(uint sceneId)
+    {
+        foreach (var scene in Scenes)
+        {
+            if (scene.Id == sceneId)
+            {
+                return scene;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -270,7 +293,7 @@ public class Renderer
     /// <summary>Reused so <see cref="Scene.GetFrustumCullResults"/> keeps its cache across pre-warm calls.</summary>
     private readonly Frustum noCullFrustum = Frustum.CreateEmpty();
 
-    private readonly SceneView[] frameViews = new SceneView[2];
+    private readonly List<SceneView> frameViews = [];
 
     // options
     /// <summary>
@@ -321,30 +344,56 @@ public class Renderer
     /// </summary>
     private ReadOnlySpan<SceneView> CollectViews(Camera camera)
     {
-        var count = 1;
+        frameViews.Clear();
 
-        frameViews[0] = new SceneView
+        frameViews.Add(new SceneView
         {
             Scene = Scene,
             Camera = camera,
             LockedCullFrustum = LockedCullFrustum,
-        };
+        });
+
+        // The maps streamed in next to this one share its space, so they are drawn through the same camera
+        if (Scene.WorldGroup is { } worldGroup)
+        {
+            foreach (var spawnGroup in worldGroup.SpawnGroups)
+            {
+                if (spawnGroup.IsLoaded && spawnGroup.Scene != Scene)
+                {
+                    frameViews.Add(new SceneView
+                    {
+                        Scene = spawnGroup.Scene,
+                        Camera = camera,
+                        LockedCullFrustum = LockedCullFrustum,
+                        FogFrom = Scene,
+                    });
+                }
+            }
+        }
 
         if (Skybox3D is { } skybox)
         {
             skybox.ConfigureCamera(SkyCamera, camera);
 
-            frameViews[count++] = new SceneView
+            frameViews.Add(new SceneView
             {
                 Scene = skybox.Scene,
                 Camera = SkyCamera,
                 Skybox = skybox,
                 LockedCullFrustum = lockedSkyCullFrustum,
-            };
+            });
         }
 
-        return frameViews.AsSpan(0, count);
+        return CollectionsMarshal.AsSpan(frameViews);
     }
+
+    /// <summary>The views of the maps streamed in next to the main one, out of what <see cref="CollectViews"/> returned.</summary>
+    private static ReadOnlySpan<SceneView> StreamedViews(ReadOnlySpan<SceneView> views)
+        => views[1..(views[^1].Skybox != null ? views.Length - 1 : views.Length)];
+
+    /// <summary>The 3D sky's view out of what <see cref="CollectViews"/> returned, when it has one and it is shown.</summary>
+    private SceneView? SkyView(ReadOnlySpan<SceneView> views)
+        => ShowSkybox && views[^1].Skybox != null ? views[^1] : null;
 
     /// <summary>The frustum a view's CPU cull runs against, or <see langword="null"/> for the camera's own.</summary>
     private Frustum? CullFrustumFor(in SceneView view) => DisableAllCulling ? noCullFrustum : view.LockedCullFrustum;
@@ -576,6 +625,7 @@ public class Renderer
         Scene.SetFogConstants(ViewBuffer.Data, view.Fog, view.FogSpace);
 
         ViewBuffer.Data.IsSkybox = view.Skybox != null;
+        ViewBuffer.Data.SceneId = view.Scene.Id;
 
         // The shadow cascades only cover the main scene
         ViewBuffer.Data.SunShadowsEnabled = ReferenceEquals(view.Scene, Scene);
@@ -685,14 +735,10 @@ public class Renderer
             scene.Clear();
         }
 
+        // The scenes of the 3D sky and of every map streamed in came with the map, so the spawn groups
+        // dispose them along with it rather than letting them outlive the next load
         EntitySystem.Clear();
-
-        // The 3D sky's scene came with the map, so it goes with it rather than outliving the next load
-        if (Skybox3D is { } skybox)
-        {
-            skybox.Scene.Dispose();
-            Skybox3D = null;
-        }
+        Skybox3D = null;
     }
 
     /// <summary>
@@ -828,17 +874,44 @@ public class Renderer
             Scene.RenderOpaqueLayer(renderContext, isMaterialPass ? depthOnlyShader : null);
         }
 
+        var streamedViews = StreamedViews(views);
+
+        if (!streamedViews.IsEmpty)
+        {
+            using (new GLDebugGroup("Streamed Worlds Opaque Render"))
+            {
+                foreach (var streamedView in streamedViews)
+                {
+                    DrawThrough(streamedView, ref renderContext);
+                    streamedView.Scene.RenderOpaqueLayer(renderContext, isMaterialPass ? depthOnlyShader : null);
+                }
+            }
+
+            DrawThrough(mainView, ref renderContext);
+        }
+
         //using (new GLDebugGroup("Sky Render"))
         {
             GraphicsContext.RenderState.SetDepthRange(DepthRange.Sky);
 
-            SceneView? skyView = ShowSkybox && views.Length > 1 ? views[1] : null;
+            var skyView = SkyView(views);
             var (copyColor, copyDepth) = (Scene.WantsSceneColor, Scene.WantsSceneDepth);
             copyDepth |= ForceResolveSceneDepth;
 
             if (isStandardPass)
             {
                 Postprocess.HasOutlineObjects = Scene.HasOutlineObjects;
+            }
+
+            foreach (var streamedView in streamedViews)
+            {
+                copyColor |= streamedView.Scene.WantsSceneColor;
+                copyDepth |= streamedView.Scene.WantsSceneDepth;
+
+                if (isStandardPass)
+                {
+                    Postprocess.HasOutlineObjects |= streamedView.Scene.HasOutlineObjects;
+                }
             }
 
             if (skyView is { Scene: var skyboxScene } skyOpaque)
@@ -929,6 +1002,20 @@ public class Renderer
         using (new GLDebugGroup("Main Scene Translucent Render"))
         {
             RenderTranslucentLayer(renderContext);
+        }
+
+        if (!streamedViews.IsEmpty)
+        {
+            using (new GLDebugGroup("Streamed Worlds Translucent Render"))
+            {
+                foreach (var streamedView in streamedViews)
+                {
+                    DrawThrough(streamedView, ref renderContext);
+                    RenderTranslucentLayer(renderContext);
+                }
+            }
+
+            DrawThrough(mainView, ref renderContext);
         }
 
         using (new GLDebugGroup("Viewmodel Translucent"))
@@ -1409,14 +1496,22 @@ public class Renderer
             Scene.LightingInfo.ClearBarnLights();
         }
 
-        if (!DisableAllCulling && Scene is { EnablePvsCulling: true, VoxelVisibility: not null })
+        // Every map in the main camera's space has visibility of its own, looked up from the same point.
+        // The main scene's toggle governs them all, the way it is the one the viewer changes.
+        var pvsPosition = LockedCullPosition ?? updateContext.Camera.Location;
+
+        foreach (var view in views)
         {
-            var pvsPosition = LockedCullPosition ?? updateContext.Camera.Location;
-            Scene.CurrentFramePvs = Scene.VoxelVisibility.GetVisibilityRowForPoint(pvsPosition);
-        }
-        else
-        {
-            Scene.CurrentFramePvs = default;
+            if (view.Skybox != null)
+            {
+                continue;
+            }
+
+            var scene = view.Scene;
+
+            scene.CurrentFramePvs = !DisableAllCulling && Scene.EnablePvsCulling && scene.VoxelVisibility != null
+                ? scene.VoxelVisibility.GetVisibilityRowForPoint(pvsPosition)
+                : default;
         }
 
         foreach (var view in views)

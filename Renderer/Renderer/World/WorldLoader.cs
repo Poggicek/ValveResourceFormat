@@ -53,8 +53,11 @@ namespace ValveResourceFormat.Renderer.World
         // Always enabled, the physics group filter decides what actually draws.
         private const string PhysicsDebugLayerName = "Physics Visualization Layer";
 
+        /// <summary>The layers every map shows by default, before adding the world layers of its own.</summary>
+        private static readonly HashSet<string> BaseEnabledLayers = ["No layer", "Entities", EditorEntityNode.LayerName, Scene.ParticlesLayerName, PhysicsDebugLayerName];
+
         /// <summary>Layer names that should be visible by default, populated during loading.</summary>
-        public HashSet<string> DefaultEnabledLayers { get; } = ["No layer", "Entities", EditorEntityNode.LayerName, Scene.ParticlesLayerName, PhysicsDebugLayerName];
+        public HashSet<string> DefaultEnabledLayers { get; } = [.. BaseEnabledLayers];
 
         /// <summary>Names of info_camera_link entities found in the world.</summary>
         public List<string> CameraNames { get; } = [];
@@ -101,16 +104,22 @@ namespace ValveResourceFormat.Renderer.World
         /// <summary>The first <c>sky_camera</c> in this map, used when it is loaded as another map's 3D sky.</summary>
         private (Vector3 Origin, float Scale)? skyCamera;
 
-        /// <summary>Applied to everything this map loads.</summary>
+        /// <summary>Gets the spawn group this map is loaded as.</summary>
+        public SpawnGroup SpawnGroup { get; }
+
+        /// <summary>Applied to everything this map loads: where its spawn group places it.</summary>
         private readonly Matrix4x4 rootTransform;
 
         private readonly EntitySystem entitySystem;
 
         /// <summary>
-        /// Whether this load is a spawn group placed inside another map, such as a 3D sky. Only the
-        /// outermost load gets a physics world and activates the entities, once every group has spawned.
+        /// Whether this map loads as part of another map's load, such as its 3D sky. That load activates the
+        /// entities once every map it brings has spawned, so this one leaves them be.
         /// </summary>
-        private readonly bool isNestedSpawnGroup;
+        private readonly bool loadsWithParent;
+
+        /// <summary>The map's own <c>worldspawn</c>, which carries its static collision when it is streamed in.</summary>
+        private WorldEntity? spawnedWorld;
 
         /// <summary>
         /// Loads a map by name, performing a full load of all world components.
@@ -120,21 +129,77 @@ namespace ValveResourceFormat.Renderer.World
         /// <param name="entitySystem">The entity world this map's entities spawn into.</param>
         /// <param name="rootTransform">Transform applied to the whole map, identity when <see langword="null"/>.</param>
         public static WorldLoader LoadMap(string mapResourceName, Scene scene, EntitySystem entitySystem, Matrix4x4? rootTransform = null)
-            => LoadMap(mapResourceName, scene, entitySystem, rootTransform, nestedSpawnGroup: false);
-
-        private static WorldLoader LoadMap(string mapResourceName, Scene scene, EntitySystem entitySystem, Matrix4x4? rootTransform, bool nestedSpawnGroup)
         {
-            var renderContext = scene.RendererContext;
-            Resource? mapResource = null;
+            var (mapResource, world) = LoadMapResources(mapResourceName, scene.RendererContext.FileLoader);
 
-            if (mapResourceName.EndsWith(GameFileLoader.CompiledFileSuffix, StringComparison.OrdinalIgnoreCase))
+            var loader = new WorldLoader(world, scene, entitySystem, rootTransform);
+            loader.Load(mapResource.ExternalReferences);
+            return loader;
+        }
+
+        /// <summary>
+        /// Loads a spawn group <see cref="SpawnGroupManager.RequestLoad"/> queued: finds its map, places it so
+        /// that its landmark lands on the one it was asked for from, and loads it into its scene.
+        /// </summary>
+        /// <param name="spawnGroup">The queued spawn group.</param>
+        /// <param name="entitySystem">The entity world its entities spawn into.</param>
+        /// <returns>Whether the map loaded.</returns>
+        internal static bool LoadSpawnGroup(SpawnGroup spawnGroup, EntitySystem entitySystem)
+        {
+            var context = entitySystem.RendererContext;
+            var mapResourceName = $"maps/{spawnGroup.MapName}.vmap";
+
+            // Stays searchable while the map is loaded, and for loading it again. A map not packed on its
+            // own may still be loose on disk, so it is tried either way.
+            MountMapPackage(context, mapResourceName, out _);
+
+            var (mapResource, world) = LoadMapResources(mapResourceName, context.FileLoader);
+
+            if (spawnGroup.Landmark is { } landmark)
             {
-                mapResource = renderContext.FileLoader.LoadFile(mapResourceName);
+                // Only the offset between the two landmarks moves the map, as in the engine, which works
+                // out the difference in their angles as well but never applies it
+                if (FindLandmarkOrigin(world, context.FileLoader, landmark.Name) is { } origin)
+                {
+                    spawnGroup.Transform = Matrix4x4.CreateTranslation(landmark.Origin - origin);
+                }
+                else
+                {
+                    context.Logger.LogWarning("Spawn group {MapName} has no landmark named '{Landmark}', loading it where it was built", spawnGroup.MapName, landmark.Name);
+                }
             }
-            else
+
+            var loader = new WorldLoader(world, spawnGroup, entitySystem, loadsWithParent: false);
+            loader.Load(mapResource.ExternalReferences);
+
+            spawnGroup.World = loader;
+            spawnGroup.Scene.Initialize();
+
+            // The entity, editor and debug layers follow what the viewer shows, and the map's own world
+            // layers start the way the map authored them
+            if (spawnGroup.Parent?.Scene.EnabledLayers is { } shownLayers)
             {
-                mapResource = renderContext.FileLoader.LoadFileCompiled(mapResourceName);
+                var layers = new HashSet<string>(shownLayers);
+
+                foreach (var layer in loader.DefaultEnabledLayers)
+                {
+                    if (!BaseEnabledLayers.Contains(layer))
+                    {
+                        layers.Add(layer);
+                    }
+                }
+
+                spawnGroup.Scene.SetEnabledLayers(layers);
             }
+
+            return true;
+        }
+
+        private static (Resource Map, WorldResource World) LoadMapResources(string mapResourceName, GameFileLoader fileLoader)
+        {
+            var mapResource = mapResourceName.EndsWith(GameFileLoader.CompiledFileSuffix, StringComparison.OrdinalIgnoreCase)
+                ? fileLoader.LoadFile(mapResourceName)
+                : fileLoader.LoadFileCompiled(mapResourceName);
 
             if (mapResource == null)
             {
@@ -142,15 +207,14 @@ namespace ValveResourceFormat.Renderer.World
             }
 
             var worldPath = GetWorldNameFromMap(mapResourceName);
-            var worldResource = renderContext.FileLoader.LoadFileCompiled(worldPath) ?? throw new FileNotFoundException($"Failed to load world file '{worldPath}'.");
+            var worldResource = fileLoader.LoadFileCompiled(worldPath) ?? throw new FileNotFoundException($"Failed to load world file '{worldPath}'.");
 
-            var loader = new WorldLoader((WorldResource)worldResource.DataBlock!, scene, entitySystem, rootTransform, nestedSpawnGroup);
-            loader.Load(mapResource.ExternalReferences);
-            return loader;
+            return (mapResource, (WorldResource)worldResource.DataBlock!);
         }
 
         /// <summary>
-        /// Initializes a new <see cref="WorldLoader"/> for the given world resource.
+        /// Initializes a new <see cref="WorldLoader"/> for the given world resource, as the spawn group every
+        /// other map of the entity world is loaded next to.
         /// Call <see cref="Load"/> to begin loading world components into the scene.
         /// </summary>
         /// <param name="world">The world data block to load.</param>
@@ -158,20 +222,37 @@ namespace ValveResourceFormat.Renderer.World
         /// <param name="entitySystem">The entity world this map's entities spawn into.</param>
         /// <param name="rootTransform">Transform applied to the whole map, identity when <see langword="null"/>.</param>
         public WorldLoader(WorldResource world, Scene scene, EntitySystem entitySystem, Matrix4x4? rootTransform = null)
-            : this(world, scene, entitySystem, rootTransform, nestedSpawnGroup: false)
+            : this(world, AddRootSpawnGroup(world, scene, entitySystem, rootTransform), entitySystem, loadsWithParent: false)
         {
         }
 
-        private WorldLoader(WorldResource world, Scene scene, EntitySystem entitySystem, Matrix4x4? rootTransform, bool nestedSpawnGroup)
+        private WorldLoader(WorldResource world, SpawnGroup spawnGroup, EntitySystem entitySystem, bool loadsWithParent)
         {
-            this.isNestedSpawnGroup = nestedSpawnGroup;
-            MapName = Path.GetDirectoryName(world.Resource!.FileName!)!.Replace('\\', '/');
+            this.loadsWithParent = loadsWithParent;
+            MapName = GetMapDirectory(world);
             World = world;
-            this.scene = scene;
+            SpawnGroup = spawnGroup;
+            scene = spawnGroup.Scene;
             this.entitySystem = entitySystem;
-            this.rootTransform = rootTransform ?? Matrix4x4.Identity;
+            rootTransform = spawnGroup.Transform;
             RendererContext = scene.RendererContext;
         }
+
+        private static SpawnGroup AddRootSpawnGroup(WorldResource world, Scene scene, EntitySystem entitySystem, Matrix4x4? rootTransform)
+        {
+            ArgumentNullException.ThrowIfNull(world);
+            ArgumentNullException.ThrowIfNull(scene);
+            ArgumentNullException.ThrowIfNull(entitySystem);
+
+            var spawnGroups = entitySystem.SpawnGroups;
+
+            return spawnGroups.Add(GetMapDirectory(world), parent: null, spawnGroups.MainWorldGroup, scene, rootTransform ?? Matrix4x4.Identity);
+        }
+
+        private static string GetMapDirectory(WorldResource world) => Path.GetDirectoryName(world.Resource!.FileName!)!.Replace('\\', '/');
+
+        /// <summary>Whether this map is the spawn group every other one is loaded next to.</summary>
+        private bool IsRootSpawnGroup => SpawnGroup.Parent == null;
 
         /// <summary> Loading screen hints.</summary>
         public IProgress<string>? LoadingProgress { get; set; }
@@ -267,8 +348,9 @@ namespace ValveResourceFormat.Renderer.World
         /// <param name="mapResourceReferences">Optional external reference list from the map resource, used to preload assets in parallel.</param>
         public void Load(ResourceExtRefList? mapResourceReferences = null)
         {
-            // Non resource files not covered by ParallelPreloadResources
-            var navMeshTask = Task.Run(LoadNavigationMesh);
+            // Non resource files not covered by ParallelPreloadResources. Only the map the viewer opened has
+            // them shown, so a map loaded next to it skips them.
+            var navMeshTask = IsRootSpawnGroup ? Task.Run(LoadNavigationMesh) : Task.CompletedTask;
 
             ParallelPreloadResources(mapResourceReferences);
             LoadWorldLightingInfo();
@@ -276,7 +358,11 @@ namespace ValveResourceFormat.Renderer.World
             LoadWorldNodes();
             LoadWorldPhysics();
             LoadWorldVisibility();
-            LoadBombDamageData();
+
+            if (IsRootSpawnGroup)
+            {
+                LoadBombDamageData();
+            }
 
             navMeshTask.Wait();
         }
@@ -316,10 +402,10 @@ namespace ValveResourceFormat.Renderer.World
             ResolveAttachmentParenting();
             ResolveParticleControlPoints();
 
-            // Every entity exists now, so the simulated ones can resolve each other by name. A nested
-            // group loads part way through the outer map's own lump, so it leaves activation to that
-            // load, which runs once everything - every spawn group - has spawned.
-            if (!isNestedSpawnGroup)
+            // Every entity exists now, so the simulated ones can resolve each other by name. A 3D sky
+            // loads part way through the outer map's own lump, so it leaves activation to that load,
+            // which runs once everything - every spawn group it brought - has spawned.
+            if (!loadsWithParent)
             {
                 entitySystem.Activate();
             }
@@ -461,10 +547,18 @@ namespace ValveResourceFormat.Renderer.World
                     scene.Add(physSceneNode, true);
                 }
 
-                // Only the player's world needs collision
-                if (phys.Parts.Length > 0 && !isNestedSpawnGroup)
+                // Only the player's world group needs collision. A map streamed in next to the one the viewer
+                // opened keeps its own on its worldspawn, so it goes when the map does.
+                if (phys.Parts.Length > 0)
                 {
-                    entitySystem.PhysicsWorld = new Rubikon(phys);
+                    if (IsRootSpawnGroup)
+                    {
+                        entitySystem.PhysicsWorld = new Rubikon(phys);
+                    }
+                    else if (scene.EntitiesCollide)
+                    {
+                        spawnedWorld?.SetStaticCollision(phys);
+                    }
                 }
             }
         }
@@ -489,7 +583,12 @@ namespace ValveResourceFormat.Renderer.World
                 return;
             }
 
-            scene.VoxelVisibility = voxelVisibility;
+            // Culling looks clusters up by where things are in the world, which is only where the
+            // visibility was built for while the map stays where it was compiled
+            if (rootTransform.IsIdentity)
+            {
+                scene.VoxelVisibility = voxelVisibility;
+            }
 
             var visNode = new VisibilitySceneNode(scene, voxelVisibility)
             {
@@ -664,12 +763,18 @@ namespace ValveResourceFormat.Renderer.World
                 // whatever scene nodes they need.
                 if (EntityFactory.IsRegistered(classname))
                 {
-                    var created = entitySystem.CreateEntity(entity, parentTransform, layerName, scene);
+                    var created = entitySystem.CreateEntity(entity, parentTransform, layerName, SpawnGroup);
 
-                    // A nested group carries a worldspawn of its own, which stays an ordinary inert entity
-                    if (created is WorldEntity worldspawn && !isNestedSpawnGroup)
+                    // The map the viewer opened supplies the root of the hierarchy; the worldspawn of every
+                    // other map stays an ordinary entity of its spawn group
+                    if (created is WorldEntity worldspawn)
                     {
-                        entitySystem.SetWorld(worldspawn);
+                        spawnedWorld ??= worldspawn;
+
+                        if (IsRootSpawnGroup)
+                        {
+                            entitySystem.SetWorld(worldspawn);
+                        }
                     }
 
                     return;
@@ -1516,48 +1621,16 @@ namespace ValveResourceFormat.Renderer.World
                 return;
             }
 
-            // Maps have to be packed in a vpk?
-            var vpkFile = Path.ChangeExtension(targetmapname, ".vpk");
-            var vpkFound = RendererContext.FileLoader.FindFile(vpkFile);
-            Package? package;
-
-            // Load the skybox map vpk and make it searchable in the file loader
-            if (vpkFound.PathOnDisk != null)
+            // Only the map the viewer opened has its 3D sky drawn
+            if (!IsRootSpawnGroup)
             {
-                // TODO: Due to the way gui contexts work, we're preloading the vpk into parent context
-                package = RendererContext.FileLoader.AddPackageToSearch(vpkFound.PathOnDisk);
+                RendererContext.Logger.LogDebug("Not loading skybox '{Targetmapname}' of streamed in map {MapName}", targetmapname, SpawnGroup.MapName);
+                return;
             }
-            else if (vpkFound.PackageEntry != null)
+
+            if (!MountMapPackage(RendererContext, targetmapname, out var mountedFromDisk))
             {
-                Debug.Assert(vpkFound.Package != null);
-
-                var innerVpkName = vpkFound.PackageEntry.GetFullPath();
-
-                RendererContext.Logger.LogInformation("Preloading vpk \"{InnerVpkName}\" from \"{PackageFileName}\"", innerVpkName, vpkFound.Package.FileName);
-
-                // TODO: Should FileLoader have a method that opens stream for us?
-                var stream = GameFileLoader.GetPackageEntryStream(vpkFound.Package, vpkFound.PackageEntry);
-
-                package = new Package();
-
-                try
-                {
-                    package.SetFileName(innerVpkName);
-                    package.OptimizeEntriesForBinarySearch(StringComparison.OrdinalIgnoreCase);
-                    package.Read(stream);
-
-                    RendererContext.FileLoader.AddPackageToSearch(package);
-
-                    package = null;
-                }
-                finally
-                {
-                    package?.Dispose();
-                }
-            }
-            else
-            {
-                return; // Not found logged by FindFile
+                return;
             }
 
             // Origin and angles only: a 3D sky is not scaled, the sky camera applies the scale instead
@@ -1568,13 +1641,19 @@ namespace ValveResourceFormat.Renderer.World
                 reference *= referenceParentTransform;
             }
 
-            // Entities are global: the skybox is another spawn group
-            // Scenery: nothing can reach the sky, so its entities never build a collider
+            // Entities are global: the skybox is another spawn group, in a world group of its own that the
+            // map's entities cannot reach. Scenery, so its entities never build a collider either.
+            var worldGroup = new WorldGroup(entity.GetStringProperty("worldgroupid") ?? targetmapname);
             var skyScene = new Scene(RendererContext) { EntitiesCollide = false };
+            var skyGroup = entitySystem.SpawnGroups.Add(targetmapname, SpawnGroup, worldGroup, skyScene, reference);
 
             LoadingProgress?.Report("Loading 3D sky…");
 
-            var skyLoader = LoadMap(targetmapname, skyScene, entitySystem, reference, nestedSpawnGroup: true);
+            var (skyMap, skyWorld) = LoadMapResources(targetmapname, RendererContext.FileLoader);
+            var skyLoader = new WorldLoader(skyWorld, skyGroup, entitySystem, loadsWithParent: true);
+
+            skyLoader.Load(skyMap.ExternalReferences);
+            skyGroup.World = skyLoader;
 
             if (currentLoadingPhase != null)
             {
@@ -1587,10 +1666,110 @@ namespace ValveResourceFormat.Renderer.World
 
             PlaceSkyboxEditorMarkers(Skybox3D);
 
-            if (package != null)
+            if (mountedFromDisk != null)
             {
-                RendererContext.FileLoader.RemovePackageFromSearch(package);
+                RendererContext.FileLoader.RemovePackageFromSearch(mountedFromDisk);
             }
+        }
+
+        /// <summary>
+        /// Makes a map loadable that is packed in a vpk of its own, as a map built to be loaded into another
+        /// usually is: a 3D sky, or the stages a map streams in. The vpk is added to the search paths
+        /// whether it sits on disk or inside another package, such as a workshop addon's.
+        /// </summary>
+        /// <param name="context">The context whose file loader should find the map.</param>
+        /// <param name="mapName">The map, with its <c>.vmap</c> extension.</param>
+        /// <param name="fromDisk">
+        /// The package opened from disk for it, which the caller may take out of the search paths once it no
+        /// longer needs the map's files, or <see langword="null"/>.
+        /// </param>
+        /// <returns>Whether the map can be loaded, including when it already could be.</returns>
+        private static bool MountMapPackage(RendererContext context, string mapName, out Package? fromDisk)
+        {
+            fromDisk = null;
+
+            var fileLoader = context.FileLoader;
+
+            // Already searchable, from the package the viewer opened or an earlier load of the same map
+            if (fileLoader.FindFile(string.Concat(mapName, GameFileLoader.CompiledFileSuffix), logNotFound: false) is { PathOnDisk: not null } or { PackageEntry: not null })
+            {
+                return true;
+            }
+
+            var vpkFound = fileLoader.FindFile(Path.ChangeExtension(mapName, ".vpk"));
+
+            if (vpkFound.PathOnDisk != null)
+            {
+                // TODO: Due to the way gui contexts work, we're preloading the vpk into parent context
+                fromDisk = fileLoader.AddPackageToSearch(vpkFound.PathOnDisk);
+                return true;
+            }
+
+            if (vpkFound.PackageEntry == null)
+            {
+                return false; // Not found logged by FindFile
+            }
+
+            Debug.Assert(vpkFound.Package != null);
+
+            var innerVpkName = vpkFound.PackageEntry.GetFullPath();
+
+            context.Logger.LogInformation("Preloading vpk \"{InnerVpkName}\" from \"{PackageFileName}\"", innerVpkName, vpkFound.Package.FileName);
+
+            // TODO: Should FileLoader have a method that opens stream for us?
+            var stream = GameFileLoader.GetPackageEntryStream(vpkFound.Package, vpkFound.PackageEntry);
+
+            var package = new Package();
+
+            try
+            {
+                package.SetFileName(innerVpkName);
+                package.OptimizeEntriesForBinarySearch(StringComparison.OrdinalIgnoreCase);
+                package.Read(stream);
+
+                fileLoader.AddPackageToSearch(package);
+
+                package = null;
+            }
+            finally
+            {
+                package?.Dispose();
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Finds where a landmark stands in a map before the map is placed: the first entity of its main
+        /// entity lumps with that name and an origin. Like the engine, this does not check what the entity is.
+        /// </summary>
+        /// <param name="world">The map's world.</param>
+        /// <param name="fileLoader">Loads the map's entity lumps.</param>
+        /// <param name="landmarkName">The name of the landmark.</param>
+        /// <returns>The landmark's origin in the map, or <see langword="null"/> when the map has none.</returns>
+        private static Vector3? FindLandmarkOrigin(WorldResource world, GameFileLoader fileLoader, string landmarkName)
+        {
+            var name = EntitySystem.FixupName(landmarkName);
+
+            foreach (var lumpName in world.GetEntityLumpNames())
+            {
+                if (lumpName == null || fileLoader.LoadFileCompiled(lumpName)?.DataBlock is not EntityLump lump)
+                {
+                    continue;
+                }
+
+                foreach (var entity in lump.GetEntities())
+                {
+                    if (entity.TargetName is { } targetName
+                        && entity.ContainsKey("origin")
+                        && EntityNameMatches(name, EntitySystem.FixupName(targetName)))
+                    {
+                        return entity.GetVector3Property("origin");
+                    }
+                }
+            }
+
+            return null;
         }
 
         /// <summary>

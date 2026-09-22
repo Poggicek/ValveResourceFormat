@@ -48,8 +48,8 @@ public class PickingTexture : Framebuffer
         /// <summary>The mesh ID within the picked object.</summary>
         public uint MeshId;
 
-        /// <summary>Non-zero when the picked pixel belongs to the skybox.</summary>
-        public uint IsSkybox;
+        /// <summary>The <see cref="Scene.Id"/> of the scene the picked object is in, see <see cref="Renderer.FindScene"/>.</summary>
+        public uint SceneId;
 
         /// <summary>Reserved padding field.</summary>
         public uint Unused2;
