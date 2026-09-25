@@ -54,6 +54,12 @@ public class Renderer : ISpawnGroupHost
     public float Uptime { get; set; }
 
     /// <summary>
+    /// When set, the time shaders see instead of <see cref="Uptime"/>. Pinning it stops everything they animate by
+    /// time, like foliage swaying in the wind, while the scene keeps simulating.
+    /// </summary>
+    public float? ShaderTimeOverride { get; set; }
+
+    /// <summary>
     /// Time elapsed since the last frame, in seconds.
     /// </summary>
     public float DeltaTime { get; set; }
@@ -1071,6 +1077,10 @@ public class Renderer : ISpawnGroupHost
     {
         LoadShaderTextures();
 
+        // The shadow passes update this buffer without binding it, and another renderer sharing the
+        // context may have left its own in the slot
+        ViewBuffer?.BindBufferBase();
+
         // Render backfaces into shadow maps
         GL.FrontFace(FrontFaceDirection.Cw);
 
@@ -1776,7 +1786,7 @@ public class Renderer : ISpawnGroupHost
 
         Uptime += updateContext.Timestep;
         DeltaTime = updateContext.Timestep;
-        ViewBuffer.Data.Time = Uptime;
+        ViewBuffer.Data.Time = ShaderTimeOverride ?? Uptime;
 
         updateContext = updateContext with { Uptime = Uptime };
 

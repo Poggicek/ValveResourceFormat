@@ -49,6 +49,7 @@ namespace GUI
             menuStrip = new ThemedMenuStrip();
             fileToolStripMenuItem = new ThemedToolStripMenuItem();
             openToolStripMenuItem = new ThemedToolStripMenuItem();
+            compareMapsToolStripMenuItem = new ThemedToolStripMenuItem();
             toolStripSeparator2 = new ToolStripSeparator();
             registerVpkFileAssociationToolStripMenuItem = new ThemedToolStripMenuItem();
             createVpkFromFolderToolStripMenuItem = new ThemedToolStripMenuItem();
@@ -117,7 +118,7 @@ namespace GUI
             // 
             // fileToolStripMenuItem
             // 
-            fileToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { openToolStripMenuItem, toolStripSeparator2, registerVpkFileAssociationToolStripMenuItem, createVpkFromFolderToolStripMenuItem, toolStripSeparator4, openWelcomeScreenToolStripMenuItem, validateShadersToolStripMenuItem });
+            fileToolStripMenuItem.DropDownItems.AddRange(new ToolStripItem[] { openToolStripMenuItem, compareMapsToolStripMenuItem, toolStripSeparator2, registerVpkFileAssociationToolStripMenuItem, createVpkFromFolderToolStripMenuItem, toolStripSeparator4, openWelcomeScreenToolStripMenuItem, validateShadersToolStripMenuItem });
             fileToolStripMenuItem.Name = "fileToolStripMenuItem";
             fileToolStripMenuItem.Padding = new Padding(4);
             fileToolStripMenuItem.Size = new System.Drawing.Size(61, 32);
@@ -132,6 +133,14 @@ namespace GUI
             openToolStripMenuItem.SVGImageResourceName = "GUI.Icons.Open.svg";
             openToolStripMenuItem.Text = "&Open";
             openToolStripMenuItem.Click += OpenToolStripMenuItem_Click;
+            // 
+            // compareMapsToolStripMenuItem
+            // 
+            compareMapsToolStripMenuItem.Name = "compareMapsToolStripMenuItem";
+            compareMapsToolStripMenuItem.Size = new System.Drawing.Size(211, 30);
+            compareMapsToolStripMenuItem.SVGImageResourceName = "GUI.Icons.FolderMap.svg";
+            compareMapsToolStripMenuItem.Text = "Compare maps…";
+            compareMapsToolStripMenuItem.Click += CompareMapsToolStripMenuItem_Click;
             // 
             // toolStripSeparator2
             // 
@@ -577,6 +586,7 @@ namespace GUI
         private ThemedToolStripMenuItem viewAssetInfoToolStripMenuItem;
         private ThemedToolStripMenuItem fileToolStripMenuItem;
         private ThemedToolStripMenuItem openToolStripMenuItem;
+        private ThemedToolStripMenuItem compareMapsToolStripMenuItem;
         private ToolStripSeparator toolStripSeparator2;
         private ThemedToolStripMenuItem createVpkFromFolderToolStripMenuItem;
         private ThemedToolStripMenuItem verifyPackageContentsToolStripMenuItem;

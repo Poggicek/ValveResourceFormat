@@ -57,6 +57,28 @@ A preview mode can be enabled in settings. When active, selecting a file in the 
 
 Relevant keyboard shortcuts are shown at the bottom of each viewer.
 
+## Comparing Map Builds
+
+Use **File → Compare maps…** to see everything that changed between two builds of a map. Pick the old build and then the new one, either as the map's `.vpk` or as a `.vmap_c`.
+
+Both builds are drawn from the same camera and compared pixel by pixel:
+
+- **Green** is a surface only in the new build
+- **Red** is a surface only in the old build, shown where it used to be
+- **Yellow** is the same surface looking different, such as a new material or lighting
+
+A lightmap rebake tints large areas yellow. Tick **Ignore lighting** to compare the unlit colors instead. **Freeze foliage sway** is on by default. It stops foliage swaying in the wind, so it matches in both builds. It also stops anything else shaders animate over time, such as water.
+
+Ticking a group under **Physics Groups** shows that collision in both builds, so clip changes show up in the view too.
+
+The list next to the view has every change to entities, static geometry and collision (like player and grenade clips), with filters and the old and new values of whatever changed. Selecting a change flies the camera to it and boxes it: red where it was, green where it is.
+
+| Key | Action |
+|-----|--------|
+| <kbd>N</kbd> / <kbd>Shift</kbd>+<kbd>N</kbd> | Next / previous change |
+| <kbd>B</kbd> (hold) | Show the old build |
+| <kbd>M</kbd> | Cycle the view: differences, new build, old build, split, heatmap |
+
 ## Exporting Files
 
 Right-click a file to access two export modes:

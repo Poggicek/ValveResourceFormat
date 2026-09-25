@@ -1213,7 +1213,7 @@ public class Rubikon
             closestHit = new TraceResult(true, trace.Origin, startNormal, 0f, -1)
             {
                 StartSolid = true,
-                ContactPoint = trace.ComputeContactPoint ? ClosestPointOnTriangle(trace.Origin, v0, v1, v2) : trace.Origin,
+                ContactPoint = trace.ComputeContactPoint ? MathUtils.ClosestPointOnTriangle(trace.Origin, v0, v1, v2) : trace.Origin,
             };
             return;
         }
@@ -1226,60 +1226,9 @@ public class Rubikon
         {
             closestHit = new TraceResult(true, hitPoint, hitNormal, hitDistance, -1)
             {
-                ContactPoint = trace.ComputeContactPoint ? ClosestPointOnTriangle(hitPoint, v0, v1, v2) : hitPoint,
+                ContactPoint = trace.ComputeContactPoint ? MathUtils.ClosestPointOnTriangle(hitPoint, v0, v1, v2) : hitPoint,
             };
         }
-    }
-
-    private static Vector3 ClosestPointOnTriangle(Vector3 p, Vector3 a, Vector3 b, Vector3 c)
-    {
-        var ab = b - a;
-        var ac = c - a;
-        var ap = p - a;
-
-        var d1 = Vector3.Dot(ab, ap);
-        var d2 = Vector3.Dot(ac, ap);
-        if (d1 <= 0 && d2 <= 0)
-        {
-            return a;
-        }
-
-        var bp = p - b;
-        var d3 = Vector3.Dot(ab, bp);
-        var d4 = Vector3.Dot(ac, bp);
-        if (d3 >= 0 && d4 <= d3)
-        {
-            return b;
-        }
-
-        var vc = d1 * d4 - d3 * d2;
-        if (vc <= 0 && d1 >= 0 && d3 <= 0)
-        {
-            return a + ab * (d1 / (d1 - d3));
-        }
-
-        var cp = p - c;
-        var d5 = Vector3.Dot(ab, cp);
-        var d6 = Vector3.Dot(ac, cp);
-        if (d6 >= 0 && d5 <= d6)
-        {
-            return c;
-        }
-
-        var vb = d5 * d2 - d1 * d6;
-        if (vb <= 0 && d2 >= 0 && d6 <= 0)
-        {
-            return a + ac * (d2 / (d2 - d6));
-        }
-
-        var va = d3 * d6 - d5 * d4;
-        if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0)
-        {
-            return b + (c - b) * ((d4 - d3) / (d4 - d3 + (d5 - d6)));
-        }
-
-        var denom = 1f / (va + vb + vc);
-        return a + ab * (vb * denom) + ac * (vc * denom);
     }
 
     private Node[] BuildHullBVH()

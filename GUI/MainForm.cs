@@ -638,6 +638,80 @@ namespace GUI
             }
         }
 
+        private void CompareMapsToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            const string Filter = "Compiled maps (*.vpk, *.vmap_c)|*.vpk;*.vmap_c|All files (*.*)|*.*";
+
+            var oldPath = AppFileDialogs.OpenFile("Pick the old build of the map", Filter);
+
+            if (oldPath == null)
+            {
+                return;
+            }
+
+            var newPath = AppFileDialogs.OpenFile("Pick the new build of the map", Filter);
+
+            if (newPath == null)
+            {
+                return;
+            }
+
+            OpenMapDiff(oldPath, newPath);
+        }
+
+        /// <summary>Opens a tab comparing two builds of a map, each a map package or a compiled map on disk.</summary>
+        public void OpenMapDiff(string oldPath, string newPath)
+        {
+            Log.Info(nameof(MainForm), $"Comparing {oldPath} to {newPath}");
+
+            var oldBuild = Types.Viewers.MapDiff.OpenBuild(oldPath);
+
+            if (oldBuild is not { } old)
+            {
+                return;
+            }
+
+            (VrfGuiContext Context, string MapFile)? newBuild;
+
+            try
+            {
+                newBuild = Types.Viewers.MapDiff.OpenBuild(newPath);
+            }
+            catch
+            {
+                old.Context.Dispose();
+                throw;
+            }
+
+            if (newBuild is not { } current)
+            {
+                old.Context.Dispose();
+                return;
+            }
+
+            var title = $"{Path.GetFileNameWithoutExtension(oldPath)} → {Path.GetFileNameWithoutExtension(newPath)}";
+
+            OpenFile(current.Context, null, null, withoutViewer: false,
+                createViewer: () => Task.FromResult<Types.Viewers.IViewer>(LoadMapDiff(current.Context, current.MapFile, old.Context, old.MapFile)),
+                tabTitle: title);
+
+            static Types.Viewers.MapDiff LoadMapDiff(VrfGuiContext newContext, string newMapFile, VrfGuiContext oldContext, string oldMapFile)
+            {
+                var viewer = new Types.Viewers.MapDiff(newContext, newMapFile, oldContext, oldMapFile);
+
+                try
+                {
+                    viewer.LoadAsync(null).GetAwaiter().GetResult();
+                    return viewer;
+                }
+                catch
+                {
+                    viewer.Dispose();
+                    throw;
+                }
+            }
+        }
+
         public void OpenFile(string fileName)
         {
             Log.Info(nameof(MainForm), $"Opening {fileName}");
@@ -660,6 +734,12 @@ namespace GUI
         }
 
         public void OpenFile(VrfGuiContext vrfGuiContext, PackageEntry? file, TreeViewWithSearchResults? packageTreeView = null, bool withoutViewer = false)
+            => OpenFile(vrfGuiContext, file, packageTreeView, withoutViewer, createViewer: null, tabTitle: null);
+
+        /// <param name="createViewer">Loads the viewer for the tab instead of picking one by the file's contents.</param>
+        /// <param name="tabTitle">Title of the tab, the file name when <see langword="null"/>.</param>
+        private void OpenFile(VrfGuiContext vrfGuiContext, PackageEntry? file, TreeViewWithSearchResults? packageTreeView, bool withoutViewer,
+            Func<Task<Types.Viewers.IViewer>>? createViewer, string? tabTitle)
         {
             var isPreview = packageTreeView != null;
 
@@ -670,7 +750,7 @@ namespace GUI
                 (_, _) => ResourceViewMode.Default,
             };
 
-            var tabTemp = new ThemedTabPage(Path.GetFileName(vrfGuiContext.FileName))
+            var tabTemp = new ThemedTabPage(tabTitle ?? Path.GetFileName(vrfGuiContext.FileName))
             {
                 ToolTipText = vrfGuiContext.FileName,
                 Tag = new ExportData
@@ -774,7 +854,7 @@ namespace GUI
 
             Types.Viewers.IViewer? createdViewer = null;
 
-            var taskLoad = Task.Run(() => Types.Viewers.ViewerFactory.CreateAndLoadAsync(vrfGuiContext, file, viewMode));
+            var taskLoad = Task.Run(createViewer ?? (() => Types.Viewers.ViewerFactory.CreateAndLoadAsync(vrfGuiContext, file, viewMode)));
 
             taskLoad.ContinueWith(t =>
             {

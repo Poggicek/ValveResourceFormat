@@ -620,6 +620,9 @@ namespace GUI.Types.GLViewers
             }, renderContext.Camera, depthMask: true);
         }
 
+        /// <summary>Whether <see cref="ValveResourceFormat.Renderer.Renderer.ResolvedSceneDepth"/> must be refreshed every frame.</summary>
+        protected virtual bool RequiresSceneDepth => false;
+
         protected override void BlitFramebufferToScreen()
         {
             Debug.Assert(MainFramebuffer != null);
@@ -674,7 +677,7 @@ namespace GUI.Types.GLViewers
             // this frame's position and last frame's facing
             UpdateSoundPlayer();
 
-            Renderer.ForceResolveSceneDepth = ShowBaseGrid;
+            Renderer.ForceResolveSceneDepth = ShowBaseGrid || RequiresSceneDepth;
 
             var quadOverdrawThisFrame = false;
 
@@ -1017,7 +1020,7 @@ namespace GUI.Types.GLViewers
             }
         }
 
-        protected void SetEnabledLayers(HashSet<string> layers)
+        protected virtual void SetEnabledLayers(HashSet<string> layers)
         {
             foreach (var scene in Renderer.Scenes)
             {
@@ -1025,7 +1028,27 @@ namespace GUI.Types.GLViewers
             }
         }
 
-        private void SetRenderMode(string renderMode)
+        /// <summary>Selects a render mode in the render mode list by name, which applies it.</summary>
+        /// <returns>Whether the scene supports the mode.</returns>
+        protected bool SelectRenderMode(string renderMode)
+        {
+            if (renderModeComboBox == null)
+            {
+                return false;
+            }
+
+            var index = renderModes.FindIndex(mode => !mode.IsHeader && mode.Name == renderMode);
+
+            if (index < 0)
+            {
+                return false;
+            }
+
+            renderModeComboBox.SelectedIndex = index;
+            return true;
+        }
+
+        protected virtual void SetRenderMode(string renderMode)
         {
             Debug.Assert(Picker != null);
             Debug.Assert(SelectedNodeRenderer != null);
