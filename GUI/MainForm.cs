@@ -671,21 +671,22 @@ namespace GUI
                 return;
             }
 
-            (VrfGuiContext Context, string MapFile)? newBuild;
+            (VrfGuiContext Context, string MapFile)? newBuild = null;
 
             try
             {
                 newBuild = Types.Viewers.MapDiff.OpenBuild(newPath);
             }
-            catch
+            finally
             {
-                old.Context.Dispose();
-                throw;
+                if (newBuild == null)
+                {
+                    old.Context.Dispose();
+                }
             }
 
             if (newBuild is not { } current)
             {
-                old.Context.Dispose();
                 return;
             }
 

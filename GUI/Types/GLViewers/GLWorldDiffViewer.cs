@@ -1,8 +1,6 @@
 using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using System.Windows.Forms;
-using GUI.Controls;
 using GUI.Utils;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Blocks;
@@ -11,9 +9,7 @@ using ValveResourceFormat.Renderer.Materials;
 using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.Renderer.Shaders;
 using ValveResourceFormat.Renderer.World;
-using ValveResourceFormat.Renderer.World.Diff;
 using ValveResourceFormat.ResourceTypes;
-using ValveResourceFormat.Serialization.KeyValues;
 using ValveResourceFormat.Utils;
 
 namespace GUI.Types.GLViewers
@@ -25,7 +21,7 @@ namespace GUI.Types.GLViewers
     class GLWorldDiffViewer : GLWorldViewer
     {
         /// <summary>How the two builds are shown. The values match the modes in map_diff.frag.slang.</summary>
-        public enum DiffViewMode
+        private enum DiffViewMode
         {
             Differences,
             NewBuild,
@@ -37,8 +33,7 @@ namespace GUI.Types.GLViewers
         private readonly World oldWorld;
         private readonly ResourceExtRefList? oldExternalReferences;
 
-        public ValveResourceFormat.Renderer.Renderer OldRenderer { get; }
-        public WorldLoader? OldLoadedWorld { get; private set; }
+        private readonly ValveResourceFormat.Renderer.Renderer OldRenderer;
 
         private Framebuffer? oldFramebuffer;
         private Framebuffer? newTonemapped;
@@ -47,24 +42,14 @@ namespace GUI.Types.GLViewers
 
         private DiffViewMode viewMode = DiffViewMode.Differences;
         private bool showOldWhileHeld;
-        private bool matchExposure = true;
         private float splitPosition = 0.5f;
         private float depthTolerance = 2f;
         private float colorThreshold = 0.1f;
         private float unchangedDim = 0.6f;
-        private float lastFrameTime;
         private float uptimeBeforeUpdate;
         private bool freezeFoliage = true;
         private float frozenShaderTime;
         private ComboBox? viewModeComboBox;
-
-        /// <summary>Gets every difference between the two builds, once loaded.</summary>
-        public MapDiffResult? Diff { get; private set; }
-
-        private MapDiffListControl? diffList;
-        private ChangeHighlightRenderer? highlightRenderer;
-        private MapDiffEntry? focusedEntry;
-        private bool showFocusedChange = true;
 
         public GLWorldDiffViewer(VrfGuiContext vrfGuiContext, RendererContext rendererContext, World world, ResourceExtRefList? externalReferences,
             RendererContext oldRendererContext, World oldWorld, ResourceExtRefList? oldExternalReferences)
@@ -82,7 +67,6 @@ namespace GUI.Types.GLViewers
         public override void Dispose()
         {
             // Delete GL resources before the base disposes the GL context
-            highlightRenderer?.Delete();
             OldRenderer.Dispose();
             oldFramebuffer?.Delete();
             newTonemapped?.Delete();
@@ -91,10 +75,9 @@ namespace GUI.Types.GLViewers
             base.Dispose();
 
             viewModeComboBox?.Dispose();
-            diffList?.Dispose();
         }
 
-        public DiffViewMode ViewMode
+        private DiffViewMode ViewMode
         {
             get => viewMode;
             set
@@ -137,7 +120,6 @@ namespace GUI.Types.GLViewers
             oldTonemapped.Initialize();
 
             compositeShader = Scene.RendererContext.ShaderLoader.LoadShader("map_diff");
-            highlightRenderer = new ChangeHighlightRenderer(Scene.RendererContext);
 
             OldRenderer.LoadRendererResources();
         }
@@ -148,28 +130,17 @@ namespace GUI.Types.GLViewers
 
             ReportLoadingStatus("Loading the old build…");
 
-            OldLoadedWorld = new WorldLoader(oldWorld, OldRenderer.Scene, OldRenderer.EntitySystem)
+            var oldLoadedWorld = new WorldLoader(oldWorld, OldRenderer.Scene, OldRenderer.EntitySystem)
             {
                 LoadingProgress = GuiContext.LoadingProgress,
             };
 
-            OldLoadedWorld.Load(oldExternalReferences);
+            oldLoadedWorld.Load(oldExternalReferences);
 
-            foreach (var spawnGroup in OldLoadedWorld.SpawnGroups)
+            foreach (var spawnGroup in oldLoadedWorld.SpawnGroups)
             {
                 OldRenderer.AddSpawnGroup(spawnGroup);
             }
-
-            Debug.Assert(LoadedWorld != null);
-
-            ReportLoadingStatus("Comparing the builds…");
-
-            // Read through the same loaders the scenes were loaded with, so the resources are already cached
-            var options = new MapDiffOptions();
-            var oldSource = MapDiffSource.Load(OldRenderer.RendererContext.FileLoader, oldWorld, options);
-            var newSource = MapDiffSource.Load(Scene.RendererContext.FileLoader, LoadedWorld.World, options);
-
-            Diff = MapDiffer.Compute(oldSource, newSource, options);
         }
 
         public override void PostSceneLoad()
@@ -190,19 +161,16 @@ namespace GUI.Types.GLViewers
             }
         }
 
+        // The base prewarm paints a frame, which draws the old build too
         protected override void PrewarmRenderer()
         {
-            base.PrewarmRenderer();
-
-            Debug.Assert(oldFramebuffer != null);
-
             OldRenderer.RendererContext.ShaderLoader.LinkLoadedShaders();
             OldRenderer.DisableAllCulling = true;
             OldRenderer.Prewarming = true;
 
             try
             {
-                RenderOldBuild(1f / 60f);
+                base.PrewarmRenderer();
             }
             finally
             {
@@ -227,59 +195,17 @@ namespace GUI.Types.GLViewers
 
         protected override void OnPaint(float frameTime)
         {
-            lastFrameTime = frameTime;
             uptimeBeforeUpdate = Renderer.Uptime;
             Renderer.ShaderTimeOverride = freezeFoliage ? frozenShaderTime : null;
 
             base.OnPaint(frameTime);
         }
 
-        protected override void SetRenderMode(string renderMode)
-        {
-            base.SetRenderMode(renderMode);
-
-            if (OldRenderer.ViewBuffer == null)
-            {
-                return;
-            }
-
-            OldRenderer.ViewBuffer.Data.RenderMode = Renderer.ViewBuffer!.Data.RenderMode;
-            OldRenderer.Postprocess.Enabled = Renderer.Postprocess.Enabled;
-
-            foreach (var scene in OldRenderer.Scenes)
-            {
-                scene.EnableCompaction = renderMode != "Meshlets";
-
-                foreach (var node in scene.AllNodes)
-                {
-                    node.SetRenderMode(renderMode);
-                }
-            }
-        }
-
-        // A layer or collision group that only the old build has must still be listed, or it could not be shown
-        protected override IEnumerable<SceneNode> NodesForLayerLists => base.NodesForLayerLists.Concat(OldRenderer.Scene.AllNodes);
-
-        protected override void ShowPhysicsGroups(HashSet<string> physicsGroups, bool renderTranslucent)
-        {
-            base.ShowPhysicsGroups(physicsGroups, renderTranslucent);
-            ShowPhysicsGroups(OldRenderer, physicsGroups, renderTranslucent);
-        }
-
-        protected override void SetEnabledLayers(HashSet<string> layers)
-        {
-            base.SetEnabledLayers(layers);
-
-            foreach (var scene in OldRenderer.Scenes)
-            {
-                scene.SetEnabledLayers(layers);
-            }
-        }
+        protected override IEnumerable<ValveResourceFormat.Renderer.Renderer> Renderers => [Renderer, OldRenderer];
 
         /// <summary>Carries the settings the sidebar changes on the new build over to the old one.</summary>
         private void SyncOldRendererSettings()
         {
-            OldRenderer.Camera = Renderer.Camera;
             OldRenderer.IsWireframe = Renderer.IsWireframe;
             OldRenderer.ShowSkybox = Renderer.ShowSkybox;
             OldRenderer.EnableBarnLights = Renderer.EnableBarnLights;
@@ -287,7 +213,8 @@ namespace GUI.Types.GLViewers
             OldRenderer.LockedCullPosition = Renderer.LockedCullPosition;
             OldRenderer.EntitySystem.Enabled = Renderer.EntitySystem.Enabled;
             OldRenderer.Postprocess.ColorCorrectionEnabled = Renderer.Postprocess.ColorCorrectionEnabled;
-            OldRenderer.Postprocess.CustomExposure = matchExposure ? Renderer.Postprocess.TonemapScalar : Renderer.Postprocess.CustomExposure;
+            // Each build adapting its own exposure would change the brightness of every pixel
+            OldRenderer.Postprocess.CustomExposure = Renderer.Postprocess.TonemapScalar;
             OldRenderer.ForceResolveSceneDepth = RequiresSceneDepth;
 
             foreach (var scene in OldRenderer.Scenes)
@@ -330,19 +257,6 @@ namespace GUI.Types.GLViewers
             }
         }
 
-        /// <summary>Boxes the selected difference, over everything.</summary>
-        private void RenderHighlight(Framebuffer framebuffer)
-        {
-            if (!showFocusedChange || highlightRenderer == null)
-            {
-                return;
-            }
-
-            framebuffer.Bind(FramebufferTarget.Framebuffer);
-            GL.Viewport(0, 0, framebuffer.Width, framebuffer.Height);
-            highlightRenderer.Render(focusedEntry);
-        }
-
         protected override void BlitFramebufferToScreen()
         {
             Debug.Assert(MainFramebuffer != null && GLDefaultFramebuffer != null);
@@ -353,16 +267,14 @@ namespace GUI.Types.GLViewers
             if (mode == DiffViewMode.NewBuild)
             {
                 base.BlitFramebufferToScreen();
-                RenderHighlight(GLDefaultFramebuffer);
                 return;
             }
 
-            RenderOldBuild(lastFrameTime);
+            RenderOldBuild(Renderer.DeltaTime);
 
             if (mode == DiffViewMode.OldBuild)
             {
                 OldRenderer.PostprocessRender(oldFramebuffer, GLDefaultFramebuffer);
-                RenderHighlight(GLDefaultFramebuffer);
                 return;
             }
 
@@ -374,18 +286,11 @@ namespace GUI.Types.GLViewers
             GLDefaultFramebuffer.Bind(FramebufferTarget.Framebuffer);
             GL.Viewport(0, 0, GLDefaultFramebuffer.Width, GLDefaultFramebuffer.Height);
 
-            if (!Matrix4x4.Invert(Renderer.Camera.ProjectionMatrix, out var projectionToView))
-            {
-                return;
-            }
-
             compositeShader.SetUniform("g_nMode", (int)mode);
             compositeShader.SetUniform("g_flSplitX", splitPosition * GLDefaultFramebuffer.Width);
             compositeShader.SetUniform("g_flDepthTolerance", depthTolerance);
             compositeShader.SetUniform("g_flColorThreshold", colorThreshold);
             compositeShader.SetUniform("g_flUnchangedDim", unchangedDim);
-            compositeShader.SetUniform("g_vInvProjRow3", new Vector4(projectionToView.M14, projectionToView.M24, projectionToView.M34, projectionToView.M44));
-            compositeShader.SetUniform("g_vViewportZRange", new Vector2(ValveResourceFormat.Renderer.Renderer.DepthRange.Scene.Near, ValveResourceFormat.Renderer.Renderer.DepthRange.Scene.Far));
 
             compositeShader.Use();
             compositeShader.SetTexture(0, "g_tNewColor", newTonemapped.Color);
@@ -397,9 +302,6 @@ namespace GUI.Types.GLViewers
 
             GL.BindVertexArray(Scene.RendererContext.MeshBufferCache.EmptyVAO);
             GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
-
-            // Drawn over the composite, where it would otherwise count as unchanged and be dimmed
-            RenderHighlight(GLDefaultFramebuffer);
         }
 
         protected override void OnKeyDown(Keys keyData)
@@ -411,14 +313,6 @@ namespace GUI.Types.GLViewers
             else if (keyData == Keys.M)
             {
                 ViewMode = (DiffViewMode)(((int)viewMode + 1) % Enum.GetValues<DiffViewMode>().Length);
-            }
-            else if (keyData == Keys.N)
-            {
-                diffList?.SelectRelative(1);
-            }
-            else if (keyData == (Keys.Shift | Keys.N))
-            {
-                diffList?.SelectRelative(-1);
             }
 
             base.OnKeyDown(keyData);
@@ -446,7 +340,7 @@ namespace GUI.Types.GLViewers
 
                 UiControl.AddControl(new Label
                 {
-                    Text = "Hold B for the old build, M cycles the view, N and Shift+N step through the changes.",
+                    Text = "Hold B for the old build, M cycles the view.",
                     MaximumSize = new System.Drawing.Size(UiControl.AdjustForDPI(200), 0),
                     AutoSize = true,
                 });
@@ -456,152 +350,14 @@ namespace GUI.Types.GLViewers
                 AddSlider("Color threshold", colorThreshold / 0.5f, v => colorThreshold = v * 0.5f, _ => $"{colorThreshold:0.00}");
                 AddSlider("Dim unchanged", unchangedDim, v => unchangedDim = v, v => $"{v:P0}");
 
-                UiControl.AddCheckBox("Match exposure", matchExposure, v => matchExposure = v);
-                UiControl.AddCheckBox("Ignore lighting", false, v => SelectRenderMode(v ? "Color" : "Default"));
                 UiControl.AddCheckBox("Freeze foliage sway", freezeFoliage, v =>
                 {
                     freezeFoliage = v;
                     frozenShaderTime = Renderer.Uptime;
                 });
-                UiControl.AddCheckBox("Box the selected change", showFocusedChange, v => showFocusedChange = v);
             }
 
             base.AddUiControls();
-
-            if (Diff == null)
-            {
-                return;
-            }
-
-            var oldName = Path.GetFileNameWithoutExtension((OldRenderer.RendererContext.FileLoader as VrfGuiContext)?.FileName) ?? "old";
-            var newName = Path.GetFileNameWithoutExtension(GuiContext.FileName);
-
-            diffList = new MapDiffListControl(Diff, oldName, newName)
-            {
-                Dock = DockStyle.Right,
-                Width = UiControl.AdjustForDPI(480),
-            };
-            diffList.EntrySelected += (_, entry) => FocusDiffEntry(entry);
-
-            // Docked right of the view rather than in the sidebar, so the list and the world are seen together
-            var container = UiControl.GLControlContainer;
-            container.Controls.Add(diffList);
-            container.Controls.Add(new Splitter { Dock = DockStyle.Right, Width = UiControl.AdjustForDPI(4) });
-            GLControl?.BringToFront();
-        }
-
-        /// <summary>Flies the camera to a difference and selects what it is about, in whichever build has it.</summary>
-        public void FocusDiffEntry(MapDiffEntry entry)
-        {
-            Debug.Assert(SelectedNodeRenderer != null);
-
-            focusedEntry = entry;
-
-            if (entry.NewEntity != null && LoadedWorld != null
-                && FindLoadedEntity(LoadedWorld.Entities, entry.NewEntity) is { } entity && Renderer.FindNode(entity) is { } node)
-            {
-                SelectAndFocusNode(node);
-                return;
-            }
-
-            SelectedNodeRenderer.SelectNode(null);
-
-            var bounds = entry.Bounds;
-
-            // Only the old build has the entity, so its node there is the one to frame
-            if (entry.NewEntity == null && entry.OldEntity != null && OldLoadedWorld != null
-                && FindLoadedEntity(OldLoadedWorld.Entities, entry.OldEntity) is { } oldEntity && OldRenderer.FindNode(oldEntity) is { } oldNode
-                && oldNode.BoundingBox.Size.MaxComponent() >= 1f)
-            {
-                bounds = oldNode.BoundingBox;
-            }
-
-            FocusCameraOnBounds(bounds);
-        }
-
-        /// <summary>
-        /// Finds the entity a scene was loaded from that a compared entity was read from. The comparison reads the
-        /// entity lumps again, so they are equal but not the same objects.
-        /// </summary>
-        private static EntityLump.Entity? FindLoadedEntity(List<EntityLump.Entity> loaded, EntityLump.Entity compared)
-        {
-            var id = compared.GetStringProperty("hammeruniqueid");
-            var classname = compared.GetStringProperty("classname");
-            var origin = compared.GetVector3Property("origin");
-
-            EntityLump.Entity? best = null;
-            var bestDistance = float.MaxValue;
-            var bestMatchesId = false;
-
-            foreach (var entity in loaded)
-            {
-                if (entity.GetStringProperty("classname") != classname)
-                {
-                    continue;
-                }
-
-                var matchesId = id != null && entity.GetStringProperty("hammeruniqueid") == id;
-
-                if (bestMatchesId && !matchesId)
-                {
-                    continue;
-                }
-
-                var distance = Vector3.DistanceSquared(entity.GetVector3Property("origin"), origin);
-
-                if ((matchesId && !bestMatchesId) || distance < bestDistance)
-                {
-                    best = entity;
-                    bestDistance = distance;
-                    bestMatchesId = matchesId;
-                }
-            }
-
-            return best;
-        }
-
-        /// <summary>Boxes the selected difference where it was in red and where it is in green, joined when it moved.</summary>
-        private sealed class ChangeHighlightRenderer(RendererContext rendererContext) : LineDebugRenderer(rendererContext, nameof(ChangeHighlightRenderer))
-        {
-            private static readonly Color32 OldColor = new(1f, 0.3f, 0.3f, 1f);
-            private static readonly Color32 NewColor = new(0.3f, 1f, 0.4f, 1f);
-            private static readonly Color32 PathColor = new(0.4f, 0.7f, 1f, 1f);
-
-            private readonly List<SimpleVertex> vertices = [];
-            private MapDiffEntry? uploaded;
-
-            public void Render(MapDiffEntry? entry)
-            {
-                if (entry == null)
-                {
-                    return;
-                }
-
-                if (entry != uploaded)
-                {
-                    uploaded = entry;
-                    vertices.Clear();
-
-                    if (entry.OldBounds is { } oldBounds)
-                    {
-                        ShapeSceneNode.AddBox(vertices, oldBounds, OldColor);
-                    }
-
-                    if (entry.NewBounds is { } newBounds)
-                    {
-                        ShapeSceneNode.AddBox(vertices, newBounds, NewColor);
-                    }
-
-                    if (entry is { OldBounds: { } from, NewBounds: { } to } && Vector3.Distance(from.Center, to.Center) > 1f)
-                    {
-                        ShapeSceneNode.AddLine(vertices, from.Center, to.Center, PathColor);
-                    }
-
-                    Upload(vertices);
-                }
-
-                RenderLines(disableDepthTest: true);
-            }
         }
 
         private void AddSlider(string name, float initial, Action<float> onChange, Func<float, string> format)

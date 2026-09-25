@@ -333,7 +333,7 @@ namespace GUI.Types.GLViewers
                 var uniqueWorldLayers = new HashSet<string>(4);
                 var uniquePhysicsGroups = new HashSet<string>();
 
-                foreach (var node in NodesForLayerLists)
+                foreach (var node in Renderers.SelectMany(static renderer => renderer.Scene.AllNodes))
                 {
                     if (node.LayerName?.StartsWith("Internal -", StringComparison.Ordinal) == true)
                     {
@@ -621,7 +621,7 @@ namespace GUI.Types.GLViewers
             }
         }
 
-        protected void SelectAndFocusNode(SceneNode node)
+        private void SelectAndFocusNode(SceneNode node)
         {
             ArgumentNullException.ThrowIfNull(node);
 
@@ -664,7 +664,7 @@ namespace GUI.Types.GLViewers
 
         private static AABB PointBounds(Vector3 point) => new(point - new Vector3(32f), point + new Vector3(32f));
 
-        protected void FocusCameraOnBounds(in AABB bbox)
+        private void FocusCameraOnBounds(in AABB bbox)
         {
             var center = bbox.Center;
 
@@ -1117,27 +1117,15 @@ namespace GUI.Types.GLViewers
                 physicsGroups.Remove(PhysicsRenderAsOpaque);
             }
 
-            using var lockedGl = MakeCurrent();
-
-            ShowPhysicsGroups(physicsGroups, renderTranslucent);
-        }
-
-        /// <summary>Gets the nodes whose world layers and physics groups are offered in the sidebar lists.</summary>
-        protected virtual IEnumerable<SceneNode> NodesForLayerLists => Scene.AllNodes;
-
-        /// <summary>Shows the collision of the given physics groups and hides the rest. Called with the GL context current.</summary>
-        protected virtual void ShowPhysicsGroups(HashSet<string> physicsGroups, bool renderTranslucent)
-            => ShowPhysicsGroups(Renderer, physicsGroups, renderTranslucent);
-
-        protected static void ShowPhysicsGroups(ValveResourceFormat.Renderer.Renderer renderer, HashSet<string> physicsGroups, bool renderTranslucent)
-        {
-            foreach (var physNode in renderer.Scene.AllNodes.OfType<PhysSceneNode>())
+            foreach (var physNode in Renderers.SelectMany(static renderer => renderer.Scene.AllNodes).OfType<PhysSceneNode>())
             {
                 physNode.Enabled = physicsGroups.Contains(physNode.PhysGroupName);
                 physNode.IsTranslucentRenderMode = renderTranslucent;
             }
 
-            foreach (var scene in renderer.Scenes)
+            using var lockedGl = MakeCurrent();
+
+            foreach (var scene in Renderers.SelectMany(static renderer => renderer.Scenes))
             {
                 scene.UpdateOctrees();
             }

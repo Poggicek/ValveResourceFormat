@@ -19,6 +19,9 @@ namespace GUI.Types.GLViewers
     internal abstract class GLSceneViewer : GLBaseControl
     {
         public ValveResourceFormat.Renderer.Renderer Renderer { get; internal set; }
+
+        /// <summary>Gets every renderer that the sidebar's render mode, layers and physics groups apply to.</summary>
+        protected virtual IEnumerable<ValveResourceFormat.Renderer.Renderer> Renderers => [Renderer];
         public UserInput Input { get; protected set; }
 
         public ValveResourceFormat.Renderer.TextRenderer TextRenderer { get; protected set; }
@@ -1020,56 +1023,39 @@ namespace GUI.Types.GLViewers
             }
         }
 
-        protected virtual void SetEnabledLayers(HashSet<string> layers)
+        protected void SetEnabledLayers(HashSet<string> layers)
         {
-            foreach (var scene in Renderer.Scenes)
+            foreach (var scene in Renderers.SelectMany(static renderer => renderer.Scenes))
             {
                 scene.SetEnabledLayers(layers);
             }
         }
 
-        /// <summary>Selects a render mode in the render mode list by name, which applies it.</summary>
-        /// <returns>Whether the scene supports the mode.</returns>
-        protected bool SelectRenderMode(string renderMode)
-        {
-            if (renderModeComboBox == null)
-            {
-                return false;
-            }
-
-            var index = renderModes.FindIndex(mode => !mode.IsHeader && mode.Name == renderMode);
-
-            if (index < 0)
-            {
-                return false;
-            }
-
-            renderModeComboBox.SelectedIndex = index;
-            return true;
-        }
-
-        protected virtual void SetRenderMode(string renderMode)
+        private void SetRenderMode(string renderMode)
         {
             Debug.Assert(Picker != null);
             Debug.Assert(SelectedNodeRenderer != null);
 
-            Renderer.ViewBuffer!.Data!.RenderMode = RenderModes.GetShaderId(renderMode);
-
-            Renderer.Postprocess.Enabled = Renderer.ViewBuffer.Data.RenderMode == 0;
-
-            foreach (var scene in Renderer.Scenes)
+            foreach (var renderer in Renderers)
             {
-                scene.EnableCompaction = renderMode != "Meshlets";
+                renderer.ViewBuffer!.Data!.RenderMode = RenderModes.GetShaderId(renderMode);
+
+                renderer.Postprocess.Enabled = renderer.ViewBuffer.Data.RenderMode == 0;
+
+                foreach (var scene in renderer.Scenes)
+                {
+                    scene.EnableCompaction = renderMode != "Meshlets";
+                }
+
+                foreach (var node in renderer.Scenes.SelectMany(static scene => scene.AllNodes))
+                {
+                    node.SetRenderMode(renderMode);
+                }
             }
 
             Picker.SetRenderMode(renderMode);
             QuadOverdrawRenderer?.SetRenderMode(renderMode);
             SelectedNodeRenderer.SetRenderMode(renderMode);
-
-            foreach (var node in Renderer.Scenes.SelectMany(static scene => scene.AllNodes))
-            {
-                node.SetRenderMode(renderMode);
-            }
         }
 
         protected override void OnKeyDown(Keys keyData)

@@ -1,6 +1,7 @@
 #version 460
 
 #include "common/utils.slang"
+#include "common/ViewConstants.slang"
 
 // Composites two builds of a map drawn from the same camera: tonemapped color and resolved opaque depth of each.
 layout (binding = 0) uniform sampler2D g_tNewColor;
@@ -8,9 +9,8 @@ layout (binding = 1) uniform sampler2D g_tOldColor;
 layout (binding = 2) uniform sampler2D g_tNewDepth;
 layout (binding = 3) uniform sampler2D g_tOldDepth;
 
+// New build and old build are drawn without this pass
 #define MODE_DIFF 0
-#define MODE_NEW 1
-#define MODE_OLD 2
 #define MODE_SPLIT 3
 #define MODE_HEATMAP 4
 
@@ -19,8 +19,6 @@ uniform float g_flSplitX = 0.0;
 uniform float g_flDepthTolerance = 1.0;
 uniform float g_flColorThreshold = 0.1;
 uniform float g_flUnchangedDim = 0.6;
-uniform vec4 g_vInvProjRow3;
-uniform vec2 g_vViewportZRange;
 
 const vec3 AddedColor = vec3(0.1, 1.0, 0.2);
 const vec3 RemovedColor = vec3(1.0, 0.1, 0.1);
@@ -31,19 +29,14 @@ out vec4 outputColor;
 bool IsSurface(float depth)
 {
     // The 2D and 3D sky sit in front of the clear depth but behind the scene's own range
-    return depth > g_vViewportZRange.x;
+    return depth > g_flViewportMinZ;
 }
 
 float DistanceFromDepth(float depth)
 {
-    float normalized = RemapValClamped(depth, g_vViewportZRange.x, g_vViewportZRange.y, 0.0, 1.0);
+    float normalized = RemapValClamped(depth, g_flViewportMinZ, g_flViewportMaxZ, 0.0, 1.0);
     float invDistance = fma(normalized, g_vInvProjRow3.z, g_vInvProjRow3.w);
     return 1.0 / max(invDistance, 1e-20);
-}
-
-float Luminance(vec3 color)
-{
-    return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
 
 void main()
@@ -52,18 +45,6 @@ void main()
 
     vec3 newColor = texelFetch(g_tNewColor, pixel, 0).rgb;
     vec3 oldColor = texelFetch(g_tOldColor, pixel, 0).rgb;
-
-    if (g_nMode == MODE_NEW)
-    {
-        outputColor = vec4(newColor, 1.0);
-        return;
-    }
-
-    if (g_nMode == MODE_OLD)
-    {
-        outputColor = vec4(oldColor, 1.0);
-        return;
-    }
 
     if (g_nMode == MODE_SPLIT)
     {
@@ -85,15 +66,14 @@ void main()
     // Depth precision falls off with distance, so the tolerance grows with it
     float tolerance = g_flDepthTolerance + min(newDistance, oldDistance) * 0.001;
 
-    vec3 colorDelta = abs(newColor - oldColor);
-    bool colorChanged = max(colorDelta.r, max(colorDelta.g, colorDelta.b)) > g_flColorThreshold;
+    bool colorChanged = max3(abs(newColor - oldColor)) > g_flColorThreshold;
 
     bool added = newSurface && newDistance + tolerance < oldDistance;
     bool removed = oldSurface && oldDistance + tolerance < newDistance;
 
     if (g_nMode == MODE_HEATMAP)
     {
-        vec3 heat = added ? AddedColor : removed ? RemovedColor : colorChanged ? ChangedColor : vec3(Luminance(newColor) * 0.15);
+        vec3 heat = added ? AddedColor : removed ? RemovedColor : colorChanged ? ChangedColor : vec3(GetLuma(newColor) * 0.15);
         outputColor = vec4(heat, 1.0);
         return;
     }
@@ -115,7 +95,7 @@ void main()
     }
     else
     {
-        vec3 grey = vec3(Luminance(newColor));
+        vec3 grey = vec3(GetLuma(newColor));
         color = mix(newColor, grey, g_flUnchangedDim) * (1.0 - 0.5 * g_flUnchangedDim);
     }
 

@@ -1,4 +1,3 @@
-using ValveKeyValue;
 using ValveResourceFormat.IO;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
@@ -41,49 +40,6 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         /// <param name="inds">The index data for the collision geometry.</param>
         public PhysSceneNode(Scene scene, List<SimpleVertexNormal> verts, List<int> inds) : base(scene, verts, inds)
         {
-        }
-
-        /// <summary>
-        /// Gets the name a collision attribute group is listed by: the entity class it belongs to, or its tool
-        /// texture, interaction tags and collision group.
-        /// </summary>
-        /// <param name="collisionAttributes">One entry of <see cref="PhysAggregateData.CollisionAttributes"/>.</param>
-        /// <param name="classname">The class of the entity the collision belongs to, <see langword="null"/> for the world.</param>
-        public static string GetGroupName(KVObject collisionAttributes, string? classname = null)
-        {
-            if (classname != null)
-            {
-                return classname;
-            }
-
-            var tags = PhysAggregateData.GetInteractAsTags(collisionAttributes);
-            var group = collisionAttributes.GetStringProperty("m_CollisionGroupString");
-            var tooltexture = MapExtract.GetToolTextureShortenedName_ForInteractStrings([.. tags]);
-            var physName = string.Empty;
-
-            if (group != null)
-            {
-                if (group.Equals("default", StringComparison.OrdinalIgnoreCase))
-                {
-                    physName = $"- default";
-                }
-                else if (!group.Equals("conditionallysolid", StringComparison.OrdinalIgnoreCase))
-                {
-                    physName = group;
-                }
-            }
-
-            if (tags.Length > 0)
-            {
-                physName = $"[{string.Join(", ", tags)}]" + physName;
-            }
-
-            if (tooltexture != "nodraw")
-            {
-                physName = $"- {tooltexture} {physName}";
-            }
-
-            return physName;
         }
 
         /// <summary>
@@ -300,8 +256,41 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 }
 
                 var attributes = phys.CollisionAttributes[collisionAttributeIndex];
-                var tooltexture = MapExtract.GetToolTextureShortenedName_ForInteractStrings([.. PhysAggregateData.GetInteractAsTags(attributes)]);
-                var physName = GetGroupName(attributes, classname);
+                var tags = PhysAggregateData.GetInteractAsTags(attributes);
+                var group = attributes.GetStringProperty("m_CollisionGroupString");
+
+                var tooltexture = MapExtract.GetToolTextureShortenedName_ForInteractStrings([.. tags]);
+
+                var physName = string.Empty;
+
+                if (classname != null)
+                {
+                    physName = classname;
+                }
+                else
+                {
+                    if (group != null)
+                    {
+                        if (group.Equals("default", StringComparison.OrdinalIgnoreCase))
+                        {
+                            physName = $"- default";
+                        }
+                        else if (!group.Equals("conditionallysolid", StringComparison.OrdinalIgnoreCase))
+                        {
+                            physName = group;
+                        }
+                    }
+
+                    if (tags.Length > 0)
+                    {
+                        physName = $"[{string.Join(", ", tags)}]" + physName;
+                    }
+
+                    if (tooltexture != "nodraw")
+                    {
+                        physName = $"- {tooltexture} {physName}";
+                    }
+                }
 
                 var physSceneNode = new PhysSceneNode(scene, verts, inds)
                 {
