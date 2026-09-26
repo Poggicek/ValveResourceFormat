@@ -202,6 +202,22 @@ namespace Tests.Renderer
             await Assert.That(result.Entries).IsEmpty();
         }
 
+        /// <summary>Older compilers write booleans as words and vectors in brackets.</summary>
+        [Test]
+        public async Task OlderValueFormatsAreNotDifferences()
+        {
+            var result = MapDiffer.Compute(
+                Load(RiverflowPackage, RiverflowLump, lump =>
+                {
+                    var entity = Entity(lump, "17");
+                    SetKey(entity, "origin", "[384.000000, -5760.000000, 0.000000]");
+                    SetKey(entity, "startdisabled", "true");
+                }),
+                Load(RiverflowPackage, RiverflowLump, lump => SetKey(Entity(lump, "17"), "startdisabled", "1")));
+
+            await Assert.That(result.Entries).IsEmpty();
+        }
+
         [Test]
         public async Task MovedSceneObjectIsReportedAsMovedGeometry()
         {

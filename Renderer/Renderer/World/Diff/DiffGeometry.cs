@@ -103,12 +103,6 @@ internal sealed class DiffDraw
     /// <summary>Gets a hash of the triangles in mesh space that ignores their order.</summary>
     public required ulong ContentHash { get; init; }
 
-    /// <summary>
-    /// Gets a hash of the triangles relative to the corner of their bounds, the same wherever they are. Geometry the
-    /// compiler bakes into world space has no transform, so a prop that moved only matches itself through this.
-    /// </summary>
-    public required ulong ShapeHash { get; init; }
-
     public required AABB Bounds { get; init; }
 
     /// <summary>
@@ -139,17 +133,6 @@ internal sealed class DiffDraw
             max = Vector3.Max(max, Vector3.Max(a, Vector3.Max(b, c)));
         }
 
-        var shapeHash = 0UL;
-
-        for (var i = 0; i + 2 < indices.Length; i += 3)
-        {
-            shapeHash += GridPoint.Triangle(
-                GridPoint.From(positions[indices[i]] - min, inversePrecision),
-                GridPoint.From(positions[indices[i + 1]] - min, inversePrecision),
-                GridPoint.From(positions[indices[i + 2]] - min, inversePrecision),
-                0);
-        }
-
         var triangles = indices.Length / 3;
 
         return new DiffDraw
@@ -158,7 +141,6 @@ internal sealed class DiffDraw
             Positions = positions,
             Indices = indices,
             ContentHash = DiffHash.Combine(contentHash, triangles),
-            ShapeHash = DiffHash.Combine(shapeHash, triangles),
             Bounds = new AABB(min, max),
         };
     }
@@ -187,6 +169,9 @@ internal sealed class DiffModel
     public ulong CollisionHash { get; init; }
 
     public int CollisionTriangleCount { get; init; }
+
+    /// <summary>Gets the collision triangles, three corners each, in model space.</summary>
+    public Vector3[] CollisionTriangles { get; init; } = [];
 
     /// <summary>Gets the bounds of the collision shapes, for brushes like triggers that draw nothing.</summary>
     public AABB? CollisionBounds { get; init; }
@@ -299,6 +284,7 @@ internal sealed class DiffGeometryCache(IFileLoader fileLoader, float precision)
             Bounds = read.Bounds,
             CollisionHash = collision.ContentHash,
             CollisionTriangleCount = collision.TriangleCount,
+            CollisionTriangles = triangles,
             CollisionBounds = collision.Bounds,
         };
     }
@@ -533,7 +519,6 @@ internal sealed class DiffGeometryCache(IFileLoader fileLoader, float precision)
             Positions = draw.Positions,
             Indices = draw.Indices,
             ContentHash = draw.ContentHash,
-            ShapeHash = draw.ShapeHash,
             Bounds = draw.Bounds,
             Tint = tint,
         };

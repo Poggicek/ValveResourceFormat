@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using ValveKeyValue;
 using ValveResourceFormat.ResourceTypes;
+using ValveResourceFormat.Serialization.KeyValues;
 using ValveResourceFormat.Utils;
 
 namespace ValveResourceFormat.Renderer.World.Diff;
@@ -286,6 +287,12 @@ public static class MapDiffer
                 continue;
             }
 
+            // Compared by what they contain below, where a change is reported as geometry or collision
+            if (key == "model" && IsCompiledWithMap(oldEntity.Model) && IsCompiledWithMap(newEntity.Model))
+            {
+                continue;
+            }
+
             if (key == "origin")
             {
                 // Compared where the entity ends up, so a template that moved moves its children too
@@ -334,8 +341,10 @@ public static class MapDiffer
                 significant.Add("model geometry");
             }
 
-            // Clips and triggers are nothing but collision
-            if (oldModel.CollisionHash != newModel.CollisionHash)
+            // Clips and triggers are nothing but collision, which compilers store with enough float noise to need a
+            // closer look than the hash
+            if (oldModel.CollisionHash != newModel.CollisionHash
+                && !SameSurface(oldModel.CollisionTriangles, newModel.CollisionTriangles, options.PositionTolerance))
             {
                 changes.Add(new MapDiffPropertyChange("model collision",
                     string.Create(CultureInfo.InvariantCulture, $"{oldModel.CollisionTriangleCount} triangles"),
@@ -364,6 +373,51 @@ public static class MapDiffer
                 : $"{significant.Distinct().Count()} changes";
 
         return EntityEntry(kind, oldEntity, oldMap, newEntity, newMap, detail, changes);
+    }
+
+    /// <summary>Whether every triangle of each set lies on the surface of the other, as far as a few points on it show.</summary>
+    private static bool SameSurface(Vector3[] a, Vector3[] b, float tolerance)
+    {
+        // Big enough to be worth comparing by the hash alone
+        if ((long)a.Length * b.Length > 9_000_000)
+        {
+            return false;
+        }
+
+        var toleranceSquared = tolerance * tolerance;
+
+        bool OnSurface(Vector3 point, Vector3[] triangles)
+        {
+            for (var i = 0; i + 2 < triangles.Length; i += 3)
+            {
+                if (Vector3.DistanceSquared(point, MathUtils.ClosestPointOnTriangle(point, triangles[i], triangles[i + 1], triangles[i + 2])) <= toleranceSquared)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        bool Covered(Vector3[] triangles, Vector3[] by)
+        {
+            for (var i = 0; i + 2 < triangles.Length; i += 3)
+            {
+                var center = (triangles[i] + triangles[i + 1] + triangles[i + 2]) / 3f;
+
+                if (!OnSurface(center, by)
+                    || !OnSurface(Vector3.Lerp(triangles[i], center, 0.05f), by)
+                    || !OnSurface(Vector3.Lerp(triangles[i + 1], center, 0.05f), by)
+                    || !OnSurface(Vector3.Lerp(triangles[i + 2], center, 0.05f), by))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return Covered(a, b) && Covered(b, a);
     }
 
     private static string Triangles(DiffModel model) => $"{model.Draws.Sum(static draw => draw.TriangleCount)} triangles";
@@ -429,6 +483,15 @@ public static class MapDiffer
             };
 
             values.TryAdd(child.Key, map.Normalize(value));
+        }
+
+        // A brush's model is compiled with the map and named after its Hammer id, which gets renumbered, so the
+        // same brush is known by what its model contains instead
+        if (entity.GetStringProperty("model")?.Replace('\\', '/') is { } model && IsCompiledWithMap(model) && values.ContainsKey("model"))
+        {
+            values["model"] = map.Geometry.Get(model) is { } compiled
+                ? string.Create(CultureInfo.InvariantCulture, $"compiled {DiffHash.Combine(compiled.ContentHash, compiled.CollisionHash):x16}")
+                : "compiled";
         }
 
         return values;
@@ -592,7 +655,6 @@ public static class MapDiffer
             return;
         }
 
-        MatchMovedObjects(oldLeft, newLeft, options, entries);
         cancellationToken.ThrowIfCancellationRequested();
 
         var changed = UnmatchedTriangles(oldLeft, newLeft, options, cancellationToken);
@@ -600,6 +662,11 @@ public static class MapDiffer
 
         // Slivers left over from clipping decals and splitting faces cannot be seen
         changed.RemoveAll(triangle => triangle.Area < options.MinimumTriangleArea);
+
+        // Surfaces only cut up differently go first, or their triangles could be paired with a flush surface of
+        // another collision group or material and reported as having changed it
+        cancellationToken.ThrowIfCancellationRequested();
+        changed = DropCoveredTriangles(changed, options.PositionTolerance);
 
         var restyled = PairRestyledTriangles(changed, 1f / options.VertexPrecision);
 
@@ -611,17 +678,114 @@ public static class MapDiffer
             }
         }
 
-        cancellationToken.ThrowIfCancellationRequested();
-        changed = DropCoveredTriangles(changed, options.PositionTolerance);
-
         // Collision is grouped apart from what is drawn, so a clip placed over a wall is its own change
         var clusters = Cluster([.. changed.Where(static triangle => !triangle.Draw.Owner.IsCollision)], options.ClusterRadius)
             .Concat(Cluster([.. changed.Where(static triangle => triangle.Draw.Owner.IsCollision)], options.ClusterRadius));
 
+        AddGeometryEntries([.. clusters.Where(cluster => cluster.Sum(static triangle => triangle.Area) >= options.MinimumChangeArea)], options, entries);
+    }
+
+    /// <summary>
+    /// Reports the changed regions, pairing one only in the old build with one of the same shape only in the new
+    /// build nearby as something that moved. This runs on what is left once identical triangles have cancelled out:
+    /// the compiler regroups aggregated props between compiles, so whole objects cannot be matched up before that.
+    /// </summary>
+    private static void AddGeometryEntries(List<List<ChangedTriangle>> clusters, MapDiffOptions options, List<MapDiffEntry> entries)
+    {
+        var inversePrecision = 1f / options.VertexPrecision;
+        var pairs = new List<(List<ChangedTriangle> Old, List<ChangedTriangle> New)>();
+
+        MatchNearest(
+            [.. clusters.Where(static cluster => cluster.TrueForAll(static triangle => !triangle.IsNew))],
+            [.. clusters.Where(static cluster => cluster.TrueForAll(static triangle => triangle.IsNew))],
+            cluster => ShapeOf(cluster, inversePrecision),
+            static cluster => BoundsOf(cluster).Center,
+            options.RematchRadius,
+            pairs, [], []);
+
+        var moved = new HashSet<List<ChangedTriangle>>(ReferenceEqualityComparer.Instance);
+
+        foreach (var (oldCluster, newCluster) in pairs)
+        {
+            moved.Add(oldCluster);
+            moved.Add(newCluster);
+            entries.Add(MovedEntry(oldCluster, newCluster));
+        }
+
         foreach (var cluster in clusters)
         {
+            if (moved.Contains(cluster))
+            {
+                continue;
+            }
+
+            // Moved by less than the grouping radius, where it was and where it is are one region
+            List<ChangedTriangle> before = [.. cluster.Where(static triangle => !triangle.IsNew)];
+            List<ChangedTriangle> after = [.. cluster.Where(static triangle => triangle.IsNew)];
+
+            if (before.Count > 0 && after.Count > 0 && ShapeOf(before, inversePrecision) == ShapeOf(after, inversePrecision))
+            {
+                entries.Add(MovedEntry(before, after));
+                continue;
+            }
+
             entries.Add(GeometryEntry(cluster));
         }
+    }
+
+    /// <summary>Hashes a region's triangles and how they look, relative to the corner of its bounds so wherever it is.</summary>
+    private static ulong ShapeOf(List<ChangedTriangle> cluster, float inversePrecision)
+    {
+        var min = BoundsOf(cluster).Min;
+        var hash = 0UL;
+
+        foreach (var triangle in cluster)
+        {
+            hash += GridPoint.Triangle(
+                GridPoint.From(triangle.A - min, inversePrecision),
+                GridPoint.From(triangle.B - min, inversePrecision),
+                GridPoint.From(triangle.C - min, inversePrecision),
+                triangle.Draw.AppearanceSeed);
+        }
+
+        return DiffHash.Combine(hash, cluster.Count);
+    }
+
+    private static AABB BoundsOf(List<ChangedTriangle> cluster)
+    {
+        var bounds = cluster[0].Bounds;
+
+        foreach (var triangle in cluster)
+        {
+            bounds = bounds.Union(triangle.Bounds);
+        }
+
+        return bounds;
+    }
+
+    private static MapDiffEntry MovedEntry(List<ChangedTriangle> oldCluster, List<ChangedTriangle> newCluster)
+    {
+        var oldBounds = BoundsOf(oldCluster);
+        var newBounds = BoundsOf(newCluster);
+        var draw = newCluster[0].Draw;
+        var isCollision = draw.Owner.IsCollision;
+        var distance = Vector3.Distance(oldBounds.Center, newBounds.Center);
+
+        return new MapDiffEntry
+        {
+            Kind = MapDiffKind.Moved,
+            Category = isCollision ? MapDiffCategory.Collision : MapDiffCategory.Geometry,
+            Type = isCollision ? "Collision" : GeometryType(draw.Owner.Model),
+            Name = isCollision ? draw.Material.Trim() : Path.GetFileNameWithoutExtension(draw.Material),
+            Detail = string.Create(CultureInfo.InvariantCulture, $"moved {distance:0} units"),
+            OldBounds = oldBounds,
+            NewBounds = newBounds,
+            Changes =
+            [
+                new("position", FormatVector(oldBounds.Center), FormatVector(newBounds.Center)),
+                new("triangles", oldCluster.Count.ToString(CultureInfo.InvariantCulture), newCluster.Count.ToString(CultureInfo.InvariantCulture)),
+            ],
+        };
     }
 
     /// <summary>The placed draws of each build that have no identical draw in the other.</summary>
@@ -660,73 +824,6 @@ public static class MapDiffer
         }
 
         return (oldLeft, newLeft);
-    }
-
-    /// <summary>
-    /// Pairs objects that are gone from one place with an identical one that appeared nearby, and reports them
-    /// as moved instead of their triangles as removed and added.
-    /// </summary>
-    private static void MatchMovedObjects(List<DiffPlacedDraw> oldLeft, List<DiffPlacedDraw> newLeft, MapDiffOptions options, List<MapDiffEntry> entries)
-    {
-        static List<DiffObject> WhollyUnmatched(List<DiffPlacedDraw> draws)
-            => [.. draws.GroupBy(static draw => draw.Owner).Where(static group => group.Count() == group.Key.Draws.Count).Select(static group => group.Key)];
-
-        var pairs = new List<(DiffObject Old, DiffObject New)>();
-
-        MatchNearest(WhollyUnmatched(oldLeft), WhollyUnmatched(newLeft),
-            static obj => obj.AppearanceHash,
-            static obj => obj.Bounds.Center,
-            options.RematchRadius,
-            pairs, [], []);
-
-        if (pairs.Count == 0)
-        {
-            return;
-        }
-
-        var paired = new HashSet<DiffObject>();
-
-        foreach (var (oldObject, newObject) in pairs)
-        {
-            paired.Add(oldObject);
-            paired.Add(newObject);
-
-            var distance = Vector3.Distance(oldObject.Bounds.Center, newObject.Bounds.Center);
-
-            // Float noise from the recompile, not a change
-            if (distance <= options.PositionTolerance && SameRotationAndScale(oldObject.Transform, newObject.Transform))
-            {
-                continue;
-            }
-
-            entries.Add(new MapDiffEntry
-            {
-                Kind = MapDiffKind.Moved,
-                Category = MapDiffCategory.Geometry,
-                Type = GeometryType(newObject.Model),
-                Name = Path.GetFileNameWithoutExtension(newObject.Model),
-                Detail = distance > options.PositionTolerance ? $"moved {distance:0} units" : "rotated or scaled",
-                OldBounds = oldObject.Bounds,
-                NewBounds = newObject.Bounds,
-                Changes =
-                [
-                    new("position", FormatVector(oldObject.Transform.Translation), FormatVector(newObject.Transform.Translation)),
-                    new("model", oldObject.Model, newObject.Model),
-                ],
-            });
-        }
-
-        oldLeft.RemoveAll(draw => paired.Contains(draw.Owner));
-        newLeft.RemoveAll(draw => paired.Contains(draw.Owner));
-    }
-
-    private static bool SameRotationAndScale(in Matrix4x4 a, in Matrix4x4 b)
-    {
-        const float Tolerance = 1e-3f;
-
-        return MathF.Abs(a.M11 - b.M11) < Tolerance && MathF.Abs(a.M12 - b.M12) < Tolerance && MathF.Abs(a.M13 - b.M13) < Tolerance
-            && MathF.Abs(a.M21 - b.M21) < Tolerance && MathF.Abs(a.M22 - b.M22) < Tolerance && MathF.Abs(a.M23 - b.M23) < Tolerance
-            && MathF.Abs(a.M31 - b.M31) < Tolerance && MathF.Abs(a.M32 - b.M32) < Tolerance && MathF.Abs(a.M33 - b.M33) < Tolerance;
     }
 
     private static string GeometryType(string model) => IsCompiledWithMap(model) ? "World geometry" : "Prop";
@@ -1058,10 +1155,7 @@ public static class MapDiffer
             var before = changed[removed].Draw;
             var after = changed[i].Draw;
 
-            // Tints stored in different spaces by different compilers round a step apart, which is no change
-            var tintDelta = Vector4.Abs(before.Tint - after.Tint);
-            var sameLook = before.Material.Equals(after.Material, StringComparison.OrdinalIgnoreCase)
-                && MathF.Max(MathF.Max(tintDelta.X, tintDelta.Y), MathF.Max(tintDelta.Z, tintDelta.W)) < 4f / 255f;
+            var sameLook = before.Material.Equals(after.Material, StringComparison.OrdinalIgnoreCase) && SameTint(before.Tint, after.Tint);
 
             if (!sameLook)
             {
@@ -1074,6 +1168,29 @@ public static class MapDiffer
         changed.AddRange(remaining);
 
         return restyled;
+    }
+
+    /// <summary>
+    /// Whether two tints are the same one stored differently. Tints stored in different spaces round a step apart,
+    /// and newer compilers store decal tints and alphas as the square root of what older ones did.
+    /// </summary>
+    private static bool SameTint(Vector4 a, Vector4 b)
+    {
+        const float Step = 4f / 255f;
+
+        var rounding = true;
+        var squareRoot = true;
+
+        for (var i = 0; i < 4; i++)
+        {
+            var x = Math.Clamp(a[i], 0f, 1f);
+            var y = Math.Clamp(b[i], 0f, 1f);
+
+            rounding &= MathF.Abs(x - y) < Step;
+            squareRoot &= MathF.Abs(MathF.Sqrt(x) - y) < Step || MathF.Abs(MathF.Sqrt(y) - x) < Step;
+        }
+
+        return rounding || squareRoot;
     }
 
     private static string FormatTint(Vector4 tint)

@@ -21,6 +21,9 @@ public sealed record MapDiffOptions
     /// <summary>Gets the area in square units under which a changed triangle is too thin to see and is ignored.</summary>
     public float MinimumTriangleArea { get; init; } = 0.25f;
 
+    /// <summary>Gets the area in square units a change of geometry or collision has to cover to be reported.</summary>
+    public float MinimumChangeArea { get; init; } = 4f;
+
     /// <summary>Gets how close changed triangles have to be to be reported as one change.</summary>
     public float ClusterRadius { get; init; } = 64f;
 

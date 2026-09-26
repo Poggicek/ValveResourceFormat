@@ -40,9 +40,6 @@ internal sealed class DiffObject
 
     public List<DiffPlacedDraw> Draws { get; } = [];
 
-    /// <summary>Gets a hash of what it looks like, wherever it is placed and however it is turned.</summary>
-    public ulong AppearanceHash { get; set; }
-
     public AABB Bounds { get; set; }
 }
 
@@ -145,7 +142,8 @@ public sealed class MapDiffSource
                 continue;
             }
 
-            var model = entity.GetStringProperty("model") ?? string.Empty;
+            // Older compilers write model paths with either slash
+            var model = entity.GetStringProperty("model")?.Replace('\\', '/') ?? string.Empty;
 
             Entities.Add(new DiffEntity
             {
@@ -154,7 +152,8 @@ public sealed class MapDiffSource
                 Classname = classname,
                 TargetName = entity.FriendlyTargetName ?? string.Empty,
                 Model = model,
-                ModelKey = Normalize(model),
+                // Compiled brush models are named after renumbered ids, so brushes match by class, name and place
+                ModelKey = model.StartsWith("maps/", StringComparison.OrdinalIgnoreCase) ? "compiled" : Normalize(model),
                 UniqueId = entity.GetStringProperty("hammeruniqueid"),
             });
         }
@@ -304,7 +303,6 @@ public sealed class MapDiffSource
 
         var kindHash = DiffHash.Combine(isCollision ? 1UL : 0UL, 0UL);
         var placementHash = HashPlacement(transform);
-        var appearanceHash = kindHash;
         var bounds = default(AABB);
 
         for (var i = 0; i < draws.Count; i++)
@@ -331,13 +329,10 @@ public sealed class MapDiffSource
                 Fingerprint = DiffHash.Combine(DiffHash.Combine(draw.ContentHash, appearanceSeed), placementHash),
             });
 
-            appearanceHash = DiffHash.Combine(DiffHash.Combine(appearanceHash, draw.ShapeHash), appearanceSeed);
-
             var drawBounds = draw.Bounds.Transform(transform);
             bounds = i == 0 ? drawBounds : bounds.Union(drawBounds);
         }
 
-        placed.AppearanceHash = appearanceHash;
         placed.Bounds = bounds;
 
         Objects.Add(placed);
