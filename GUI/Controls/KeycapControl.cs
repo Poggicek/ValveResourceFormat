@@ -47,6 +47,26 @@ namespace GUI.Controls
             }
         }
 
+        /// <summary>
+        /// Whether the keycap is outlined as the binding currently in effect.
+        /// </summary>
+        public bool Highlighted
+        {
+            get => highlighted;
+            set
+            {
+                if (highlighted != value)
+                {
+                    highlighted = value;
+                    Invalidate();
+                }
+            }
+        }
+
+        private bool highlighted;
+
+        private static readonly Color HighlightColor = Color.FromArgb(76, 175, 80);
+
         private const int KeycapPadding = 2;
         private const int SpaceBetweenKeyAndDesc = 4;
         private const int CornerRadius = 3;
@@ -95,7 +115,9 @@ namespace GUI.Controls
             var borderColor = isLight
                 ? ControlPaint.Dark(Themer.CurrentThemeColors.Border, 0.2f)
                 : ControlPaint.Light(Themer.CurrentThemeColors.Border, 0.2f);
-            using var borderPen = new Pen(borderColor, this.AdjustForDPI(1));
+            using var borderPen = Highlighted
+                ? new Pen(HighlightColor, this.AdjustForDPI(2))
+                : new Pen(borderColor, this.AdjustForDPI(1));
             borderPen.Alignment = PenAlignment.Inset;
             graphics.DrawPath(borderPen, path);
 

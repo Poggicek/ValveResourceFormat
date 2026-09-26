@@ -108,7 +108,12 @@ public partial class MainFormBottomPanel : Panel
         }
         else
         {
-            keybindingsPanel.SetKeybindings(keybindings);
+            // When only the highlighted key changed, the keycaps redraw themselves
+            if (!keybindingsPanel.SetKeybindings(keybindings) && keybindingsPanel.Visible)
+            {
+                return;
+            }
+
             keybindingsPanel.Visible = true;
         }
 

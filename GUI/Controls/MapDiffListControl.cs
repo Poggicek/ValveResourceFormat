@@ -14,8 +14,8 @@ namespace GUI.Controls
     internal sealed class MapDiffListControl : UserControl
     {
         private readonly MapDiffResult result;
-        private readonly DataGridView changesGrid;
-        private readonly DataGridView detailsGrid;
+        private readonly BufferedDataGridView changesGrid;
+        private readonly BufferedDataGridView detailsGrid;
         private readonly ThemedTextBox filterTextBox;
         private readonly Dictionary<MapDiffKind, CheckBox> kindFilters = [];
         private readonly Dictionary<MapDiffCategory, CheckBox> categoryFilters = [];
@@ -157,9 +157,21 @@ namespace GUI.Controls
             return checkBox;
         }
 
-        private static DataGridView CreateGrid()
+        /// <summary>
+        /// A grid that paints into a back buffer. Drawing straight to the window is slow while the world is being
+        /// rendered next to it, as every line and string waits on the GPU; scrolling took ~55 ms per step.
+        /// </summary>
+        private sealed class BufferedDataGridView : DataGridView
         {
-            var grid = new DataGridView
+            public BufferedDataGridView()
+            {
+                DoubleBuffered = true;
+            }
+        }
+
+        private static BufferedDataGridView CreateGrid()
+        {
+            var grid = new BufferedDataGridView
             {
                 Dock = DockStyle.Fill,
                 ReadOnly = true,

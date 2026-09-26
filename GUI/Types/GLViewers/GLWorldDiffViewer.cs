@@ -46,7 +46,9 @@ namespace GUI.Types.GLViewers
         private Shader? compositeShader;
 
         private DiffViewMode viewMode = DiffViewMode.Differences;
-        private bool showOldWhileHeld;
+
+        /// <summary>The builds held to peek at, in the order their keys went down, so the last one pressed shows.</summary>
+        private readonly List<DiffViewMode> peekedBuilds = [];
         private bool matchExposure = true;
         private float splitPosition = 0.5f;
         private float depthTolerance = 2f;
@@ -100,6 +102,7 @@ namespace GUI.Types.GLViewers
             set
             {
                 viewMode = value;
+                NotifyViewModeChanged();
 
                 if (viewModeComboBox != null && viewModeComboBox.SelectedIndex != (int)value)
                 {
@@ -108,7 +111,23 @@ namespace GUI.Types.GLViewers
             }
         }
 
-        private DiffViewMode EffectiveViewMode => showOldWhileHeld ? DiffViewMode.OldBuild : viewMode;
+        /// <summary>Gets the view being shown, which is a build while its peek key (Q or E) is held.</summary>
+        public DiffViewMode EffectiveViewMode => peekedBuilds.Count > 0 ? peekedBuilds[^1] : viewMode;
+
+        private DiffViewMode? shownViewMode;
+
+        /// <summary>Refreshes the keybinding bar, which marks the key of the view being shown.</summary>
+        private void NotifyViewModeChanged()
+        {
+            // Holding a peek key repeats the key down, only redraw the bar when the view really changes
+            if (shownViewMode == EffectiveViewMode)
+            {
+                return;
+            }
+
+            shownViewMode = EffectiveViewMode;
+            Program.MainForm.ShowSelectedTabKeybindings();
+        }
 
         protected override bool RequiresSceneDepth => EffectiveViewMode is DiffViewMode.Differences or DiffViewMode.Heatmap;
 
@@ -350,6 +369,19 @@ namespace GUI.Types.GLViewers
 
             var mode = EffectiveViewMode;
 
+            if (peekedBuilds.Count > 0)
+            {
+                // Peeking looks the same as either build's own view, so say which one it is
+                TextRenderer.AddText(new ValveResourceFormat.Renderer.TextRenderer.TextRenderRequest
+                {
+                    X = 8f,
+                    Y = 28f,
+                    Scale = 22f,
+                    Color = mode == DiffViewMode.OldBuild ? ChangeHighlightRenderer.OldColor : ChangeHighlightRenderer.NewColor,
+                    Text = mode == DiffViewMode.OldBuild ? "OLD BUILD" : "NEW BUILD",
+                });
+            }
+
             if (mode == DiffViewMode.NewBuild)
             {
                 base.BlitFramebufferToScreen();
@@ -404,13 +436,35 @@ namespace GUI.Types.GLViewers
 
         protected override void OnKeyDown(Keys keyData)
         {
-            if (keyData == Keys.B)
+            if (PeekedBuild(keyData) is { } build)
             {
-                showOldWhileHeld = true;
+                // Key repeat moves it to the end as well, which keeps the build pressed last on top
+                peekedBuilds.Remove(build);
+                peekedBuilds.Add(build);
+                NotifyViewModeChanged();
+
+                // Q would also fly the camera up, moving it away from what is being compared
+                return;
             }
             else if (keyData == Keys.M)
             {
                 ViewMode = (DiffViewMode)(((int)viewMode + 1) % Enum.GetValues<DiffViewMode>().Length);
+            }
+            else if (keyData == Keys.F1)
+            {
+                ViewMode = DiffViewMode.NewBuild;
+            }
+            else if (keyData == Keys.F2)
+            {
+                ViewMode = DiffViewMode.OldBuild;
+            }
+            else if (keyData == Keys.F3)
+            {
+                ViewMode = DiffViewMode.Differences;
+            }
+            else if (keyData == Keys.F4)
+            {
+                ViewMode = DiffViewMode.Heatmap;
             }
             else if (keyData == Keys.N)
             {
@@ -426,27 +480,44 @@ namespace GUI.Types.GLViewers
 
         protected override void OnKeyUp(Keys keyCode)
         {
-            if (keyCode == Keys.B)
+            if (PeekedBuild(keyCode) is { } build)
             {
-                showOldWhileHeld = false;
+                peekedBuilds.Remove(build);
+                NotifyViewModeChanged();
             }
 
             base.OnKeyUp(keyCode);
+        }
+
+        private static DiffViewMode? PeekedBuild(Keys key) => key switch
+        {
+            Keys.Q => DiffViewMode.OldBuild,
+            Keys.E => DiffViewMode.NewBuild,
+            _ => null,
+        };
+
+        private void ReleasePeekedBuilds()
+        {
+            // Key ups are not seen once focus moves elsewhere
+            peekedBuilds.Clear();
+            NotifyViewModeChanged();
         }
 
         protected override void AddUiControls()
         {
             Debug.Assert(UiControl != null);
 
+            GLControl?.LostFocus += (_, _) => ReleasePeekedBuilds();
+
             using (UiControl.BeginGroup("Compare"))
             {
-                viewModeComboBox = UiControl.AddSelection("View", (_, i) => viewMode = (DiffViewMode)i);
+                viewModeComboBox = UiControl.AddSelection("View", (_, i) => ViewMode = (DiffViewMode)i);
                 viewModeComboBox.Items.AddRange(["Differences", "New build", "Old build", "Split", "Heatmap"]);
                 viewModeComboBox.SelectedIndex = (int)viewMode;
 
                 UiControl.AddControl(new Label
                 {
-                    Text = "Hold B for the old build, M cycles the view, N and Shift+N step through the changes.",
+                    Text = "Hold Q for the old build or E for the new build, and let go to return to the view. M cycles the view, N and Shift+N step through the changes.",
                     MaximumSize = new System.Drawing.Size(UiControl.AdjustForDPI(200), 0),
                     AutoSize = true,
                 });
@@ -563,8 +634,8 @@ namespace GUI.Types.GLViewers
         /// <summary>Boxes the selected difference where it was in red and where it is in green, joined when it moved.</summary>
         private sealed class ChangeHighlightRenderer(RendererContext rendererContext) : LineDebugRenderer(rendererContext, nameof(ChangeHighlightRenderer))
         {
-            private static readonly Color32 OldColor = new(1f, 0.3f, 0.3f, 1f);
-            private static readonly Color32 NewColor = new(0.3f, 1f, 0.4f, 1f);
+            public static readonly Color32 OldColor = new(1f, 0.3f, 0.3f, 1f);
+            public static readonly Color32 NewColor = new(0.3f, 1f, 0.4f, 1f);
             private static readonly Color32 PathColor = new(0.4f, 0.7f, 1f, 1f);
 
             private readonly List<SimpleVertex> vertices = [];

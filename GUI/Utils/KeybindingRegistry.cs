@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Windows.Forms;
 using GUI.Types.Exporter;
 using GUI.Types.GLViewers;
@@ -7,7 +8,8 @@ namespace GUI.Utils
     /// <summary>
     /// Represents a single keybinding with its key combination and description.
     /// </summary>
-    public readonly record struct KeybindingInfo(string KeyCombination, string Description);
+    /// <param name="Highlighted">Whether the binding is the one currently in effect, such as the selected view.</param>
+    public readonly record struct KeybindingInfo(string KeyCombination, string Description, bool Highlighted = false);
 
     /// <summary>
     /// Enum representing different viewer types in the application.
@@ -18,6 +20,7 @@ namespace GUI.Utils
         TextureViewer,
         ModelViewer,
         WorldViewer,
+        WorldDiffViewer,
         ParticleViewer,
         MaterialViewer,
         AudioPlayer,
@@ -69,6 +72,19 @@ namespace GUI.Utils
                 //new("Ctrl+Click", "Multi-select"),
                 //new("Esc", "Deselect"),
                 //new("Del", "Hide"),
+                new("F11", "Fullscreen"),
+                new("Ctrl+C", "Screenshot"),
+            ],
+
+            [ViewerType.WorldDiffViewer] =
+            [
+                new("F1", "New build"),
+                new("F2", "Old build"),
+                new("F3", "Differences"),
+                new("F4", "Heatmap"),
+                new("Q/E", "Peek old/new"),
+                new("N", "Next change"),
+                new("X", "Walk"),
                 new("F11", "Fullscreen"),
                 new("Ctrl+C", "Screenshot"),
             ],
@@ -150,9 +166,36 @@ namespace GUI.Utils
             return contents switch
             {
                 Types.Viewers.Audio => ViewerType.AudioPlayer,
+                Types.Viewers.MapDiff => ViewerType.WorldDiffViewer,
                 //PackageViewer => ViewerType.PackageViewer,
                 _ => ViewerType.Default
             };
+        }
+
+        /// <summary>
+        /// Gets the keybindings for a tab, highlighting the ones that reflect the viewer's current state.
+        /// </summary>
+        /// <param name="tab">The tab page to get keybindings for</param>
+        /// <returns>List of keybindings, or empty list if none defined</returns>
+        public static List<KeybindingInfo> GetKeybindingsForTab(TabPage? tab)
+        {
+            var keybindings = GetKeybindingsForViewer(GetViewerTypeFromTab(tab));
+
+            if (tab?.Tag is not ExportData { DisposableContents: Types.Viewers.MapDiff { Viewer: { } diffViewer } })
+            {
+                return keybindings;
+            }
+
+            var activeKey = diffViewer.EffectiveViewMode switch
+            {
+                GLWorldDiffViewer.DiffViewMode.NewBuild => "F1",
+                GLWorldDiffViewer.DiffViewMode.OldBuild => "F2",
+                GLWorldDiffViewer.DiffViewMode.Differences => "F3",
+                GLWorldDiffViewer.DiffViewMode.Heatmap => "F4",
+                _ => null,
+            };
+
+            return [.. keybindings.Select(binding => binding with { Highlighted = binding.KeyCombination == activeKey })];
         }
 
         /// <summary>

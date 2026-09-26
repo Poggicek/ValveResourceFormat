@@ -453,8 +453,7 @@ namespace GUI
 
         private void UpdateBottomPanelKeybindings()
         {
-            var viewerType = KeybindingRegistry.GetViewerTypeFromTab(mainTabs.SelectedTab);
-            var keybindings = KeybindingRegistry.GetKeybindingsForViewer(viewerType);
+            var keybindings = KeybindingRegistry.GetKeybindingsForTab(mainTabs.SelectedTab);
             mainFormBottomPanel.UpdateKeybindings(keybindings);
         }
 
@@ -463,7 +462,7 @@ namespace GUI
         /// </summary>
         public void ShowPreviewKeybindings(TabPage previewTab)
         {
-            var keybindings = KeybindingRegistry.GetKeybindingsForViewer(KeybindingRegistry.GetViewerTypeFromTab(previewTab));
+            var keybindings = KeybindingRegistry.GetKeybindingsForTab(previewTab);
             mainFormBottomPanel.UpdateKeybindings(keybindings);
         }
 

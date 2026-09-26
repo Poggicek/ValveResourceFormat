@@ -29,6 +29,8 @@ namespace GUI.Types.Viewers
         private RendererContext? oldRendererContext;
         private GLWorldDiffViewer? viewer;
 
+        public GLWorldDiffViewer? Viewer => viewer;
+
         public Task LoadAsync(Stream? stream)
         {
             var (newWorld, newReferences) = LoadWorld(newContext, newMapFile);

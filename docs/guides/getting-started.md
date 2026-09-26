@@ -76,8 +76,10 @@ The list next to the view has every change to entities, static geometry and coll
 | Key | Action |
 |-----|--------|
 | <kbd>N</kbd> / <kbd>Shift</kbd>+<kbd>N</kbd> | Next / previous change |
-| <kbd>B</kbd> (hold) | Show the old build |
+| <kbd>Q</kbd> / <kbd>E</kbd> (hold) | Peek at the old / new build, letting go returns to the view you were in |
 | <kbd>M</kbd> | Cycle the view: differences, new build, old build, split, heatmap |
+| <kbd>F1</kbd> / <kbd>F2</kbd> | New build / old build |
+| <kbd>F3</kbd> / <kbd>F4</kbd> | Differences / heatmap |
 
 ## Exporting Files
 
