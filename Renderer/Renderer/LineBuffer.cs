@@ -47,10 +47,11 @@ namespace ValveResourceFormat.Renderer
 
         /// <summary>Draws the lines, with the object id as instancing base for picking.</summary>
         /// <param name="objectId">Object id used as instancing base for picking.</param>
-        public void Draw(uint objectId = 0)
+        /// <param name="primitive">How the vertices are joined, <see cref="PrimitiveType.Triangles"/> for a triangle list.</param>
+        public void Draw(uint objectId = 0, PrimitiveType primitive = PrimitiveType.Lines)
         {
             VertexArray.Bind(vao, Shader);
-            GL.DrawArraysInstancedBaseInstance(PrimitiveType.Lines, 0, VertexCount, 1, objectId);
+            GL.DrawArraysInstancedBaseInstance(primitive, 0, VertexCount, 1, objectId);
         }
 
         /// <summary>Deletes the GL objects.</summary>

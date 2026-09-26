@@ -663,6 +663,10 @@ public static class MapDiffer
         // Slivers left over from clipping decals and splitting faces cannot be seen
         changed.RemoveAll(triangle => triangle.Area < options.MinimumTriangleArea);
 
+        // Every changed collision surface of both builds, before the ones the other build covers are dropped, to
+        // cut what is still there out of the triangles that are left
+        var collisionSurfaces = new SurfaceIndex([.. changed.Where(static triangle => triangle.Draw.Owner.IsCollision)], options.SurfaceTolerance);
+
         // Surfaces only cut up differently go first, or their triangles could be paired with a flush surface of
         // another collision group or material and reported as having changed it
         cancellationToken.ThrowIfCancellationRequested();
@@ -682,7 +686,7 @@ public static class MapDiffer
         var clusters = Cluster([.. changed.Where(static triangle => !triangle.Draw.Owner.IsCollision)], options.ClusterRadius)
             .Concat(Cluster([.. changed.Where(static triangle => triangle.Draw.Owner.IsCollision)], options.ClusterRadius));
 
-        AddGeometryEntries([.. clusters.Where(cluster => cluster.Sum(static triangle => triangle.Area) >= options.MinimumChangeArea)], options, entries);
+        AddGeometryEntries([.. clusters.Where(cluster => cluster.Sum(static triangle => triangle.Area) >= options.MinimumChangeArea)], options, collisionSurfaces, entries);
     }
 
     /// <summary>
@@ -690,7 +694,7 @@ public static class MapDiffer
     /// build nearby as something that moved. This runs on what is left once identical triangles have cancelled out:
     /// the compiler regroups aggregated props between compiles, so whole objects cannot be matched up before that.
     /// </summary>
-    private static void AddGeometryEntries(List<List<ChangedTriangle>> clusters, MapDiffOptions options, List<MapDiffEntry> entries)
+    private static void AddGeometryEntries(List<List<ChangedTriangle>> clusters, MapDiffOptions options, SurfaceIndex collisionSurfaces, List<MapDiffEntry> entries)
     {
         var inversePrecision = 1f / options.VertexPrecision;
         var pairs = new List<(List<ChangedTriangle> Old, List<ChangedTriangle> New)>();
@@ -729,7 +733,7 @@ public static class MapDiffer
                 continue;
             }
 
-            entries.Add(GeometryEntry(cluster));
+            entries.Add(GeometryEntry(cluster, collisionSurfaces));
         }
     }
 
@@ -785,8 +789,14 @@ public static class MapDiffer
                 new("position", FormatVector(oldBounds.Center), FormatVector(newBounds.Center)),
                 new("triangles", oldCluster.Count.ToString(CultureInfo.InvariantCulture), newCluster.Count.ToString(CultureInfo.InvariantCulture)),
             ],
+            Triangles = CollisionTriangles(oldCluster.Concat(newCluster)),
         };
     }
+
+    private static MapDiffTriangle[] CollisionTriangles(IEnumerable<ChangedTriangle> triangles)
+        => [.. triangles
+            .Where(static triangle => triangle.Draw.Owner.IsCollision)
+            .Select(static triangle => new MapDiffTriangle(triangle.A, triangle.B, triangle.C, triangle.IsNew, triangle.Draw.Material.Trim()))];
 
     /// <summary>The placed draws of each build that have no identical draw in the other.</summary>
     private static (List<DiffPlacedDraw> Old, List<DiffPlacedDraw> New) UnmatchedDraws(MapDiffSource oldMap, MapDiffSource newMap)
@@ -1245,6 +1255,15 @@ public static class MapDiffer
             OldBounds = bounds,
             NewBounds = bounds,
             Changes = changes,
+
+            // The same surface is in both builds, each in its own group
+            Triangles = owner.IsCollision
+                ? [.. cluster.SelectMany(static triangle => (MapDiffTriangle[])
+                    [
+                        new(triangle.A, triangle.B, triangle.C, IsNew: false, triangle.Previous!.Material.Trim()),
+                        new(triangle.A, triangle.B, triangle.C, IsNew: true, triangle.Draw.Material.Trim()),
+                    ])]
+                : [],
         };
     }
 
@@ -1355,7 +1374,7 @@ public static class MapDiffer
         return clusters.Values;
     }
 
-    private static MapDiffEntry GeometryEntry(List<ChangedTriangle> cluster)
+    private static MapDiffEntry GeometryEntry(List<ChangedTriangle> cluster, SurfaceIndex collisionSurfaces)
     {
         AABB? oldBounds = null;
         AABB? newBounds = null;
@@ -1434,6 +1453,7 @@ public static class MapDiffer
             OldBounds = oldBounds,
             NewBounds = newBounds,
             Changes = changes,
+            Triangles = [.. cluster.Where(static triangle => triangle.Draw.Owner.IsCollision).SelectMany(collisionSurfaces.Uncovered)],
         };
     }
 
@@ -1486,5 +1506,232 @@ public static class MapDiffer
 
         unmatchedOld.AddRange(oldItems.Where(item => !used.Contains(item)));
         unmatchedNew.AddRange(newItems.Where(item => !used.Contains(item)));
+    }
+
+    /// <summary>
+    /// The changed triangles of both builds by where they are, to find which part of a triangle the other build has
+    /// no surface over. A clip made taller keeps its old face as part of the new, larger one, so only the part
+    /// above the old face is new.
+    /// </summary>
+    private sealed class SurfaceIndex
+    {
+        private const float CellSize = 128f;
+        private const int MaxCellsPerAxis = 64;
+
+        // More pieces than this and the triangle is kept whole, rather than cut into dust
+        private const int MaxPieces = 64;
+
+        private readonly List<ChangedTriangle> triangles;
+        private readonly float tolerance;
+        private readonly Dictionary<GridPoint, List<int>> cells = [];
+
+        public SurfaceIndex(List<ChangedTriangle> triangles, float tolerance)
+        {
+            this.triangles = triangles;
+            this.tolerance = tolerance;
+
+            for (var i = 0; i < triangles.Count; i++)
+            {
+                foreach (var cell in CellsOf(triangles[i].Bounds))
+                {
+                    if (!cells.TryGetValue(cell, out var list))
+                    {
+                        list = [];
+                        cells.Add(cell, list);
+                    }
+
+                    list.Add(i);
+                }
+            }
+        }
+
+        private IEnumerable<GridPoint> CellsOf(AABB bounds)
+        {
+            var from = CellOf(bounds.Min - new Vector3(tolerance));
+            var to = CellOf(bounds.Max + new Vector3(tolerance));
+
+            for (var x = from.X; x <= Math.Min(to.X, from.X + MaxCellsPerAxis); x++)
+            {
+                for (var y = from.Y; y <= Math.Min(to.Y, from.Y + MaxCellsPerAxis); y++)
+                {
+                    for (var z = from.Z; z <= Math.Min(to.Z, from.Z + MaxCellsPerAxis); z++)
+                    {
+                        yield return new GridPoint(x, y, z);
+                    }
+                }
+            }
+        }
+
+        private static GridPoint CellOf(Vector3 point)
+            => new((int)MathF.Floor(point.X / CellSize), (int)MathF.Floor(point.Y / CellSize), (int)MathF.Floor(point.Z / CellSize));
+
+        /// <summary>The parts of a triangle that no surface of the same group in the other build lies on.</summary>
+        public List<MapDiffTriangle> Uncovered(ChangedTriangle triangle)
+        {
+            var group = triangle.Draw.Material.Trim();
+            var normal = Vector3.Normalize(Vector3.Cross(triangle.B - triangle.A, triangle.C - triangle.A));
+
+            if (!float.IsFinite(normal.X))
+            {
+                return [];
+            }
+
+            List<List<Vector3>> pieces = [[triangle.A, triangle.B, triangle.C]];
+            var bounds = triangle.Bounds;
+            var seen = new HashSet<int>();
+
+            foreach (var cell in CellsOf(bounds))
+            {
+                if (!cells.TryGetValue(cell, out var candidates))
+                {
+                    continue;
+                }
+
+                foreach (var candidate in candidates)
+                {
+                    var other = triangles[candidate];
+
+                    if (other.IsNew == triangle.IsNew || !seen.Add(candidate)
+                        || other.Draw.AppearanceSeed != triangle.Draw.AppearanceSeed
+                        || !Overlaps(bounds, other.Bounds))
+                    {
+                        continue;
+                    }
+
+                    // On the same plane, facing either way: a box face and the face of a neighbour flush with it
+                    var otherNormal = Vector3.Cross(other.B - other.A, other.C - other.A);
+
+                    if (MathF.Abs(Vector3.Dot(Vector3.Normalize(otherNormal), normal)) < 0.999f
+                        || MathF.Abs(Vector3.Dot(other.A - triangle.A, normal)) > tolerance
+                        || MathF.Abs(Vector3.Dot(other.B - triangle.A, normal)) > tolerance
+                        || MathF.Abs(Vector3.Dot(other.C - triangle.A, normal)) > tolerance)
+                    {
+                        continue;
+                    }
+
+                    pieces = Subtract(pieces, other, normal);
+
+                    if (pieces.Count == 0)
+                    {
+                        return [];
+                    }
+
+                    if (pieces.Count > MaxPieces)
+                    {
+                        return [new MapDiffTriangle(triangle.A, triangle.B, triangle.C, triangle.IsNew, group)];
+                    }
+                }
+            }
+
+            var result = new List<MapDiffTriangle>();
+
+            foreach (var piece in pieces)
+            {
+                for (var i = 1; i + 1 < piece.Count; i++)
+                {
+                    result.Add(new MapDiffTriangle(piece[0], piece[i], piece[i + 1], triangle.IsNew, group));
+                }
+            }
+
+            return result;
+        }
+
+        private bool Overlaps(AABB a, AABB b)
+            => a.Min.X <= b.Max.X + tolerance && b.Min.X <= a.Max.X + tolerance
+            && a.Min.Y <= b.Max.Y + tolerance && b.Min.Y <= a.Max.Y + tolerance
+            && a.Min.Z <= b.Max.Z + tolerance && b.Min.Z <= a.Max.Z + tolerance;
+
+        /// <summary>
+        /// Takes a triangle out of convex pieces on its plane: each piece loses what is inside all three edges of
+        /// it, and what is outside one edge is kept as a piece of its own.
+        /// </summary>
+        private List<List<Vector3>> Subtract(List<List<Vector3>> pieces, ChangedTriangle cutter, Vector3 normal)
+        {
+            ReadOnlySpan<Vector3> corners = [cutter.A, cutter.B, cutter.C];
+            Span<(Vector3 Point, Vector3 Inward)> edges = stackalloc (Vector3, Vector3)[3];
+
+            for (var i = 0; i < 3; i++)
+            {
+                var from = corners[i];
+                var to = corners[(i + 1) % 3];
+                var opposite = corners[(i + 2) % 3];
+                var inward = Vector3.Cross(normal, to - from);
+
+                if (Vector3.Dot(opposite - from, inward) < 0f)
+                {
+                    inward = -inward;
+                }
+
+                edges[i] = (from, Vector3.Normalize(inward));
+            }
+
+            var result = new List<List<Vector3>>();
+
+            foreach (var piece in pieces)
+            {
+                var remaining = piece;
+
+                foreach (var (point, inward) in edges)
+                {
+                    // Only what is clearly outside, and everything that could be inside, so a shared edge leaves nothing
+                    var outside = Clip(remaining, point, -inward, -tolerance * 0.5f);
+
+                    if (Area(outside) > 0.01f)
+                    {
+                        result.Add(outside);
+                    }
+
+                    remaining = Clip(remaining, point, inward, tolerance * 0.5f);
+
+                    if (remaining.Count < 3)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// The part of a convex polygon on the side of a plane through <paramref name="point"/> that
+        /// <paramref name="keep"/> points to, with the plane moved out by <paramref name="margin"/>.
+        /// </summary>
+        private static List<Vector3> Clip(List<Vector3> polygon, Vector3 point, Vector3 keep, float margin)
+        {
+            var result = new List<Vector3>(polygon.Count + 1);
+
+            for (var i = 0; i < polygon.Count; i++)
+            {
+                var current = polygon[i];
+                var next = polygon[(i + 1) % polygon.Count];
+                var currentDistance = Vector3.Dot(current - point, keep) + margin;
+                var nextDistance = Vector3.Dot(next - point, keep) + margin;
+
+                if (currentDistance >= 0f)
+                {
+                    result.Add(current);
+                }
+
+                if ((currentDistance >= 0f) != (nextDistance >= 0f))
+                {
+                    result.Add(Vector3.Lerp(current, next, currentDistance / (currentDistance - nextDistance)));
+                }
+            }
+
+            return result;
+        }
+
+        private static float Area(List<Vector3> polygon)
+        {
+            var area = Vector3.Zero;
+
+            for (var i = 1; i + 1 < polygon.Count; i++)
+            {
+                area += Vector3.Cross(polygon[i] - polygon[0], polygon[i + 1] - polygon[0]);
+            }
+
+            return area.Length() * 0.5f;
+        }
     }
 }

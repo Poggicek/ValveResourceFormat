@@ -977,6 +977,43 @@ public class Renderer : ISpawnGroupHost
     }
 
     /// <summary>
+    /// Draws the depth of the main view's translucent layer on its own, as if it were opaque, so where the nearest
+    /// translucent surface, such as collision or glass, is can be compared. Opaque geometry is not drawn and hides
+    /// nothing. Uses the draw lists of the last <see cref="Render(Framebuffer)"/>, so call it after that with the
+    /// same camera.
+    /// </summary>
+    /// <param name="renderContext">The context to draw with, whose framebuffer has a depth attachment.</param>
+    public void RenderTranslucentDepth(Scene.RenderContext renderContext)
+    {
+        if (ViewBuffer == null)
+        {
+            throw new InvalidOperationException("Initialize() must be called before rendering");
+        }
+
+        using var _ = new GLDebugGroup("Translucent Depth");
+
+        // Another renderer sharing the context may have drawn since, with its own buffers in the slots
+        LoadShaderTextures();
+        ViewBuffer.BindBufferBase();
+
+        GL.Viewport(0, 0, renderContext.Framebuffer.Width, renderContext.Framebuffer.Height);
+        renderContext.Framebuffer.BindAndClear();
+
+        var mainView = CollectViews(renderContext.Camera)[0];
+
+        GraphicsContext.RenderState.SetDepthRange(DepthRange.Scene);
+
+        // Translucent materials and shapes take depth writes from the pass, decals still turn them off
+        using var state = GraphicsContext.RenderState.Scope(depthWrite: true, blend: false);
+
+        foreach (var viewState in mainView.States)
+        {
+            DrawThrough(mainView, viewState, ref renderContext);
+            viewState.RenderTranslucentLayer(renderContext);
+        }
+    }
+
+    /// <summary>
     /// Empties the entity world and every scene, leaving the renderer ready to load something else.
     /// </summary>
     public void Clear()

@@ -69,7 +69,7 @@ Both builds are drawn from the same camera and compared pixel by pixel:
 
 A lightmap rebake tints large areas yellow. Tick **Ignore lighting** to compare the unlit colors instead. **Freeze foliage sway** is on by default. It stops foliage swaying in the wind, so it matches in both builds. It also stops anything else shaders animate over time, such as water.
 
-Ticking a group under **Physics Groups** shows that collision in both builds, so clip changes show up in the view too.
+Ticking a group under **Physics Groups** shows that collision in both builds. The collision the list has as changed is marked in the view too: green where it was added, red where it was removed and yellow where a face moved or changed group. A changed face seen through collision that is still there, like the back of a clip whose front did not change, is striped.
 
 The list next to the view has every change to entities, static geometry and collision (like player and grenade clips), with filters and the old and new values of whatever changed. Selecting a change flies the camera to it and boxes it: red where it was, green where it is.
 
@@ -78,7 +78,7 @@ The list next to the view has every change to entities, static geometry and coll
 | <kbd>N</kbd> / <kbd>Shift</kbd>+<kbd>N</kbd> | Next / previous change |
 | <kbd>Q</kbd> / <kbd>E</kbd> (hold) | Peek at the old / new build, letting go returns to the view you were in |
 | <kbd>M</kbd> | Cycle the view: differences, new build, old build, split, heatmap |
-| <kbd>F1</kbd> / <kbd>F2</kbd> | New build / old build |
+| <kbd>F1</kbd> / <kbd>F2</kbd> | Old build / new build |
 | <kbd>F3</kbd> / <kbd>F4</kbd> | Differences / heatmap |
 
 ## Exporting Files

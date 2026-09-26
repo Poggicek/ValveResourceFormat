@@ -78,8 +78,8 @@ namespace GUI.Utils
 
             [ViewerType.WorldDiffViewer] =
             [
-                new("F1", "New build"),
-                new("F2", "Old build"),
+                new("F1", "Old build"),
+                new("F2", "New build"),
                 new("F3", "Differences"),
                 new("F4", "Heatmap"),
                 new("Q/E", "Peek old/new"),
@@ -188,8 +188,8 @@ namespace GUI.Utils
 
             var activeKey = diffViewer.EffectiveViewMode switch
             {
-                GLWorldDiffViewer.DiffViewMode.NewBuild => "F1",
-                GLWorldDiffViewer.DiffViewMode.OldBuild => "F2",
+                GLWorldDiffViewer.DiffViewMode.OldBuild => "F1",
+                GLWorldDiffViewer.DiffViewMode.NewBuild => "F2",
                 GLWorldDiffViewer.DiffViewMode.Differences => "F3",
                 GLWorldDiffViewer.DiffViewMode.Heatmap => "F4",
                 _ => null,

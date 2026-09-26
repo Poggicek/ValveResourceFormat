@@ -38,6 +38,14 @@ public enum MapDiffCategory
 /// <param name="NewValue">The value in the new build, <see langword="null"/> when it has none.</param>
 public readonly record struct MapDiffPropertyChange(string Key, string? OldValue, string? NewValue);
 
+/// <summary>One triangle of a surface that changed, in world space.</summary>
+/// <param name="A">The first corner.</param>
+/// <param name="B">The second corner.</param>
+/// <param name="C">The third corner.</param>
+/// <param name="IsNew">Whether it is in the new build, rather than in the old one.</param>
+/// <param name="Group">The collision group it is in, as the physics groups are listed.</param>
+public readonly record struct MapDiffTriangle(Vector3 A, Vector3 B, Vector3 C, bool IsNew, string Group);
+
 /// <summary>One difference between two builds of a map.</summary>
 public sealed class MapDiffEntry
 {
@@ -70,6 +78,9 @@ public sealed class MapDiffEntry
 
     /// <summary>Gets the individual values that differ.</summary>
     public IReadOnlyList<MapDiffPropertyChange> Changes { get; init; } = [];
+
+    /// <summary>Gets the collision triangles that differ, for collision changes.</summary>
+    public IReadOnlyList<MapDiffTriangle> Triangles { get; init; } = [];
 
     /// <summary>Gets where to look at the change: the new build's bounds, or the old build's when it was removed.</summary>
     public AABB Bounds => NewBounds ?? OldBounds ?? default;

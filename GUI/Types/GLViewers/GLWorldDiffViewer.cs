@@ -43,6 +43,19 @@ namespace GUI.Types.GLViewers
         private Framebuffer? oldFramebuffer;
         private Framebuffer? newTonemapped;
         private Framebuffer? oldTonemapped;
+
+        // Collision is translucent and never in the resolved scene depth, so the triangles the comparison found
+        // changed are drawn on their own: added ones against the new build's depth, removed ones against the old's
+        private Framebuffer? newChangedCollision;
+        private Framebuffer? oldChangedCollision;
+
+        // The nearest translucent surface of each build, to tell a changed face seen through one still there
+        private Framebuffer? newTranslucentDepth;
+        private Framebuffer? oldTranslucentDepth;
+        private LineBuffer? addedCollisionTriangles;
+        private LineBuffer? removedCollisionTriangles;
+        private HashSet<string> shownPhysicsGroups = [];
+        private bool changedCollisionDirty = true;
         private Shader? compositeShader;
 
         private DiffViewMode viewMode = DiffViewMode.Differences;
@@ -52,7 +65,7 @@ namespace GUI.Types.GLViewers
         private bool matchExposure = true;
         private float splitPosition = 0.5f;
         private float depthTolerance = 2f;
-        private float colorThreshold = 0.1f;
+        private float colorThreshold = 0.05f;
         private float unchangedDim = 0.6f;
         private float lastFrameTime;
         private float uptimeBeforeUpdate;
@@ -89,6 +102,12 @@ namespace GUI.Types.GLViewers
             oldFramebuffer?.Delete();
             newTonemapped?.Delete();
             oldTonemapped?.Delete();
+            newChangedCollision?.Delete();
+            oldChangedCollision?.Delete();
+            newTranslucentDepth?.Delete();
+            oldTranslucentDepth?.Delete();
+            addedCollisionTriangles?.Delete();
+            removedCollisionTriangles?.Delete();
 
             base.Dispose();
 
@@ -154,6 +173,21 @@ namespace GUI.Types.GLViewers
 
             oldTonemapped = Framebuffer.Prepare(nameof(oldTonemapped), MainFramebuffer.Width, MainFramebuffer.Height, 0, ImageFormat.RGBA8888, null);
             oldTonemapped.Initialize();
+
+            newChangedCollision = Framebuffer.Prepare(nameof(newChangedCollision), MainFramebuffer.Width, MainFramebuffer.Height, 0, ImageFormat.RGBA8888, MainFramebuffer.DepthFormat);
+            newChangedCollision.Initialize();
+
+            oldChangedCollision = Framebuffer.Prepare(nameof(oldChangedCollision), MainFramebuffer.Width, MainFramebuffer.Height, 0, ImageFormat.RGBA8888, MainFramebuffer.DepthFormat);
+            oldChangedCollision.Initialize();
+
+            newTranslucentDepth = Framebuffer.Prepare(nameof(newTranslucentDepth), MainFramebuffer.Width, MainFramebuffer.Height, 0, null, MainFramebuffer.DepthFormat);
+            newTranslucentDepth.Initialize();
+
+            oldTranslucentDepth = Framebuffer.Prepare(nameof(oldTranslucentDepth), MainFramebuffer.Width, MainFramebuffer.Height, 0, null, MainFramebuffer.DepthFormat);
+            oldTranslucentDepth.Initialize();
+
+            addedCollisionTriangles = new LineBuffer(Scene.RendererContext, nameof(addedCollisionTriangles));
+            removedCollisionTriangles = new LineBuffer(Scene.RendererContext, nameof(removedCollisionTriangles));
 
             compositeShader = Scene.RendererContext.ShaderLoader.LoadShader("map_diff");
             highlightRenderer = new ChangeHighlightRenderer(Scene.RendererContext);
@@ -242,6 +276,10 @@ namespace GUI.Types.GLViewers
             oldFramebuffer?.Resize(w, h, NumSamples);
             newTonemapped?.Resize(w, h);
             oldTonemapped?.Resize(w, h);
+            newChangedCollision?.Resize(w, h);
+            oldChangedCollision?.Resize(w, h);
+            newTranslucentDepth?.Resize(w, h);
+            oldTranslucentDepth?.Resize(w, h);
         }
 
         protected override void OnPaint(float frameTime)
@@ -283,6 +321,9 @@ namespace GUI.Types.GLViewers
         {
             base.ShowPhysicsGroups(physicsGroups, renderTranslucent);
             ShowPhysicsGroups(OldRenderer, physicsGroups, renderTranslucent);
+
+            shownPhysicsGroups = [.. physicsGroups.Select(static group => group.Trim())];
+            changedCollisionDirty = true;
         }
 
         protected override void SetEnabledLayers(HashSet<string> layers)
@@ -349,6 +390,84 @@ namespace GUI.Types.GLViewers
             }
         }
 
+        /// <summary>Uploads the changed triangles of the collision groups being shown, the others would mark nothing visible.</summary>
+        private void UploadChangedCollision()
+        {
+            Debug.Assert(addedCollisionTriangles != null && removedCollisionTriangles != null);
+
+            if (!changedCollisionDirty || Diff == null)
+            {
+                return;
+            }
+
+            changedCollisionDirty = false;
+
+            List<SimpleVertex> added = [];
+            List<SimpleVertex> removed = [];
+
+            foreach (var entry in Diff.Entries)
+            {
+                foreach (var triangle in entry.Triangles)
+                {
+                    if (!shownPhysicsGroups.Contains(triangle.Group))
+                    {
+                        continue;
+                    }
+
+                    var vertices = triangle.IsNew ? added : removed;
+                    vertices.Add(new SimpleVertex(triangle.A, Color32.White));
+                    vertices.Add(new SimpleVertex(triangle.B, Color32.White));
+                    vertices.Add(new SimpleVertex(triangle.C, Color32.White));
+                }
+            }
+
+            addedCollisionTriangles.Upload(added);
+            removedCollisionTriangles.Upload(removed);
+        }
+
+        private static void RenderTranslucentDepth(ValveResourceFormat.Renderer.Renderer renderer, Framebuffer target)
+        {
+            renderer.RenderTranslucentDepth(new Scene.RenderContext
+            {
+                Camera = renderer.Camera,
+                Framebuffer = target,
+                Scene = renderer.Scene,
+                Textures = renderer.Textures,
+            });
+        }
+
+        /// <summary>Marks where changed collision triangles show in front of a build's opaque surfaces.</summary>
+        private static void RenderChangedCollision(ValveResourceFormat.Renderer.Renderer renderer, Framebuffer scene, Framebuffer target, LineBuffer triangles)
+        {
+            using var _ = new GLDebugGroup("Changed Collision");
+
+            var (w, h) = (target.Width, target.Height);
+
+            GL.BlitNamedFramebuffer(scene.FboHandle, target.FboHandle, 0, 0, w, h, 0, 0, w, h, ClearBufferMask.DepthBufferBit, BlitFramebufferFilter.Nearest);
+
+            target.ClearColor = new OpenTK.Mathematics.Color4(0f, 0f, 0f, 0f);
+            target.ClearMask = ClearBufferMask.ColorBufferBit;
+            target.BindAndClear();
+            GL.Viewport(0, 0, w, h);
+
+            if (triangles.VertexCount == 0)
+            {
+                return;
+            }
+
+            // The camera constants the depth was drawn with
+            renderer.ViewBuffer?.BindBufferBase();
+            GraphicsContext.RenderState.SetDepthRange(ValveResourceFormat.Renderer.Renderer.DepthRange.Scene);
+
+            // Collision is often flush with a wall, the bias the physics shapes are drawn with keeps it in front
+            // Writes depth, so the composite knows how far the nearest changed face is
+            using var state = GraphicsContext.RenderState.Scope(cullMode: RsCullMode.None, depthBias: 100, depthBiasClamp: 0.05f, slopeScaledDepthBias: 2f,
+                depthTest: true, depthWrite: true, depthFunc: RsComparison.CloserEqual, blend: false);
+
+            triangles.Shader.Use();
+            triangles.Draw(primitive: PrimitiveType.Triangles);
+        }
+
         /// <summary>Boxes the selected difference, over everything.</summary>
         private void RenderHighlight(Framebuffer framebuffer)
         {
@@ -366,6 +485,9 @@ namespace GUI.Types.GLViewers
         {
             Debug.Assert(MainFramebuffer != null && GLDefaultFramebuffer != null);
             Debug.Assert(oldFramebuffer != null && newTonemapped != null && oldTonemapped != null && compositeShader != null);
+            Debug.Assert(newChangedCollision != null && oldChangedCollision != null);
+            Debug.Assert(newTranslucentDepth != null && oldTranslucentDepth != null);
+            Debug.Assert(addedCollisionTriangles != null && removedCollisionTriangles != null);
 
             var mode = EffectiveViewMode;
 
@@ -401,6 +523,16 @@ namespace GUI.Types.GLViewers
             Renderer.PostprocessRender(MainFramebuffer, newTonemapped);
             OldRenderer.PostprocessRender(oldFramebuffer, oldTonemapped);
 
+            UploadChangedCollision();
+            RenderChangedCollision(Renderer, MainFramebuffer, newChangedCollision, addedCollisionTriangles);
+            RenderChangedCollision(OldRenderer, oldFramebuffer, oldChangedCollision, removedCollisionTriangles);
+
+            if (addedCollisionTriangles.VertexCount > 0 || removedCollisionTriangles.VertexCount > 0)
+            {
+                RenderTranslucentDepth(Renderer, newTranslucentDepth);
+                RenderTranslucentDepth(OldRenderer, oldTranslucentDepth);
+            }
+
             using var _ = new GLDebugGroup("Map Diff Composite");
 
             GLDefaultFramebuffer.Bind(FramebufferTarget.Framebuffer);
@@ -424,6 +556,12 @@ namespace GUI.Types.GLViewers
             compositeShader.SetTexture(1, "g_tOldColor", oldTonemapped.Color);
             compositeShader.SetTexture(2, "g_tNewDepth", Renderer.ResolvedSceneDepth);
             compositeShader.SetTexture(3, "g_tOldDepth", OldRenderer.ResolvedSceneDepth);
+            compositeShader.SetTexture(4, "g_tAddedCollision", newChangedCollision.Color);
+            compositeShader.SetTexture(5, "g_tRemovedCollision", oldChangedCollision.Color);
+            compositeShader.SetTexture(6, "g_tAddedCollisionDepth", newChangedCollision.Depth);
+            compositeShader.SetTexture(7, "g_tRemovedCollisionDepth", oldChangedCollision.Depth);
+            compositeShader.SetTexture(8, "g_tNewTranslucentDepth", newTranslucentDepth.Depth);
+            compositeShader.SetTexture(9, "g_tOldTranslucentDepth", oldTranslucentDepth.Depth);
 
             using var state = GraphicsContext.RenderState.Scope(depthTest: false, depthWrite: false, blend: false);
 
@@ -452,11 +590,11 @@ namespace GUI.Types.GLViewers
             }
             else if (keyData == Keys.F1)
             {
-                ViewMode = DiffViewMode.NewBuild;
+                ViewMode = DiffViewMode.OldBuild;
             }
             else if (keyData == Keys.F2)
             {
-                ViewMode = DiffViewMode.OldBuild;
+                ViewMode = DiffViewMode.NewBuild;
             }
             else if (keyData == Keys.F3)
             {

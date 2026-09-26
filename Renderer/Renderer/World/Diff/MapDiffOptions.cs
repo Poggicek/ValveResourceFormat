@@ -28,6 +28,12 @@ public sealed record MapDiffOptions
     public float ClusterRadius { get; init; } = 64f;
 
     /// <summary>
+    /// Gets how far apart two collision faces can be and still be marked as the same surface. A clip nudged by
+    /// less than this is only marked where it grew past its old faces.
+    /// </summary>
+    public float SurfaceTolerance { get; init; } = 4f;
+
+    /// <summary>
     /// Gets the keyvalues that the map compiler derives from other data, whose changes on their own do not
     /// make an entity count as modified.
     /// </summary>

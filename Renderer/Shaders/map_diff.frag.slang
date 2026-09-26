@@ -2,11 +2,19 @@
 
 #include "common/utils.slang"
 
-// Composites two builds of a map drawn from the same camera: tonemapped color and resolved opaque depth of each.
+// Composites two builds of a map drawn from the same camera: tonemapped color and resolved opaque depth of each,
+// where the collision triangles found added and removed show in front of each build's opaque surfaces, and the
+// nearest translucent surface of each build.
 layout (binding = 0) uniform sampler2D g_tNewColor;
 layout (binding = 1) uniform sampler2D g_tOldColor;
 layout (binding = 2) uniform sampler2D g_tNewDepth;
 layout (binding = 3) uniform sampler2D g_tOldDepth;
+layout (binding = 4) uniform sampler2D g_tAddedCollision;
+layout (binding = 5) uniform sampler2D g_tRemovedCollision;
+layout (binding = 6) uniform sampler2D g_tAddedCollisionDepth;
+layout (binding = 7) uniform sampler2D g_tRemovedCollisionDepth;
+layout (binding = 8) uniform sampler2D g_tNewTranslucentDepth;
+layout (binding = 9) uniform sampler2D g_tOldTranslucentDepth;
 
 #define MODE_DIFF 0
 #define MODE_NEW 1
@@ -41,6 +49,12 @@ float DistanceFromDepth(float depth)
     return 1.0 / max(invDistance, 1e-20);
 }
 
+// Distance to a surface, or effectively infinite where there is none
+float SurfaceDistance(float depth)
+{
+    return IsSurface(depth) ? DistanceFromDepth(depth) : 1e30;
+}
+
 float Luminance(vec3 color)
 {
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
@@ -73,14 +87,8 @@ void main()
         return;
     }
 
-    float newDepth = texelFetch(g_tNewDepth, pixel, 0).r;
-    float oldDepth = texelFetch(g_tOldDepth, pixel, 0).r;
-
-    bool newSurface = IsSurface(newDepth);
-    bool oldSurface = IsSurface(oldDepth);
-
-    float newDistance = newSurface ? DistanceFromDepth(newDepth) : 1e30;
-    float oldDistance = oldSurface ? DistanceFromDepth(oldDepth) : 1e30;
+    float newDistance = SurfaceDistance(texelFetch(g_tNewDepth, pixel, 0).r);
+    float oldDistance = SurfaceDistance(texelFetch(g_tOldDepth, pixel, 0).r);
 
     // Depth precision falls off with distance, so the tolerance grows with it
     float tolerance = g_flDepthTolerance + min(newDistance, oldDistance) * 0.001;
@@ -88,12 +96,47 @@ void main()
     vec3 colorDelta = abs(newColor - oldColor);
     bool colorChanged = max(colorDelta.r, max(colorDelta.g, colorDelta.b)) > g_flColorThreshold;
 
-    bool added = newSurface && newDistance + tolerance < oldDistance;
-    bool removed = oldSurface && oldDistance + tolerance < newDistance;
+    bool added = newDistance + tolerance < oldDistance;
+    bool removed = oldDistance + tolerance < newDistance;
+
+    // Collision is translucent and leaves the opaque depth alone, and compiles triangulate and stack it
+    // differently, so the triangles the comparison found changed say what happened to it. Where both builds
+    // have one, a face moved or changed group.
+    bool behind = false;
+
+    if (!added && !removed)
+    {
+        bool addedCollision = texelFetch(g_tAddedCollision, pixel, 0).a > 0.5;
+        bool removedCollision = texelFetch(g_tRemovedCollision, pixel, 0).a > 0.5;
+
+        added = addedCollision && !removedCollision;
+        removed = removedCollision && !addedCollision;
+        colorChanged = colorChanged || (addedCollision && removedCollision);
+
+        // A changed face seen through a translucent surface of its build that is nearer, like the back face of a
+        // clip whose front did not change, is behind it rather than all of the clip
+        if (addedCollision || removedCollision)
+        {
+            float markDistance = SurfaceDistance(addedCollision
+                ? texelFetch(g_tAddedCollisionDepth, pixel, 0).r
+                : texelFetch(g_tRemovedCollisionDepth, pixel, 0).r);
+            float nearest = SurfaceDistance(addedCollision
+                ? texelFetch(g_tNewTranslucentDepth, pixel, 0).r
+                : texelFetch(g_tOldTranslucentDepth, pixel, 0).r);
+
+            // Both come from the same faces drawn the same way, so a clip only a couple of units thick still counts
+            behind = nearest + 0.25 + nearest * 0.0005 < markDistance;
+        }
+    }
+
+    // Behind is drawn in stripes, which read as seen through what is in front
+    float stripes = step(0.5, fract((gl_FragCoord.x + gl_FragCoord.y) / 12.0));
+    float markStrength = behind ? 0.55 * stripes : 0.55;
 
     if (g_nMode == MODE_HEATMAP)
     {
         vec3 heat = added ? AddedColor : removed ? RemovedColor : colorChanged ? ChangedColor : vec3(Luminance(newColor) * 0.15);
+        heat = behind && stripes < 0.5 ? heat * 0.35 : heat;
         outputColor = vec4(heat, 1.0);
         return;
     }
@@ -102,12 +145,12 @@ void main()
 
     if (added)
     {
-        color = mix(newColor, AddedColor, 0.55);
+        color = mix(newColor, AddedColor, markStrength);
     }
     else if (removed)
     {
         // Show what used to be there
-        color = mix(oldColor, RemovedColor, 0.55);
+        color = mix(oldColor, RemovedColor, markStrength);
     }
     else if (colorChanged)
     {
