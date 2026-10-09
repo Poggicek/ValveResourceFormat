@@ -1,11 +1,14 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Windows.Forms;
 using GUI.Controls;
+using GUI.Forms;
 using GUI.Utils;
 using ValveResourceFormat.Blocks;
 using ValveResourceFormat.Particles;
+using ValveResourceFormat.Particles.Debugging;
 using ValveResourceFormat.Particles.Upgrade;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.Particles;
@@ -51,6 +54,24 @@ namespace GUI.Types.GLViewers
         private float screenSize = SnapshotParticleSystem.DefaultScreenSize;
         private bool ShowRenderBounds { get; set; }
 
+        private ParticleDebugSession? debugSession;
+        private ParticleDebuggerForm? debuggerForm;
+        private ParticleDebugRenderer? debugRenderer;
+
+        internal ParticleSceneNode? ParticleNode => particleSceneNode;
+
+        /// <summary>Whether the simulation overlay is drawn over the scene.</summary>
+        internal bool ShowDebugOverlay { get; set; }
+
+        internal bool ShowDebugVelocity { get; set; } = true;
+        internal bool ShowDebugControlPoints { get; set; } = true;
+
+        /// <summary>The system whose particle the overlay picks out.</summary>
+        internal ParticleSystemSimulation? DebugSelectedSystem { get; set; }
+
+        /// <summary>The <see cref="Particle.UniqueParticleId"/> of the particle the overlay picks out.</summary>
+        internal int DebugSelectedParticleId { get; set; } = -1;
+
         public GLParticleViewer(VrfGuiContext vrfGuiContext, RendererContext rendererContext, ParticleSystem particleSystem, ParticleSnapshot? particleSnapshot = null)
             : base(vrfGuiContext, rendererContext, Frustum.CreateEmpty())
         {
@@ -60,6 +81,12 @@ namespace GUI.Types.GLViewers
 
         public override void Dispose()
         {
+            debuggerForm?.Close();
+
+            // Delete GL resources before the base disposes the GL context
+            debugRenderer?.Delete();
+            debugRenderer = null;
+
             base.Dispose();
 
             slowmodeTrackBar?.Dispose();
@@ -165,8 +192,9 @@ namespace GUI.Types.GLViewers
                     return;
                 }
 
-                particleSceneNode.IsPaused = !particleSceneNode.IsPaused;
-                pauseButton.Text = particleSceneNode.IsPaused ? "Resume" : "Pause";
+                using var lockedGl = MakeCurrent();
+                debugSession?.Continue();
+                SetPaused(!particleSceneNode.IsPaused);
             };
 
             endCapButton = new ThemedButton
@@ -233,9 +261,114 @@ namespace GUI.Types.GLViewers
                 }
             }
 
+            using (UiControl.BeginGroup("Debugging"))
+            {
+                var debuggerButton = new ThemedButton
+                {
+                    Text = "Open Debugger",
+                    AutoSize = true,
+                };
+                debuggerButton.Click += (_, _) => OpenDebugger();
+                UiControl.AddControl(debuggerButton);
+            }
+
             AddOperatorTree();
 
             base.AddUiControls();
+        }
+
+        private void OpenDebugger()
+        {
+            if (debuggerForm != null)
+            {
+                debuggerForm.Activate();
+                return;
+            }
+
+            if (particleSceneNode == null)
+            {
+                return;
+            }
+
+            debugSession = new ParticleDebugSession();
+
+            using (MakeCurrent())
+            {
+                particleSceneNode.ParticleSimulation.AttachDebugSession(debugSession);
+            }
+
+            ShowDebugOverlay = true;
+
+            debuggerForm = new ParticleDebuggerForm(this, debugSession);
+            debuggerForm.FormClosed += (_, _) => CloseDebugger();
+            debuggerForm.Show(Program.MainForm);
+        }
+
+        private void CloseDebugger()
+        {
+            debuggerForm = null;
+            debugSession = null;
+            ShowDebugOverlay = false;
+            DebugSelectedSystem = null;
+            DebugSelectedParticleId = -1;
+
+            RunLocked(() => particleSceneNode?.ParticleSimulation.AttachDebugSession(null));
+        }
+
+        /// <summary>Runs <paramref name="action"/> while the render loop is held off, so it can touch the scene.</summary>
+        internal void RunLocked(Action action)
+        {
+            if (GraphicsContext == null)
+            {
+                return;
+            }
+
+            using var lockedGl = MakeCurrent();
+            action();
+        }
+
+        /// <summary>Pauses or resumes the effect.</summary>
+        internal void SetPaused(bool paused)
+        {
+            particleSceneNode?.IsPaused = paused;
+            RefreshPauseButton();
+        }
+
+        /// <summary>Makes the pause button match the effect, which a debugger break can pause.</summary>
+        internal void RefreshPauseButton()
+        {
+            pauseButton?.Text = particleSceneNode?.IsPaused == true ? "Resume" : "Pause";
+        }
+
+        protected override void RenderDebugLines(Scene.RenderContext renderContext)
+        {
+            if (!ShowDebugOverlay || particleSceneNode == null)
+            {
+                return;
+            }
+
+            debugRenderer ??= new ParticleDebugRenderer(Scene.RendererContext);
+            debugRenderer.ShowVelocity = ShowDebugVelocity;
+            debugRenderer.ShowControlPoints = ShowDebugControlPoints;
+
+            var root = particleSceneNode.ParticleSimulation;
+            debugRenderer.Render(root, DebugSelectedSystem, DebugSelectedParticleId);
+
+            if (!ShowDebugControlPoints)
+            {
+                return;
+            }
+
+            var controlPoints = new SortedList<int, ControlPoint>();
+            root.RenderState.CollectControlPoints(controlPoints);
+
+            foreach (var (index, point) in controlPoints)
+            {
+                if (float.IsFinite(point.Position.LengthSquared()))
+                {
+                    DrawWorldSpaceText(string.Create(CultureInfo.InvariantCulture, $"CP{index}"), 4f, point.Position + new Vector3(0f, 0f, 6f), new Color32(1f, 0.3f, 1f, 1f), renderContext);
+                }
+            }
         }
 
         private void AddOperatorTree()

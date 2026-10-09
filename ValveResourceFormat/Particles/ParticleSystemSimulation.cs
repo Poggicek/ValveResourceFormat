@@ -5,6 +5,7 @@ using ValveKeyValue;
 using ValveResourceFormat.Blocks;
 using ValveResourceFormat.IO;
 using ValveResourceFormat.Particles.Constraints;
+using ValveResourceFormat.Particles.Debugging;
 using ValveResourceFormat.Particles.Emitters;
 using ValveResourceFormat.Particles.ForceGenerators;
 using ValveResourceFormat.Particles.Initializers;
@@ -271,14 +272,14 @@ namespace ValveResourceFormat.Particles
 
             IReadOnlyList<KVObject> Functions(string key) => rootData.GetArray(key) ?? [];
 
-            SetupFunctions(Functions("m_Emitters"), ParticleControllerFactory.TryCreateEmitter, emitters, "emitter");
-            SetupFunctions(Functions("m_Initializers"), ParticleControllerFactory.TryCreateInitializer, initializers, "initializer");
-            SetupFunctions(Functions("m_ForceGenerators"), ParticleControllerFactory.TryCreateForceGenerator, ForceGenerators, "force generator");
-            SetupFunctions(Functions("m_Operators"), ParticleControllerFactory.TryCreateOperator, operators, "operator");
-            SetupFunctions(Functions("m_Constraints"), ParticleControllerFactory.TryCreateConstraint, constraints, "constraint");
+            SetupFunctions(Functions("m_Emitters"), ParticleControllerFactory.TryCreateEmitter, emitters, ParticleFunctionStage.Emitter, "emitter");
+            SetupFunctions(Functions("m_Initializers"), ParticleControllerFactory.TryCreateInitializer, initializers, ParticleFunctionStage.Initializer, "initializer");
+            SetupFunctions(Functions("m_ForceGenerators"), ParticleControllerFactory.TryCreateForceGenerator, ForceGenerators, ParticleFunctionStage.ForceGenerator, "force generator");
+            SetupFunctions(Functions("m_Operators"), ParticleControllerFactory.TryCreateOperator, operators, ParticleFunctionStage.Operator, "operator");
+            SetupFunctions(Functions("m_Constraints"), ParticleControllerFactory.TryCreateConstraint, constraints, ParticleFunctionStage.Constraint, "constraint");
             constraintPasses = ReadConstraintPasses(Functions("m_Operators"));
 
-            SetupFunctions(Functions("m_PreEmissionOperators"), ParticleControllerFactory.TryCreatePreEmissionOperator, preEmissionOperators, "pre-emission operator");
+            SetupFunctions(Functions("m_PreEmissionOperators"), ParticleControllerFactory.TryCreatePreEmissionOperator, preEmissionOperators, ParticleFunctionStage.PreEmissionOperator, "pre-emission operator");
 
             SetupChildParticles(Functions("m_Children"));
 
@@ -371,31 +372,39 @@ namespace ValveResourceFormat.Particles
 
         private delegate bool TryCreateFunction<T>(string className, KVObject data, ILogger logger, int behaviorVersion, [MaybeNullWhen(false)] out T result);
 
-        private void SetupFunctions<T>(IEnumerable<KVObject> data, TryCreateFunction<T> tryCreate, List<T> target, string label)
+        private void SetupFunctions<T>(IEnumerable<KVObject> data, TryCreateFunction<T> tryCreate, List<T> target, ParticleFunctionStage stage, string label)
+            where T : ParticleFunction
         {
             var definitionIndex = 0;
 
             foreach (var info in data)
             {
+                var className = info.GetStringProperty("_class");
+
                 if (IsOperatorDisabled(info, logger))
                 {
+                    debugFunctions.Add(new ParticleDebugFunction(stage, className, definitionIndex, info, ParticleFunctionStatus.Disabled));
                     definitionIndex++;
                     continue;
                 }
 
-                var className = info.GetStringProperty("_class");
-                if (tryCreate(className, info, logger, BehaviorVersion, out var function))
+                var log = new ParticleFunctionLog(logger);
+
+                if (tryCreate(className, info, log, BehaviorVersion, out var function))
                 {
                     if (function is ParticleFunctionInitializer initializer)
                     {
                         initializer.DefinitionIndex = definitionIndex;
                     }
 
+                    function.DebugFunction = new ParticleDebugFunction(stage, className, definitionIndex, info, ParticleFunctionStatus.Active, function, log);
+                    debugFunctions.Add(function.DebugFunction);
                     target.Add(function);
                 }
                 else
                 {
                     logger.LogUniqueWarningFor([label, className], UnsupportedClassWarning, label, className, Name);
+                    debugFunctions.Add(new ParticleDebugFunction(stage, className, definitionIndex, info, ParticleFunctionStatus.Unsupported));
                 }
 
                 definitionIndex++;

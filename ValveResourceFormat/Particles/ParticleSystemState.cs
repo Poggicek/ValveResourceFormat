@@ -214,6 +214,35 @@ namespace ValveResourceFormat.Particles
             return Data?.GetControlPointSnapshot(cp) ?? ParentSystem?.GetControlPointSnapshot(cp);
         }
 
+        /// <summary>
+        /// Adds every control point this system can see to <paramref name="destination"/> by index: the
+        /// ones it reads from its parent, replaced by its own overrides. Unlike
+        /// <see cref="GetControlPoint"/> this creates none.
+        /// </summary>
+        /// <param name="destination">Receives the control points.</param>
+        public void CollectControlPoints(IDictionary<int, ControlPoint> destination)
+        {
+            if (ParentSystem != null)
+            {
+                ParentSystem.CollectControlPoints(destination);
+            }
+            else
+            {
+                foreach (var (index, point) in controlPoints)
+                {
+                    destination[index] = point;
+                }
+            }
+
+            if (controlPointOverrides != null)
+            {
+                foreach (var (index, point) in controlPointOverrides)
+                {
+                    destination[index] = point;
+                }
+            }
+        }
+
         /// <summary>Highest control point index this system has touched; some emitters scale their rate by it.</summary>
         public int HighestControlPoint { get; private set; }
 

@@ -2,6 +2,7 @@ using System.Linq;
 using ValveKeyValue;
 using ValveResourceFormat.Blocks;
 using ValveResourceFormat.Particles;
+using ValveResourceFormat.Particles.Debugging;
 using ValveResourceFormat.Renderer.Particles.Renderers;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
@@ -93,24 +94,42 @@ namespace ValveResourceFormat.Renderer.Particles
 
         private void SetupRenderers(IReadOnlyList<KVObject> rendererData, Scene scene)
         {
-            foreach (var rendererInfo in rendererData)
+            for (var i = 0; i < rendererData.Count; i++)
             {
-                var parse = new ParticleDefinitionParser(rendererInfo, rendererContext.Logger, Simulation.BehaviorVersion);
+                var rendererInfo = rendererData[i];
+                var rendererClass = rendererInfo.GetStringProperty("_class");
+                var log = new ParticleFunctionLog(rendererContext.Logger);
+                var parse = new ParticleDefinitionParser(rendererInfo, log, Simulation.BehaviorVersion);
 
                 if (parse.Boolean("m_bDisableOperator", default))
                 {
+                    Simulation.AddDebugFunction(new ParticleDebugFunction(ParticleFunctionStage.Renderer, rendererClass, i, rendererInfo, ParticleFunctionStatus.Disabled));
                     continue;
                 }
 
-                var rendererClass = rendererInfo.GetStringProperty("_class");
                 var renderer = ParticleRendererFactory.Create(rendererClass, parse, rendererContext, scene);
 
                 if (renderer == null)
                 {
                     rendererContext.Logger.LogUniqueWarningFor(["renderer", rendererClass], UnsupportedClassWarning, "renderer", rendererClass, Simulation.Name);
+                    Simulation.AddDebugFunction(new ParticleDebugFunction(ParticleFunctionStage.Renderer, rendererClass, i, rendererInfo, ParticleFunctionStatus.Unsupported));
                     continue;
                 }
 
+                // A renderer that only draws into the bloom pass is built but never drawn, since that pass is missing.
+                var status = renderer.OnlyRenderInEffectsBloomPass ? ParticleFunctionStatus.Unsupported : ParticleFunctionStatus.Active;
+
+                renderer.DebugFunction = new ParticleDebugFunction(ParticleFunctionStage.Renderer, rendererClass, i, rendererInfo, status, renderer, log)
+                {
+                    Note = renderer switch
+                    {
+                        { OnlyRenderInEffectsBloomPass: true } => "only draws in the bloom pass, which is not implemented",
+                        { OnlyRenderInEffectsWaterPass: true } => "draws in the water effects pass",
+                        _ => $"draws in the {renderer.Pass} pass",
+                    },
+                };
+
+                Simulation.AddDebugFunction(renderer.DebugFunction);
                 renderers.Add(renderer);
             }
         }

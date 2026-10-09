@@ -103,12 +103,14 @@ namespace ValveResourceFormat.Particles
 
                 if (childResource == null)
                 {
+                    skippedChildren.Add($"{childName}: file not found");
                     continue;
                 }
 
                 if (IsSelfOrAncestor(childResource.FileName))
                 {
                     logger.LogUniqueWarning("Skipped child {Child} of particle system {File}, because it is that system or one of its parents", childName, Name);
+                    skippedChildren.Add($"{childName}: it is this system or one of its parents");
                     continue;
                 }
 

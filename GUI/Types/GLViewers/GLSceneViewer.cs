@@ -624,6 +624,11 @@ namespace GUI.Types.GLViewers
             }, renderContext.Camera, depthMask: true);
         }
 
+        /// <summary>Draws a viewer's own debug lines over the scene, along with the other line overlays.</summary>
+        protected virtual void RenderDebugLines(Scene.RenderContext renderContext)
+        {
+        }
+
         protected override void BlitFramebufferToScreen()
         {
             Debug.Assert(MainFramebuffer != null);
@@ -751,6 +756,8 @@ namespace GUI.Types.GLViewers
                     physicsTraceRenderer ??= new PhysicsTraceDebugRenderer(Scene.RendererContext);
                     physicsTraceRenderer.Render(Renderer.EntitySystem.PhysicsWorld, Input, Renderer.Camera);
                 }
+
+                RenderDebugLines(renderContext);
 
                 if (ShowBaseGrid && baseGrid != null)
                 {

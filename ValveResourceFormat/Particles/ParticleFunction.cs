@@ -27,6 +27,15 @@ namespace ValveResourceFormat.Particles
         readonly bool StrengthFastPath;
         protected readonly ILogger Logger;
 
+        /// <summary>
+        /// Whether the debugger has switched this function off. A bypassed function reports a zero run
+        /// strength and is never in its phase, so every walk skips it.
+        /// </summary>
+        public bool Bypassed { get; set; }
+
+        /// <summary>How the debugger describes this function. Set by whatever builds it.</summary>
+        public Debugging.ParticleDebugFunction? DebugFunction { get; set; }
+
         public ParticleFunction(ParticleDefinitionParser parse)
         {
             Logger = parse.Logger;
@@ -62,14 +71,14 @@ namespace ValveResourceFormat.Particles
         /// in. Walks with no operator strength to evaluate, such as the initializers, test this alone.
         /// </summary>
         public bool RunsInCurrentPhase(ParticleSystemState systemState)
-            => opEndCapState == ParticleEndCapMode.PARTICLE_ENDCAP_ALWAYS_ON
-                || systemState.InEndCap == (opEndCapState == ParticleEndCapMode.PARTICLE_ENDCAP_ENDCAP_ON);
+            => !Bypassed && (opEndCapState == ParticleEndCapMode.PARTICLE_ENDCAP_ALWAYS_ON
+                || systemState.InEndCap == (opEndCapState == ParticleEndCapMode.PARTICLE_ENDCAP_ENDCAP_ON));
 
         public float GetOperatorRunStrength(ParticleSystemState systemState) // CheckIfOperatorShouldRun
         {
             if (StrengthFastPath)
             {
-                return 1f;
+                return Bypassed ? 0f : 1f;
             }
 
             if (!RunsInCurrentPhase(systemState))

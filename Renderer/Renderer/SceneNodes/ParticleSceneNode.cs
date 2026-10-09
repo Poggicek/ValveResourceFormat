@@ -22,6 +22,9 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
         internal IEnumerable<ParticleFunctionRenderer> Renderers => particleRenderer.EnumerateRenderers();
 
+        /// <summary>The simulation of the root system, for inspecting and debugging it.</summary>
+        public ParticleSystemSimulation ParticleSimulation => particleRenderer.Simulation;
+
         /// <summary>
         /// Gets the preview model scene node loaded from particle preview state, if any.
         /// </summary>
@@ -39,6 +42,15 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         /// the simulation.
         /// </summary>
         public bool IsPaused { get; set; }
+
+        private float pendingStep;
+
+        /// <summary>
+        /// Advances the effect by a single step of <paramref name="seconds"/> at its next update while it
+        /// is <see cref="IsPaused"/>.
+        /// </summary>
+        /// <param name="seconds">How much time the step covers.</param>
+        public void Step(float seconds) => pendingStep = seconds;
 
         /// <summary>
         /// Whether to load preview control point state, and loop playback when finished.
@@ -626,7 +638,13 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
             if (IsPaused)
             {
-                return;
+                if (pendingStep <= 0f)
+                {
+                    return;
+                }
+
+                frameTime = pendingStep;
+                pendingStep = 0f;
             }
 
             if (frameTime > 0f && (Preview || particleRenderer.IsWithinDrawDistance(context.Camera)))
@@ -634,6 +652,12 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 particleRenderer.SetCameraPosition(context.Camera.Location);
                 particleRenderer.Update(frameTime, context.Uptime);
                 stepped = true;
+
+                // A debugger watching for a bad value stops on the frame that produced it
+                if (ParticleSimulation.Trace?.Session.Break != null)
+                {
+                    IsPaused = true;
+                }
 
                 if (!Preview)
                 {

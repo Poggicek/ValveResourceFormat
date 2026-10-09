@@ -1,3 +1,4 @@
+using ValveResourceFormat.Particles.Debugging;
 using ValveResourceFormat.Particles.Utils;
 
 namespace ValveResourceFormat.Particles
@@ -139,14 +140,21 @@ namespace ValveResourceFormat.Particles
             particleCollection.Current[index].CreationTime = systemState.Age - ageAtSpawn;
             particleCollection.Current[index].Age = ageAtSpawn;
 
+            var trace = Trace;
+            trace?.BeginSpawn(in particleCollection.Current[index], initializers.Count);
+
             // Below behavior version 6 the first writer of an attribute wins: a later initializer whose
             // declared write set is already fully initialized is skipped, up to firstMultipleOverride.
             var written = SpawnWrittenFields;
 
-            foreach (var initializer in initializers)
+            for (var i = 0; i < initializers.Count; i++)
             {
+                var initializer = initializers[i];
+
                 if (!initializer.RunsInCurrentPhase(systemState))
                 {
+                    trace?.RecordInitializer(i, initializer, in particleCollection.Current[index],
+                        initializer.Bypassed ? ParticleSpawnOutcome.Bypassed : ParticleSpawnOutcome.NotInPhase);
                     continue;
                 }
 
@@ -156,11 +164,14 @@ namespace ValveResourceFormat.Particles
                     && (firstMultipleOverride < 0 || initializer.DefinitionIndex < firstMultipleOverride)
                     && (fields & ~written) == 0)
                 {
+                    trace?.RecordInitializer(i, initializer, in particleCollection.Current[index], ParticleSpawnOutcome.AlreadyWritten);
                     continue;
                 }
 
                 initializer.Initialize(ref particleCollection.Current[index], particleCollection, systemState);
                 written |= fields;
+
+                trace?.RecordInitializer(i, initializer, in particleCollection.Current[index], ParticleSpawnOutcome.Ran);
             }
 
             // The initial velocity is encoded into the Verlet state at spawn (prev = pos - vel*dt);
@@ -172,6 +183,8 @@ namespace ValveResourceFormat.Particles
             // particle's initial value (fade out/in, radius interpolation) read the initialized value rather
             // than the default template.
             particleCollection.Initial[index] = emitted;
+
+            trace?.EndSpawn(in emitted, systemState.Age);
         }
 
         /// <summary>Stops emission on the system and its children, leaving live particles to finish.</summary>
@@ -310,6 +323,7 @@ namespace ValveResourceFormat.Particles
         private void ClearParticles()
         {
             particleCollection.Clear();
+            Trace?.Clear();
             systemState.ParticleCount = 0;
             particlesEmitted = 0;
 
@@ -485,29 +499,29 @@ namespace ValveResourceFormat.Particles
                 particle.Age = systemState.Age - particle.CreationTime;
             }
 
+            // A pre-simulation burst runs far too many steps to trace, and only its end result shows
+            var trace = preSimulating ? null : Trace;
+            trace?.BeginStep(particleCollection, systemState, frameTime);
+
             // Each function that runs displaces the per-particle draws of the ones after it. emitters
             // and initializers inherit whatever the pre-emission walk left behind.
             systemState.Random.OperatorOffset = 0;
 
             foreach (var preEmissionOperator in preEmissionOperators)
             {
-                if (preEmissionOperator.GetOperatorRunStrength(systemState) <= 0f)
+                var strength = preEmissionOperator.GetOperatorRunStrength(systemState);
+
+                if (strength <= 0f || (preEmissionOperator.RunOnce && preEmissionOperator.HasRun))
                 {
+                    trace?.Record(preEmissionOperator, particleCollection, systemState, 0f);
                     continue;
                 }
 
-                if (preEmissionOperator.RunOnce)
-                {
-                    if (preEmissionOperator.HasRun)
-                    {
-                        continue;
-                    }
-
-                    preEmissionOperator.HasRun = true;
-                }
-
+                preEmissionOperator.HasRun = true;
                 preEmissionOperator.Operate(ref systemState, frameTime);
                 systemState.Random.OperatorOffset += ParticleRandom.OperatorStride;
+
+                trace?.Record(preEmissionOperator, particleCollection, systemState, strength);
             }
 
             foreach (var emitter in emitters)
@@ -516,11 +530,16 @@ namespace ValveResourceFormat.Particles
 
                 if (strength <= 0.0f)
                 {
+                    trace?.Record(emitter, particleCollection, systemState, 0f);
                     continue;
                 }
 
                 emitter.Emit(frameTime, systemState, strength);
+
+                trace?.Record(emitter, particleCollection, systemState, strength);
             }
+
+            trace?.RecordSpawns();
 
             systemState.Random.OperatorOffset = 0;
 
@@ -530,17 +549,23 @@ namespace ValveResourceFormat.Particles
 
                 if (strength <= 0.0f)
                 {
+                    trace?.Record(particleOperator, particleCollection, systemState, 0f);
                     continue;
                 }
 
                 particleOperator.Operate(particleCollection, frameTime, systemState, strength);
                 systemState.Random.OperatorOffset += ParticleRandom.OperatorStride;
+
+                trace?.Record(particleOperator, particleCollection, systemState, strength);
             }
 
-            RunConstraints(frameTime);
+            RunConstraints(frameTime, trace);
 
             // Remove all dead particles
             particleCollection.PruneExpired();
+
+            trace?.Record("Remove expired", particleCollection, systemState);
+            trace?.EndStep(particleCollection, systemState);
 
             particleCollection.PreviousFrameTime = frameTime;
 
@@ -582,7 +607,7 @@ namespace ValveResourceFormat.Particles
         // constraints run from a work list bounded by m_nMaxConstraintPasses: each constraint runs once,
         // then is re-run only when a different constraint moved particles this frame. A lone constraint
         // therefore runs once.
-        private void RunConstraints(float frameTime)
+        private void RunConstraints(float frameTime, ParticleSimulationTrace? trace)
         {
             if (constraints.Count == 0)
             {
@@ -605,12 +630,18 @@ namespace ValveResourceFormat.Particles
                     satisfied[i] = true;
 
                     var constraint = constraints[i];
-                    if (constraint.GetOperatorRunStrength(systemState) <= 0.0f)
+                    var strength = constraint.GetOperatorRunStrength(systemState);
+
+                    if (strength <= 0.0f)
                     {
+                        trace?.Record(constraint, particleCollection, systemState, 0f, pass + 1);
                         continue;
                     }
 
-                    if (constraint.ApplyConstraint(particleCollection, frameTime, systemState))
+                    var moved = constraint.ApplyConstraint(particleCollection, frameTime, systemState);
+                    trace?.Record(constraint, particleCollection, systemState, strength, pass + 1);
+
+                    if (moved)
                     {
                         changed = true;
                         for (var j = 0; j < constraints.Count; j++)

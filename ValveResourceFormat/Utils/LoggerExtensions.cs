@@ -20,6 +20,8 @@ public static class LoggerExtensions
     /// <param name="args">Values for the template, which together with it identify the warning.</param>
     public static void LogUniqueWarning(this ILogger logger, string message, params ReadOnlySpan<object?> args)
     {
+        (logger as IWarningRecorder)?.Record(message, args);
+
         if (FirstOccurrence(message, args))
         {
             Write(logger, message, args);
@@ -38,6 +40,8 @@ public static class LoggerExtensions
     /// <param name="args">Values for the template. Any not in <paramref name="identity"/> are context only.</param>
     public static void LogUniqueWarningFor(this ILogger logger, ReadOnlySpan<object?> identity, string message, params ReadOnlySpan<object?> args)
     {
+        (logger as IWarningRecorder)?.Record(message, args);
+
         if (FirstOccurrence(message, identity))
         {
             Write(logger, message, args);
@@ -73,4 +77,14 @@ public static class LoggerExtensions
         logger.LogWarning(message, args.ToArray());
 #pragma warning restore CA2254
     }
+}
+
+/// <summary>
+/// A logger that wants every warning raised through <see cref="LoggerExtensions"/>, including the
+/// repeats the extensions hold back because some other logger already reported them.
+/// </summary>
+internal interface IWarningRecorder
+{
+    /// <summary>Records a warning without forwarding it anywhere.</summary>
+    void Record(string message, ReadOnlySpan<object?> args);
 }
