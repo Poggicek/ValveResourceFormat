@@ -16,7 +16,7 @@ internal sealed partial class MovementServices
             newOrigin -= ((HullMax - HullMin) - (DuckHullMax - DuckHullMin)) * 0.5f;
         }
 
-        var trace = Collision.TraceHull(mv.AbsOrigin, newOrigin, HullMin, HullMax, Rubikon.Cs2PlayerCollisionFilter);
+        var trace = TracePlayerBBox(mv.AbsOrigin, newOrigin, HullMin, HullMax, Rubikon.Cs2PlayerCollisionFilter);
 
         return !trace.StartSolid && trace.Fraction == 1f;
     }
@@ -139,7 +139,7 @@ internal sealed partial class MovementServices
 
                 var newOrigin = mv.AbsOrigin - ((HullMax - HullMin) - (DuckHullMax - DuckHullMin));
                 var groundCheck = newOrigin with { Z = newOrigin.Z - Vars.StepSize };
-                var trace = Collision.TraceHull(newOrigin, groundCheck, HullMin, HullMax, Rubikon.Cs2PlayerCollisionFilter);
+                var trace = TracePlayerBBox(newOrigin, groundCheck, HullMin, HullMax, Rubikon.Cs2PlayerCollisionFilter);
 
                 if (trace.StartSolid || trace.Fraction == 1f)
                 {

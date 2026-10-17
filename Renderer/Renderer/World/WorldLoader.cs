@@ -481,7 +481,7 @@ namespace ValveResourceFormat.Renderer.World
                 // Every spawn group adds its collision to the physics world of its world group, a 3D sky's included
                 if (phys.Parts.Length > 0)
                 {
-                    entitySystem.GetPhysicsWorld(scene.WorldGroup).Add(scene, new Rubikon(phys), rootTransform);
+                    entitySystem.GetPhysicsWorld(scene.WorldGroup).Add(scene, new Rubikon(phys, RendererContext.FileLoader.BuildMeshWings), rootTransform);
                 }
             }
         }

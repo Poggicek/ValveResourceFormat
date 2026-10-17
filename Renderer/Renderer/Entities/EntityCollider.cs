@@ -50,9 +50,10 @@ public sealed class EntityCollider
 
     /// <summary>Builds a collider from a brush entity's compiled physics.</summary>
     /// <param name="physics">The entity model's physics aggregate.</param>
-    public EntityCollider(PhysAggregateData physics)
+    /// <param name="buildMeshWings">Whether to build the neighbours of mesh triangles as the game does on load.</param>
+    public EntityCollider(PhysAggregateData physics, bool buildMeshWings = false)
     {
-        Shape = new Rubikon(physics);
+        Shape = new Rubikon(physics, buildMeshWings);
         LocalBounds = ComputeBounds(Shape, out var isEmpty);
         IsEmpty = isEmpty;
         Transform = Matrix4x4.Identity;

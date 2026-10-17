@@ -96,6 +96,7 @@ internal sealed partial class MovementServices
 
         if (probe && !trace.StartSolid && trace.Fraction > 0f && trace.Fraction < 1f)
         {
+            Recorder?.Note("snapped to ground", mv.AbsOrigin, mv.Velocity, trace.EndPos.Z - mv.AbsOrigin.Z);
             mv.AbsOrigin = trace.EndPos;
         }
     }
@@ -170,6 +171,12 @@ internal sealed partial class MovementServices
 
         BaseVelocity = baseVelocity;
         GroundEntity = newGround;
+
+        if (hadGround != hasNewGround)
+        {
+            // The value is the ground normal's Z, which decides whether a surface is a ramp or a floor
+            Recorder?.Note(hasNewGround ? "landed" : "left ground", mv.AbsOrigin, mv.Velocity, trace?.Normal.Z ?? float.NaN);
+        }
 
         if (!hasNewGround)
         {
@@ -337,6 +344,7 @@ internal sealed partial class MovementServices
 
             if (!TestPlayerPosition(test, out _))
             {
+                Recorder?.Note("unstuck", test, mv.Velocity);
                 StuckLast = 0;
                 mv.AbsOrigin = test;
                 return false;
