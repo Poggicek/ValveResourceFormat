@@ -1004,7 +1004,7 @@ public class ViewmodelSceneNode : ModelSceneNode
         var bodyYaw = bodyAnimator != null ? float.DegreesToRadians(bodyAnimator.BodyYaw) : camera.Yaw;
         var playerYawRotation = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, bodyYaw);
         var playerRotation = Quaternion.Normalize(playerYawRotation);
-        PlayerTransform = Matrix4x4.CreateFromQuaternion(playerRotation) * Matrix4x4.CreateTranslation(input.PlayerMovement.Position);
+        PlayerTransform = Matrix4x4.CreateFromQuaternion(playerRotation) * Matrix4x4.CreateTranslation(input.PlayerMovement.RenderPosition);
     }
 
     private void UpdateThirdpersonItems(Scene.UpdateContext context)

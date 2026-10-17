@@ -59,6 +59,13 @@ public sealed class PhysicsWorld
         bodies.Add(new Body(owner, shape, transform, inverse, transform.IsIdentity));
     }
 
+    /// <summary>Gets how many shapes have been added.</summary>
+    internal int BodyCount => bodies.Count;
+
+    /// <summary>Gets a shape, the transform placing it in the world, and that transform's inverse.</summary>
+    internal (Rubikon Shape, Matrix4x4 Transform, Matrix4x4 InverseTransform) GetBody(int index)
+        => (bodies[index].Shape, bodies[index].Transform, bodies[index].InverseTransform);
+
     /// <summary>Removes every shape added for <paramref name="owner"/>.</summary>
     public void Remove(Scene owner) => bodies.RemoveAll(body => body.Owner == owner);
 

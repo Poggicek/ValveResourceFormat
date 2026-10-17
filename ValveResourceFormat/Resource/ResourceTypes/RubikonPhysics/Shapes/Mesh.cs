@@ -114,6 +114,39 @@ namespace ValveResourceFormat.ResourceTypes.RubikonPhysics.Shapes
         }
 
         /// <summary>
+        /// Represents the neighbours of a triangle in the mesh: for each edge, the vertex of the adjacent
+        /// triangle opposite that edge, or -1 when the edge has no neighbour.
+        /// </summary>
+        /// <seealso href="https://s2v.app/SchemaExplorer/cs2/physicslib/RnWing_t">RnWing_t</seealso>
+        [StructLayout(LayoutKind.Sequential)]
+        public readonly struct Wing
+        {
+            /// <summary>The vertex index across the edge from the first to the second triangle vertex.</summary>
+            public readonly int X;
+            /// <summary>The vertex index across the edge from the second to the third triangle vertex.</summary>
+            public readonly int Y;
+            /// <summary>The vertex index across the edge from the third to the first triangle vertex.</summary>
+            public readonly int Z;
+
+            /// <summary>
+            /// Initializes a new instance of the <see cref="Wing"/> struct.
+            /// </summary>
+            public Wing(KVObject data)
+            {
+                var indices = data.GetArray<object>("m_nIndex")!.Select(Convert.ToInt32).ToArray();
+
+                if (indices.Length != 3)
+                {
+                    throw new InvalidDataException("Wing must have 3 indices");
+                }
+
+                X = indices[0];
+                Y = indices[1];
+                Z = indices[2];
+            }
+        }
+
+        /// <summary>
         /// Gets the minimum bounds.
         /// </summary>
         public Vector3 Min { get; }
@@ -199,6 +232,21 @@ namespace ValveResourceFormat.ResourceTypes.RubikonPhysics.Shapes
             }
 
             return MemoryMarshal.Cast<byte, Triangle>(Data.GetArray<byte>("m_Triangles"));
+        }
+
+        /// <summary>
+        /// The neighbours of each triangle in <see cref="GetTriangles"/>, or empty when the mesh has no adjacency data.
+        /// </summary>
+        public ReadOnlySpan<Wing> GetWings()
+        {
+            if (Data.IsNotBlobType("m_Wings"))
+            {
+                var wingsArr = Data.GetArray("m_Wings");
+                return wingsArr.Select(w => new Wing(w)).ToArray();
+            }
+
+            var blob = Data.GetArray<byte>("m_Wings");
+            return blob is null ? [] : MemoryMarshal.Cast<byte, Wing>(blob);
         }
     }
 }

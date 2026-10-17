@@ -14,6 +14,7 @@ using ValveResourceFormat.Renderer.Editor;
 using ValveResourceFormat.Renderer.Editor.Entities;
 using ValveResourceFormat.Renderer.Editor.Picking;
 using ValveResourceFormat.Renderer.Input;
+using ValveResourceFormat.Renderer.Movement;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.Renderer.Utils;
@@ -282,11 +283,10 @@ namespace GUI.Types.GLViewers
                 var isKzMap = kzMapPrefixes.Any(prefix => mapName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
 
                 ShowSpeed = isKzMap;
-                Input.PlayerMovement.PrestrafeEnabled = isKzMap;
-                Input.PlayerMovement.AutoBunnyHop = isKzMap;
-                Input.PlayerMovement.AirAccelerate = isKzMap
-                    ? PlayerMovement.AirAccelerateMovementMaps
-                    : PlayerMovement.AirAccelerateCompetitive;
+                var vars = Input.PlayerMovement.Vars;
+                vars.AutoBunnyHopping = isKzMap;
+                vars.EnableBunnyHopping = isKzMap;
+                vars.AirAccelerate = isKzMap ? MovementVars.AirAccelerateMovementMaps : new MovementVars().AirAccelerate;
 
                 Input.EntitySystem = Renderer.EntitySystem;
                 Renderer.EntitySystem.SpawnPlayer(Input.PlayerMovement, Scene);

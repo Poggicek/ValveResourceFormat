@@ -44,7 +44,7 @@ namespace ValveResourceFormat.Renderer
             {
                 var movement = input.PlayerMovement;
                 var halfExtents = movement.HullHalfExtents;
-                var feet = movement.Position;
+                var feet = movement.RenderPosition;
                 var hull = new AABB(
                     feet - new Vector3(halfExtents.X, halfExtents.Y, 0f),
                     feet + new Vector3(halfExtents.X, halfExtents.Y, halfExtents.Z * 2f));
