@@ -37,6 +37,9 @@ public class UserInput
     private float TransitionDuration = 1.5f;
     private float TransitionEndTime = -1f;
     private CameraLite StartingCamera;
+    /// <summary>Gets the renderer context, for the game files gameplay reads.</summary>
+    internal RendererContext RendererContext => Renderer.RendererContext;
+
     /// <summary>Gets the internal camera whose location and angles are updated by input processing.</summary>
     public Camera Camera { get; }
     /// <summary>Gets or sets the physics world used for orbit-target and player-movement ray traces.</summary>
@@ -304,17 +307,16 @@ public class UserInput
         }
         else
         {
-            if (Viewmodel != null)
-            {
-                PlayerMovement.RunSpeed = Viewmodel.WeaponMaxSpeed;
-            }
+            PlayerMovement.WeaponMaxSpeed = Viewmodel?.WeaponMaxSpeed;
+
+            // The view turns before movement samples it, so this frame's command carries this frame's aim
+            Camera.Pitch += MouseDeltaPitchYaw.X;
+            Camera.Yaw -= MouseDeltaPitchYaw.Y;
+            Camera.ClampRotation();
 
             PlayerMovement.ProcessMovement(Camera, deltaTime);
 
             Velocity = PlayerMovement.Velocity;
-            Camera.Pitch += MouseDeltaPitchYaw.X;
-            Camera.Yaw -= MouseDeltaPitchYaw.Y;
-            Camera.ClampRotation();
         }
 
         Viewmodel?.ProcessInput(this, Renderer.Uptime);

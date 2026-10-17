@@ -49,6 +49,18 @@ public class Rubikon
         /// <summary>Gets the surface property index of each triangle, or an empty array when the whole mesh uses <see cref="SurfacePropertyHash"/>.</summary>
         public int[] TriangleSurfaceProperties { get; init; } = [];
 
+        /// <summary>Gets the neighbours of each triangle in <see cref="Triangles"/>, or an empty array when the mesh has no adjacency data.</summary>
+        public Wing[] Wings { get; init; } = [];
+
+        /// <summary>Gets the mesh flags.</summary>
+        public uint Flags { get; init; }
+
+        /// <summary>Gets the minimum bounds of the mesh.</summary>
+        public Vector3 Min { get; init; }
+
+        /// <summary>Gets the maximum bounds of the mesh.</summary>
+        public Vector3 Max { get; init; }
+
         /// <summary>Gets the surface property hash of a triangle in <see cref="Triangles"/>.</summary>
         public uint GetSurfacePropertyHash(int triangleIndex)
             => (uint)triangleIndex < (uint)TriangleSurfaceProperties.Length
@@ -73,6 +85,9 @@ public class Rubikon
     {
         /// <summary>Gets the hash of the surface property of the hull.</summary>
         public uint SurfacePropertyHash { get; init; }
+
+        /// <summary>Gets the hull's centroid, which box casts against it are computed relative to.</summary>
+        public Vector3 Centroid { get; init; }
     }
 
     /// <summary>Compound collision data: child shapes under the compound's own tree, whose leaves hold child shape ids.</summary>
@@ -155,6 +170,10 @@ public class Rubikon
             SurfacePropertyHash = GetSurfacePropertyHash(surfacePropertyHashes, surfacePropertyIndex),
             SurfacePropertyHashes = surfacePropertyHashes,
             TriangleSurfaceProperties = mesh.Materials,
+            Wings = [.. mesh.GetWings()],
+            Flags = mesh.Flags,
+            Min = mesh.Min,
+            Max = mesh.Max,
         };
     }
 
@@ -172,6 +191,7 @@ public class Rubikon
         )
         {
             SurfacePropertyHash = surfacePropertyHash,
+            Centroid = hull.Centroid,
         };
     }
 
@@ -719,6 +739,45 @@ public class Rubikon
     }
 
     /// <summary>The <see cref="OverlapHullsQuery"/> for solid volumes: a box inside a hull counts.</summary>
+    /// <summary>Collects the hulls whose bounds overlap a box, in the shape's local space.</summary>
+    /// <param name="min">Minimum of the box.</param>
+    /// <param name="max">Maximum of the box.</param>
+    /// <param name="results">Receives the indices into <see cref="Hulls"/>.</param>
+    internal void CollectHulls(Vector3 min, Vector3 max, List<int> results)
+    {
+        if (HullTree.Length == 0)
+        {
+            return;
+        }
+
+        var center = (min + max) * 0.5f;
+        var query = new CollectHullsQuery(center, max - center, Hulls, HullIndices, results);
+        TraverseBvh(HullTree, ref query);
+    }
+
+    private readonly struct CollectHullsQuery(Vector3 center, Vector3 halfExtents, PhysicsHullData[] hulls, int[] hullIndices, List<int> results) : IBvhQuery
+    {
+        public bool IntersectsNode(in Node node) => BoxIntersectsAABB(center, halfExtents, node.Min, node.Max);
+
+        public bool DescendLeftFirst(int splitAxis) => true;
+
+        public bool VisitLeaf(int start, int count)
+        {
+            for (var i = start; i < start + count; i++)
+            {
+                var index = hullIndices[i];
+                var hull = hulls[index];
+
+                if (BoxIntersectsAABB(center, halfExtents, hull.Min, hull.Max))
+                {
+                    results.Add(index);
+                }
+            }
+
+            return false;
+        }
+    }
+
     private struct VolumeOverlapHullsQuery(Vector3 center, Vector3 halfExtents, CollisionFilter filter, PhysicsHullData[] hulls, int[] hullIndices) : IBvhQuery
     {
         public bool Overlaps;

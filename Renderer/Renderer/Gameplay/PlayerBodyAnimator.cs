@@ -93,7 +93,7 @@ internal sealed class PlayerBodyAnimator
 
         Update(new BodyState
         {
-            Position = movement.Position,
+            Position = movement.RenderPosition,
             Velocity = input.Velocity,
             AimYaw = float.RadiansToDegrees(input.Camera.Yaw),
             AimPitch = float.RadiansToDegrees(input.Camera.Pitch),

@@ -45,6 +45,9 @@ public sealed class EntityCollider
         }
     }
 
+    /// <summary>Gets the inverse of <see cref="Transform"/>, from the world into the shape's local space.</summary>
+    internal Matrix4x4 InverseTransform => inverseTransform;
+
     /// <summary>Builds a collider from a brush entity's compiled physics.</summary>
     /// <param name="physics">The entity model's physics aggregate.</param>
     public EntityCollider(PhysAggregateData physics)
