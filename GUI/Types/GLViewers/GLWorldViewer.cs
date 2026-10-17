@@ -278,7 +278,7 @@ namespace GUI.Types.GLViewers
 
                 Input.TryLoadViewmodel(Scene, Renderer.EntitySystem);
 
-                var kzMapPrefixes = new[] { "bhop", "surf", "kz", "dr" };
+                var kzMapPrefixes = new[] { "bhop", "surf", "kz", "dr", "ramptest" };
                 var mapName = Path.GetFileName(LoadedWorld.MapName);
                 var isKzMap = kzMapPrefixes.Any(prefix => mapName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
 
@@ -1256,6 +1256,7 @@ namespace GUI.Types.GLViewers
 
             playPauseButton = UiControl.AddToolbarButton(playImage, "Play", () => RequestSimulation(SimulationRequest.PlayOrPause), centered: true);
             stopButton = UiControl.AddToolbarButton(stopImage, "Stop", () => RequestSimulation(SimulationRequest.Stop), centered: true);
+            UiControl.AddToolbarButton("Export Movement", ExportMovementRecording, centered: true);
 
             toolEntitiesButton = UiControl.AddToolbarToggle("Tool Entities", tools.ShowToolEntities, v =>
             {
@@ -1273,6 +1274,35 @@ namespace GUI.Types.GLViewers
 
             UpdateSimulationButtons(simulationState);
             RequestVisibilityUpdate();
+        }
+
+        // The last seconds of the player's movement in full detail, for working out why a move went wrong
+        private void ExportMovementRecording()
+        {
+            var recorder = Input.PlayerMovement.Recorder;
+
+            if (recorder.TickCount == 0)
+            {
+                _ = AppMessageDialogs.ShowMessageAsync("Nothing is recorded yet, walk around in play mode first.", "Export movement", MessageIcon.Warning);
+                return;
+            }
+
+            var mapName = LoadedWorld?.MapName is { } map ? Path.GetFileNameWithoutExtension(map) : "movement";
+            var defaultName = $"{mapName}_movement_{DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture)}.json";
+            var fileName = AppFileDialogs.SaveFile("Export movement recording", defaultName, "json", "JSON (*.json)|*.json");
+
+            if (fileName == null)
+            {
+                return;
+            }
+
+            using (var stream = File.Create(fileName))
+            {
+                recorder.Export(stream, LoadedWorld?.MapName);
+            }
+
+            Log.Info(nameof(GLWorldViewer), string.Create(CultureInfo.InvariantCulture, $"Exported {recorder.TickCount} ticks of movement to {fileName}"));
+            GLControl?.Focus();
         }
 
         private void RequestSimulation(SimulationRequest request)

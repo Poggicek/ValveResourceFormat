@@ -107,6 +107,12 @@ namespace ValveResourceFormat.IO
         // Counter-Strike 2 mounts its content as the CS:GO SDK, not under its own app id
         private const int CounterStrike2SteamAppId = 710;
 
+        /// <summary>
+        /// Gets whether a game found builds the neighbours of physics mesh triangles when it loads them, as its
+        /// <c>gameinfo.gi</c> asks with <c>Physics/BuildMeshWings</c>. Compiled meshes do not carry them.
+        /// </summary>
+        public bool BuildMeshWings { get; private set; } = true;
+
         /// <summary>Gets whether the game found is Counter-Strike 2.</summary>
         public bool IsCounterStrike2 => SteamAppId == CounterStrike2SteamAppId;
 
@@ -499,6 +505,11 @@ namespace ValveResourceFormat.IO
         {
             var gameName = gameInfo.TryGetValue("game", out var game) ? game.ToString() : null;
             Logger.LogInformation("Found \"{GameName}\" from \"{GameInfo}\"", gameName, gameinfoPath);
+
+            if (gameInfo.TryGetValue("Physics", out var physics) && physics.GetBooleanProperty("BuildMeshWings"))
+            {
+                BuildMeshWings = true;
+            }
 
             if (!gameInfo.TryGetValue("FileSystem", out var fileSystem))
             {

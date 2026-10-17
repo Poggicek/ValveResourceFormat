@@ -78,7 +78,7 @@ public sealed class PostProcessingVolume : BaseModelEntity
 
             if (volumePhysics != null)
             {
-                postProcess.Collider = new EntityCollider(volumePhysics)
+                postProcess.Collider = new EntityCollider(volumePhysics, EntitySystem.RendererContext.FileLoader.BuildMeshWings)
                 {
                     Transform = transform,
                 };

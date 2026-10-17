@@ -35,6 +35,12 @@ internal struct GameTrace
 }
 
 /// <summary>
+/// The shape a trace hit: a mesh and its triangle, or a hull, with the transform placing it in the world.
+/// Both shapes are null for a plane.
+/// </summary>
+internal readonly record struct TraceHitShape(Rubikon.PhysicsMeshData? Mesh, Rubikon.PhysicsHullData? Hull, int TriangleIndex, Matrix4x4 Transform);
+
+/// <summary>
 /// Sweeps the player's hull through the world and the solid entities, picking the hit the way the
 /// game's physics query does.
 /// </summary>
@@ -58,7 +64,10 @@ internal sealed class MovementCollision
     private readonly List<Candidate> Candidates = [];
     private readonly List<int> HullCandidates = [];
 
-    private record struct Candidate(ShapeCastHit Cast, BaseEntity? Entity, uint SurfacePropertyHash, bool IsLadder);
+    private record struct Candidate(ShapeCastHit Cast, BaseEntity? Entity, uint SurfacePropertyHash, bool IsLadder, TraceHitShape Shape);
+
+    /// <summary>Gets the shape the last <see cref="TraceHull"/> hit, default when it hit nothing.</summary>
+    public TraceHitShape LastHitShape { get; private set; }
 
     /// <summary>Sweeps a box with the given bounds around its origin.</summary>
     /// <param name="start">Origin at the start.</param>
@@ -77,6 +86,7 @@ internal sealed class MovementCollision
         var center = new Vector3(cx + start.X, cy + start.Y, cz + start.Z);
 
         Candidates.Clear();
+        LastHitShape = default;
 
         // The static world is one broadphase tree whose hits collapse into the nearest. A hit at zero
         // ends the whole query, before the entity tree is looked at.
@@ -113,6 +123,7 @@ internal sealed class MovementCollision
         }
 
         var fraction = best.Cast.Fraction;
+        LastHitShape = best.Shape;
 
         return new GameTrace
         {
@@ -162,7 +173,7 @@ internal sealed class MovementCollision
             }
 
             if (world.GroundPlane is { } height && !Rubikon.SkipsCollision(collisionName, [], [])
-                && Consider(CastPlane(Vector3.UnitZ, height, center, delta, halfExtents), 0, []))
+                && Consider(CastPlane(Vector3.UnitZ, height, center, delta, halfExtents), 0, [], default))
             {
                 return true;
             }
@@ -170,7 +181,7 @@ internal sealed class MovementCollision
 
         foreach (var plane in Planes)
         {
-            if (Consider(CastPlane(plane.AsVector3(), plane.W, center, delta, halfExtents), 0, []))
+            if (Consider(CastPlane(plane.AsVector3(), plane.W, center, delta, halfExtents), 0, [], default))
             {
                 return true;
             }
@@ -179,7 +190,7 @@ internal sealed class MovementCollision
         foreach (var hull in Hulls)
         {
             if (RubikonShapeCast.CastBoxAgainstHull(hull, Matrix4x4.Identity, center, delta, halfExtents, MaxFraction, out var cast)
-                && Consider(cast, hull.SurfacePropertyHash, hull.InteractAs))
+                && Consider(cast, hull.SurfacePropertyHash, hull.InteractAs, new TraceHitShape(null, hull, -1, Matrix4x4.Identity)))
             {
                 return true;
             }
@@ -218,14 +229,14 @@ internal sealed class MovementCollision
     }
 
     /// <returns>Whether the hit ended the query.</returns>
-    private bool Consider(in ShapeCastHit cast, uint surfacePropertyHash, string[] interactAs)
+    private bool Consider(in ShapeCastHit cast, uint surfacePropertyHash, string[] interactAs, in TraceHitShape shape)
     {
         if (cast.Fraction >= 1f)
         {
             return false;
         }
 
-        var candidate = new Candidate(cast, CurrentEntity, surfacePropertyHash, IsLadder(interactAs));
+        var candidate = new Candidate(cast, CurrentEntity, surfacePropertyHash, IsLadder(interactAs), shape);
 
         if (!CollapseHits || StaticBestIndex < 0)
         {
@@ -336,7 +347,7 @@ internal sealed class MovementCollision
         }
 
         var surface = cast.TriangleIndex >= 0 ? mesh.GetSurfacePropertyHash(cast.TriangleIndex) : mesh.SurfacePropertyHash;
-        return Consider(cast, surface, interactAs);
+        return Consider(cast, surface, interactAs, new TraceHitShape(mesh, null, cast.TriangleIndex, transform));
     }
 
     private bool CastHull(Rubikon.PhysicsHullData hull, in Matrix4x4 transform, Vector3 center, Vector3 delta, Vector3 halfExtents,
@@ -348,7 +359,7 @@ internal sealed class MovementCollision
             return false;
         }
 
-        return Consider(cast, hull.SurfacePropertyHash, interactAs);
+        return Consider(cast, hull.SurfacePropertyHash, interactAs, new TraceHitShape(null, hull, -1, transform));
     }
 
     private static bool Overlaps(Vector3 minA, Vector3 maxA, Vector3 minB, Vector3 maxB)

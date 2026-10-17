@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace ValveResourceFormat.Renderer.Movement;
 
 internal sealed partial class MovementServices
@@ -275,6 +277,7 @@ internal sealed partial class MovementServices
 
         if (MathF.Sqrt(((ez * ez) + (ey * ey)) + (ex * ex)) < 1f)
         {
+            Recorder?.Note("stopped, too slow", mv.AbsOrigin, mv.Velocity);
             mv.ZeroVelocity();
             FinalizeVelocity(mv);
             return;
@@ -311,7 +314,10 @@ internal sealed partial class MovementServices
 
             TryPlayerMove(mv, (destination, trace));
 
-            if (!StepMove(mv, startOrigin, startVelocity))
+            var stepped = StepMove(mv, startOrigin, startVelocity);
+            Recorder?.Note(stepped ? "step move used" : "step move not used", mv.AbsOrigin, mv.Velocity);
+
+            if (!stepped)
             {
                 // Very slow players get a minimum velocity to test step ups with
                 var startSpeed = Length(startVelocity);
@@ -482,6 +488,7 @@ internal sealed partial class MovementServices
             var savedDelta = mv.FrameVelocityDelta;
             var savedZ = mv.Velocity.Z;
 
+            Recorder?.Note("apex: horizontal then vertical move", mv.AbsOrigin, mv.Velocity);
             mv.Velocity.Z = 0f;
 
             if ((speed2D * FrameTime) < 0.09375f)
@@ -577,15 +584,19 @@ internal sealed partial class MovementServices
 
             var moveDistance = speed * timeLeft;
             var fraction = trace.Fraction;
+            var fractionZeroed = false;
 
             // A first move that would get less than 1/32 of a unit is no move at all
             if (allFraction == 0f && fraction < 1f && moveDistance >= 0.03125f && (fraction * moveDistance) < 0.03125f)
             {
                 trace.Fraction = 0f;
                 fraction = 0f;
+                fractionZeroed = true;
             }
 
-            if ((fraction * minMoveSpeed) > 0.03125f)
+            var moved = (fraction * minMoveSpeed) > 0.03125f;
+
+            if (moved)
             {
                 planesSinceMove = 0;
                 planeCount = 0;
@@ -595,8 +606,21 @@ internal sealed partial class MovementServices
 
             allFraction += fraction;
 
+            var clip = new ClipRecord
+            {
+                Bump = bump,
+                TimeLeft = timeLeft,
+                Fraction = fraction,
+                FractionZeroed = fractionZeroed,
+                Moved = moved,
+                Origin = mv.AbsOrigin,
+                Normal = trace.Normal,
+                VelocityIn = mv.Velocity,
+            };
+
             if (fraction == 1f)
             {
+                RecordClip(clip, ClipOutcome.Finished, mv.Velocity, planeCount);
                 break;
             }
 
@@ -612,6 +636,7 @@ internal sealed partial class MovementServices
                     && MathF.Sqrt((mv.Velocity.X * mv.Velocity.X) + (mv.Velocity.Y * mv.Velocity.Y)) < 1f))
             {
                 mv.ZeroVelocity();
+                RecordClip(clip, planeCount >= MaxClipPlanes ? ClipOutcome.StoppedOutOfPlanes : ClipOutcome.StoppedLanded, mv.Velocity, planeCount);
                 break;
             }
 
@@ -641,9 +666,12 @@ internal sealed partial class MovementServices
                     (planes[0].Y * backoff) + originalVelocity.Y,
                     (planes[0].Z * backoff) + originalVelocity.Z);
                 originalVelocity = mv.Velocity;
+
+                RecordClip(clip, ClipOutcome.Reflected, mv.Velocity, planeCount);
             }
             else
             {
+                var outcome = ClipOutcome.Clipped;
                 int i;
 
                 for (i = 0; i < planeCount; i++)
@@ -676,8 +704,11 @@ internal sealed partial class MovementServices
                     if (planeCount != 2)
                     {
                         mv.ZeroVelocity();
+                        RecordClip(clip, ClipOutcome.StoppedCorner, mv.Velocity, planeCount);
                         break;
                     }
+
+                    outcome = ClipOutcome.Crease;
 
                     var direction = new Vector3(
                         (planes[0].Y * planes[1].Z) - (planes[0].Z * planes[1].Y),
@@ -695,14 +726,18 @@ internal sealed partial class MovementServices
                 // Turned back against the original velocity: stop dead to avoid oscillating in corners
                 if (Dot(mv.Velocity, primalVelocity) <= 0f)
                 {
+                    RecordClip(clip, ClipOutcome.StoppedReversed, mv.Velocity, planeCount);
                     mv.ZeroVelocity();
                     break;
                 }
+
+                RecordClip(clip, outcome, mv.Velocity, planeCount);
             }
         }
 
         if (allFraction == 0f && planesSinceMove > 0)
         {
+            Recorder?.Note("no progress, velocity zeroed", mv.AbsOrigin, mv.Velocity);
             mv.ZeroVelocity();
         }
 
@@ -825,6 +860,9 @@ internal sealed partial class MovementServices
         return usedStep;
     }
 
+    private void RecordClip(in ClipRecord clip, ClipOutcome outcome, Vector3 velocityOut, int planeCount)
+        => Recorder?.Clip(clip with { Outcome = outcome, VelocityOut = velocityOut, PlaneCount = planeCount });
+
     /// <summary>Keeps the player on the ground going down slopes and stairs.</summary>
     private void StayOnGround(MoveData mv)
     {
@@ -844,11 +882,17 @@ internal sealed partial class MovementServices
             // Smaller differences than a network unit are left alone
             if (MathF.Abs(mv.AbsOrigin.Z - trace.EndPos.Z) > 0.015625f)
             {
+                Recorder?.Note("snapped down", mv.AbsOrigin, mv.Velocity, trace.EndPos.Z - mv.AbsOrigin.Z);
                 mv.AbsOrigin = trace.EndPos;
             }
         }
     }
 
-    private GameTrace TracePlayerBBox(Vector3 start, Vector3 end, Vector3 mins, Vector3 maxs, string collisionName)
-        => Collision.TraceHull(start, end, mins, maxs, collisionName);
+    private GameTrace TracePlayerBBox(Vector3 start, Vector3 end, Vector3 mins, Vector3 maxs, string collisionName,
+        [CallerMemberName] string caller = "")
+    {
+        var trace = Collision.TraceHull(start, end, mins, maxs, collisionName);
+        Recorder?.Trace(caller, collisionName, start, end, mins, maxs, trace, Collision.LastHitShape);
+        return trace;
+    }
 }

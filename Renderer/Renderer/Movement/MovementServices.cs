@@ -246,6 +246,8 @@ internal sealed partial class MovementServices
     /// <summary>Runs one user command: one tick of movement.</summary>
     public void RunCommand(UserCmd cmd)
     {
+        Recorder?.BeginTick(this, cmd, CaptureState(AbsOrigin, AbsVelocity));
+
         TickBase++;
 
         TickCount = TickBase;
@@ -255,6 +257,8 @@ internal sealed partial class MovementServices
         Jumped = false;
 
         DoMovement(cmd);
+
+        Recorder?.EndTick(CaptureState(AbsOrigin, AbsVelocity));
     }
 
     private void DoMovement(UserCmd cmd)
@@ -611,9 +615,14 @@ internal sealed partial class MovementServices
 
                 previousWhen = move.When;
 
+                Recorder?.BeginSlice(new SliceRecord(mv.SubtickStartFraction, mv.SubtickEndFraction, FrameTime, CurTime, mv.ForwardMove, mv.SideMove,
+                    mv.ViewAngles, Buttons.Held, CaptureState(mv.AbsOrigin, mv.Velocity)));
+
                 StartSubtickMove(mv);
                 ProcessMovement(mv);
                 FinishSubtickMove(mv);
+
+                Recorder?.EndSlice(CaptureState(mv.AbsOrigin, mv.Velocity));
 
                 (CurTime, FrameTime, TickCount) = savedTime;
             }
@@ -1124,6 +1133,7 @@ internal sealed partial class MovementServices
 
         if (MoveType != MoveType.None && CheckStuck(mv))
         {
+            Recorder?.Note("stuck, move skipped", mv.AbsOrigin, mv.Velocity);
             return false;
         }
 

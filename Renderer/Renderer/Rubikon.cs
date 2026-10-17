@@ -118,7 +118,8 @@ public class Rubikon
 
     /// <summary>Initializes <see cref="Rubikon"/> by parsing the mesh and hull shapes from the first part of the physics aggregate data.</summary>
     /// <param name="physicsData">Source physics aggregate containing shapes and collision attributes.</param>
-    public Rubikon(PhysAggregateData physicsData)
+    /// <param name="buildMeshWings">Whether to build the neighbours of mesh triangles as the game does on load, see <see cref="IO.GameFileLoader.BuildMeshWings"/>.</param>
+    public Rubikon(PhysAggregateData physicsData, bool buildMeshWings = false)
     {
         if (physicsData.Parts.Length == 0)
         {
@@ -140,7 +141,7 @@ public class Rubikon
         foreach (var mesh in worldMeshes)
         {
             Meshes[meshIndex++] = CreateMeshData(mesh.Shape, physicsData.CollisionAttributes[mesh.CollisionAttributeIndex],
-                surfacePropertyHashes, mesh.SurfacePropertyIndex);
+                surfacePropertyHashes, mesh.SurfacePropertyIndex, buildMeshWings);
         }
 
         // we want to run player clip traces first because the mesh is much simpler
@@ -158,19 +159,24 @@ public class Rubikon
         HullIndices = [.. Enumerable.Range(0, Hulls.Length)];
         HullTree = BuildHullBVH();
 
-        Compounds = [.. physicsData.Parts[0].Shape.Compounds.Select(compound => CreateCompoundData(compound, physicsData.CollisionAttributes[compound.CollisionAttributeIndex], surfacePropertyHashes))];
+        Compounds = [.. physicsData.Parts[0].Shape.Compounds.Select(compound => CreateCompoundData(compound, physicsData.CollisionAttributes[compound.CollisionAttributeIndex], surfacePropertyHashes, buildMeshWings))];
     }
 
-    private static PhysicsMeshData CreateMeshData(ResourceTypes.RubikonPhysics.Shapes.Mesh mesh, KVObject collisionAttributes, uint[] surfacePropertyHashes, int surfacePropertyIndex)
+    private static PhysicsMeshData CreateMeshData(ResourceTypes.RubikonPhysics.Shapes.Mesh mesh, KVObject collisionAttributes, uint[] surfacePropertyHashes,
+        int surfacePropertyIndex, bool buildMeshWings)
     {
         var (interactAs, interactExclude) = GetInteractStrings(collisionAttributes);
+        Vector3[] vertices = [.. mesh.GetVertices()];
+        Triangle[] triangles = [.. mesh.GetTriangles()];
 
-        return new PhysicsMeshData(interactAs, interactExclude, [.. mesh.GetVertices()], [.. mesh.GetTriangles()], [.. mesh.ParseNodes()])
+        return new PhysicsMeshData(interactAs, interactExclude, vertices, triangles, [.. mesh.ParseNodes()])
         {
             SurfacePropertyHash = GetSurfacePropertyHash(surfacePropertyHashes, surfacePropertyIndex),
             SurfacePropertyHashes = surfacePropertyHashes,
             TriangleSurfaceProperties = mesh.Materials,
-            Wings = [.. mesh.GetWings()],
+
+            // The game never reads compiled wings, it builds them on load or goes without
+            Wings = buildMeshWings ? RubikonMeshWings.Build(triangles, vertices.Length) : [],
             Flags = mesh.Flags,
             Min = mesh.Min,
             Max = mesh.Max,
@@ -195,7 +201,7 @@ public class Rubikon
         };
     }
 
-    private static PhysicsCompoundData CreateCompoundData(CompoundDescriptor descriptor, KVObject collisionAttributes, uint[] surfacePropertyHashes)
+    private static PhysicsCompoundData CreateCompoundData(CompoundDescriptor descriptor, KVObject collisionAttributes, uint[] surfacePropertyHashes, bool buildMeshWings)
     {
         var surfacePropertyHash = GetSurfacePropertyHash(surfacePropertyHashes, descriptor.SurfacePropertyIndex);
         var compound = descriptor.Shape;
@@ -207,7 +213,7 @@ public class Rubikon
             compound.HullBaseIndex,
             compound.MeshBaseIndex,
             [.. compound.Hulls.Select(hull => CreateHullData(hull, collisionAttributes, surfacePropertyHash))],
-            [.. compound.Meshes.Select(mesh => CreateMeshData(mesh, collisionAttributes, surfacePropertyHashes, descriptor.SurfacePropertyIndex))]
+            [.. compound.Meshes.Select(mesh => CreateMeshData(mesh, collisionAttributes, surfacePropertyHashes, descriptor.SurfacePropertyIndex, buildMeshWings))]
         );
     }
 

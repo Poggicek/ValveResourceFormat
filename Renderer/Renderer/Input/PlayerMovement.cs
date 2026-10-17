@@ -49,13 +49,17 @@ public sealed class PlayerMovement : IPlayerController
     public PlayerMovement(UserInput input)
     {
         Input = input;
-        Services = new MovementServices(Vars, Collision);
+        Recorder = new MovementRecorder(Vars);
+        Services = new MovementServices(Vars, Collision) { Recorder = Recorder };
         SoundEffects = new Effects(this);
         Services.Effects = SoundEffects;
     }
 
     /// <summary>Gets the console variables the movement reads, with the game's defaults.</summary>
     public MovementVars Vars { get; } = new();
+
+    /// <summary>Gets the recorder keeping the last ten seconds of movement in detail, for export.</summary>
+    public MovementRecorder Recorder { get; }
 
     /// <summary>Gets or sets whether the player is placed at the camera on the next frame.</summary>
     public bool Initialize { get; set; }
@@ -281,6 +285,7 @@ public sealed class PlayerMovement : IPlayerController
         Services.Reset(origin, viewAngles);
         Services.AbsVelocity = Input.Velocity;
         Unstick();
+        Recorder.Mark("reset");
 
         Commands.Reset(held, viewAngles);
         Accumulator = 0f;
@@ -387,6 +392,7 @@ public sealed class PlayerMovement : IPlayerController
         var moved = feetPosition - Services.AbsOrigin;
 
         Services.AbsOrigin = feetPosition;
+        Recorder.Mark("teleport");
         PreviousOrigin += moved;
         RenderPosition += moved;
         EyePosition += moved;

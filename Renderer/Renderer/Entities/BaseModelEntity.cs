@@ -149,7 +149,7 @@ public abstract class BaseModelEntity : BaseEntity
         {
             if (BuildsCollider)
             {
-                Collider = new EntityCollider(physics);
+                Collider = new EntityCollider(physics, Scene.RendererContext.FileLoader.BuildMeshWings);
                 UpdateColliderTransform();
             }
 

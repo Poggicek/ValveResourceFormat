@@ -115,7 +115,8 @@ namespace ValveResourceFormat.ResourceTypes.RubikonPhysics.Shapes
 
         /// <summary>
         /// Represents the neighbours of a triangle in the mesh: for each edge, the vertex of the adjacent
-        /// triangle opposite that edge, or -1 when the edge has no neighbour.
+        /// triangle opposite that edge, -1 when the edge has no neighbour, or -2 when more than two
+        /// triangles share it.
         /// </summary>
         /// <seealso href="https://s2v.app/SchemaExplorer/cs2/physicslib/RnWing_t">RnWing_t</seealso>
         [StructLayout(LayoutKind.Sequential)]
@@ -127,6 +128,16 @@ namespace ValveResourceFormat.ResourceTypes.RubikonPhysics.Shapes
             public readonly int Y;
             /// <summary>The vertex index across the edge from the third to the first triangle vertex.</summary>
             public readonly int Z;
+
+            /// <summary>
+            /// Initializes a new instance of the <see cref="Wing"/> struct from its three vertex indices.
+            /// </summary>
+            public Wing(int x, int y, int z)
+            {
+                X = x;
+                Y = y;
+                Z = z;
+            }
 
             /// <summary>
             /// Initializes a new instance of the <see cref="Wing"/> struct.
