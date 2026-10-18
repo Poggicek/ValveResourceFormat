@@ -485,9 +485,6 @@ public class AnimationGraphExtract : IDisposable
     /// </summary>
     public IReadOnlyList<KVObject> Parameters { get; set; } = [];
 
-    /// <summary>
-    /// Builds the mapping from compiled node indices to their actual node IDs.
-    /// </summary>
     private void BuildNodeIdMap(IReadOnlyList<KVObject> compiledNodes)
     {
         compiledNodeIndexMap = [];
@@ -537,9 +534,8 @@ public class AnimationGraphExtract : IDisposable
     private const long GeneratedNodeIdMax = 999_999_999L;
 
     /// <summary>
-    /// Ids handed to nodes the document needs but the compiled graph does not number. One cursor
-    /// serves the whole document: every generated id has to be unique across it, not just within the
-    /// pass that produced it.
+    /// Ids for nodes the document needs but the compiled graph does not number. One cursor serves
+    /// the whole document, so ids stay unique across passes rather than only within one.
     /// </summary>
     private long generatedNodeIdCursor = GeneratedNodeIdMin;
 
@@ -582,10 +578,9 @@ public class AnimationGraphExtract : IDisposable
     ];
 
     /// <summary>
-    /// Places every canvas of a graph document. A node manager is its own canvas in the editor, as
-    /// is each state machine, so each is laid out in its own coordinate space. Whatever positions
-    /// the document arrived with are replaced, so a decompiled graph opens arranged rather than
-    /// however it was last dragged around.
+    /// Lays out every canvas of a graph document. Each node manager and state machine is its own
+    /// canvas with its own coordinates. Authored positions are replaced, so a decompiled graph opens
+    /// arranged rather than however it was last dragged around.
     /// </summary>
     private static void RelayoutEditorGraph(KVObject root)
     {
@@ -706,7 +701,7 @@ public class AnimationGraphExtract : IDisposable
 
     /// <summary>
     /// Lays out one state machine's states on their own canvas, wired by the transitions between
-    /// them, replacing whatever positions the state machine was authored with.
+    /// them, replacing authored positions.
     /// </summary>
     private static void RelayoutEditorStates(IReadOnlyList<KVObject> states)
     {
@@ -1071,8 +1066,7 @@ public class AnimationGraphExtract : IDisposable
 
     private KVObject ExtractParameterID(KVObject? paramHandle, bool requireFloat = false)
     {
-        // Graphs from before the handle was mandatory leave it out wherever the parameter is
-        // optional, which reads the same as a handle bound to nothing.
+        // Older graphs omit the handle where the parameter is optional, same as one bound to nothing.
         if (paramHandle == null)
         {
             return MakeNodeIdObjectValue(-1);
@@ -2974,14 +2968,7 @@ public class AnimationGraphExtract : IDisposable
                             }
                             else if (itemKey == "m_tags")
                             {
-                                try
-                                {
-                                    convertedItem.Add("m_tagSpans", ConvertTagSpansArray(item.GetArray("m_tags")));
-                                }
-                                catch
-                                {
-                                    convertedItem.Add("m_tagSpans", KVObject.Array());
-                                }
+                                convertedItem.Add("m_tagSpans", ConvertTagSpansArray(item.GetArray("m_tags")));
                             }
                             else if (itemKey == "m_vPos")
                             {
@@ -3008,14 +2995,7 @@ public class AnimationGraphExtract : IDisposable
                 }
                 if (key == "m_tags")
                 {
-                    try
-                    {
-                        node.Add("m_tagSpans", ConvertTagSpansArray(compiledNode.GetArray("m_tags")));
-                    }
-                    catch
-                    {
-                        node.Add("m_tagSpans", KVObject.Array());
-                    }
+                    node.Add("m_tagSpans", ConvertTagSpansArray(compiledNode.GetArray("m_tags")));
                     continue;
                 }
             }
@@ -3198,15 +3178,7 @@ public class AnimationGraphExtract : IDisposable
                         }
                         if (trigger.ContainsKey("m_tags"))
                         {
-                            try
-                            {
-                                var tagIndices = trigger.GetIntegerArray("m_tags");
-                                convertedItem.Add("m_tags", ConvertTagIndicesArray(tagIndices));
-                            }
-                            catch (InvalidCastException)
-                            {
-                                convertedItem.Add("m_tags", KVObject.Array());
-                            }
+                            convertedItem.Add("m_tags", ConvertTagIndicesArray(trigger.GetIntegerArray("m_tags")));
                         }
                         else
                         {
@@ -3267,27 +3239,12 @@ public class AnimationGraphExtract : IDisposable
                 }
                 else if (key == "m_tags")
                 {
-                    try
-                    {
-                        var tagIndices = compiledNode.GetIntegerArray("m_tags");
-                        node.Add("m_tagSpans", ConvertTagIndicesArray(tagIndices));
-                    }
-                    catch (InvalidCastException)
-                    {
-                        node.Add("m_tagSpans", KVObject.Array());
-                    }
+                    node.Add("m_tagSpans", ConvertTagIndicesArray(compiledNode.GetIntegerArray("m_tags")));
                     continue;
                 }
                 else if (key == "m_paramSpans")
                 {
-                    try
-                    {
-                        node.Add("m_paramSpans", ConvertParamSpans(compiledNode.GetSubCollection("m_paramSpans")));
-                    }
-                    catch
-                    {
-                        node.Add("m_paramSpans", KVObject.Array());
-                    }
+                    node.Add("m_paramSpans", ConvertParamSpans(compiledNode.GetSubCollection("m_paramSpans")));
                     continue;
                 }
             }
@@ -4102,57 +4059,27 @@ public class AnimationGraphExtract : IDisposable
             {
                 if (className is "CSequence" or "CCycleControlClip" or "CBlend2D")
                 {
-                    try
-                    {
-                        node.Add("m_tagSpans", ConvertTagSpansArray(compiledNode.GetArray("m_tags")));
-                    }
-                    catch
-                    {
-                        node.Add("m_tagSpans", KVObject.Array());
-                    }
+                    node.Add("m_tagSpans", ConvertTagSpansArray(compiledNode.GetArray("m_tags")));
                     continue;
                 }
                 else if (className == "CSelector")
                 {
-                    try
-                    {
-                        var tagIndices = compiledNode.GetIntegerArray(key);
-                        node.Add(key, ConvertTagIndicesArray(tagIndices));
-                    }
-                    catch (InvalidCastException)
-                    {
-                        node.Add(key, KVObject.Array());
-                    }
+                    node.Add(key, ConvertTagIndicesArray(compiledNode.GetIntegerArray(key)));
                     continue;
                 }
                 else
                 {
-                    try
-                    {
-                        var tagIds = compiledNode.GetIntegerArray(key);
-                        node.Add(key, MakeArray(tagIds.Select(MakeNodeIdObjectValue)));
-                        continue;
-                    }
-                    catch (InvalidCastException)
-                    {
-                        continue;
-                    }
+                    node.Add(key, MakeArray(compiledNode.GetIntegerArray(key).Select(MakeNodeIdObjectValue)));
+                    continue;
                 }
             }
 
             if (key == "m_paramSpans")
             {
-                try
+                var compiledParamSpans = compiledNode.GetSubCollection("m_paramSpans");
+                if (compiledParamSpans?.ContainsKey("m_spans") == true)
                 {
-                    var compiledParamSpans = compiledNode.GetSubCollection("m_paramSpans");
-                    if (compiledParamSpans?.ContainsKey("m_spans") == true)
-                    {
-                        node.Add("m_paramSpans", ConvertParamSpans(compiledParamSpans));
-                    }
-                }
-                catch
-                {
-                    node.Add("m_paramSpans", KVObject.Array());
+                    node.Add("m_paramSpans", ConvertParamSpans(compiledParamSpans));
                 }
                 continue;
             }

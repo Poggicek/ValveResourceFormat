@@ -20,12 +20,6 @@ namespace ValveResourceFormat.Particles.Utils
         public readonly Vector3 MidPointOffset = Vector3.Zero;
         public readonly Vector3 EndOffset = Vector3.Zero;
 
-        public ParticlePathParameters(int startControlPointNumber, int endControlPointNumber)
-        {
-            StartControlPointNumber = startControlPointNumber;
-            EndControlPointNumber = endControlPointNumber;
-        }
-
         public ParticlePathParameters(ParticleDefinitionParser parse)
         {
             var pathParams = parse.Data.GetSubCollection("m_PathParams");
@@ -66,9 +60,8 @@ namespace ValveResourceFormat.Particles.Utils
     }
 
     /// <summary>
-    /// Evaluates path positions the way the engine does: three points (start, displaced midpoint,
-    /// end) form a quadratic Bezier, so the curve bends toward the midpoint without passing
-    /// through it.
+    /// Evaluates path positions: three points (start, displaced midpoint, end) form a quadratic
+    /// Bezier, so the curve bends toward the midpoint without passing through it.
     /// </summary>
     static class ParticlePath
     {
@@ -79,7 +72,7 @@ namespace ValveResourceFormat.Particles.Utils
         public static Vector3 GetControlPointAtTime(ParticleSystemState state, int controlPoint, float time)
         {
             var point = state.GetControlPoint(controlPoint);
-            return Vector3.Lerp(point.PositionPrevious, point.Position, point.StepFraction(state.Age, time));
+            return Vector3.Lerp(point.PositionPrevious, point.Position, point.StepFraction(state, time));
         }
 
         /// <summary>

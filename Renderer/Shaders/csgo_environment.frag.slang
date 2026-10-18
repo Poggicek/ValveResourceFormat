@@ -2,6 +2,8 @@
 
 #define GameVfx_csgo_environment_blend 0
 
+#define BARN_LIGHT_CHEAP_WORLD_SHADING 1
+
 #include "common/utils.slang"
 #include "common/features.slang"
 #include "csgo_environment_features.slang"
@@ -202,8 +204,7 @@ uniform int F_USE_NEW_BLENDING;
         #endif
     #endif
 
-    // Color composite parameters, shared by both blend paths. At these defaults the
-    // composite is a plain lerp toward the upper layer.
+    // Color composite parameters for both blend paths. At these defaults, a plain lerp to the upper layer.
     uniform float g_flColorOverlay2 = 0.0;
     uniform float g_flColorReplace2 = 1.0;
     uniform float g_flNormalCombine2 = 0.0; // 0 .. 8
@@ -261,10 +262,9 @@ uniform int F_USE_NEW_BLENDING;
 
     uniform float g_flBlendSoftnessDistanceModifierStrength = 1.0;
 
-    // How much this layer widens the blend softness at range. A seam a few pixels wide up close
-    // would harden into a jagged edge once the height maps are reading their small mips, so the
-    // softness grows with the mip the height map lands on and with how fast that height moves
-    // across a pixel. Scaled by the layer's share of the vertex paint.
+    // Widens blend softness at range. A seam a few pixels wide up close would harden into a jagged edge
+    // on small height mips, so softness grows with mip level and with how fast height changes
+    // per pixel. Scaled by the layer's share of the vertex paint.
     float BlendSoftnessAtRange(sampler2D heightTexture, vec2 texCoord, float height, float scale, float layerWeight)
     {
         float lod = textureQueryLod(heightTexture, texCoord).x;
@@ -334,8 +334,7 @@ uniform int F_USE_NEW_BLENDING;
         o.difference = difference;
         o.signedRaw = signedFactor;
 
-        // The weight-scaled carry and the height it is measured against only propagate
-        // once the layer is actually present; signedRaw propagates regardless.
+        // Weight-scaled carry and underHeight only propagate once the layer is present; signedRaw always does.
         if (o.weight > 0.05)
         {
             o.signedCarry = signedFactor * o.weight;
@@ -499,8 +498,8 @@ vec3 LayerNormal(vec2 encoded, sampler2D normalTexture, int uvSet, vec2 scale, f
         layerNormal = ProjectedLayerNormal(normalTexture, scale, frame, geometricNormal, tangent, bitangent);
     }
 
-    // Contrast steers the normal away from flat, or past it where a material authors above 1. The
-    // game does this to the finished normal rather than to the encoded pair, so flat is Up here.
+    // Contrast steers the normal away from flat, or past it above 1. Applied to the finished normal,
+    // not the encoded pair, so flat is Up.
     return normalize(mix(Up, layerNormal, contrast));
 }
 
@@ -654,9 +653,8 @@ vec3 ColorizeTint(vec3 albedo, vec3 tint, float amount)
         vec2 layerAmount;
     };
 
-    // Rounds the seam off. A height ramp is pushed along the geometric normal and differentiated
-    // in screen space, which gives the normal the rounded edge would have had, and that is folded
-    // into the surface normal over the same band the border uses.
+    // Rounds the seam off: a height ramp pushed along the geometric normal is differentiated in screen
+    // space to give the rounded edge's normal, folded into the surface normal over the border's band.
     vec3 BlendBevelNormal(vec3 normal, vec3 geometricNormal, vec3 tangent, vec3 bitangent, vec3 positionWs,
                           SeamFrame seam, BevelParams p)
     {
@@ -755,8 +753,8 @@ MaterialProperties_t GetMaterial(vec3 vertexNormals)
     vec4 color = SampleMaterialTexture(g_tColor1, g_nUVSet1, vTexCoord.xy, g_vTexCoordScale1, biplanar);
     vec4 height = SampleMaterialTexture(g_tHeight1, g_nUVSet1, vTexCoord.xy, g_vTexCoordScale1, biplanar);
 
-    // The height the water line is judged against, and how hard wetness darkens, both blended up
-    // the layers the same way the colour is. The legacy blend path judges the raw height instead.
+    // Wetness height and darkening blend up the layers the way colour does. The legacy blend path
+    // judges the raw height instead.
     float wetHeight = WetnessHeight(height.r, g_flHeightMapZeroPoint1, g_flHeightMapScale1);
     float rawHeight = height.r;
     float wetDarkening = g_flWetnessDarkeningStrength1;
@@ -764,9 +762,9 @@ MaterialProperties_t GetMaterial(vec3 vertexNormals)
 
     vec3 aoLevels = g_vAmbientOcclusionLevels1.xyz;
 
-    float tintMask1 = saturate(((height.g - 0.5) * g_fTintMaskContrast1 + 0.5) * g_fTintMaskBrightness1);
+    float tintMask1 = ContrastBrightness(height.g, g_fTintMaskContrast1, g_fTintMaskBrightness1);
     height.a = g_bMetalness1 ? height.a : 0.0;
-    float roughness = saturate(((normal.b - 0.5) * g_fTextureRoughnessContrast1 + 0.5) * g_fTextureRoughnessBrightness1);
+    float roughness = ContrastBrightness(normal.b, g_fTextureRoughnessContrast1, g_fTextureRoughnessBrightness1);
 
     vec3 normalTs = LayerNormal(normal.rg, g_tNormal1, g_nUVSet1, g_vTexCoordScale1,
         g_fTextureNormalContrast1, g_flTexCoordRotation1, biplanar, mat.GeometricNormal, mat.Tangent, mat.Bitangent);
@@ -797,9 +795,9 @@ MaterialProperties_t GetMaterial(vec3 vertexNormals)
     vec4 height2 = SampleMaterialTexture(g_tHeight2, g_nUVSet2, vTexCoord2.xy, g_vTexCoordScale2, biplanar);
     vec4 normal2 = SampleMaterialTexture(g_tNormal2, g_nUVSet2, vTexCoord2.xy, g_vTexCoordScale2, biplanar);
 
-    float tintMask2 = saturate(((height2.g - 0.5) * g_fTintMaskContrast2 + 0.5) * g_fTintMaskBrightness2);
+    float tintMask2 = ContrastBrightness(height2.g, g_fTintMaskContrast2, g_fTintMaskBrightness2);
     height2.a = g_bMetalness2 ? height2.a : 0.0;
-    float roughness2 = saturate(((normal2.b - 0.5) * g_fTextureRoughnessContrast2 + 0.5) * g_fTextureRoughnessBrightness2);
+    float roughness2 = ContrastBrightness(normal2.b, g_fTextureRoughnessContrast2, g_fTextureRoughnessBrightness2);
 
     vec4 color2MaybeColorCorrected = mix(color2, vec4((color2 * g_mTextureAdjust2).rgb, color2.a), bvec4(g_nColorCorrectionMode2 == 1));
     vec4 color2ColorCorrectedTinted = color2 * g_mTextureColorAdjust2;
@@ -902,9 +900,9 @@ MaterialProperties_t GetMaterial(vec3 vertexNormals)
         vec4 height3 = SampleMaterialTexture(g_tHeight3, g_nUVSet3, vTexCoord3.xy, g_vTexCoordScale3, biplanar);
         vec4 normal3 = SampleMaterialTexture(g_tNormal3, g_nUVSet3, vTexCoord3.xy, g_vTexCoordScale3, biplanar);
 
-        float tintMask3 = saturate(((height3.g - 0.5) * g_fTintMaskContrast3 + 0.5) * g_fTintMaskBrightness3);
+        float tintMask3 = ContrastBrightness(height3.g, g_fTintMaskContrast3, g_fTintMaskBrightness3);
         height3.a = g_bMetalness3 ? height3.a : 0.0;
-        float roughness3 = saturate(((normal3.b - 0.5) * g_fTextureRoughnessContrast3 + 0.5) * g_fTextureRoughnessBrightness3);
+        float roughness3 = ContrastBrightness(normal3.b, g_fTextureRoughnessContrast3, g_fTextureRoughnessBrightness3);
 
         vec4 color3MaybeColorCorrected = mix(color3, vec4((color3 * g_mTextureAdjust3).rgb, color3.a), bvec4(g_nColorCorrectionMode3 == 1));
         vec4 color3ColorCorrectedTinted = color3 * g_mTextureColorAdjust3;

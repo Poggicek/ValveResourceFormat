@@ -5,15 +5,7 @@ using ValveResourceFormat.Renderer.SceneNodes;
 
 namespace ValveResourceFormat.Renderer;
 
-/// <summary>
-/// What one view keeps of one scene from frame to frame: what it culled, the draw lists it collected,
-/// its GPU cull results and the lights it binned.
-/// </summary>
-/// <remarks>
-/// A <see cref="Scene"/> holds what every view shares: the nodes, their GPU buffers and the lighting.
-/// Everything that depends on the camera lives here instead, so one scene can be drawn through several
-/// cameras in a frame without one view overwriting another's lists.
-/// </remarks>
+/// <summary>Culling results and draw lists for drawing a scene through one view.</summary>
 public sealed class SceneViewState : IDisposable
 {
     /// <summary>Gets the scene this state draws.</summary>
@@ -37,31 +29,34 @@ public sealed class SceneViewState : IDisposable
     /// <summary>Gets whether anything is queued to draw into the water effects map this frame.</summary>
     public bool HasWaterEffects => waterEffectsRenderList.Count > 0;
 
+    /// <summary>Gets whether anything is queued to draw into the effects bloom map this frame.</summary>
+    public bool HasEffectsBloom => effectsBloomRenderList.Count > 0;
+
     /// <summary>Gets whether any water surface is queued to draw this frame.</summary>
     public bool HasWater => renderLists[RenderPass.Water].Count > 0;
 
-    /// <summary>Gets or sets the depth pyramid occlusion tests of this view read, shared by every view.</summary>
+    /// <summary>Gets whether the translucent layer has shapes for <see cref="RenderOrderIndependentFills"/> this frame.</summary>
+    internal bool HasOrderIndependentFills => orderIndependentFills.Count > 0;
+
     internal RenderTexture? DepthPyramid { get; set; }
 
-    /// <summary>Gets or sets the view-projection this view had when <see cref="DepthPyramid"/> was built.</summary>
     internal Matrix4x4 DepthPyramidViewProjection { get; set; }
 
-    /// <summary>Gets or sets whether the depth pyramid is current and safe to cull this view against.</summary>
     internal bool DepthPyramidValid { get; set; }
 
-    // Cull results written by the meshlet cull, rebuilt from the scene's template when its layout changes
     private StorageBuffer? indirectDraws;
     private StorageBuffer? compactedDraws;
     private StorageBuffer? compactedCounts;
     private int indirectLayoutVersion = -1;
 
     private StorageBuffer? pvsHiddenGpu;
-    private bool pvsCullActive;
+    private bool cpuHiddenActive;
     private uint[] pvsHiddenBits = [];
 
     private readonly List<SceneNode> cullResults = [];
     private int staticCullCount;
-    private int lastFrustum = -1;
+    private readonly Plane[] lastFrustumPlanes = new Plane[6];
+    private bool hasLastFrustum;
     private int lastOctreeVersion = -1;
 
     private readonly Dictionary<RenderPass, List<MeshBatchRenderer.Request>> renderLists = new()
@@ -76,7 +71,6 @@ public sealed class SceneViewState : IDisposable
         [RenderPass.Outline] = [],
     };
 
-    /// <summary>Draw calls for first-person layer geometry.</summary>
     private readonly Dictionary<RenderPass, List<MeshBatchRenderer.Request>> viewmodelRenderLists = new()
     {
         [RenderPass.Opaque] = [],
@@ -85,9 +79,17 @@ public sealed class SceneViewState : IDisposable
 
     /// <summary>Translucent draws that go to the water effects map instead of the scene.</summary>
     private readonly List<MeshBatchRenderer.Request> waterEffectsRenderList = [];
+    private readonly List<MeshBatchRenderer.Request> effectsBloomRenderList = [];
+
+    /// <summary>Translucent shapes whose fills skip the sorted translucent layer when it draws them order independently.</summary>
+    private readonly List<ShapeSceneNode> orderIndependentFills = [];
 
     /// <summary>Visible nodes that draw themselves, listed once each however many passes they draw in.</summary>
     private readonly List<SceneNode> customBufferNodes = [];
+
+    private readonly HashSet<SceneAggregate> aggregatesWithVisibleFragments = [];
+
+    private readonly Predicate<MeshBatchRenderer.Request> hasNoVisibleFragments;
 
     private readonly Dictionary<DepthOnlyBucket, List<MeshBatchRenderer.Request>> depthOnlyDraws = Scene.CreateDepthOnlyDrawCallCollection();
 
@@ -97,17 +99,27 @@ public sealed class SceneViewState : IDisposable
     /// <inheritdoc cref="alphaTestAggregateDraws"/>
     private readonly List<MeshBatchRenderer.Request> alphaTestOpaqueDraws = [];
 
-    /// <summary>Initializes the state for drawing <paramref name="scene"/> through one view.</summary>
-    /// <param name="scene">The scene to draw, already initialized.</param>
+    /// <summary>Surfaces drawn over the resolved opaque scene, for <see cref="RenderTranslucentDepthLayer"/>.</summary>
+    private readonly List<MeshBatchRenderer.Request> translucentDepthDraws = [];
+
+    /// <summary>Gets whether any surface is queued for <see cref="RenderTranslucentDepthLayer"/> this frame.</summary>
+    public bool HasTranslucentDepthDraws => translucentDepthDraws.Count > 0;
+
+    // Mesh surfaces only: particles draw themselves and never reach this list, and additive glows hide nothing behind them
+    private static bool WritesTranslucentDepth(RenderMaterial material)
+        => material is { IsCs2Water: false, CanPrimeDepth: true, IsAdditive: false };
+
+    /// <summary>Initializes a view of an already initialized <paramref name="scene"/>.</summary>
     public SceneViewState(Scene scene)
     {
         ArgumentNullException.ThrowIfNull(scene);
 
         Scene = scene;
+        hasNoVisibleFragments = request => request.Node is SceneAggregate aggregate && !aggregatesWithVisibleFragments.Contains(aggregate);
         LightBinner = new LightBinner(this);
         LightBinner.LoadShaders();
 
-        // Sizes the lists for everything the scene holds, so the first frames do not grow them
+        // Presizes the lists so the first frames do not grow them
         CollectSceneDrawCalls(new Camera(), Frustum.CreateEmpty());
     }
 
@@ -118,12 +130,11 @@ public sealed class SceneViewState : IDisposable
     /// <returns>A list of visible scene nodes (valid until the next call to this method).</returns>
     public List<SceneNode> GetFrustumCullResults(Frustum frustum)
     {
-        var currentFrustum = frustum.GetHashCode();
-
         // Optimization: Do not clear static culled results from last frame if the frustum did not change
-        if (lastFrustum != currentFrustum || lastOctreeVersion != Scene.OctreeVersion)
+        if (!hasLastFrustum || !frustum.Planes.AsSpan().SequenceEqual(lastFrustumPlanes) || lastOctreeVersion != Scene.OctreeVersion)
         {
-            lastFrustum = currentFrustum;
+            frustum.Planes.CopyTo(lastFrustumPlanes, 0);
+            hasLastFrustum = true;
             lastOctreeVersion = Scene.OctreeVersion;
 
             cullResults.Clear();
@@ -145,9 +156,10 @@ public sealed class SceneViewState : IDisposable
     {
         var objectEntryCount = Scene.ObjectEntryCount;
 
-        pvsCullActive = !Pvs.IsEmpty && Scene.VoxelVisibility != null && objectEntryCount > 0;
+        var pvsCullActive = !Pvs.IsEmpty && Scene.VoxelVisibility != null;
+        cpuHiddenActive = (pvsCullActive || Scene.VisibilityBoxes.View.IsActive) && objectEntryCount > 0;
 
-        if (!pvsCullActive)
+        if (!cpuHiddenActive)
         {
             return;
         }
@@ -164,7 +176,7 @@ public sealed class SceneViewState : IDisposable
 
     private void MarkNodeHiddenGpu(SceneNode node)
     {
-        if (pvsCullActive && node is SceneAggregate.Fragment && node.Id < (uint)Scene.ObjectEntryCount)
+        if (cpuHiddenActive && node is SceneAggregate.Fragment && node.Id < (uint)Scene.ObjectEntryCount)
         {
             MathUtils.SetBit(pvsHiddenBits, (int)node.Id);
         }
@@ -247,6 +259,11 @@ public sealed class SceneViewState : IDisposable
             queueList = alphaTestOpaqueDraws;
         }
 
+        if (isLatePass && !isViewmodelLayer && WritesTranslucentDepth(request.Call.Material))
+        {
+            translucentDepthDraws.Add(request);
+        }
+
         // Only draws that happen after the grab can make use of the resolved copies.
         if (isLatePass)
         {
@@ -261,7 +278,7 @@ public sealed class SceneViewState : IDisposable
     /// Frustum-culls the scene and populates the per-pass render lists for the upcoming frame.
     /// </summary>
     /// <param name="camera">The camera used to sort translucent draw calls by distance.</param>
-    /// <param name="cullFrustum">An optional override frustum for culling; defaults to the camera's view frustum.</param>
+    /// <param name="cullFrustum">An optional override frustum for culling; defaults to the camera frustum.</param>
     public void CollectSceneDrawCalls(Camera camera, Frustum? cullFrustum = null)
     {
         ArgumentNullException.ThrowIfNull(camera);
@@ -277,9 +294,12 @@ public sealed class SceneViewState : IDisposable
         }
 
         waterEffectsRenderList.Clear();
+        effectsBloomRenderList.Clear();
+        orderIndependentFills.Clear();
         customBufferNodes.Clear();
         alphaTestAggregateDraws.Clear();
         alphaTestOpaqueDraws.Clear();
+        translucentDepthDraws.Clear();
 
         foreach (var bucket in depthOnlyDraws.Values)
         {
@@ -287,7 +307,7 @@ public sealed class SceneViewState : IDisposable
         }
 
         WantsSceneColor = false;
-        WantsSceneDepth = false;
+        WantsSceneDepth = Scene.ProjectedDecals.Count > 0;
 
         ResetPvsHiddenBits();
 
@@ -297,13 +317,7 @@ public sealed class SceneViewState : IDisposable
 
         PerfStats.Active.Count(Counter.SceneObjectInView, visibleNodes.Count);
 
-        foreach (var node in visibleNodes)
-        {
-            if (node is SceneAggregate resetAggregate)
-            {
-                resetAggregate.AnyChildrenVisible = false;
-            }
-        }
+        aggregatesWithVisibleFragments.Clear();
 
         // Collect mesh calls
         foreach (var node in visibleNodes)
@@ -313,15 +327,30 @@ public sealed class SceneViewState : IDisposable
                 continue;
             }
 
-            if (node is MeshCollectionNode or SceneAggregate or SceneAggregate.Fragment or ParticleSceneNode && !Scene.IsNodeInPvs(node, pvs))
+            if (!Scene.IsNodeInPvs(node, pvs))
             {
                 PerfStats.Active.Count(Counter.SceneObjectCulledByPvs, 1);
                 MarkNodeHiddenGpu(node);
                 continue;
             }
 
+            // The viewmodel is drawn at the eye, not where it is placed
+            var isViewmodel = (node.RenderPasses & CustomRenderPasses.Viewmodel) != 0;
+
+            if (!isViewmodel && Scene.VisibilityBoxes.View.IsCulled(node.BoundingBox))
+            {
+                PerfStats.Active.Count(Counter.SceneObjectCulledByVisibilityBox, 1);
+                MarkNodeHiddenGpu(node);
+                continue;
+            }
+
             if (node is MeshCollectionNode meshCollection)
             {
+                if ((node.RenderPasses & CustomRenderPasses.Default) == 0)
+                {
+                    continue;
+                }
+
                 foreach (var mesh in meshCollection.RenderableMeshes)
                 {
                     foreach (var call in mesh.DrawCallsOpaque)
@@ -364,7 +393,7 @@ public sealed class SceneViewState : IDisposable
                     continue;
                 }
 
-                fragment.Parent.AnyChildrenVisible = true;
+                aggregatesWithVisibleFragments.Add(fragment.Parent);
                 Add(new MeshBatchRenderer.Request
                 {
                     Mesh = fragment.RenderMesh,
@@ -376,12 +405,15 @@ public sealed class SceneViewState : IDisposable
             {
                 if (aggregate.InstanceTransforms.Count > 0)
                 {
-                    Add(new MeshBatchRenderer.Request
+                    foreach (var call in aggregate.RenderMesh.DrawCallsOpaque)
                     {
-                        Mesh = aggregate.RenderMesh,
-                        Call = aggregate.RenderMesh.DrawCallsOpaque[0],
-                        Node = node,
-                    }, RenderPass.Opaque);
+                        Add(new MeshBatchRenderer.Request
+                        {
+                            Mesh = aggregate.RenderMesh,
+                            Call = call,
+                            Node = node,
+                        }, RenderPass.Opaque);
+                    }
                 }
                 else if (Scene.DrawMeshletsIndirect && aggregate.CanDrawIndirect)
                 {
@@ -429,11 +461,21 @@ public sealed class SceneViewState : IDisposable
                 if ((customPasses & CustomRenderPasses.Translucent) != 0)
                 {
                     customLists[RenderPass.Translucent].Add(customRender);
+
+                    if (node is ShapeSceneNode { HasOrderIndependentFill: true } shape)
+                    {
+                        orderIndependentFills.Add(shape);
+                    }
                 }
 
                 if ((customPasses & CustomRenderPasses.WaterEffects) != 0)
                 {
                     waterEffectsRenderList.Add(customRender);
+                }
+
+                if ((customPasses & CustomRenderPasses.EffectsBloom) != 0)
+                {
+                    effectsBloomRenderList.Add(customRender);
                 }
 
                 if (node.IsSelected)
@@ -443,6 +485,9 @@ public sealed class SceneViewState : IDisposable
             }
         }
 
+        renderLists[RenderPass.OpaqueAggregate].RemoveAll(hasNoVisibleFragments);
+        alphaTestAggregateDraws.RemoveAll(hasNoVisibleFragments);
+
         // avoid buffer updates mid rendering
         foreach (var node in customBufferNodes)
         {
@@ -450,10 +495,6 @@ public sealed class SceneViewState : IDisposable
         }
     }
 
-    /// <summary>
-    /// Brings the cull output buffers in line with the scene's indirect draw layout, which is rebuilt
-    /// whenever a static node is added, removed or toggled.
-    /// </summary>
     private void EnsureIndirectDrawBuffers()
     {
         if (indirectLayoutVersion == Scene.IndirectLayoutVersion)
@@ -486,7 +527,6 @@ public sealed class SceneViewState : IDisposable
         compactedCounts.Create(counts, BufferUsage.GpuOnly);
     }
 
-    /// <summary>Binds the indirect draw buffers chosen by <see cref="Scene.UpdateIndirectRenderingState"/>.</summary>
     internal void BindIndirectDrawBuffers()
     {
         if (!Scene.DrawMeshletsIndirect)
@@ -541,10 +581,7 @@ public sealed class SceneViewState : IDisposable
         return true;
     }
 
-    /// <summary>
-    /// Dispatches the GPU frustum (and optional occlusion) culling compute shader, writing this view's
-    /// surviving indirect draw commands.
-    /// </summary>
+    /// <summary>Dispatches the GPU frustum (and optional occlusion) culling compute shader.</summary>
     /// <param name="frustum">The view frustum used to cull meshlets.</param>
     public void MeshletCullGpu(Frustum frustum)
     {
@@ -578,7 +615,7 @@ public sealed class SceneViewState : IDisposable
         scene.CommandMeshletsGpu.BindBufferBase();
         indirectDraws.BindBufferBase();
 
-        // Instance transforms move each fragment's shared cull data into world space
+        // Fragments share cull data in model space; instance transforms move it into world space
         scene.InstanceBufferGpu.BindBufferBase();
         scene.TransformBufferGpu.BindBufferBase();
 
@@ -586,7 +623,7 @@ public sealed class SceneViewState : IDisposable
         scene.ObjectLodGpu.BindBufferBase();
         scene.ActiveLodBitsGpu.BindBufferBase();
 
-        var pvsWords = pvsCullActive ? MathUtils.DivideRoundUp(Math.Max(scene.ObjectEntryCount, 1), 32) : 1;
+        var pvsWords = cpuHiddenActive ? MathUtils.DivideRoundUp(Math.Max(scene.ObjectEntryCount, 1), 32) : 1;
 
         if (pvsHiddenBits.Length < pvsWords)
         {
@@ -597,7 +634,7 @@ public sealed class SceneViewState : IDisposable
             ReservedBufferSlots.BufferSlot10, "PvsHidden");
         pvsHiddenGpu.BindBufferBase();
 
-        cullShader.SetUniform("g_bPvsCullEnabled", pvsCullActive);
+        cullShader.SetUniform("g_bCpuHiddenEnabled", cpuHiddenActive);
 
         var occlusionDebugEnabled = scene.OcclusionDebugEnabled && scene.OcclusionDebug != null;
 
@@ -625,10 +662,7 @@ public sealed class SceneViewState : IDisposable
         }
     }
 
-    /// <summary>
-    /// Dispatches the GPU draw compaction compute shader, packing this view's non-zero indirect draw
-    /// commands together to avoid empty draw calls.
-    /// </summary>
+    /// <summary>Packs non-zero indirect draw commands together on the GPU to avoid empty draw calls.</summary>
     public void CompactIndirectDraws()
     {
         EnsureIndirectDrawBuffers();
@@ -728,8 +762,6 @@ public sealed class SceneViewState : IDisposable
     /// <summary>Prepasses the alpha tested geometry and then draws it, both after the opaque geometry.</summary>
     private void RenderAlphaTestGeometry(Scene.RenderContext renderContext, Shader? depthOnlyShader)
     {
-        alphaTestAggregateDraws.RemoveAll(MeshBatchRenderer.IsAggregateWithNoVisibleChildren);
-
         if (alphaTestAggregateDraws.Count == 0 && alphaTestOpaqueDraws.Count == 0)
         {
             return;
@@ -787,6 +819,48 @@ public sealed class SceneViewState : IDisposable
     }
 
     /// <summary>
+    /// Draws the fills of the translucent layer's shapes with <see cref="ShapeSceneNode.HasOrderIndependentFill"/>
+    /// into the order independent layers, in any order.
+    /// </summary>
+    internal void RenderOrderIndependentFills()
+    {
+        foreach (var shape in orderIndependentFills)
+        {
+            shape.RenderOrderIndependentFill();
+        }
+    }
+
+    internal void RenderOrderIndependentLines()
+    {
+        foreach (var shape in orderIndependentFills)
+        {
+            shape.RenderOrderIndependentLines();
+        }
+    }
+
+    /// <summary>
+    /// Lays down the depth of the surfaces the refract, water and translucent layers draw over the opaque scene,
+    /// collected during <see cref="CollectSceneDrawCalls"/>, each through its material's own depth mode where it has one.
+    /// </summary>
+    /// <param name="renderContext">The render context for this pass, bound to a depth buffer that already holds the opaque depth.</param>
+    /// <param name="depthOnlyShader">The shader for materials without a depth mode of their own.</param>
+    public void RenderTranslucentDepthLayer(Scene.RenderContext renderContext, Shader depthOnlyShader)
+    {
+        using var _ = new GLDebugGroup("Translucent Depth");
+
+        PerfStats.Active.SuspendTriangleCounter();
+
+        translucentDepthDraws.Sort(MeshBatchRenderer.CompareCustomPipeline);
+
+        renderContext.RenderPass = RenderPass.DepthOnly;
+        renderContext.DepthOnlyShader = depthOnlyShader;
+        MeshBatchRenderer.Render(translucentDepthDraws, renderContext);
+        renderContext.DepthOnlyShader = null;
+
+        PerfStats.Active.ResumeTriangleCounter();
+    }
+
+    /// <summary>
     /// Renders the opaque first-person viewmodel layer collected during <see cref="CollectSceneDrawCalls"/>.
     /// Rendered before the main scene so its reserved near depth range can never be overtaken by world geometry.
     /// </summary>
@@ -841,6 +915,15 @@ public sealed class SceneViewState : IDisposable
         renderContext.RenderPass = RenderPass.Translucent;
         renderContext.Layer = RenderLayer.WaterEffects;
         MeshBatchRenderer.Render(waterEffectsRenderList, renderContext);
+    }
+
+    /// <summary>Renders the draw calls that fill the effects bloom map; the caller owns the render target.</summary>
+    /// <param name="renderContext">The render context for this pass.</param>
+    public void RenderEffectsBloomLayer(Scene.RenderContext renderContext)
+    {
+        renderContext.RenderPass = RenderPass.Translucent;
+        renderContext.Layer = RenderLayer.Bloom;
+        MeshBatchRenderer.Render(effectsBloomRenderList, renderContext);
     }
 
     /// <summary>Renders water draw calls collected during <see cref="CollectSceneDrawCalls"/>.</summary>

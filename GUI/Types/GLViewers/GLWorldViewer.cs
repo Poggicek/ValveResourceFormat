@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Windows.Forms;
 using GUI.Controls;
 using GUI.Forms;
@@ -9,6 +10,10 @@ using GUI.Utils;
 using ValveResourceFormat.Blocks;
 using ValveResourceFormat.IO;
 using ValveResourceFormat.Renderer;
+using ValveResourceFormat.Renderer.Editor;
+using ValveResourceFormat.Renderer.Editor.Entities;
+using ValveResourceFormat.Renderer.Editor.Picking;
+using ValveResourceFormat.Renderer.Entities;
 using ValveResourceFormat.Renderer.Input;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.SceneNodes;
@@ -17,7 +22,6 @@ using ValveResourceFormat.Renderer.World;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
 using static GUI.Controls.SavedCameraPositionsControl;
-using static ValveResourceFormat.Renderer.PickingTexture;
 
 namespace GUI.Types.GLViewers
 {
@@ -34,11 +38,45 @@ namespace GUI.Types.GLViewers
         private ComboBox? cameraComboBox;
         private SavedCameraPositionsControl? savedCameraPositionsControl;
         private EntityInfoForm? entityInfoForm;
+        private ThemedButton? playPauseButton;
+        private ThemedButton? stopButton;
+        private System.Drawing.Image? playImage;
+        private System.Drawing.Image? pauseImage;
+        private System.Drawing.Image? stopImage;
+        private ThemedToggleButton? toolEntitiesButton;
+        private ThemedToggleButton? toolMaterialsButton;
+        private readonly ToolsVisibility tools = new();
+        private volatile HashSet<string> chosenPhysicsGroups = [];
+        private SimulationState simulationState;
+        private int simulationRequest;
         private bool ignoreLayersChangeEvents = true;
         private List<Matrix4x4> CameraMatrices = [];
         private WorldNodeLoader? LoadedWorldNode;
         public WorldLoader? LoadedWorld;
         private EntityLump.Entity? entityInfoEntity;
+
+        private enum SimulationState
+        {
+            /// <summary>The world rests as it loaded.</summary>
+            Stopped,
+
+            /// <summary>Entity logic runs.</summary>
+            Playing,
+
+            /// <summary>Entity logic is held where it was.</summary>
+            Paused,
+        }
+
+        private enum SimulationRequest
+        {
+            None,
+            Play,
+            Pause,
+
+            /// <summary>Pause while playing, otherwise play.</summary>
+            PlayOrPause,
+            Stop,
+        }
 
         /// <summary>Jump from the entity info popup to the entity's node in the I/O graph tab, when the map has one.</summary>
         public Func<EntityLump.Entity, bool>? ShowEntityInGraph { get; set; }
@@ -69,6 +107,13 @@ namespace GUI.Types.GLViewers
             cameraComboBox?.Dispose();
             savedCameraPositionsControl?.Dispose();
             entityInfoForm?.Dispose();
+            playPauseButton?.Dispose();
+            stopButton?.Dispose();
+            playImage?.Dispose();
+            pauseImage?.Dispose();
+            stopImage?.Dispose();
+            toolEntitiesButton?.Dispose();
+            toolMaterialsButton?.Dispose();
         }
 
         private void AddSceneExposureSlider()
@@ -105,7 +150,7 @@ namespace GUI.Types.GLViewers
                 var loc = Renderer.Camera.Location;
                 var cameraAngles = Renderer.Camera.GetQAngle();
 
-                AppClipboard.SetText($"setpos {loc.X:F6} {loc.Y:F6} {loc.Z:F6}; setang {cameraAngles.X:F6} {cameraAngles.Y:F6} {cameraAngles.Z:F6}");
+                AppClipboard.SetText(string.Create(CultureInfo.InvariantCulture, $"setpos {loc.X:F6} {loc.Y:F6} {loc.Z:F6}; setang {cameraAngles.X:F6} {cameraAngles.Y:F6} {cameraAngles.Z:F6}"));
 
                 return;
             }
@@ -196,8 +241,6 @@ namespace GUI.Types.GLViewers
         {
             var cameraSet = false;
 
-            // Bring up the sound player before any models load, so their animation clips can pre-cache sound events
-            ReportLoadingStatus("Loading sound events…");
             InitializeSoundPlayer();
 
             if (world != null)
@@ -205,6 +248,7 @@ namespace GUI.Types.GLViewers
                 LoadedWorld = new WorldLoader(world, Scene, Renderer.EntitySystem)
                 {
                     LoadingProgress = GuiContext.LoadingProgress,
+                    DefaultEnabledLayers = { HammerEntityVisuals.MarkerLayerName },
                 };
 
                 LoadedWorld.Load(mapExternalReferences);
@@ -214,7 +258,9 @@ namespace GUI.Types.GLViewers
                     Renderer.AddSpawnGroup(spawnGroup);
                 }
 
-                NavMeshSceneNode.AddNavNodesToScene(LoadedWorld.NavMesh, Scene);
+                NavMeshSceneNode.AddNavNodesToScene(LoadedWorld.NavMesh, Scene, LoadedWorld.NavigationHullNames);
+                NavSpaceSceneNode.AddToScene(LoadedWorld.NavSpace, Scene);
+                NavMeshSceneNode.AddFlowMapNodesToScene(LoadedWorld.NavFlowMap, LoadedWorld.NavMesh, Scene, LoadedWorld.NavigationHullNames);
                 CS2BombDamageSceneNode.AddBakedBombDamageToScene(LoadedWorld.BombDamage, Scene);
 
                 if (LoadedWorld.CameraMatrices.Count > 0)
@@ -245,6 +291,9 @@ namespace GUI.Types.GLViewers
 
                 Input.EntitySystem = Renderer.EntitySystem;
                 Renderer.EntitySystem.SpawnPlayer(Input.PlayerMovement, Scene);
+
+                // The world rests as it loaded until it is played
+                Renderer.EntitySystem.Enabled = false;
             }
 
             if (!cameraSet)
@@ -300,7 +349,7 @@ namespace GUI.Types.GLViewers
                 }
 
                 SetEnabledPhysicsGroups([.. physicsGroups]);
-            });
+            }, height: 250);
 
             using (UiControl.BeginGroup("Camera"))
             {
@@ -330,6 +379,8 @@ namespace GUI.Types.GLViewers
 
             if (world != null)
             {
+                AddSimulationToolbar();
+
                 var uniqueWorldLayers = new HashSet<string>(4);
                 var uniquePhysicsGroups = new HashSet<string>();
 
@@ -376,7 +427,32 @@ namespace GUI.Types.GLViewers
 
                 if (uniquePhysicsGroups.Count > 0)
                 {
+                    Debug.Assert(physicsGroupsComboBox != null);
+
+                    physicsGroupsComboBox.BeginUpdate();
+
                     SetAvailablePhysicsGroups(uniquePhysicsGroups);
+
+                    // Groups of tools materials start shown, it is the tools materials switch that hides them
+                    var toolsMaterialGroups = Scene.AllNodes
+                        .OfType<PhysSceneNode>()
+                        .Where(static node => node.IsToolsMaterial)
+                        .Select(static node => node.PhysGroupName)
+                        .ToHashSet();
+
+                    foreach (var group in toolsMaterialGroups)
+                    {
+                        var checkboxIndex = physicsGroupsComboBox.FindStringExact(group);
+
+                        if (checkboxIndex > -1)
+                        {
+                            physicsGroupsComboBox.SetItemCheckState(checkboxIndex, CheckState.Checked);
+                        }
+                    }
+
+                    physicsGroupsComboBox.EndUpdate();
+
+                    SetEnabledPhysicsGroups(toolsMaterialGroups);
                 }
 
                 using (UiControl.BeginGroup("World"))
@@ -388,13 +464,22 @@ namespace GUI.Types.GLViewers
 
                     UiControl.AddCheckBox("Show Fog", Scene.FogEnabled, v => Scene.FogEnabled = v);
 
-                    UiControl.AddCheckBox("Entity System", Renderer.EntitySystem.Enabled, v => Renderer.EntitySystem.Enabled = v);
-
                     UiControl.AddCheckBox("Color Correction", Renderer.Postprocess.ColorCorrectionEnabled, v => Renderer.Postprocess.ColorCorrectionEnabled = v);
 
                     if (Scene.VoxelVisibility != null)
                     {
                         UiControl.AddCheckBox("PVS Culling", Scene.EnablePvsCulling, v => Scene.EnablePvsCulling = v);
+                    }
+
+                    if (Renderer.Scenes.Any(static scene => scene.VisibilityBoxes.Count > 0))
+                    {
+                        UiControl.AddCheckBox("Visibility Boxes", Scene.VisibilityBoxes.Enabled, v =>
+                        {
+                            foreach (var scene in Renderer.Scenes)
+                            {
+                                scene.VisibilityBoxes.Enabled = v;
+                            }
+                        });
                     }
 
                     CheckBox? occlusionCullingCheckBox = null;
@@ -579,8 +664,6 @@ namespace GUI.Types.GLViewers
                 tabControl.SelectTab(tabPage);
             }
 
-            Debug.Assert(SelectedNodeRenderer != null);
-
             var hasBounds = false;
             var bounds = default(AABB);
             var selectedAny = false;
@@ -595,11 +678,11 @@ namespace GUI.Types.GLViewers
                 {
                     if (selectedAny)
                     {
-                        SelectedNodeRenderer.ToggleNode(node);
+                        Selection.Toggle(node);
                     }
                     else
                     {
-                        SelectedNodeRenderer.SelectNode(node, forceDisableDepth: true);
+                        Selection.Select(node);
                         selectedAny = true;
                     }
 
@@ -625,9 +708,7 @@ namespace GUI.Types.GLViewers
         {
             ArgumentNullException.ThrowIfNull(node);
 
-            Debug.Assert(SelectedNodeRenderer != null);
-
-            SelectedNodeRenderer.SelectNode(node, forceDisableDepth: true);
+            Selection.Select(node);
             FocusCameraOnBounds(SelectionBounds(node));
             EnsureNodeVisible(node);
         }
@@ -653,7 +734,6 @@ namespace GUI.Types.GLViewers
         {
             var origin = entity.GetVector3Property("origin");
 
-            // An entity of a spawn group is placed with the group, and one of the 3D sky shows up magnified
             if (Renderer.SpawnGroups.FirstOrDefault(group => group.Entities.Contains(entity)) is { } spawnGroup)
             {
                 origin = spawnGroup.EntityOriginToWorld(origin);
@@ -684,6 +764,20 @@ namespace GUI.Types.GLViewers
 
         private void EnsureNodeVisible(SceneNode node)
         {
+            if (node.LayerName != null && ToolsVisibility.IsToolEntityLayer(node.LayerName) && !tools.ShowToolEntities)
+            {
+                tools.ShowToolEntities = true;
+                toolEntitiesButton?.Checked = true;
+                RequestVisibilityUpdate();
+            }
+
+            if (node is PhysSceneNode { IsToolsMaterial: true } && !tools.ShowToolMaterials)
+            {
+                tools.ShowToolMaterials = true;
+                toolMaterialsButton?.Checked = true;
+                RequestVisibilityUpdate();
+            }
+
             if (!node.LayerEnabled && worldLayersComboBox != null && node.LayerName != null)
             {
                 var layerId = worldLayersComboBox.Items.IndexOf(node.LayerName);
@@ -707,173 +801,219 @@ namespace GUI.Types.GLViewers
 
         private void ShowSceneNodeDetails(SceneNode sceneNode)
         {
-            var isEntity = sceneNode.EntityData != null;
-            entityInfoEntity = sceneNode.EntityData;
+            if (sceneNode.EntityData != null)
+            {
+                ShowEntityDetails(sceneNode.EntityData);
+                return;
+            }
 
+            var form = PrepareEntityInfoForm(null);
+            var info = form.EntityInfoControl;
+
+            form.Text = $"{sceneNode.GetType().Name}: {sceneNode.Name}";
+
+            static string FormatVector(Vector3 vector)
+            {
+                return $"{vector.X:F2} {vector.Y:F2} {vector.Z:F2}";
+            }
+
+            static string ToRenderColor(Vector4 tint)
+            {
+                tint *= 255.0f;
+                return $"{tint.X:F0} {tint.Y:F0} {tint.Z:F0}";
+            }
+
+            if (sceneNode is SceneAggregate.Fragment sceneFragment)
+            {
+                var material = sceneFragment.DrawCall.Material.Material;
+                info.AddProperty("Shader", material.ShaderName);
+                info.AddProperty("Material", material.Name, new LinkedFile(material.Name));
+                info.AddProperty("Aggregate Model", sceneFragment.Name!, new LinkedFile(sceneFragment.Name!));
+
+                var tris = sceneFragment.DrawCall.IndexCount / 3;
+                if (sceneFragment.DrawCall.NumMeshlets > 0)
+                {
+                    var clusters = sceneFragment.DrawCall.NumMeshlets;
+                    var trisPerCluster = tris / clusters;
+                    info.AddProperty("Triangles / Clusters / Per Cluster", $"{tris} / {clusters} / {trisPerCluster}");
+                }
+                else
+                {
+                    info.AddProperty("Triangles", $"{tris}");
+                }
+
+                info.AddProperty("Model Tint", ToRenderColor(sceneFragment.DrawCall.TintColor));
+                info.AddProperty("Model Alpha", $"{sceneFragment.DrawCall.TintColor.W:F6}");
+
+                if (sceneFragment.TintAlpha != Vector4.One)
+                {
+                    info.AddProperty("Instance Tint", ToRenderColor(sceneFragment.TintAlpha));
+                    info.AddProperty("Final Tint", ToRenderColor(sceneFragment.DrawCall.TintColor * sceneFragment.TintAlpha));
+                }
+            }
+            else if (sceneNode is SceneClutter clutter)
+            {
+                var drawCalls = clutter.RenderMesh.DrawCallsOpaque;
+                var tris = drawCalls.Sum(static drawCall => drawCall.IndexCount / 3);
+
+                info.AddProperty("Clutter Model", clutter.Name!, new LinkedFile(clutter.Name!));
+
+                foreach (var drawCall in drawCalls)
+                {
+                    var material = drawCall.Material.Material;
+                    info.AddProperty("Shader", material.ShaderName);
+                    info.AddProperty("Material", material.Name, new LinkedFile(material.Name));
+                }
+
+                info.AddProperty("Instances", $"{clutter.InstanceTransforms.Count}");
+                info.AddProperty("Triangles", $"{(long)tris * clutter.InstanceTransforms.Count}");
+                info.AddProperty("Triangles Per Instance", $"{tris}");
+                info.AddProperty("Instance Tint", ToRenderColor(clutter.TintAlpha));
+                info.AddProperty("Begin Cull Size", $"{clutter.BeginCullSize:G6}");
+                info.AddProperty("End Cull Size", $"{clutter.EndCullSize:G6}");
+            }
+            else if (sceneNode is ModelSceneNode modelSceneNode)
+            {
+                info.AddProperty("Model", modelSceneNode.Name!, new LinkedFile(modelSceneNode.Name!));
+                info.AddProperty("Model Tint", ToRenderColor(modelSceneNode.TintAlpha));
+                info.AddProperty("Model Alpha", $"{modelSceneNode.Alpha:F6}");
+
+                if (modelSceneNode.LightingOrigin.HasValue)
+                {
+                    info.AddProperty("Custom Lighting Origin", FormatVector(modelSceneNode.LightingOrigin.Value));
+                }
+            }
+            else if (sceneNode is PhysSceneNode physSceneNode)
+            {
+                PhysicsDetails.AddNodeDetails(info, physSceneNode);
+            }
+
+            if (sceneNode.CubeMapPrecomputedHandshake > 0)
+            {
+                info.AddProperty("Cubemap Handshake", $"{sceneNode.CubeMapPrecomputedHandshake}");
+            }
+
+            if (sceneNode.LightProbeVolumePrecomputedHandshake > 0)
+            {
+                info.AddProperty("Light Probe Handshake", $"{sceneNode.LightProbeVolumePrecomputedHandshake}");
+            }
+
+            info.AddProperty("Flags", sceneNode.Flags.ToString());
+            info.AddProperty("Layer", sceneNode.LayerName ?? string.Empty);
+
+            if (Renderer.SpawnGroups.FirstOrDefault(group => group.Scene == sceneNode.Scene) is { } spawnGroup)
+            {
+                form.Text += SpawnGroupSuffix(spawnGroup);
+            }
+
+            info.ShowPopulatedTabs();
+        }
+
+        private void ShowEntityDetails(EntityLump.Entity entity)
+        {
+            var form = PrepareEntityInfoForm(entity);
+
+            form.EntityInfoControl.PopulateFromEntity(GetLinkableEntities(), entity);
+
+            var modelEntity = Renderer.EntitySystem.Entities.OfType<BaseModelEntity>().FirstOrDefault(candidate => candidate.Data == entity);
+
+            if (modelEntity?.Physics != null)
+            {
+                PhysicsDetails.AddEntityDetails(form.EntityInfoControl, modelEntity, modelEntity.Physics);
+            }
+
+            var classname = entity.GetStringProperty("classname");
+            var targetName = entity.FriendlyTargetName;
+            form.Text = string.IsNullOrEmpty(targetName)
+                ? $"Entity: {classname}"
+                : $"Entity: {classname} ({targetName})";
+
+            if (Renderer.SpawnGroups.FirstOrDefault(group => group.Entities.Contains(entity)) is { } spawnGroup)
+            {
+                form.Text += SpawnGroupSuffix(spawnGroup);
+            }
+
+            form.EntityInfoControl.ShowPopulatedTabs();
+        }
+
+        private static string SpawnGroupSuffix(SpawnGroup spawnGroup)
+            => spawnGroup.WorldGroup != null ? " (in 3D skybox)" : $" (in {spawnGroup.MapName})";
+
+        /// <summary>
+        /// Opens the details window if it is not open yet, and empties it for <paramref name="entity"/>,
+        /// or for a scene node that is not an entity when it is null.
+        /// </summary>
+        private EntityInfoForm PrepareEntityInfoForm(EntityLump.Entity? entity)
+        {
             if (entityInfoForm == null)
             {
-                entityInfoForm = new EntityInfoForm(GuiContext);
+                entityInfoForm = new EntityInfoForm();
+                entityInfoForm.EntityInfoControl.LinkedResourceActivated += OnLinkedResourceActivated;
+                entityInfoForm.EntityInfoControl.ConnectionFireRequested += OnConnectionFireRequested;
+                entityInfoForm.EntityInfoControl.CanFireConnections = true;
 
                 if (ShowEntityInGraph != null)
                 {
                     entityInfoForm.AddShowInGraphButton(OnShowInGraphButtonClick);
                 }
 
+                entityInfoForm.FormClosed += OnEntityInfoFormClosed;
                 entityInfoForm.Show();
-                entityInfoForm.EntityInfoControl.OutputsGrid.CellDoubleClick += OnEntityInfoOutputsCellDoubleClick;
-                entityInfoForm.EntityInfoControl.InputsGrid.CellDoubleClick += OnEntityInfoInputsCellDoubleClick;
-                entityInfoForm.EntityInfoControl.Disposed += OnEntityInfoFormDisposed;
             }
 
-            Debug.Assert(entityInfoForm != null);
+            entityInfoEntity = entity;
 
             if (entityInfoForm.ShowInGraphButton != null)
             {
-                entityInfoForm.ShowInGraphButton.Visible = isEntity
-                    && entityInfoEntity != null
-                    && (EntityHasGraphNode?.Invoke(entityInfoEntity) ?? false);
+                entityInfoForm.ShowInGraphButton.Visible = entity != null && (EntityHasGraphNode?.Invoke(entity) ?? false);
             }
 
             entityInfoForm.EntityInfoControl.Clear();
 
-            if (isEntity)
-            {
-                ShowEntityProperties(sceneNode);
-            }
-            else
-            {
-                entityInfoForm.Text = $"{sceneNode.GetType().Name}: {sceneNode.Name}";
-
-                static string FormatVector(Vector3 vector)
-                {
-                    return $"{vector.X:F2} {vector.Y:F2} {vector.Z:F2}";
-                }
-
-                static string ToRenderColor(Vector4 tint)
-                {
-                    tint *= 255.0f;
-                    return $"{tint.X:F0} {tint.Y:F0} {tint.Z:F0}";
-                }
-
-                if (sceneNode is SceneAggregate.Fragment sceneFragment)
-                {
-                    var material = sceneFragment.DrawCall.Material.Material;
-                    entityInfoForm.EntityInfoControl.AddProperty("Shader", material.ShaderName);
-                    entityInfoForm.EntityInfoControl.AddProperty("Material", material.Name);
-                    entityInfoForm.EntityInfoControl.AddProperty("Aggregate Model", sceneFragment.Name!);
-
-                    var tris = sceneFragment.DrawCall.IndexCount / 3;
-                    if (sceneFragment.DrawCall.NumMeshlets > 0)
-                    {
-                        var clusters = sceneFragment.DrawCall.NumMeshlets;
-                        var trisPerCluster = tris / clusters;
-                        entityInfoForm.EntityInfoControl.AddProperty("Triangles / Clusters / Per Cluster", $"{tris} / {clusters} / {trisPerCluster}");
-                    }
-                    else
-                    {
-                        entityInfoForm.EntityInfoControl.AddProperty("Triangles", $"{tris}");
-                    }
-
-                    entityInfoForm.EntityInfoControl.AddProperty("Model Tint", ToRenderColor(sceneFragment.DrawCall.TintColor));
-                    entityInfoForm.EntityInfoControl.AddProperty("Model Alpha", $"{sceneFragment.DrawCall.TintColor.W:F6}");
-
-                    if (sceneFragment.TintAlpha != Vector4.One)
-                    {
-                        entityInfoForm.EntityInfoControl.AddProperty("Instance Tint", ToRenderColor(sceneFragment.TintAlpha));
-                        entityInfoForm.EntityInfoControl.AddProperty("Final Tint", ToRenderColor(sceneFragment.DrawCall.TintColor * sceneFragment.TintAlpha));
-                    }
-                }
-                else if (sceneNode is ModelSceneNode modelSceneNode)
-                {
-                    entityInfoForm.EntityInfoControl.AddProperty("Model", modelSceneNode.Name!);
-                    entityInfoForm.EntityInfoControl.AddProperty("Model Tint", ToRenderColor(modelSceneNode.TintAlpha));
-                    entityInfoForm.EntityInfoControl.AddProperty("Model Alpha", $"{modelSceneNode.Alpha:F6}");
-
-                    if (modelSceneNode.LightingOrigin.HasValue)
-                    {
-                        entityInfoForm.EntityInfoControl.AddProperty("Custom Lighting Origin", FormatVector(modelSceneNode.LightingOrigin.Value));
-                    }
-                }
-
-                if (sceneNode.CubeMapPrecomputedHandshake > 0)
-                {
-                    entityInfoForm.EntityInfoControl.AddProperty("Cubemap Handshake", $"{sceneNode.CubeMapPrecomputedHandshake}");
-                }
-
-                if (sceneNode.LightProbeVolumePrecomputedHandshake > 0)
-                {
-                    entityInfoForm.EntityInfoControl.AddProperty("Light Probe Handshake", $"{sceneNode.LightProbeVolumePrecomputedHandshake}");
-                }
-
-                entityInfoForm.EntityInfoControl.AddProperty("Flags", sceneNode.Flags.ToString());
-                entityInfoForm.EntityInfoControl.AddProperty("Layer", sceneNode.LayerName ?? string.Empty);
-            }
-
-            if (Renderer.SpawnGroups.FirstOrDefault(group => group.Scene == sceneNode.Scene) is { } spawnGroup)
-            {
-                entityInfoForm.Text += spawnGroup.WorldGroup != null ? " (in 3D skybox)" : $" (in {spawnGroup.MapName})";
-            }
-
-            entityInfoForm.EntityInfoControl.ShowPopulatedTabs();
-            entityInfoForm.EntityInfoControl.Show();
+            return entityInfoForm;
         }
 
-        private void OnEntityInfoOutputsCellDoubleClick(object? sender, DataGridViewCellEventArgs e)
+        private List<EntityLump.Entity> GetLinkableEntities()
         {
-            if (entityInfoForm == null)
+            if (LoadedWorld == null)
             {
-                return;
+                return [];
             }
 
-            if (e.ColumnIndex != 1)
+            if (Renderer.SpawnGroups.Count == 0)
             {
-                return;
+                return LoadedWorld.Entities;
             }
 
-            var entityName = (string)(entityInfoForm.EntityInfoControl.OutputsGrid[e.ColumnIndex, e.RowIndex].Value ?? string.Empty);
-
-            if (string.IsNullOrEmpty(entityName))
-            {
-                return;
-            }
-
-            var node = Renderer.FindNodeByTargetName(entityName);
-
-            if (node == null)
-            {
-                return;
-            }
-
-            SelectAndFocusNode(node);
-            ShowSceneNodeDetails(node);
+            return [.. LoadedWorld.Entities, .. Renderer.SpawnGroups.SelectMany(static group => group.Entities)];
         }
 
-        private void OnEntityInfoInputsCellDoubleClick(object? sender, DataGridViewCellEventArgs e)
+        private void OnLinkedResourceActivated(object? sender, LinkedResource link)
         {
-            if (entityInfoForm == null)
+            switch (link)
             {
-                return;
+                case LinkedEntities { Entities: [var entity] }:
+                    SelectAndFocusEntity(entity);
+                    ShowEntityDetails(entity);
+                    break;
+
+                case LinkedEntities { Entities: var entities }:
+                    SelectAndFocusEntities(entities);
+                    break;
+
+                case LinkedFile { Path: var path }:
+                    if (Viewers.Resource.OpenExternalReference(GuiContext, path))
+                    {
+                        entityInfoForm?.Close();
+                    }
+                    break;
             }
+        }
 
-            if (e.ColumnIndex != 0 || e.RowIndex < 0)
-            {
-                return;
-            }
-
-            if (entityInfoForm.EntityInfoControl.InputsGrid.Rows[e.RowIndex].Tag is not EntityLump.Entity sourceEntity)
-            {
-                return;
-            }
-
-            var node = Renderer.FindNode(sourceEntity);
-
-            if (node == null)
-            {
-                return;
-            }
-
-            SelectAndFocusNode(node);
-            ShowSceneNodeDetails(node);
+        private void OnConnectionFireRequested(object? sender, EntityLump.Connection connection)
+        {
+            using var lockedGl = MakeCurrent();
+            Renderer.EntitySystem.QueueConnection(connection, Renderer.EntitySystem.Player);
         }
 
         private void OnShowInGraphButtonClick(object? sender, EventArgs e)
@@ -884,29 +1024,20 @@ namespace GUI.Types.GLViewers
             }
         }
 
-        private void OnEntityInfoFormDisposed(object? sender, EventArgs e)
+        private void OnEntityInfoFormClosed(object? sender, FormClosedEventArgs e)
         {
-            if (entityInfoForm == null)
-            {
-                return;
-            }
-
-            entityInfoForm.EntityInfoControl.OutputsGrid.CellDoubleClick -= OnEntityInfoOutputsCellDoubleClick;
-            entityInfoForm.EntityInfoControl.InputsGrid.CellDoubleClick -= OnEntityInfoInputsCellDoubleClick;
-            entityInfoForm.EntityInfoControl.Disposed -= OnEntityInfoFormDisposed;
             entityInfoForm = null;
+            entityInfoEntity = null;
         }
 
-        protected override void OnPicked(object? sender, PickingResponse pickingResponse)
+        protected override void OnPicked(PickResult result)
         {
-            Debug.Assert(SelectedNodeRenderer != null);
-
-            var pixelInfo = pickingResponse.PixelInfo;
+            var pixelInfo = result.Pixel;
 
             // Void
-            if (pixelInfo.ObjectId == 0 || pixelInfo.Unused2 != 0)
+            if (result.HitNothing)
             {
-                SelectedNodeRenderer.SelectNode(null);
+                Selection.Clear();
                 return;
             }
 
@@ -918,15 +1049,15 @@ namespace GUI.Types.GLViewers
                 return;
             }
 
-            if (pickingResponse.Intent == PickingIntent.Select)
+            if (result.Intent == PickIntent.Select)
             {
-                if ((Control.ModifierKeys & Keys.Control) > 0)
+                if (result.Has(PickModifiers.Control))
                 {
-                    SelectedNodeRenderer.ToggleNode(sceneNode);
+                    Selection.Toggle(sceneNode);
                 }
                 else
                 {
-                    SelectedNodeRenderer.SelectNode(sceneNode);
+                    Selection.Select(sceneNode);
                 }
 
                 //Update the entity properties window if it was opened
@@ -940,7 +1071,7 @@ namespace GUI.Types.GLViewers
                 return;
             }
 
-            if (pickingResponse.Intent == PickingIntent.Details)
+            if (result.Intent == PickIntent.Details)
             {
                 Program.MainForm.Invoke(() =>
                 {
@@ -984,7 +1115,7 @@ namespace GUI.Types.GLViewers
                 // The inverse of a view matrix, so its third row is the camera's backward direction
                 var forward = -transform.GetRow(2).AsVector3();
 
-                if (viewerControl is GLSceneViewer sceneViewer)
+                if (viewerControl is GLSceneViewer sceneViewer && sceneNode is not SceneAggregate { InstanceTransforms.Count: > 0 })
                 {
                     sceneViewer.Input.Camera.CopyFrom(Renderer.Camera);
                     sceneViewer.Input.Camera.SetLocation(transform.Translation);
@@ -1044,27 +1175,6 @@ namespace GUI.Types.GLViewers
             });
         }
 
-        private void ShowEntityProperties(SceneNode sceneNode)
-        {
-            Debug.Assert(entityInfoForm != null);
-            Debug.Assert(sceneNode.EntityData != null);
-
-            if (LoadedWorld is null)
-            {
-                entityInfoForm.EntityInfoControl.PopulateFromEntity(sceneNode.EntityData);
-            }
-            else
-            {
-                entityInfoForm.EntityInfoControl.PopulateFromEntity(LoadedWorld.Entities, sceneNode.EntityData);
-            }
-
-            var classname = sceneNode.EntityData.GetStringProperty("classname");
-            var targetName = sceneNode.EntityData.FriendlyTargetName;
-            entityInfoForm.Text = string.IsNullOrEmpty(targetName)
-                ? $"Entity: {classname}"
-                : $"Entity: {classname} ({targetName})";
-        }
-
         private void SetAvailableLayers(IEnumerable<string> worldLayers)
         {
             Debug.Assert(worldLayersComboBox != null);
@@ -1110,37 +1220,198 @@ namespace GUI.Types.GLViewers
 
         private void SetEnabledPhysicsGroups(HashSet<string> physicsGroups)
         {
-            var renderTranslucent = !physicsGroups.Contains(PhysicsRenderAsOpaque);
-
-            if (!renderTranslucent)
-            {
-                physicsGroups.Remove(PhysicsRenderAsOpaque);
-            }
-
-            using var lockedGl = MakeCurrent();
-
-            ShowPhysicsGroups(physicsGroups, renderTranslucent);
+            chosenPhysicsGroups = physicsGroups;
+            RequestVisibilityUpdate();
         }
+
+        protected override bool HasToolsVisibilityControls => world != null;
+
+        protected override HashSet<string> FilterLayers(HashSet<string> layers)
+            => HasToolsVisibilityControls ? tools.FilterLayers(layers) : layers;
+
+        /// <summary>Gets the physics groups chosen in the sidebar list.</summary>
+        protected HashSet<string> ChosenPhysicsGroups => chosenPhysicsGroups;
 
         /// <summary>Gets the nodes whose world layers and physics groups are offered in the sidebar lists.</summary>
         protected virtual IEnumerable<SceneNode> NodesForLayerLists => Scene.AllNodes;
 
-        /// <summary>Shows the collision of the given physics groups and hides the rest. Called with the GL context current.</summary>
-        protected virtual void ShowPhysicsGroups(HashSet<string> physicsGroups, bool renderTranslucent)
-            => ShowPhysicsGroups(Renderer, physicsGroups, renderTranslucent);
-
-        protected static void ShowPhysicsGroups(ValveResourceFormat.Renderer.Renderer renderer, HashSet<string> physicsGroups, bool renderTranslucent)
+        protected override void ApplyVisibilityTo(ValveResourceFormat.Renderer.Renderer renderer)
         {
+            if (HasToolsVisibilityControls)
+            {
+                foreach (var scene in renderer.Scenes)
+                {
+                    scene.ShowToolsMaterials = tools.ShowToolMaterials;
+                }
+            }
+
+            base.ApplyVisibilityTo(renderer);
+
+            var physicsGroups = chosenPhysicsGroups;
+            var renderTranslucent = !physicsGroups.Contains(PhysicsRenderAsOpaque);
+
             foreach (var physNode in renderer.Scene.AllNodes.OfType<PhysSceneNode>())
             {
-                physNode.Enabled = physicsGroups.Contains(physNode.PhysGroupName);
+                var groupChosen = physicsGroups.Contains(physNode.PhysGroupName);
+
+                physNode.Enabled = HasToolsVisibilityControls ? tools.IsPhysicsVisible(physNode, groupChosen) : groupChosen;
                 physNode.IsTranslucentRenderMode = renderTranslucent;
             }
+        }
 
-            foreach (var scene in renderer.Scenes)
+        // Above the viewport rather than in the sidebar: how the world is run and what of the tools is drawn
+        private void AddSimulationToolbar()
+        {
+            Debug.Assert(UiControl != null);
+
+            // The image list hands out a copy each time it is asked
+            playImage = AppIcons.ImageList.Images[AppIcons.Icons["RendererPlay"]];
+            pauseImage = AppIcons.ImageList.Images[AppIcons.Icons["RendererPause"]];
+            stopImage = AppIcons.ImageList.Images[AppIcons.Icons["RendererStop"]];
+
+            playPauseButton = UiControl.AddToolbarButton(playImage, "Play", () => RequestSimulation(SimulationRequest.PlayOrPause), centered: true);
+            stopButton = UiControl.AddToolbarButton(stopImage, "Stop", () => RequestSimulation(SimulationRequest.Stop), centered: true);
+
+            toolEntitiesButton = UiControl.AddToolbarToggle("Tool Entities", tools.ShowToolEntities, v =>
             {
-                scene.UpdateOctrees();
+                tools.ShowToolEntities = v;
+                RequestVisibilityUpdate();
+            });
+            toolMaterialsButton = UiControl.AddToolbarToggle("Tool Materials", tools.ShowToolMaterials, v =>
+            {
+                tools.ShowToolMaterials = v;
+                RequestVisibilityUpdate();
+            });
+
+            UpdateSimulationButtons(simulationState);
+            RequestVisibilityUpdate();
+        }
+
+        private void RequestSimulation(SimulationRequest request)
+        {
+            Interlocked.Exchange(ref simulationRequest, (int)request);
+
+            // Hands the keyboard back to the viewport, which the click took, so the player can be walked
+            GLControl?.Focus();
+        }
+
+        private void UpdateSimulationButtons(SimulationState state)
+        {
+            var playing = state == SimulationState.Playing;
+
+            playPauseButton?.Image = playing ? pauseImage : playImage;
+            playPauseButton?.AccessibleName = playing ? "Pause" : "Play";
+            stopButton?.Enabled = state != SimulationState.Stopped;
+        }
+
+        protected override (string Text, Color32 Color)? ModeLabel => simulationState switch
+        {
+            SimulationState.Playing => ("PLAY MODE", new Color32(90, 220, 90)),
+            SimulationState.Paused => ("PLAY MODE (PAUSED)", new Color32(90, 220, 90)),
+            _ => null,
+        };
+
+        protected override void OnUpdate(float frameTime)
+        {
+            ApplySimulationRequest();
+
+            base.OnUpdate(frameTime);
+        }
+
+        // Walking into a world at rest plays it
+        protected override void OnWalkModeEntered()
+        {
+            if (simulationState == SimulationState.Stopped)
+            {
+                ApplySimulation(SimulationRequest.Play);
             }
+        }
+
+        private void ApplySimulationRequest()
+            => ApplySimulation((SimulationRequest)Interlocked.Exchange(ref simulationRequest, (int)SimulationRequest.None));
+
+        // On the render thread, which owns the entity world and the scene
+        private void ApplySimulation(SimulationRequest request)
+        {
+            if (world == null)
+            {
+                return;
+            }
+
+            if (request == SimulationRequest.PlayOrPause)
+            {
+                request = simulationState == SimulationState.Playing ? SimulationRequest.Pause : SimulationRequest.Play;
+            }
+
+            var entitySystem = Renderer.EntitySystem;
+
+            switch (request, simulationState)
+            {
+                case (SimulationRequest.Play, SimulationState.Stopped):
+                    simulationState = SimulationState.Playing;
+                    ResetScene();
+                    entitySystem.Enabled = true;
+                    entitySystem.StartRound();
+                    Input.SetWalkMode(true);
+                    break;
+
+                case (SimulationRequest.Play, SimulationState.Paused):
+                    simulationState = SimulationState.Playing;
+                    entitySystem.Enabled = true;
+                    break;
+
+                case (SimulationRequest.Pause, SimulationState.Playing):
+                    simulationState = SimulationState.Paused;
+                    entitySystem.Enabled = false;
+                    break;
+
+                case (SimulationRequest.Stop, SimulationState.Playing or SimulationState.Paused):
+                    simulationState = SimulationState.Stopped;
+                    entitySystem.Enabled = false;
+                    Input.SetWalkMode(false);
+                    ResetScene();
+                    break;
+
+                default:
+                    return;
+            }
+
+            var state = simulationState;
+
+            if (UiControl is { IsHandleCreated: true } control)
+            {
+                control.BeginInvoke(() => UpdateSimulationButtons(state));
+            }
+        }
+
+        /// <summary>
+        /// Puts the world back as it loaded: every entity is removed, along with what they left in the scene,
+        /// and spawned again from the map's entity lumps.
+        /// </summary>
+        private void ResetScene()
+        {
+            Debug.Assert(LoadedWorld != null);
+
+            // Its nodes are about to go
+            Selection.Clear();
+
+            Renderer.RemoveEntities();
+
+            LoadedWorld.LoadingProgress = null;
+            LoadedWorld.ReloadEntities();
+
+            foreach (var spawnGroup in LoadedWorld.SpawnGroups)
+            {
+                Renderer.AddSpawnGroup(spawnGroup);
+                spawnGroup.Scene.Initialize();
+            }
+
+            Scene.RebindLighting();
+
+            Renderer.EntitySystem.SpawnPlayer(Input.PlayerMovement, Scene);
+
+            ApplyRenderModeToNodes();
+            ApplyVisibility();
         }
     }
 }

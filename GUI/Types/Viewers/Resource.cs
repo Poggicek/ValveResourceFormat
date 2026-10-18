@@ -1,7 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
-using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Threading.Tasks;
@@ -20,7 +19,9 @@ using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.World;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.ResourceTypes.GenericData.CS2;
+using ValveResourceFormat.ResourceTypes.ModelAnimation2;
 using ValveResourceFormat.Serialization.KeyValues;
+using Sound = ValveResourceFormat.ResourceTypes.Sound;
 
 namespace GUI.Types.Viewers
 {
@@ -31,11 +32,19 @@ namespace GUI.Types.Viewers
         ResourceBlocksOnly,
     };
 
-    class Resource(VrfGuiContext vrfGuiContext, ResourceViewMode viewMode, bool verifyFileSize) : IViewer, IDisposable
+    class Resource(VrfGuiContext vrfGuiContext, ResourceViewMode viewMode) : IViewer, IDisposable
     {
+        /// <summary>
+        /// Keyvalues blocks larger than this on disk are not turned into text for display, their text
+        /// would come close to or exceed the largest string .NET can hold.
+        /// </summary>
+        private const long MaxKeyValuesBlockSizeForText = 64 * 1024 * 1024;
+
         private ValveResourceFormat.Resource? resource;
         private RendererContext? rendererContext;
-        private readonly List<(GLGraphViewer Viewer, string TabName)> preparedGraphViewers = [];
+        private readonly List<(Func<GLGraphViewer> Create, string TabName)> preparedGraphViewers = [];
+        private readonly List<GLGraphViewer> loadedGraphViewers = [];
+        private const string EntityIOGraphTabName = "ENTITY I/O GRAPH";
         public GLBaseControl? GLViewer { get; private set; }
         private CodeTextBox? GLViewerError;
         private string? GLViewerTabName;
@@ -57,7 +66,7 @@ namespace GUI.Types.Viewers
             {
                 if (stream != null)
                 {
-                    resource.Read(stream, verifyFileSize);
+                    resource.Read(stream);
                 }
                 else
                 {
@@ -80,7 +89,7 @@ namespace GUI.Types.Viewers
                 }
                 catch (Exception ex)
                 {
-                    GLViewerError = CodeTextBox.CreateFromException(ex, vrfGuiContext.FullPath);
+                    GLViewerError = CodeTextBox.CreateFromException(ex, vrfGuiContext.DisplayPath);
                 }
             }
         }
@@ -204,14 +213,6 @@ namespace GUI.Types.Viewers
                     }
                     break;
 
-                case ResourceType.EntityLump:
-                    if (resource.DataBlock is EntityLump entityLumpData)
-                    {
-                        GLViewer = new EntityIOGraphViewer(vrfGuiContext, rendererContext, entityLumpData);
-                        GLViewerTabName = "ENTITY I/O GRAPH";
-                    }
-                    break;
-
                 case ResourceType.Material:
                 {
                     if (resource.DataBlock is Material { ShaderName: "sky.vfx" })
@@ -297,8 +298,16 @@ namespace GUI.Types.Viewers
                     }
                     catch (Exception ex)
                     {
-                        GLViewerError = CodeTextBox.CreateFromException(ex, vrfGuiContext.FullPath);
+                        GLViewerError = CodeTextBox.CreateFromException(ex, vrfGuiContext.DisplayPath);
                     }
+                }
+
+                // Creating the GL viewer waits on other threads, and the tab can be closed while it does
+                if (resTabs.IsDisposed)
+                {
+                    GLViewerError?.Dispose();
+                    GLViewerError = null;
+                    return;
                 }
 
                 if (GLViewerError != null)
@@ -310,25 +319,15 @@ namespace GUI.Types.Viewers
                     errorTab.Controls.Add(GLViewerError);
                     resTabs.TabPages.Add(errorTab);
                 }
-
-                // Entity lumps get the same browsable grid a map's world viewer provides, with or
-                // without the graph tab the GL viewer adds.
-                if (!isPreview && resource.DataBlock is EntityLump standaloneLump)
-                {
-                    var entitiesTabPage = new ThemedTabPage("Entity List");
-                    entitiesTabPage.Controls.Add(new EntityViewer(vrfGuiContext, standaloneLump.GetEntities()));
-                    resTabs.TabPages.Add(entitiesTabPage);
-                }
             }
 
             if (isPreview && !selectData)
             {
                 var previewTab = resTabs.TabPages[0];
 
-                // Preview only displays the first tab page, so copy over the contents
-                foreach (Control c in previewTab.Controls)
+                while (previewTab.Controls.Count > 0)
                 {
-                    containerTabPage.Controls.Add(c);
+                    containerTabPage.Controls.Add(previewTab.Controls[0]);
                 }
 
                 resTabs.Dispose();
@@ -347,15 +346,41 @@ namespace GUI.Types.Viewers
 
             resTabs.Disposed += OnTabDisposed;
 
-            List<RawBinary>? binaryBuffers = null;
+            var loadedResource = resource;
+            var blocksByType = new Dictionary<BlockType, List<(int Index, Block Block)>>();
 
-            foreach (var block in resource.Blocks)
+            for (var blockIndex = 0; blockIndex < resource.Blocks.Count; blockIndex++)
             {
-                // They are just binary blobs, and the actual layout of them is stored in CTRL, so the tabs are not useful here
-                if (block is RawBinary rawBlock && block.Type is BlockType.MVTX or BlockType.MIDX or BlockType.MADJ)
+                var block = resource.Blocks[blockIndex];
+
+                if (!blocksByType.TryGetValue(block.Type, out var blocksOfType))
                 {
-                    binaryBuffers ??= [];
-                    binaryBuffers.Add(rawBlock);
+                    blocksOfType = [];
+                    blocksByType[block.Type] = blocksOfType;
+                }
+
+                blocksOfType.Add((blockIndex, block));
+            }
+
+            for (var blockIndex = 0; blockIndex < resource.Blocks.Count; blockIndex++)
+            {
+                var block = resource.Blocks[blockIndex];
+                var blocksOfType = blocksByType[block.Type];
+
+                // Models repeat their per mesh blocks, so these get a single tab listing them all
+                if (blocksOfType.Count > 1)
+                {
+                    if (blocksOfType[0].Index == blockIndex)
+                    {
+                        var listTab = new ThemedTabPage($"{block.Type} ({blocksOfType.Count})");
+                        resTabs.TabPages.Add(listTab);
+
+                        PopulateWhenShown(listTab, () =>
+                        {
+                            listTab.Controls.Add(new RepeatedBlocksViewer(blocksOfType, GetBlockNames(loadedResource), (selectedBlock, container) => PopulateBlockView(loadedResource, selectedBlock, container)));
+                        });
+                    }
+
                     continue;
                 }
 
@@ -418,36 +443,12 @@ namespace GUI.Types.Viewers
                 var blockTab = new ThemedTabPage(block.Type.ToString());
                 resTabs.TabPages.Add(blockTab);
 
-                try
-                {
-                    AddTextViewControl(resource, block, blockTab);
-                }
-                catch (Exception e)
-                {
-                    Log.Error(nameof(Resource), e.ToString());
-                    AddByteViewControl(resource, block, blockTab);
-                }
+                PopulateWhenShown(blockTab, () => PopulateBlockView(loadedResource, block, blockTab));
 
                 if (block.Type == BlockType.DATA && selectData)
                 {
                     resTabs.SelectTab(blockTab);
                 }
-            }
-
-            if (binaryBuffers != null)
-            {
-                var blockTab = new ThemedTabPage("Buffers");
-                resTabs.TabPages.Add(blockTab);
-
-                var text = new StringBuilder();
-
-                foreach (var block in binaryBuffers)
-                {
-                    text.AppendLine(CultureInfo.InvariantCulture, $"{block.Type} - {block.Size} bytes");
-                }
-
-                var textBox = CodeTextBox.Create(text.ToString());
-                blockTab.Controls.Add(textBox);
             }
 
             try
@@ -456,7 +457,7 @@ namespace GUI.Types.Viewers
             }
             catch (Exception ex)
             {
-                var control = CodeTextBox.CreateFromException(ex, vrfGuiContext.FullPath);
+                var control = CodeTextBox.CreateFromException(ex, vrfGuiContext.DisplayPath);
 
                 var tabEx = new ThemedTabPage("Decompile Error");
                 tabEx.Controls.Add(control);
@@ -499,14 +500,14 @@ namespace GUI.Types.Viewers
                     {
                         var worldTabPage = new ThemedTabPage("World Data");
                         resTabs.TabPages.Add(worldTabPage);
-                        AddTextViewControl(ResourceType.WorldNode, loadedWorld.World, worldTabPage);
+                        PopulateWhenShown(worldTabPage, () => AddTextViewControl(ResourceType.WorldNode, loadedWorld.World, worldTabPage));
                     }
 
                     if (loadedWorld.MainWorldNode != null)
                     {
                         var worldNodeTabPage = new ThemedTabPage("Node Data");
                         resTabs.TabPages.Add(worldNodeTabPage);
-                        AddTextViewControl(ResourceType.WorldNode, loadedWorld.MainWorldNode, worldNodeTabPage);
+                        PopulateWhenShown(worldNodeTabPage, () => AddTextViewControl(ResourceType.WorldNode, loadedWorld.MainWorldNode, worldNodeTabPage));
                     }
 
                     var entitiesTabPage = new ThemedTabPage("Entity List");
@@ -516,14 +517,14 @@ namespace GUI.Types.Viewers
 
                 if (!isPreview)
                 {
-                    foreach (var (viewer, tabName) in preparedGraphViewers)
+                    foreach (var (create, tabName) in preparedGraphViewers)
                     {
-                        AddGraphViewerTab(viewer, tabName, resTabs);
+                        var (tabPage, graph) = AddGraphViewerTab(create, tabName, resTabs);
 
-                        if (GLViewer is GLWorldViewer worldViewerWithGraph && viewer is EntityIOGraphViewer entityGraphViewer)
+                        if (GLViewer is GLWorldViewer worldViewerWithGraph && tabName == EntityIOGraphTabName)
                         {
-                            worldViewerWithGraph.ShowEntityInGraph = entityGraphViewer.ShowEntity;
-                            worldViewerWithGraph.EntityHasGraphNode = entityGraphViewer.HasEntity;
+                            worldViewerWithGraph.ShowEntityInGraph = entity => ShowEntityInGraph(entity, graph, tabPage);
+                            worldViewerWithGraph.EntityHasGraphNode = entity => !graph.IsCompleted || (graph.Result as EntityIOGraphViewer)?.HasEntity(entity) == true;
                         }
                     }
                 }
@@ -534,17 +535,81 @@ namespace GUI.Types.Viewers
             return AddSpecialViewerData(resource, isPreview, resTabs);
         }
 
-        private static void AddGraphViewerTab(GLGraphViewer viewer, string tabName, TabControl resTabs)
+        private (TabPage TabPage, Task<GLGraphViewer?> Graph) AddGraphViewerTab(Func<GLGraphViewer> create, string tabName, TabControl resTabs)
         {
-            viewer.InitializeLoad();
             var tabPage = new ThemedTabPage(tabName);
-            tabPage.Controls.Add(viewer.InitializeUiControls(isPreview: false));
+#pragma warning disable CA2000 // Ownership is transferred to the tab, which disposes it
+            var loadingFile = new LoadingFile();
+#pragma warning restore CA2000
+            tabPage.Controls.Add(loadingFile);
             resTabs.TabPages.Add(tabPage);
+
+            return (tabPage, LoadGraphViewerAsync(create, tabPage, loadingFile));
         }
 
-        // Runs on the background load thread: graph construction (entity scans, icon decoding,
-        // layout) is expensive and must not block the UI thread's loading indicator. The UI
-        // thread later only creates the tabs and GL windows in AddSpecialViewer.
+        // Built and loaded off the UI thread, each in its own renderer context as the viewers share no GL objects
+        private async Task<GLGraphViewer?> LoadGraphViewerAsync(Func<GLGraphViewer> create, TabPage tabPage, LoadingFile loadingFile)
+        {
+            GLGraphViewer? viewer = null;
+
+            try
+            {
+                viewer = await Task.Run(create).ConfigureAwait(true);
+                await Task.Run(viewer.InitializeLoad).ConfigureAwait(true);
+            }
+            catch (Exception e)
+            {
+                viewer?.Dispose();
+
+                if (!tabPage.IsDisposed)
+                {
+                    loadingFile.Dispose();
+                    tabPage.Controls.Add(CodeTextBox.CreateFromException(e, vrfGuiContext.DisplayPath));
+                }
+
+                return null;
+            }
+
+            if (tabPage.IsDisposed)
+            {
+                viewer.Dispose();
+                return null;
+            }
+
+            loadedGraphViewers.Add(viewer);
+            loadingFile.Dispose();
+            tabPage.Controls.Add(viewer.InitializeUiControls(isPreview: false));
+
+            return viewer;
+        }
+
+        private static bool ShowEntityInGraph(EntityLump.Entity entity, Task<GLGraphViewer?> graph, TabPage tabPage)
+        {
+            if (graph.IsCompleted)
+            {
+                return (graph.Result as EntityIOGraphViewer)?.ShowEntity(entity) == true;
+            }
+
+            // Its tab shows that it is loading until it can jump to the entity
+            if (tabPage.Parent is TabControl tabControl)
+            {
+                tabControl.SelectTab(tabPage);
+            }
+
+            _ = ShowEntityWhenLoadedAsync(entity, graph);
+            return true;
+        }
+
+        private static async Task ShowEntityWhenLoadedAsync(EntityLump.Entity entity, Task<GLGraphViewer?> graph)
+        {
+            if (await graph.ConfigureAwait(true) is EntityIOGraphViewer entityGraph)
+            {
+                entityGraph.ShowEntity(entity);
+            }
+        }
+
+        // Runs on the background load thread, but only reads the graph resources. Building the viewers is left to
+        // their tabs, so it does not hold up the main viewer.
         private void PrepareExtraGraphViewers(VrfGuiContext vrfGuiContext, ValveResourceFormat.Resource resource)
         {
             if (rendererContext == null)
@@ -567,7 +632,7 @@ namespace GUI.Types.Viewers
 
                 if (hasConnections)
                 {
-                    preparedGraphViewers.Add((new EntityIOGraphViewer(vrfGuiContext, rendererContext, loadedWorld.Entities, glWorldViewer.SelectAndFocusEntities), "ENTITY I/O GRAPH"));
+                    preparedGraphViewers.Add((() => new EntityIOGraphViewer(vrfGuiContext, vrfGuiContext.CreateRendererContext(), loadedWorld.Entities, glWorldViewer.SelectAndFocusEntities), EntityIOGraphTabName));
                 }
 
                 PrepareMapPulseGraphViewers(vrfGuiContext, loadedWorld.Entities);
@@ -606,8 +671,7 @@ namespace GUI.Types.Viewers
                 if (rendererContext.FileLoader.LoadFileCompiled(script)?.DataBlock is BinaryKV3 pulseData)
                 {
                     var tabName = scripts.Count > 1 ? $"PULSE GRAPH ({Path.GetFileNameWithoutExtension(script)})" : "PULSE GRAPH";
-                    var viewer = new PulseGraphViewer(vrfGuiContext, rendererContext, pulseData.Data);
-                    preparedGraphViewers.Add((viewer, tabName));
+                    preparedGraphViewers.Add((() => new PulseGraphViewer(vrfGuiContext, vrfGuiContext.CreateRendererContext(), pulseData.Data), tabName));
                 }
             }
         }
@@ -635,7 +699,7 @@ namespace GUI.Types.Viewers
             }
             else if (model.Data.ContainsKey("m_animGraph2Refs"))
             {
-                Log.Warn(nameof(Resource), "Model has a non-array m_animGraph2Refs value, skipping its animation graph tabs.");
+                Log.Warn(nameof(Resource), $"Model \"{vrfGuiContext.DisplayPath}\" has a non-array m_animGraph2Refs value, skipping its animation graph tabs.");
             }
 
             if (model.Data.ContainsKey("m_refAnimGraph"))
@@ -648,17 +712,17 @@ namespace GUI.Types.Viewers
 
             foreach (var path in graphPaths)
             {
-                GLGraphViewer viewer;
+                Func<GLGraphViewer> create;
                 string baseName;
 
                 switch (rendererContext.FileLoader.LoadFileCompiled(path)?.DataBlock)
                 {
                     case AnimGraph ag1Data:
-                        viewer = new AG1GraphViewer(vrfGuiContext, rendererContext, ag1Data.Data);
+                        create = () => new AG1GraphViewer(vrfGuiContext, vrfGuiContext.CreateRendererContext(), ag1Data.Data);
                         baseName = "AG1 ANIMATION GRAPH";
                         break;
                     case BinaryKV3 nmGraphData:
-                        viewer = new AG2GraphViewer(vrfGuiContext, rendererContext, nmGraphData.Data);
+                        create = () => new AG2GraphViewer(vrfGuiContext, vrfGuiContext.CreateRendererContext(), nmGraphData.Data);
                         baseName = "AG2 ANIMATION GRAPH";
                         break;
                     default:
@@ -666,7 +730,7 @@ namespace GUI.Types.Viewers
                 }
 
                 var tabName = graphPaths.Count > 1 ? $"{baseName} ({Path.GetFileNameWithoutExtension(path)})" : baseName;
-                preparedGraphViewers.Add((viewer, tabName));
+                preparedGraphViewers.Add((create, tabName));
             }
         }
 
@@ -695,15 +759,12 @@ namespace GUI.Types.Viewers
                     break;
 
                 case ResourceType.Sound:
-                    if (resource.ContainsBlockType(BlockType.DATA))
+                    if (resource.DataBlock is Sound { StreamingDataSize: > 0 } soundData)
                     {
                         var specialTabPage = new ThemedTabPage("SOUND");
                         var autoPlay = ((Settings.QuickPreviewFlags)Settings.Config.QuickFilePreview & Settings.QuickPreviewFlags.AutoPlaySounds) != 0;
 
-                        if (resource.DataBlock is Sound soundData)
-                        {
-                            specialTabPage.Controls.Add(CreateSoundInfoLabel(soundData));
-                        }
+                        specialTabPage.Controls.Add(CreateSoundInfoLabel(soundData));
 
                         try
                         {
@@ -713,7 +774,7 @@ namespace GUI.Types.Viewers
 
                                 try
                                 {
-                                    var audio = new AudioPlaybackPanel(ownedStream, isPreview && autoPlay, loopMarkers);
+                                    var audio = new AudioPlaybackPanel(ownedStream, vrfGuiContext.DisplayPath, isPreview && autoPlay, loopMarkers);
                                     specialTabPage.Controls.Add(audio);
                                     ownedStream = null;
                                 }
@@ -725,18 +786,28 @@ namespace GUI.Types.Viewers
                         }
                         catch (Exception e)
                         {
-                            Log.Error(nameof(AudioPlayer), e.ToString());
-
-                            var msg = new Label
-                            {
-                                Text = $"NAudio Exception: {e}",
-                                Dock = DockStyle.Fill,
-                            };
-
-                            specialTabPage.Controls.Add(msg);
+                            var errorControl = CodeTextBox.CreateFromException(e, vrfGuiContext.DisplayPath);
+                            specialTabPage.Controls.Add(errorControl);
+                            errorControl.BringToFront(); // Fill below the docked info label instead of under it
                         }
 
                         resTabs.TabPages.Add(specialTabPage);
+                        return true;
+                    }
+                    break;
+
+                case ResourceType.EntityLump:
+                    if (resource.DataBlock is EntityLump entityLumpData)
+                    {
+                        var specialTabPage = new ThemedTabPage("Entity List");
+                        specialTabPage.Controls.Add(new EntityViewer(vrfGuiContext, entityLumpData.GetEntities()));
+                        resTabs.TabPages.Add(specialTabPage);
+
+                        if (!isPreview)
+                        {
+                            AddGraphViewerTab(() => new EntityIOGraphViewer(vrfGuiContext, vrfGuiContext.CreateRendererContext(), entityLumpData), EntityIOGraphTabName, resTabs);
+                        }
+
                         return true;
                     }
                     break;
@@ -893,24 +964,113 @@ namespace GUI.Types.Viewers
                 }
             }
 
+            void OnKeyDown(object? sender, KeyEventArgs e)
+            {
+                if (e.KeyData != (Keys.Control | Keys.C) || treeView.SelectedNode is not { } node)
+                {
+                    return;
+                }
+
+                AppClipboard.SetText(node.Tag is ResourceExtRefList.ResourceReferenceInfo refInfo ? refInfo.Name : node.Text);
+                e.SuppressKeyPress = true;
+            }
+
             void OnDisposed(object? sender, EventArgs e)
             {
                 treeView.NodeMouseDoubleClick -= OnNodeDoubleClick;
+                treeView.KeyDown -= OnKeyDown;
                 treeView.Disposed -= OnDisposed;
             }
 
             treeView.NodeMouseDoubleClick += OnNodeDoubleClick;
+            treeView.KeyDown += OnKeyDown;
             treeView.Disposed += OnDisposed;
 
             return treeView;
         }
 
-        private static void AddByteViewControl(ValveResourceFormat.Resource resource, Block block, TabPage blockTab)
+        // Both before and after the MVTX MIDX update
+        private static readonly string[] EmbeddedMeshBlockKeys =
+        [
+            "data_block", "vbib_block", "morph_block", "tools_vb_block",
+            "m_nDataBlock", "m_nMorphBlock", "m_nVBIBBlock", "m_nToolsVBBlock",
+        ];
+
+        private static readonly string[] EmbeddedMeshBufferKeys = ["m_vertexBuffers", "m_indexBuffers", "m_toolsBuffers"];
+
+        /// <summary>
+        /// Names the blocks a model's embedded meshes are stored in after the mesh, so the repeated
+        /// blocks can be told apart.
+        /// </summary>
+        private static Dictionary<int, string> GetBlockNames(ValveResourceFormat.Resource resource)
+        {
+            var names = new Dictionary<int, string>();
+
+            if (resource.GetBlockByType(BlockType.CTRL) is not BinaryKV3 ctrl || ctrl.Data.Root.GetArray("embedded_meshes") is not { } embeddedMeshes)
+            {
+                return names;
+            }
+
+            foreach (var embeddedMesh in embeddedMeshes)
+            {
+                var name = embeddedMesh.GetStringProperty("m_Name") ?? embeddedMesh.GetStringProperty("name");
+
+                foreach (var key in EmbeddedMeshBlockKeys)
+                {
+                    AddName(embeddedMesh.GetIntegerProperty(key, -1), name);
+                }
+
+                foreach (var key in EmbeddedMeshBufferKeys)
+                {
+                    foreach (var buffer in embeddedMesh.GetArray(key) ?? [])
+                    {
+                        AddName(buffer.GetIntegerProperty("m_nBlockIndex", -1), name);
+                    }
+                }
+            }
+
+            return names;
+
+            void AddName(long blockIndex, string name)
+            {
+                if (blockIndex >= 0)
+                {
+                    names.TryAdd((int)blockIndex, name);
+                }
+            }
+        }
+
+        private void PopulateBlockView(ValveResourceFormat.Resource resource, Block block, Control container)
+        {
+            // Mesh buffers are compressed binary blobs whose layout is described in CTRL
+            if (block.Type is BlockType.MVTX or BlockType.MIDX or BlockType.MADJ or BlockType.MSLT)
+            {
+                AddByteViewControl(resource, block, container);
+                return;
+            }
+
+            try
+            {
+                AddTextViewControl(resource.ResourceType, block, container);
+            }
+            catch (Exception e)
+            {
+                Log.Error(nameof(Resource), $"Failed to show the {block.Type} block of \"{vrfGuiContext.DisplayPath}\" as text, showing bytes instead: {e}");
+                AddByteViewControl(resource, block, container);
+            }
+        }
+
+        private static void AddByteViewControl(ValveResourceFormat.Resource resource, Block block, Control blockTab)
         {
             Debug.Assert(resource.Reader != null);
 
-            resource.Reader.BaseStream.Position = block.Offset;
-            var input = resource.Reader.ReadBytes((int)block.Size);
+            byte[] input;
+
+            lock (resource.ReaderLock)
+            {
+                resource.Reader.BaseStream.Position = block.Offset;
+                input = resource.Reader.ReadBytes((int)block.Size);
+            }
 
             var text = ByteViewer.GetTextFromBytes(input.AsSpan());
 
@@ -933,44 +1093,119 @@ namespace GUI.Types.Viewers
             }));
         }
 
-        private void AddTextViewControl(ValveResourceFormat.Resource resource, Block block, TabPage blockTab)
+        private static void AddTextViewControl(ResourceType resourceType, Block block, Control blockTab)
         {
-            if (resource.ResourceType == ResourceType.SboxShader && block is SboxShader shaderBlock)
+            if (block.Size > MaxKeyValuesBlockSizeForText && TryGetKvDataBlock(block, out var root, out var header))
             {
-                var tabPage = new ThemedTabPage();
-                var viewer = new CompiledShader(vrfGuiContext);
-
-                try
-                {
-                    viewer.Create(
-                        tabPage,
-                        shaderBlock.Shaders,
-                        Path.GetFileNameWithoutExtension(resource.FileName.AsSpan()),
-                        ValveResourceFormat.CompiledShader.VcsProgramType.Features
-                    );
-
-                    foreach (Control control in tabPage.Controls)
-                    {
-                        blockTab.Controls.Add(control);
-                    }
-
-                    viewer = null;
-                }
-                finally
-                {
-                    viewer?.Dispose();
-                    tabPage.Dispose();
-                }
-
+                AddTooLargeForTextControl(block, new KVDocument(header, name: null, root), blockTab);
                 return;
             }
 
-            AddTextViewControl(resource.ResourceType, block, blockTab);
+            ViewerContent.Text content;
+
+            try
+            {
+                content = GetTextViewContent(resourceType, block);
+            }
+            catch (OutOfMemoryException) when (TryGetKvDataBlock(block, out var kvRoot, out var kvHeader))
+            {
+                AddTooLargeForTextControl(block, new KVDocument(kvHeader, name: null, kvRoot), blockTab);
+                return;
+            }
+
+            ViewerContentPresenter.Present(blockTab, content);
         }
 
-        private static void AddTextViewControl(ResourceType resourceType, Block block, TabPage blockTab)
+        private static void AddTooLargeForTextControl(Block block, KVDocument document, Control blockTab)
         {
-            ViewerContentPresenter.Present(blockTab, GetTextViewContent(resourceType, block));
+            var message = CodeTextBox.Create(
+                $"The {block.Type} block is {block.Size:N0} bytes, which is too large to display as text.{Environment.NewLine}Save it as a text file instead.",
+                HighlightLanguage.None);
+
+            var saveButton = new ThemedButton
+            {
+                Text = "Save as text...",
+                Dock = DockStyle.Top,
+                Height = 32,
+            };
+            saveButton.Click += OnSaveClick;
+
+            blockTab.Controls.Add(message);
+            blockTab.Controls.Add(saveButton);
+
+            async void OnSaveClick(object? sender, EventArgs e)
+            {
+                var defaultName = $"{Path.GetFileNameWithoutExtension(block.Resource.FileName)}_{block.Type}.kv3";
+                var fileName = AppFileDialogs.SaveFile("Save block as text", defaultName, "kv3", "KeyValues3 (*.kv3)|*.kv3|All files (*.*)|*.*");
+
+                if (fileName == null)
+                {
+                    return;
+                }
+
+                saveButton.Enabled = false;
+
+                try
+                {
+                    await Task.Run(() =>
+                    {
+                        using var stream = File.Create(fileName);
+                        KVSerializer.Create(KVSerializationFormat.KeyValues3Text).Serialize(stream, document);
+                    }).ConfigureAwait(true);
+
+                    Log.Info(nameof(Resource), $"Saved {block.Type} block to \"{Path.GetFileName(fileName)}\"");
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(nameof(Resource), $"Failed to save {block.Type} block to \"{Path.GetFileName(fileName)}\": {ex}");
+                }
+                finally
+                {
+                    if (!saveButton.IsDisposed)
+                    {
+                        saveButton.Enabled = true;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Runs <paramref name="populate"/> the first time <paramref name="page"/> is shown, so the
+        /// contents of tabs that are never opened are not built.
+        /// </summary>
+        private void PopulateWhenShown(TabPage page, Action populate)
+        {
+            if (page.Visible)
+            {
+                TryPopulate();
+                return;
+            }
+
+            void OnVisibleChanged(object? sender, EventArgs e)
+            {
+                if (!page.Visible || page.IsDisposed || page.Disposing)
+                {
+                    return;
+                }
+
+                page.VisibleChanged -= OnVisibleChanged;
+                TryPopulate();
+            }
+
+            // Usually runs from a UI event, where an escaping exception would not say which file failed
+            void TryPopulate()
+            {
+                try
+                {
+                    populate();
+                }
+                catch (Exception ex)
+                {
+                    page.Controls.Add(CodeTextBox.CreateFromException(ex, vrfGuiContext.DisplayPath));
+                }
+            }
+
+            page.VisibleChanged += OnVisibleChanged;
         }
 
         private static ViewerContent.Text GetTextViewContent(ResourceType resourceType, Block block)
@@ -1097,18 +1332,18 @@ namespace GUI.Types.Viewers
 
         private void DisposeExtraGraphViewers()
         {
-            foreach (var (viewer, _) in preparedGraphViewers)
+            foreach (var viewer in loadedGraphViewers)
             {
                 viewer.Dispose();
             }
 
+            loadedGraphViewers.Clear();
             preparedGraphViewers.Clear();
         }
 
         public void Dispose()
         {
-            // Order matters: nothing may dispose a resource until every thread that could still be
-            // reading it has stopped
+            // Order matters: a resource must not be disposed while any thread may still be reading it.
             GLViewer?.Dispose();
             rendererContext?.Dispose();
             resource?.Dispose();

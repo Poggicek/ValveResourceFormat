@@ -58,7 +58,7 @@ namespace ValveResourceFormat.Utils
 
         /// <summary>
         /// Remaps a value from one range to another, holding the output at the range ends
-        /// for inputs outside the input range. Mirrors Source's RemapValClamped.
+        /// for inputs outside the input range.
         /// </summary>
         /// <param name="x">Value to remap.</param>
         /// <param name="inputMin">Input range minimum.</param>
@@ -69,7 +69,7 @@ namespace ValveResourceFormat.Utils
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static float RemapValClamped(float x, float inputMin, float inputMax, float outputMin, float outputMax)
         {
-            // Source treats a degenerate input range as a threshold
+            // A degenerate input range is treated as a threshold
             if (inputMin == inputMax)
             {
                 return x >= inputMax ? outputMax : outputMin;
@@ -177,12 +177,44 @@ namespace ValveResourceFormat.Utils
         }
 
         /// <summary>
+        /// The largest of the given values, compared with <see cref="MathF.Max(float, float)"/>.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Max(float a, float b, float c)
+        {
+            return MathF.Max(MathF.Max(a, b), c);
+        }
+
+        /// <inheritdoc cref="Max(float, float, float)"/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Max(float a, float b, float c, float d)
+        {
+            return MathF.Max(MathF.Max(a, b), MathF.Max(c, d));
+        }
+
+        /// <summary>
+        /// The smallest of the given values, compared with <see cref="MathF.Min(float, float)"/>.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Min(float a, float b, float c)
+        {
+            return MathF.Min(MathF.Min(a, b), c);
+        }
+
+        /// <inheritdoc cref="Min(float, float, float)"/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Min(float a, float b, float c, float d)
+        {
+            return MathF.Min(MathF.Min(a, b), MathF.Min(c, d));
+        }
+
+        /// <summary>
         /// The largest of a vector's three components.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static float MaxComponent(this Vector3 v)
         {
-            return MathF.Max(v.X, MathF.Max(v.Y, v.Z));
+            return Max(v.X, v.Y, v.Z);
         }
 
         /// <summary>
@@ -191,7 +223,7 @@ namespace ValveResourceFormat.Utils
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static float MinComponent(this Vector3 v)
         {
-            return MathF.Min(v.X, MathF.Min(v.Y, v.Z));
+            return Min(v.X, v.Y, v.Z);
         }
 
         /// <summary>
@@ -211,6 +243,19 @@ namespace ValveResourceFormat.Utils
         public static float AngleBetween(Vector3 a, Vector3 b)
         {
             return SafeAcos(Vector3.Dot(a, b));
+        }
+
+        /// <summary>
+        /// The angle in radians between two rotations, the shorter way round.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float AngleBetween(Quaternion a, Quaternion b)
+        {
+            // An arc cosine of the dot product cannot resolve angles below about 0.03 degrees in single
+            // precision, as their cosine rounds to one; the sine of the difference rotation can.
+            var difference = Quaternion.Conjugate(a) * b;
+            var sine = new Vector3(difference.X, difference.Y, difference.Z).Length();
+            return 2f * MathF.Atan2(sine, MathF.Abs(difference.W));
         }
 
         /// <summary>
@@ -397,6 +442,6 @@ namespace ValveResourceFormat.Utils
         /// The largest per-axis scale baked into a transform.
         /// </summary>
         public static float MaxAxisScale(this Matrix4x4 m)
-            => MathF.Max(m.AxisScale(0), MathF.Max(m.AxisScale(1), m.AxisScale(2)));
+            => Max(m.AxisScale(0), m.AxisScale(1), m.AxisScale(2));
     }
 }

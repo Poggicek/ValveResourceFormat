@@ -3,70 +3,108 @@ using ValveResourceFormat.Serialization.KeyValues;
 namespace ValveResourceFormat.Renderer.Entities;
 
 /// <summary>
-/// <c>func_door</c>. A brush that slides open along its <c>movedir</c> and back
-/// again, Source's <c>CBaseDoor</c>. Not simulated: the blocking behaviour that reverses a door onto
-/// whoever stands in it, and the door groups that open together.
+/// <c>func_door</c>. A brush that slides open along its <c>movedir</c> and back again. Not simulated:
+/// sounds, the <c>master</c>, damage to whatever blocks it, and door groups.
 /// </summary>
+/// <seealso href="https://s2v.app/SchemaExplorer/cs2/server/CBaseDoor">CBaseDoor</seealso>
 public class FuncDoor : BaseToggle
 {
     /// <summary>What a <c>func_door</c>'s <c>spawnflags</c> mean.</summary>
     [Flags]
     public enum SpawnFlag : uint
     {
+        /// <summary>
+        /// The legacy way to spawn open: spawns at the open end, with the fully open and fully closed
+        /// outputs swapped.
+        /// </summary>
+        StartsOpen = 1,
+
+        /// <summary>
+        /// Non-solid to the player, who can never block it. In game the player is also carried along the whole
+        /// push; only the never-blocking part is modeled.
+        /// </summary>
+        NonSolidToPlayer = 4,
+
         /// <summary>Things pass straight through it.</summary>
         Passable = 8,
 
-        /// <summary>Stays open once opened, rather than coming back by itself.</summary>
+        /// <summary>Stays open until told to close.</summary>
         Toggle = 32,
 
-        /// <summary>The player may open it by pressing use. Source's <c>SF_DOOR_PUSE</c>.</summary>
+        /// <summary>The player may open it by pressing use.</summary>
         UseOpens = 256,
 
         /// <summary>Opens when the player walks into it.</summary>
         TouchOpens = 1024,
 
-        /// <summary>Spawns locked, and stays that way until something unlocks it.</summary>
+        /// <summary>Spawns locked until unlocked.</summary>
         StartsLocked = 2048,
 
         /// <summary>Refuses use entirely, whatever else is set.</summary>
         IgnoreUse = 32768,
+
+        /// <summary>Also takes a use while moving, the way a prop door does.</summary>
+        NewUseRules = 65536,
     }
 
-    /// <summary>
-    /// Gets whether the player can open this door by pressing it. Source's <c>CBaseDoor::ObjectCaps</c>:
-    /// a door is only usable when the map said so.
-    /// </summary>
+    private enum MoveDoneFunction
+    {
+        None,
+        HitTop,
+        HitBottom,
+        GoDown,
+    }
+
+    /// <summary>Gets whether the player can open this door by pressing it.</summary>
     public override EntityCapability ObjectCaps
         => HasSpawnFlags(SpawnFlag.UseOpens) && !HasSpawnFlags(SpawnFlag.IgnoreUse)
             ? EntityCapability.ImpulseUse
             : EntityCapability.None;
 
-    /// <summary>Gets where the door is in its travel.</summary>
+    /// <summary>Gets whether the door is open or on its way there.</summary>
     public bool IsOpen => State is ToggleState.AtTop or ToggleState.GoingUp;
 
     /// <summary>Gets whether the door refuses to open.</summary>
-    public bool IsLocked { get; protected set; }
+    public bool IsLocked { get; private set; }
 
-    /// <summary>Gets the seconds the door stays open before closing; -1 means it stays open.</summary>
-    public float Wait { get; protected set; }
+    /// <summary>Gets the seconds the door stays open before closing; a negative wait keeps it open.</summary>
+    public float Wait { get; private set; }
+
+    /// <summary>
+    /// Gets the <c>forceclosed</c> keyvalue: a blocked door holds its course instead of turning back,
+    /// but still cannot move through the blocker.
+    /// </summary>
+    public bool ForceClosed { get; private set; }
 
     /// <summary>Gets where the door is in its travel.</summary>
     protected ToggleState State { get; set; }
 
     /// <summary>Gets the place the door rests when closed.</summary>
-    protected Vector3 PositionClosed { get; set; }
+    protected Vector3 PositionClosed { get; private set; }
 
     /// <summary>Gets the place the door rests when open.</summary>
-    protected Vector3 PositionOpen { get; set; }
+    protected Vector3 PositionOpen { get; private set; }
 
-    /// <summary>Gets the entity that last set the door moving, for whatever the travel needs it for.</summary>
+    /// <summary>
+    /// Gets the entity that last set the door going. The outputs report it; reaching either end clears it.
+    /// </summary>
     protected BaseEntity? LastActivator { get; private set; }
 
-    /// <summary>Gets whether the door closes whatever stands in it, the <c>forceclosed</c> keyvalue.</summary>
-    public bool ForceClosed { get; private set; }
-
     /// <inheritdoc/>
-    protected override bool PusherForcesThrough => ForceClosed;
+    protected override bool IsUnblockableByPlayer => HasSpawnFlags(SpawnFlag.NonSolidToPlayer);
+
+    private bool StaysOpen => HasSpawnFlags(SpawnFlag.Toggle);
+
+    private BaseEntity OutputActivator => LastActivator ?? this;
+
+    private MoveDoneFunction moveDoneFunction;
+    private string? chainTarget;
+
+    // A touch that sets the door going is the last until it comes back
+    private bool isTouchArmed;
+
+    // Stops chained doors passing a touch back
+    private bool isChaining;
 
     /// <summary>Initializes a <c>func_door</c> from its keyvalues.</summary>
     public FuncDoor(EntitySystem system, EntitySpawnInfo spawnInfo) : base(system, spawnInfo)
@@ -76,21 +114,22 @@ public class FuncDoor : BaseToggle
     /// <inheritdoc/>
     public override void Spawn()
     {
-        // A door keeps its authored orientation: only a button spends its angles on the travel direction
-        ResolveMoveDirection(consumeAngles: false);
+        var localDirection = ResolveEntitySpaceMoveDirection();
 
-        Speed = KeyValues.GetFloatProperty("speed", 100f);
+        // Only an unset speed falls back; a negative one is kept
+        Speed = KeyValues.GetFloatProperty("speed");
 
-        if (Speed <= 0f)
+        if (Speed == 0f)
         {
             Speed = 100f;
         }
 
-        Wait = ReadWait();
+        Wait = KeyValues.GetFloatProperty("wait", 4f);
         Lip = KeyValues.GetFloatProperty("lip");
         ForceClosed = KeyValues.GetBooleanProperty("forceclosed");
-        // Both spellings: the flag is how the compiled maps carry it, the keyvalue how the FGD offers it
-        IsLocked = HasSpawnFlags(SpawnFlag.StartsLocked) || KeyValues.GetBooleanProperty("startlocked");
+        IsLocked = HasSpawnFlags(SpawnFlag.StartsLocked);
+        chainTarget = KeyValues.GetStringProperty("chainstodoor");
+        isTouchArmed = true;
 
         if (HasSpawnFlags(SpawnFlag.Passable))
         {
@@ -98,103 +137,252 @@ public class FuncDoor : BaseToggle
         }
 
         PositionClosed = Origin;
-        PositionOpen = PositionClosed + (MoveDirection * GetTravelDistance());
+        PositionOpen = PositionClosed + MoveDirection * GetTravelDistance(localDirection);
 
-        SetUpTravel();
-
-        // A door that spawns open is authored at its open position, so the two ends swap
-        if (SpawnsOpen())
-        {
-            SwapEnds();
-            State = ToggleState.AtBottom;
-        }
+        SetUpSpawnPosition();
     }
-
-    /// <summary>Reads how long the door stays open, whichever keyvalue the class authors it as.</summary>
-    protected virtual float ReadWait() => KeyValues.GetFloatProperty("wait", 4f);
-
-    /// <summary>Reads whether the map authored the door at its open position.</summary>
-    protected virtual bool SpawnsOpen() => KeyValues.GetBooleanProperty("spawnpos");
 
     /// <summary>
-    /// Works out where the door's two ends are. A door that turns rather than slides overrides this.
+    /// Puts the door where it spawns. One that spawns open is moved to its open end, so closing it returns
+    /// it to the authored position.
     /// </summary>
-    protected virtual void SetUpTravel()
+    protected virtual void SetUpSpawnPosition()
     {
-    }
+        if (KeyValues.GetInt32Property("spawnpos") == 1 || HasSpawnFlags(SpawnFlag.StartsOpen))
+        {
+            JumpTo(PositionOpen, Angles);
+            State = ToggleState.AtTop;
+            return;
+        }
 
-    /// <summary>Exchanges the two ends, for a door the map authored in its open position.</summary>
-    protected virtual void SwapEnds()
-    {
-        (PositionClosed, PositionOpen) = (PositionOpen, PositionClosed);
-        Origin = PositionClosed;
+        State = ToggleState.AtBottom;
     }
 
     /// <summary>Sets the door travelling towards one of its two ends.</summary>
     protected virtual void StartMove(bool opening) => LinearMove(opening ? PositionOpen : PositionClosed);
+
+    /// <summary>Puts the door at one of its ends without travelling or changing its state.</summary>
+    /// <param name="atOpenEnd">Whether to the open end rather than the closed one.</param>
+    protected virtual void JumpToEnd(bool atOpenEnd) => JumpTo(atOpenEnd ? PositionOpen : PositionClosed, Angles);
 
     /// <inheritdoc/>
     public override void MoveDone()
     {
         FinishLinearMove();
 
-        if (State == ToggleState.GoingUp)
+        var next = moveDoneFunction;
+        moveDoneFunction = MoveDoneFunction.None;
+
+        switch (next)
         {
-            State = ToggleState.AtTop;
+            case MoveDoneFunction.HitTop:
+                HitTop();
+                break;
 
-            OnArrived(open: true);
-            EntitySystem.TriggerOutput(this, "OnFullyOpen");
+            case MoveDoneFunction.HitBottom:
+                HitBottom();
+                break;
 
-            // A toggle door waits to be told; the rest close themselves after their wait
-            if (!StaysOpen && Wait >= 0f)
-            {
-                SetNextThink(EntitySystem.CurrentTime + Wait);
-            }
+            case MoveDoneFunction.GoDown:
+                GoDown();
+                break;
+        }
+    }
 
+    /// <summary>
+    /// Ignores the press while the door is moving, or open and due to close by itself, unless
+    /// <see cref="SpawnFlag.NewUseRules"/> is set.
+    /// </summary>
+    public override void Use(BaseEntity? activator)
+    {
+        LastActivator = activator;
+
+        // Players cannot use a door without UseOpens (in game it only plays a locked sound)
+        if (activator is PlayerEntity && !HasSpawnFlags(SpawnFlag.UseOpens))
+        {
             return;
         }
 
-        if (State == ToggleState.GoingDown)
-        {
-            State = ToggleState.AtBottom;
+        var allowed = HasSpawnFlags(SpawnFlag.NewUseRules)
+            ? State is ToggleState.AtBottom or ToggleState.GoingDown
+                || (StaysOpen && State is ToggleState.AtTop or ToggleState.GoingUp)
+            : State == ToggleState.AtBottom
+                || (StaysOpen && State == ToggleState.AtTop);
 
-            OnArrived(open: false);
-            EntitySystem.TriggerOutput(this, "OnFullyClosed");
+        if (!allowed)
+        {
+            return;
+        }
+
+        if (IsLocked)
+        {
+            EntitySystem.TriggerOutput(this, "OnLockedUse", activator);
+            return;
+        }
+
+        DoorActivate();
+    }
+
+    /// <summary>
+    /// Passes the touch on to chained doors, and opens this one for a player when
+    /// <see cref="SpawnFlag.TouchOpens"/> is set.
+    /// </summary>
+    protected override void OnTouch(BaseEntity other)
+    {
+        if (!isTouchArmed)
+        {
+            return;
+        }
+
+        ChainTouch(other);
+
+        if (other is not PlayerEntity || !HasSpawnFlags(SpawnFlag.TouchOpens))
+        {
+            return;
+        }
+
+        if (IsLocked)
+        {
+            EntitySystem.TriggerOutput(this, "OnLockedUse", other, caller: other);
+            return;
+        }
+
+        LastActivator = other;
+        DoorActivate();
+
+        isTouchArmed = false;
+    }
+
+    // Only chains to doors in the same state, so an open door is not closed by it
+    private void ChainTouch(BaseEntity other)
+    {
+        if (isChaining || string.IsNullOrEmpty(chainTarget))
+        {
+            return;
+        }
+
+        foreach (var entity in EntitySystem.FindAllByTargetName(chainTarget))
+        {
+            if (entity != this && entity is FuncDoor door && door.State == State)
+            {
+                door.isChaining = true;
+                door.OnTouch(other);
+                door.isChaining = false;
+            }
         }
     }
 
-    /// <summary>Gets whether the door stays open until told to close.</summary>
-    private bool StaysOpen => HasSpawnFlags(SpawnFlag.Toggle);
-
-    /// <summary>Runs when the door lands at either end, for a class with sounds to play.</summary>
-    protected virtual void OnArrived(bool open)
-    {
-    }
-
-    /// <summary>Runs as the door sets off, for a class with sounds to play.</summary>
-    protected virtual void OnSetOff(bool opening)
-    {
-    }
-
-    /// <summary>Closes the door once it has stood open for its wait.</summary>
-    public override void Think() => Close();
+    /// <inheritdoc/>
+    protected override void OnStartBlocked(BaseEntity blocker)
+        => EntitySystem.TriggerOutput(this, State == ToggleState.GoingDown ? "OnBlockedClosing" : "OnBlockedOpening", blocker);
 
     /// <inheritdoc/>
-    public override void Use(BaseEntity? activator) => Toggle(activator);
+    protected override void OnEndBlocked()
+        => EntitySystem.TriggerOutput(this, State == ToggleState.GoingDown ? "OnUnblockedClosing" : "OnUnblockedOpening", this);
+
+    /// <summary>
+    /// Runs every tick the door is blocked. Unless <see cref="ForceClosed"/> is set, turns the door around
+    /// and every door sharing its name; doors with a negative <see cref="Wait"/> never turn.
+    /// </summary>
+    protected override void OnBlocked(BaseEntity blocker)
+    {
+        if (ForceClosed)
+        {
+            return;
+        }
+
+        if (Wait >= 0f)
+        {
+            Reverse();
+        }
+
+        if (string.IsNullOrEmpty(TargetName))
+        {
+            return;
+        }
+
+        foreach (var entity in EntitySystem.FindAllByTargetName(TargetName))
+        {
+            if (entity != this && entity is FuncDoor { Wait: >= 0f } door)
+            {
+                door.Reverse();
+            }
+        }
+    }
+
+    // A door that was closing opens again, anything else closes
+    private void Reverse()
+    {
+        if (State == ToggleState.GoingDown)
+        {
+            GoUp();
+        }
+        else
+        {
+            GoDown();
+        }
+    }
+
+    // A toggle door standing open closes; any other door opens unless it already is
+    private void DoorActivate()
+    {
+        if (StaysOpen && State == ToggleState.AtTop)
+        {
+            GoDown();
+        }
+        else if (!IsOpen)
+        {
+            GoUp();
+        }
+    }
 
     // Protected rather than private, so a subclass's input table inherits them
 
-    /// <summary>Opens the door.</summary>
+    /// <summary>Opens the door. Ignored silently when locked or already open.</summary>
     [EntityInput("Open")]
-    protected void InputOpen(EntityInputData data) => Open(data.Activator);
+    protected void InputOpen(EntityInputData data)
+    {
+        if (IsOpen || IsLocked)
+        {
+            return;
+        }
 
-    /// <summary>Closes the door.</summary>
+        // Only inputs that start the door replace the activator
+        LastActivator = data.Activator;
+        GoUp();
+    }
+
+    /// <summary>Closes the door, even one already closing, which sets it off again.</summary>
     [EntityInput("Close")]
-    protected void InputClose(EntityInputData data) => Close();
+    protected void InputClose(EntityInputData data)
+    {
+        if (State != ToggleState.AtBottom)
+        {
+            LastActivator = data.Activator;
+            GoDown();
+        }
+    }
 
-    /// <summary>Opens a closed door, closes an open one.</summary>
+    /// <summary>Opens a closed door and closes an open one. A moving or locked door ignores it.</summary>
     [EntityInput("Toggle")]
-    protected void InputToggle(EntityInputData data) => Toggle(data.Activator);
+    protected void InputToggle(EntityInputData data)
+    {
+        if (IsLocked)
+        {
+            return;
+        }
+
+        if (State == ToggleState.AtBottom)
+        {
+            LastActivator = data.Activator;
+            GoUp();
+        }
+        else if (State == ToggleState.AtTop)
+        {
+            LastActivator = data.Activator;
+            GoDown();
+        }
+    }
 
     /// <summary>Stops the door opening until it is unlocked.</summary>
     [EntityInput("Lock")]
@@ -204,68 +392,61 @@ public class FuncDoor : BaseToggle
     [EntityInput("Unlock")]
     protected void InputUnlock(EntityInputData data) => IsLocked = false;
 
-    /// <summary>Changes how fast the door travels.</summary>
+    /// <summary>Changes how fast the door travels from its next move on.</summary>
     [EntityInput("SetSpeed")]
-    protected void InputSetSpeed(EntityInputData data) => Speed = MathF.Max(data.Float(Speed), 0f);
+    protected void InputSetSpeed(EntityInputData data) => Speed = data.Float();
 
-    /// <summary>Opens the door, unless it is locked or already going that way.</summary>
-    public void Open(BaseEntity? activator = null)
+    /// <summary>Jumps the door to its open end for 0, else its closed end.</summary>
+    [EntityInput("SetToggleState")]
+    protected void InputSetToggleState(EntityInputData data) => JumpToEnd(data.Int() == 0);
+
+    private void GoUp()
     {
-        LastActivator = activator;
-
-        if (IsLocked)
-        {
-            OnLockedUse();
-            EntitySystem.TriggerOutput(this, "OnLockedUse", activator);
-            return;
-        }
-
-        if (State is ToggleState.AtTop or ToggleState.GoingUp)
-        {
-            return;
-        }
-
         State = ToggleState.GoingUp;
-        SetNextThink(-1f);
+        moveDoneFunction = MoveDoneFunction.HitTop;
 
-        EntitySystem.TriggerOutput(this, "OnOpen", activator);
-
-        OnSetOff(opening: true);
         StartMove(opening: true);
+
+        EntitySystem.TriggerOutput(this, "OnOpen", OutputActivator);
     }
 
-    /// <summary>Closes the door, unless it is already going that way.</summary>
-    public void Close()
+    private void GoDown()
     {
-        if (State is ToggleState.AtBottom or ToggleState.GoingDown)
-        {
-            return;
-        }
-
         State = ToggleState.GoingDown;
-        SetNextThink(-1f);
+        moveDoneFunction = MoveDoneFunction.HitBottom;
 
-        EntitySystem.TriggerOutput(this, "OnClose");
-
-        OnSetOff(opening: false);
         StartMove(opening: false);
+
+        EntitySystem.TriggerOutput(this, "OnClose", OutputActivator);
     }
 
-    /// <summary>Runs on a press that the lock refused, for a class with sounds to play.</summary>
-    protected virtual void OnLockedUse()
+    private void HitTop()
     {
-    }
+        State = ToggleState.AtTop;
 
-    /// <summary>Opens a closed door and closes an open one, which is what a use or a toggle means.</summary>
-    public void Toggle(BaseEntity? activator = null)
-    {
-        if (IsOpen)
+        // Toggle doors wait to be told and can be touched again; others close after Wait (never if negative)
+        if (StaysOpen)
         {
-            Close();
+            isTouchArmed = true;
         }
         else
         {
-            Open(activator);
+            moveDoneFunction = MoveDoneFunction.GoDown;
+            SetMoveDoneTime(Wait);
         }
+
+        EntitySystem.TriggerOutput(this, HasSpawnFlags(SpawnFlag.StartsOpen) ? "OnFullyClosed" : "OnFullyOpen", OutputActivator);
+
+        LastActivator = null;
+    }
+
+    private void HitBottom()
+    {
+        State = ToggleState.AtBottom;
+        isTouchArmed = true;
+
+        EntitySystem.TriggerOutput(this, HasSpawnFlags(SpawnFlag.StartsOpen) ? "OnFullyOpen" : "OnFullyClosed", OutputActivator);
+
+        LastActivator = null;
     }
 }

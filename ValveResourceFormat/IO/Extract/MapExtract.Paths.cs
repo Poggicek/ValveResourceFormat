@@ -5,8 +5,8 @@ using ValveResourceFormat.IO.ContentFormats.ValveMap;
 using ValveResourceFormat.Particles.Utils;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
-using static ValveResourceFormat.ResourceTypes.EntityLump;
 using ValveResourceFormat.Utils;
+using static ValveResourceFormat.ResourceTypes.EntityLump;
 
 namespace ValveResourceFormat.IO;
 
@@ -423,7 +423,7 @@ public sealed partial class MapExtract
 
             foreach (var part in physics.Parts)
             {
-                foreach (var mesh in part.Shape.Meshes)
+                foreach (var mesh in part.Shape.GetAllMeshes())
                 {
                     physicsVertices += mesh.Shape.GetVertices().Length;
                 }
@@ -832,7 +832,7 @@ public sealed partial class MapExtract
 
     /// <summary>
     /// Length of one path segment the way the compiler measures it: the cubic Bezier through the node
-    /// handles, summed as chords over 4, 8, ... 128 samples until the sum moves by under one percent.
+    /// handles, summed as chords over 2, 4, ... 128 samples until the sum moves by under one percent.
     /// </summary>
     private static float CompilerSegmentLength(Vector3 p0, Vector3 outHandle, Vector3 p3, Vector3 inHandle)
     {

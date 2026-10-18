@@ -6,11 +6,13 @@ namespace ValveResourceFormat.Particles
     /// <summary>
     /// Particle attribute remapping handler.
     /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/particleslib/CParticleFloatInput">CParticleFloatInput</seealso>
     class AttributeMapping
     {
         /// <summary>
         /// Input handling modes for attribute mapping operations.
         /// </summary>
+        /// <seealso href="https://s2v.app/SchemaExplorer/cs2/particleslib/ParticleFloatInputMode_t">ParticleFloatInputMode_t</seealso>
         internal enum PfInputMode
         {
             /// <summary>Invalid input mode.</summary>
@@ -24,6 +26,7 @@ namespace ValveResourceFormat.Particles
         /// <summary>
         /// Attribute mapping transformation types.
         /// </summary>
+        /// <seealso href="https://s2v.app/SchemaExplorer/cs2/particleslib/ParticleFloatMapType_t">ParticleFloatMapType_t</seealso>
         internal enum PfMapType
         {
             /// <summary>Invalid mapping type.</summary>
@@ -46,13 +49,14 @@ namespace ValveResourceFormat.Particles
             Min,
             /// <summary>Takes the larger of the input value and the compare value.</summary>
             Max,
-            /// <summary>Takes the remainder of the input value divided by the compare value.</summary>
+            /// <summary>Takes the remainder of the input value divided by the compare value, or the input itself when that is 0.</summary>
             Mod,
         };
 
         /// <summary>
         /// Rounding modes for <see cref="PfMapType.Round"/>.
         /// </summary>
+        /// <seealso href="https://s2v.app/SchemaExplorer/cs2/particleslib/ParticleFloatRoundType_t">ParticleFloatRoundType_t</seealso>
         internal enum PfRoundType
         {
             /// <summary>Invalid rounding mode.</summary>
@@ -208,7 +212,7 @@ namespace ValveResourceFormat.Particles
 
                 case PfMapType.Mod:
                     // Truncated remainder, keeping the sign of the input
-                    return value % compareValue;
+                    return compareValue == 0f ? value : value % compareValue;
 
                 default:
                     return value;

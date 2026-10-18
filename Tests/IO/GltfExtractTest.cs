@@ -51,9 +51,8 @@ namespace Tests.IO
 
                 var root = ModelRoot.Load(outPath);
 
-                // The root_motion bone has no per-frame bone animation, so any net displacement of its
-                // translation channel comes purely from the baked root motion (~47.92 source units forward,
-                // ~1.22 m once the source->glTF unit conversion is baked into the export).
+                // root_motion has no per-frame bone animation, so its translation displacement is purely baked
+                // root motion (~47.92 source units forward, ~1.22 m after the source-to-glTF unit conversion).
                 var anim = root.LogicalAnimations.Single(a => a.Name == "box_creature_leggy_walk");
                 var rootMotionNode = root.LogicalNodes.Single(n => n.Name == "root_motion");
                 var sampler = anim.FindTranslationChannel(rootMotionNode)?.GetTranslationSampler();
@@ -112,9 +111,8 @@ namespace Tests.IO
             });
         }
 
-        // Regression guard for issue #1135: bone translation keyframes must be baked into meters (matching
-        // the unit-scaled armature), not left in source inches. In-inches channels under a 0.0254 armature
-        // scale are exactly what made bones stretch ~39x once transforms were applied.
+        // Regression guard for issue #1135: translation keys must be in meters, matching the armature.
+        // Inch keys under a 0.0254 armature scale stretch bones ~39x once transforms are applied.
         [Test]
         public async Task TestSkinnedAnimationStaysMeterScaled()
         {
@@ -147,9 +145,8 @@ namespace Tests.IO
             });
         }
 
-        // The non-skinned mesh path bakes the conversion into vertex positions and leaves the node at
-        // identity (it used to live on the node transform). Verify the geometry is in meters with no residual
-        // node scale or placement.
+        // The non-skinned mesh path bakes the conversion into vertex positions, leaving the node at identity.
+        // Geometry must be in meters with no residual node scale or placement.
         [Test]
         public async Task TestStaticMeshConversionBakedIntoGeometry()
         {
@@ -201,6 +198,38 @@ namespace Tests.IO
                 var childJoint = skin.Joints.Single(n => n.Name == "Attachment_2");
                 await Assert.That(childJoint.VisualParent?.Name).IsEqualTo("Base")
                     .Because("Attachment_2 names \"Base\" as its m_parentName");
+            });
+        }
+
+        [Test]
+        public async Task TestStandaloneMeshWithRepeatedBoneNameExportsRigged()
+        {
+            // Has a second "root" bone parented to the first one, which every other bone names as its parent
+            await WithExportedGlb("dcg_tower_dire_base_destruction.vmesh_c", async root =>
+            {
+                await Assert.That(root.LogicalSkins).IsNotEmpty();
+
+                var roots = root.LogicalSkins[0].Joints.Where(n => n.Name == "root").ToArray();
+
+                using (Assert.Multiple())
+                {
+                    await Assert.That(roots).Count().IsEqualTo(2);
+                    await Assert.That(roots[1].VisualParent).IsEqualTo(roots[0]);
+                }
+            });
+        }
+
+        [Test]
+        public async Task TestStandaloneMeshWithBoneHashesOnlyExportsUnrigged()
+        {
+            // Older render skeletons store bone hashes and bind poses, but no named bones to build joints from
+            await WithExportedGlb("blackin_bg_body_lod0.vmesh_c", async root =>
+            {
+                using (Assert.Multiple())
+                {
+                    await Assert.That(root.LogicalSkins).IsEmpty();
+                    await Assert.That(root.LogicalNodes.Where(n => n.Mesh != null)).IsNotEmpty();
+                }
             });
         }
 
@@ -328,6 +357,30 @@ namespace Tests.IO
                 await Assert.That(physicsNodes).IsNotEmpty();
                 await Assert.That(physicsNodes.All(node => node.Extras?["CollisionGroup"]?.GetValue<string>() == "default")).IsTrue();
             });
+        }
+
+        [Test]
+        public async Task TestPhysicsZeroLengthCapsuleHasUnitNormals()
+        {
+            // Has a capsule whose two ends are the same point
+            await WithExportedGlb("void_spirit_ar.vphys_c", async root =>
+            {
+                var normals = root.LogicalMeshes
+                    .SelectMany(mesh => mesh.Primitives)
+                    .SelectMany(primitive => primitive.GetVertexAccessor("NORMAL").AsVector3Array())
+                    .ToArray();
+
+                await Assert.That(normals).IsNotEmpty();
+                await Assert.That(normals.All(normal => MathF.Abs(normal.Length() - 1f) < 1e-4f)).IsTrue();
+            });
+        }
+
+        [Test]
+        public async Task TestPhysicsDegenerateTriangleHasUnitNormal()
+        {
+            var normal = GltfModelExporter.ComputeNormal(Vector3.Zero, Vector3.Zero, Vector3.UnitX);
+
+            await Assert.That(MathF.Abs(normal.Length() - 1f) < 1e-4f).IsTrue();
         }
     }
 }

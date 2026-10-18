@@ -44,10 +44,28 @@ namespace ValveResourceFormat.Renderer
             return a.RenderOrder - b.RenderOrder;
         }
 
-        /// <summary>Compares two requests by distance from camera, furthest first (back-to-front).</summary>
+        /// <summary>Compares two requests by distance from camera, furthest first (back-to-front), with ties in a stable order.</summary>
         public static int CompareCameraDistance(Request a, Request b)
         {
-            return -a.DistanceFromCamera.CompareTo(b.DistanceFromCamera);
+            var byDistance = b.DistanceFromCamera.CompareTo(a.DistanceFromCamera);
+            if (byDistance != 0)
+            {
+                return byDistance;
+            }
+
+            var byNode = a.Node.Id.CompareTo(b.Node.Id);
+            if (byNode != 0 || a.Call == null || b.Call == null)
+            {
+                return byNode;
+            }
+
+            var byMesh = a.Mesh.MeshIndex.CompareTo(b.Mesh.MeshIndex);
+            if (byMesh != 0)
+            {
+                return byMesh;
+            }
+
+            return a.Call.Index.CompareTo(b.Call.Index);
         }
 
         /// <summary>Compares two requests by draw stage first, then by shader program sort ID.</summary>
@@ -72,12 +90,6 @@ namespace ValveResourceFormat.Renderer
             _ => 0,
         };
 
-        /// <summary>Returns <see langword="true"/> if the request is a <see cref="SceneAggregate"/> with no visible children.</summary>
-        public static bool IsAggregateWithNoVisibleChildren(Request req)
-        {
-            return req.Node is SceneAggregate { AnyChildrenVisible: false };
-        }
-
         /// <summary>Sorts requests according to the active render pass and issues all draw calls.</summary>
         /// <param name="requests">Draw call requests to process.</param>
         /// <param name="context">Render context describing the current pass and scene state.</param>
@@ -95,7 +107,6 @@ namespace ValveResourceFormat.Renderer
             }
             else if (context.RenderPass == RenderPass.OpaqueAggregate)
             {
-                var removed = requests.RemoveAll(IsAggregateWithNoVisibleChildren);
                 requests.Sort(CompareStageThenProgram);
             }
             else if (context.RenderPass == RenderPass.StaticOverlay)
@@ -195,6 +206,11 @@ namespace ValveResourceFormat.Renderer
                     if (context.RenderPass is RenderPass.Opaque or RenderPass.Translucent or RenderPass.Outline or RenderPass.DepthOnly)
                     {
                         material?.PostRender();
+
+                        if (config.LightProbeType == LightProbeType.IndividualProbes && request.Node.LightProbeBinding is { } lightProbe)
+                        {
+                            request.Node.Scene.LightingInfo.BindInstanceLightProbeTextures(lightProbe);
+                        }
 
                         // Custom nodes render themselves and may issue several draws internally; count them as one draw call.
                         counters.Count(Counter.DrawCall);
@@ -329,6 +345,13 @@ namespace ValveResourceFormat.Renderer
                 && request.Node.LightProbeBinding is { } lightProbe)
             {
                 request.Node.Scene.LightingInfo.BindInstanceLightProbeTextures(lightProbe);
+            }
+
+            if (request.Node is SceneClutter clutter)
+            {
+                PerfStats.Active.CountDrawCall(request.Node);
+                clutter.Scene.ClutterCuller?.Draw(clutter, request.Call);
+                return;
             }
 
             var instanceCount = 1;

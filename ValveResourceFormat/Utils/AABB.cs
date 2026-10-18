@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace ValveResourceFormat.Utils
 {
     /// <summary>
@@ -161,11 +163,9 @@ namespace ValveResourceFormat.Utils
             var extents = Max - center;
             var newCenter = Vector3.Transform(center, transform);
 
-            var newExtents = new Vector3(
-                MathF.Abs(transform.M11) * extents.X + MathF.Abs(transform.M21) * extents.Y + MathF.Abs(transform.M31) * extents.Z,
-                MathF.Abs(transform.M12) * extents.X + MathF.Abs(transform.M22) * extents.Y + MathF.Abs(transform.M32) * extents.Z,
-                MathF.Abs(transform.M13) * extents.X + MathF.Abs(transform.M23) * extents.Y + MathF.Abs(transform.M33) * extents.Z
-            );
+            var newExtents = Vector3.Abs(new Vector3(transform.M11, transform.M12, transform.M13)) * extents.X
+                + Vector3.Abs(new Vector3(transform.M21, transform.M22, transform.M23)) * extents.Y
+                + Vector3.Abs(new Vector3(transform.M31, transform.M32, transform.M33)) * extents.Z;
 
             return new AABB(newCenter - newExtents, newCenter + newExtents);
         }
@@ -173,7 +173,7 @@ namespace ValveResourceFormat.Utils
         /// <inheritdoc/>
         public override readonly string ToString()
         {
-            return $"AABB [({Min.X},{Min.Y},{Min.Z}) -> ({Max.X},{Max.Y},{Max.Z}))";
+            return string.Create(CultureInfo.InvariantCulture, $"AABB [({Min.X},{Min.Y},{Min.Z}) -> ({Max.X},{Max.Y},{Max.Z}))");
         }
 
         /// <inheritdoc/>

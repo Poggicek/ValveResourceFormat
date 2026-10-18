@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -249,24 +248,7 @@ namespace ValveResourceFormat.Renderer.Shaders
 
                                 parsedData.RenderModes.Add(renderMode);
 
-                                value = RenderModes.GetShaderId(renderMode);
-
-                                if (value == 0)
-                                {
-                                    var renderModeObj = new RenderModes.RenderMode(renderMode);
-                                    var index = RenderModes.Items.IndexOf(renderModeObj);
-
-                                    if (index == -1)
-                                    {
-                                        Debug.Assert(false); // Add to <see cref="RenderModes.Items"/> if this assert is hit
-
-                                        RenderModes.Items = RenderModes.Items.Add(renderModeObj);
-                                        index = RenderModes.Items.IndexOf(renderModeObj);
-                                    }
-
-                                    value = (byte)index;
-                                    RenderModes.AddShaderId(renderMode, value);
-                                }
+                                value = RenderModes.GetOrAddShaderId(renderMode);
 
                                 builder.Append("#define ");
                                 builder.Append(defineName);
@@ -402,7 +384,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             return ExtensionToProgramType.GetValueOrDefault(ext, ShaderProgramType.Max);
         }
 
-        /// <summary>Gets the map from shader base names to a bool array indicating which pipeline stages (vertex, fragment, compute) exist in a mounted shader directory, on disk, or in the assembly manifest.</summary>
+        /// <summary>Gets each shader base name with its available stages (vertex, fragment, compute), from mounted directories, disk or the assembly manifest.</summary>
         public Dictionary<string, bool[]> AvailableShaders { get; private set; }
 
         /// <summary>Initializes a new instance of the <see cref="ShaderParser"/> class and discovers all available shader files.</summary>
@@ -490,13 +472,12 @@ namespace ValveResourceFormat.Renderer.Shaders
         private const string ShaderSourceDirectoryMetadataKey = "ShaderSourceDirectory";
 
         /// <summary>
-        /// Gets the folder holding the shaders shipped with the renderer as loose files on disk, or <see langword="null"/>
-        /// when only the copies embedded in this assembly are available.
+        /// Gets the folder of loose built-in shader files, or <see langword="null"/> when only the
+        /// embedded copies are available.
         /// </summary>
         /// <remarks>
-        /// Debug builds record the absolute path of the shader folder at compile time so that shader files can be edited
-        /// and hot reloaded without rebuilding. It is not recorded in release builds, and points at a folder that does not
-        /// exist when the assembly is used on another machine, in which case the embedded shaders are used instead.
+        /// Debug builds record the absolute shader folder path at compile time for hot reloading. Release builds do not,
+        /// and a recorded path that is missing on another machine falls back to the embedded shaders.
         /// </remarks>
         public static string? ShaderSourceDirectory { get; } = FindShaderSourceDirectory();
 

@@ -42,9 +42,6 @@ namespace GUI.Types.Viewers
             viewer = new GLWorldDiffViewer(newContext, newRendererContext, newWorld, newReferences, oldRendererContext, oldWorld, oldReferences);
             viewer.InitializeLoad();
 
-            // The new build's cache is cleared by the viewer once it has loaded, the old one's is not
-            oldContext.ClearCache();
-
             return Task.CompletedTask;
         }
 

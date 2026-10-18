@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 
 namespace ValveResourceFormat.ResourceTypes.ModelAnimation
@@ -16,7 +17,7 @@ namespace ValveResourceFormat.ResourceTypes.ModelAnimation
         /// <remarks>
         /// Returns the vector components formatted as "&lt;X Y Z&gt;" with 3 decimal places.
         /// </remarks>
-        public override readonly string ToString() => $"<{X:0.000} {Y:0.000} {Z:0.000}>";
+        public override readonly string ToString() => string.Create(CultureInfo.InvariantCulture, $"<{X:0.000} {Y:0.000} {Z:0.000}>");
     }
 
     internal class SegmentHelpers
@@ -27,7 +28,7 @@ namespace ValveResourceFormat.ResourceTypes.ModelAnimation
         /// Read and decode encoded quaternion.
         /// </summary>
         /// <param name="bytes">The byte stream.</param>
-        /// <returns>Quaternion.</returns>
+        /// <returns>The decoded rotation.</returns>
         public static Quaternion ReadQuaternion(ReadOnlySpan<byte> bytes)
         {
             // Values

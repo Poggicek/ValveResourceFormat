@@ -9,6 +9,7 @@ namespace ValveResourceFormat.Graphs;
 /// Builds the node graph of a compiled Pulse graph: one card per cell, wired by the instruction
 /// flow and the register bindings between them.
 /// </summary>
+/// <seealso href="https://s2v.app/SchemaExplorer/cs2/pulse_runtime_lib/CPulseGraphDef">CPulseGraphDef</seealso>
 internal sealed class PulseGraphBuilder
 {
     /// <summary>Receives diagnostics about cells the definition could not be read cleanly from.</summary>
@@ -41,6 +42,7 @@ internal sealed class PulseGraphBuilder
     private readonly KVObject graphDefinition;
 
     // Every serialized instruction code, in order. Typed variants such as ADD_INT only exist at runtime.
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/pulse_runtime_lib/PulseInstructionCode_t">PulseInstructionCode_t</seealso>
     enum InstructionCode
     {
         INVALID,
@@ -93,8 +95,9 @@ internal sealed class PulseGraphBuilder
         SET_TEMPVAR_OBSERVABLE,
     }
 
-    // The full EPulseValueType set (pulse_system). A register names one of these, optionally with
+    // The full value type set. A register names one of these, optionally with
     // a ":subtype" the parser strips. Drives socket/wire colour and is shown on variable nodes.
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/pulse_runtime_lib/PulseValueType_t">PulseValueType_t</seealso>
     enum PulseValueType
     {
         PVAL_INVALID,
@@ -118,10 +121,12 @@ internal sealed class PulseGraphBuilder
         PVAL_SNDEVT_NAME,
         PVAL_SNDEVT_GUID,
         PVAL_ENTITY_NAME,
+        PVAL_LEAF,
         PVAL_TYPESAFE_INT,
         PVAL_TYPESAFE_INT64,
         PVAL_GAMETIME,
         PVAL_SCHEMA_ENUM,
+        PVAL_ENUM,
         PVAL_PANORAMA_PANEL_HANDLE,
         PVAL_MODEL_MATERIAL_GROUP,
         PVAL_OPAQUE_HANDLE,
@@ -157,6 +162,10 @@ internal sealed class PulseGraphBuilder
     // Per chunk, the last instruction of each loop keyed by its first
     private Dictionary<int, int>[] loopsByChunk = [];
 
+    // Instructions on the flow currently being walked, with the flow entering each and the wire count at that point
+    private readonly Dictionary<(int Chunk, int Instruction), (FlowContinuation Entry, int WireCount)> walkPath = [];
+    private readonly Stack<(int Chunk, int Instruction)> walkPathOrder = [];
+
     // A call or leap node, labelled with its target chunk's name once every chunk is named
     private readonly record struct RemoteNodeInfo(int TargetChunk, Node Node, string TargetNamePrefix);
 
@@ -164,6 +173,7 @@ internal sealed class PulseGraphBuilder
     // constant that is printed inline where it is read. The latest write wins.
     private readonly record struct RegisterValue(GraphSocket? Socket, KVObject? Constant);
 
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/pulse_runtime_lib/CPulse_OutflowConnection">CPulse_OutflowConnection</seealso>
     private sealed record PulseOutflowConnection(string SourceOutflowName, int DestChunk, int DestInstructionIdx, KVObject? OutflowRegisterMap)
     {
         public static PulseOutflowConnection? FromKV(KVObject obj)
@@ -184,22 +194,18 @@ internal sealed class PulseGraphBuilder
         }
     }
 
-    #region Socket types
-    // Buckets match the ones the pulse editor itself binds wires by (pulse_scene_styles_v2):
-    // string, number, bool, flow, and one "other" bucket for every remaining type.
-    private static GraphHue HueOfPval(PulseValueType valueType) => valueType switch
+    private static GraphHue HueOf(PulseValueType valueType) => PulseHues.HueOf(valueType switch
     {
         PulseValueType.PVAL_INT or PulseValueType.PVAL_FLOAT
             or PulseValueType.PVAL_TYPESAFE_INT or PulseValueType.PVAL_TYPESAFE_INT64
-            or PulseValueType.PVAL_GAMETIME => GraphHue.Amber,
-        PulseValueType.PVAL_STRING => GraphHue.Green,
-        PulseValueType.PVAL_BOOL => GraphHue.Orange,
-        PulseValueType.PVAL_CURSOR_FLOW => GraphHue.Neutral,
-        _ => GraphHue.Teal,
-    };
-    #endregion Socket types
+            or PulseValueType.PVAL_GAMETIME => PulseValueKind.Number,
+        PulseValueType.PVAL_STRING => PulseValueKind.String,
+        PulseValueType.PVAL_BOOL => PulseValueKind.Bool,
+        PulseValueType.PVAL_CURSOR_FLOW => PulseValueKind.Flow,
+        _ => PulseValueKind.Other,
+    });
 
-    private static Node CreateNode(string name, string nodeType, PulseCategory category, KVObject? data = null) => new(data)
+    private static Node CreateNode(string name, string nodeType, PulseCategory category) => new()
     {
         Name = name,
         NodeType = nodeType,
@@ -241,9 +247,8 @@ internal sealed class PulseGraphBuilder
         }
     }
 
-    // Adds a flow output to node and draws the flow it leads to. The outflow's own out params are
-    // registers of the destination chunk, set when the flow starts there.
-    private void TraverseOutflow(
+    // The outflow's own out params are registers of the destination chunk, set when the flow starts there.
+    private FlowContinuation TraverseOutflow(
         GraphDocument document,
         Node node,
         string socketLabel,
@@ -267,10 +272,10 @@ internal sealed class PulseGraphBuilder
         var outputSocket = node.CreateFlowOut(socketLabel);
         if (destChunk == -1)
         {
-            return;
+            return FlowContinuation.Of(outputSocket);
         }
 
-        TraverseNodesForChunk(
+        return TraverseNodesForChunk(
             document,
             destChunk,
             FlowContinuation.Of(outputSocket),
@@ -362,14 +367,13 @@ internal sealed class PulseGraphBuilder
 
     private readonly Dictionary<(string HubType, int Bank, int Index), Node> variableHubs = [];
 
-    // One hub node per variable; writes wire into it and reads out of it, so a variable's reads and
-    // writes are visible connectivity. Temporaries live in a bank named by the chunk that uses them,
-    // so the same index means different values in different banks.
-    private Node VariableHubFor(GraphDocument document, string hubType, int bankIndex, int index, string name, KVObject? data)
+    // One hub node per variable: writes wire into it, reads wire out of it. Temporaries are banked
+    // by the chunk that uses them, so one index means different values in each bank.
+    private Node VariableHubFor(GraphDocument document, string hubType, int bankIndex, int index, string name)
     {
         if (!variableHubs.TryGetValue((hubType, bankIndex, index), out var node))
         {
-            node = CreateNode(name, hubType, PulseCategory.Variable, data);
+            node = CreateNode(name, hubType, PulseCategory.Variable);
             document.AddNode(node);
             variableHubs[(hubType, bankIndex, index)] = node;
         }
@@ -438,7 +442,7 @@ internal sealed class PulseGraphBuilder
             name = variable.GetStringProperty("m_Name");
         }
 
-        return VariableHubFor(document, VariableHubType, -1, varIndex, name, variable);
+        return VariableHubFor(document, VariableHubType, -1, varIndex, name);
     }
 
     private Node TempVariableHubFromInstruction(GraphDocument document, int chunkIndex, KVObject instruction, out string name)
@@ -456,7 +460,7 @@ internal sealed class PulseGraphBuilder
             name = tempVar.GetStringProperty("m_Name");
         }
 
-        return VariableHubFor(document, TempVariableHubType, bankIndex, tempVarIndex, name, null);
+        return VariableHubFor(document, TempVariableHubType, bankIndex, tempVarIndex, name);
     }
 
     private Node BlackboardReferenceHubFromInstruction(GraphDocument document, KVObject instruction, out string name)
@@ -473,13 +477,16 @@ internal sealed class PulseGraphBuilder
             name = reference.GetStringProperty("m_NodeName", $"<BLACKBOARD REFERENCE {referenceIndex}>");
         }
 
-        return VariableHubFor(document, BlackboardReferenceHubType, -1, referenceIndex, name, reference);
+        return VariableHubFor(document, BlackboardReferenceHubType, -1, referenceIndex, name);
     }
 
     /// <summary>The port a flow continues into, created on first use.</summary>
-    private sealed class FlowContinuation(Func<GraphSocket> create)
+    private sealed class FlowContinuation(Func<GraphSocket> create, Node? breakNode = null)
     {
         private GraphSocket? socket;
+
+        /// <summary>The loop break the flow stopped at, if it did.</summary>
+        public Node? BreakNode { get; } = breakNode;
 
         /// <summary>A port the node only grows once a flow continues into it.</summary>
         /// <param name="node">The node the port would belong to.</param>
@@ -489,8 +496,15 @@ internal sealed class PulseGraphBuilder
         /// <param name="existing">The port to continue from.</param>
         public static FlowContinuation Of(GraphSocket existing) => new(() => existing);
 
+        /// <summary>A flow that left its loop at a break, resuming where the loop completes.</summary>
+        /// <param name="node">The break node.</param>
+        public static FlowContinuation Break(Node node) => new(() => node.CreateFlowOut(""), node);
+
         /// <summary>The port itself.</summary>
         public GraphSocket Socket => socket ??= create();
+
+        /// <summary>Whether <see cref="Socket"/> has been used.</summary>
+        public bool IsCreated => socket != null;
     }
 
     private static FlowContinuation CreateSequentialActionSockets(GraphDocument document, Node node, FlowContinuation previousActionOutSocket)
@@ -927,9 +941,8 @@ internal sealed class PulseGraphBuilder
 
         var forLoopNode = CreateNode("Loop", "Flow control", PulseCategory.FlowControl);
 
-        // No info? One last try, but this is an assumption already.
-        // If the latest condition instruction is LT/LTE then in theory we can connect the start and end condition sockets.
-        // There are no greater-than instructions, those compile to LT/LTE with swapped operands.
+        // Last resort, an assumption: if the latest condition is LT/LTE, its operands are the start
+        // and end. There is no greater-than instruction, it compiles to LT/LTE with swapped operands.
         if (regStop == -1 && regStart == -1)
         {
             if (GetInstructionType(instrComp) is InstructionCode.LT or InstructionCode.LTE)
@@ -945,9 +958,8 @@ internal sealed class PulseGraphBuilder
         if (regStart != -1)
         {
             AddNodeRegisterInput(document, forLoopNode, chunkIndex, registerValues, regStart, "First index");
-            // add the index output
-            // this will be remembered when we do a loop iteration (should also handle foreach type of loop)
-            registerValues[regStart] = new(forLoopNode.AddOutput("Index", GraphHue.Amber), null);
+            // Kept across loop iterations, should also handle foreach type of loop.
+            registerValues[regStart] = new(forLoopNode.AddOutput("Index", PulseHues.HueOf(PulseValueKind.Number)), null);
         }
         else
         {
@@ -1014,7 +1026,6 @@ internal sealed class PulseGraphBuilder
         previousActionOutSocket = FlowContinuation.Of(forLoopNode.CreateFlowOut("Finished"));
 
         document.AddNode(forLoopNode);
-        // do stuff outside the loop
         instructionIdx = outsideLoopTargetInstructionIdx;
         return true;
     }
@@ -1025,6 +1036,55 @@ internal sealed class PulseGraphBuilder
         Dictionary<int, RegisterValue> registerValues,
         int startingInstructionIdx = 0,
         int endingInstructionIdx = int.MaxValue /* non-inclusive */)
+    {
+        var walkDepth = walkPathOrder.Count;
+        var flow = WalkChunk(document, chunkIndex, sourceActionOutSocket, registerValues, startingInstructionIdx, endingInstructionIdx);
+
+        while (walkPathOrder.Count > walkDepth)
+        {
+            walkPath.Remove(walkPathOrder.Pop());
+        }
+
+        return flow;
+    }
+
+    // An instruction already on the walk is not walked again, the flow is wired back into the first
+    // node drawn at or after it instead
+    private bool TryJumpBack(GraphDocument document, int chunkIndex, int instructionIdx, FlowContinuation previousActionOutSocket)
+    {
+        if (!walkPath.TryGetValue((chunkIndex, instructionIdx), out var target))
+        {
+            return false;
+        }
+
+        var targetInput = target.Entry.IsCreated
+            ? document.Wires.Skip(target.WireCount).FirstOrDefault(wire => wire.From == target.Entry.Socket)?.To
+            : null;
+
+        if (targetInput != null)
+        {
+            var source = previousActionOutSocket.Socket;
+            if (!targetInput.Wires.Any(wire => wire.From == source))
+            {
+                document.Connect(source, targetInput, label: "Jump back");
+            }
+
+            return true;
+        }
+
+        var node = CreateNode("Jump Back", "Flow", PulseCategory.FlowControl);
+        CreateSequentialActionSockets(document, node, previousActionOutSocket);
+        node.AddText($"To instruction {instructionIdx}");
+        document.AddNode(node);
+        return true;
+    }
+
+    private FlowContinuation WalkChunk(GraphDocument document,
+        int chunkIndex,
+        FlowContinuation sourceActionOutSocket,
+        Dictionary<int, RegisterValue> registerValues,
+        int startingInstructionIdx,
+        int endingInstructionIdx)
     {
         if (chunkIndex < 0)
         {
@@ -1038,6 +1098,11 @@ internal sealed class PulseGraphBuilder
         var previousActionOutSocket = sourceActionOutSocket;
         for (var instructionIdx = startingInstructionIdx; instructionIdx < finalEndingInstructionIdx; instructionIdx++)
         {
+            if (TryJumpBack(document, chunkIndex, instructionIdx, previousActionOutSocket))
+            {
+                return previousActionOutSocket;
+            }
+
             // A loop ending past the range being walked is not the one currently being drawn
             while (chunkLoops.TryGetValue(instructionIdx, out var loopEnd) && finalEndingInstructionIdx > loopEnd)
             {
@@ -1051,6 +1116,14 @@ internal sealed class PulseGraphBuilder
             {
                 break;
             }
+
+            if (TryJumpBack(document, chunkIndex, instructionIdx, previousActionOutSocket))
+            {
+                return previousActionOutSocket;
+            }
+
+            walkPath.Add((chunkIndex, instructionIdx), (previousActionOutSocket, document.WireCount));
+            walkPathOrder.Push((chunkIndex, instructionIdx));
 
             var instruction = instructions[instructionIdx];
             var instrType = GetInstructionType(instruction);
@@ -1075,7 +1148,6 @@ internal sealed class PulseGraphBuilder
                     var funcName = binding.GetStringProperty("m_FuncName");
                     var cellIndex = binding.GetInt32Property("m_nCellIndex");
 
-                    // show name after '::' separator, if can't find then show full name
                     var funcNameSplitIdx = funcName.IndexOf("::", StringComparison.Ordinal);
                     var methodName = funcNameSplitIdx >= 0 ? funcName[(funcNameSplitIdx + 2)..] : funcName;
                     var node = CreateNode(GetCellName(cellIndex), methodName, GetCellCategory(cellIndex));
@@ -1190,7 +1262,7 @@ internal sealed class PulseGraphBuilder
                         node.AddMessage("No enclosing loop, halts the cursor");
                     }
                     document.AddNode(node);
-                    return previousActionOutSocket;
+                    return FlowContinuation.Break(node);
                 }
                 case InstructionCode.PULSE_CALL_SYNC:
                 case InstructionCode.PULSE_CALL_ASYNC_FIRE:
@@ -1207,8 +1279,25 @@ internal sealed class PulseGraphBuilder
                         else
                         {
                             // A call within the same chunk runs inline, e.g. a loop body, and comes back to the next instruction
-                            previousActionOutSocket = TraverseNodesForChunk(document, chunkIndex, previousActionOutSocket,
+                            var body = TraverseNodesForChunk(document, chunkIndex, previousActionOutSocket,
                                 new Dictionary<int, RegisterValue>(registerValues), callDestInstructionIdx);
+
+                            if (body.BreakNode is not { } breakNode)
+                            {
+                                previousActionOutSocket = body;
+                                break;
+                            }
+
+                            // A break leaves the loop at the break destination of the nearest call carrying one
+                            var loopCallInfo = callInfos.ElementAtOrDefault(instruction.GetInt32Property("m_nCallInfoIndex"));
+                            var breakDestChunk = loopCallInfo?.GetInt32Property("m_nBreakDestChunk", -1) ?? -1;
+                            if (loopCallInfo == null || breakDestChunk == -1)
+                            {
+                                return body;
+                            }
+
+                            return TraverseOutflow(document, breakNode, "Loop completed", chunkIndex, breakDestChunk,
+                                loopCallInfo.GetInt32Property("m_nBreakDestInstruction"), finalEndingInstructionIdx, registerValues);
                         }
                         break;
                     }
@@ -1245,14 +1334,14 @@ internal sealed class PulseGraphBuilder
                 }
                 case InstructionCode.JUMP:
                 {
-                    TraverseNodesForChunk(
+                    var jumped = TraverseNodesForChunk(
                         document,
                         chunkIndex,
                         previousActionOutSocket,
                         new Dictionary<int, RegisterValue>(registerValues),
                         instruction.GetInt32Property("m_nDestInstruction"),
                         finalEndingInstructionIdx);
-                    return previousActionOutSocket;
+                    return jumped.BreakNode != null ? jumped : previousActionOutSocket;
                 }
                 case InstructionCode.JUMP_COND:
                 {
@@ -1261,9 +1350,8 @@ internal sealed class PulseGraphBuilder
                     // If false we don't take the jump. So traverse starting from currentinstr + 1
                     var destInstructionIdxFalse = instructionIdx + 1;
 
-                    // Find out the jump out instruction after the True case is finished.
-                    // Whether the graph code run through true or false, it will end up at one, unless it's just a return
-                    // in which case we don't have to worry about anything
+                    // Find the jump out instruction after the true case. Both paths reach it unless the branch
+                    // is a return, which needs no handling.
                     var firstInstructionAfterBranches = -1;
                     var falseInstruction = instructions[destInstructionIdxFalse];
                     if (GetInstructionType(falseInstruction) == InstructionCode.JUMP)
@@ -1297,8 +1385,8 @@ internal sealed class PulseGraphBuilder
                     var node = CreateIfNode(document, instruction, chunkIndex, previousActionOutSocket, registerValues);
                     AddChunkLeapNode(document, instruction, FlowContinuation.Of(node.CreateFlowOut("True")));
 
-                    // Since leaps don't come back after executing we don't have to worry about defining "bounds" for the conditions, unlike regular jumps.
-                    // Also no need for a "Finished" socket because no way for true and false flows to merge back again.
+                    // Leaps never come back, so the conditions need no bounds unlike regular jumps, and there
+                    // is no "Finished" socket as the true and false flows never merge.
                     previousActionOutSocket = FlowContinuation.Of(node.CreateFlowOut("False"));
 
                     document.AddNode(node);
@@ -1315,7 +1403,7 @@ internal sealed class PulseGraphBuilder
                     var reg1 = instruction.GetInt32Property("m_nReg1");
                     var reg2 = instruction.GetInt32Property("m_nReg2");
 
-                    if (reg0 == -1) // nothing to do
+                    if (reg0 == -1)
                     {
                         break;
                     }
@@ -1338,7 +1426,6 @@ internal sealed class PulseGraphBuilder
                         AddNodeRegisterInput(document, node, chunkIndex, registerValues, reg0, "arg");
                     }
 
-                    // create output socket for this node, and store it for future connections
                     registerValues[reg0] = new(node.CreateSocketOutFromValueType("retval", GetValueTypeFromRegister(chunkIndex, reg0)), null);
                     document.AddNode(node);
                     break;
@@ -1349,8 +1436,8 @@ internal sealed class PulseGraphBuilder
         return previousActionOutSocket;
     }
 
-    // Generates outflows and labels for specific cells, this is needed as each one can have very different meaning or behavior.
-    // Additionally, handle outflows. Explicitly, or automatically.
+    // Labels and outflows are generated per cell class, as each can mean something different.
+    // Handles explicit and automatic outflows.
     private void PopulateCellAndTraverseOutflows(
         GraphDocument document,
         Node node,
@@ -1365,7 +1452,7 @@ internal sealed class PulseGraphBuilder
 
         switch (cell.GetStringProperty("_class"))
         {
-            // here we assume that wait is going to be processed sequentially, not out of order, even though it's theoretically possible.
+            // Assumes waits resolve in order, though theoretically they may not.
             case "CPulseCell_Inflow_Wait":
             {
                 var wakeResume = cell["m_WakeResume"];
@@ -1413,7 +1500,7 @@ internal sealed class PulseGraphBuilder
                     }
 
                     var timeFromPrevious = timelineEvent.GetFloatProperty("m_flTimeFromPrevious");
-                    var socketLabel = $"(Time from prev: {timeFromPrevious}s) | {eventOutflow.SourceOutflowName}";
+                    var socketLabel = string.Create(CultureInfo.InvariantCulture, $"(Time from prev: {timeFromPrevious}s) | {eventOutflow.SourceOutflowName}");
                     AddOutflowSocket(document, node, eventOutflow, socketLabel, chunkIndex, registerValues, maxInstructionIdx);
                     processedOutflowNames.Add(eventOutflow.SourceOutflowName);
                 }
@@ -1489,8 +1576,7 @@ internal sealed class PulseGraphBuilder
         // General info as a node
         var graphInfoNode = CreateNode("Graph info", "", PulseCategory.Other);
 
-        // Remap some atomic graph keys to more user friendly names for display
-        // If some keys change their name in the future, they still will be displayed, just with the raw key name.
+        // Remaps some graph keys to friendlier names; unmapped keys still display under their raw name.
         Dictionary<string, string> prettyNameMap = new()
         {
             { "m_DomainIdentifier", "Domain" },
@@ -1511,12 +1597,11 @@ internal sealed class PulseGraphBuilder
         }
         document.AddNode(graphInfoNode);
 
-        // Variable definitions go on the same hub their reads and writes link to, since there's no
-        // specific pane for displaying them.
+        // Definitions share the hub their reads and writes link to, since no pane displays them.
         for (var varIndex = 0; varIndex < variables.Count; varIndex++)
         {
             var variable = variables[varIndex];
-            var node = VariableHubFor(document, VariableHubType, -1, varIndex, variable.GetStringProperty("m_Name"), variable);
+            var node = VariableHubFor(document, VariableHubType, -1, varIndex, variable.GetStringProperty("m_Name"));
             node.AddText($"Type: {variable.GetStringProperty("m_Type")}");
             node.AddText($"Initial value: {variable["m_DefaultValue"]}");
             node.AddText($"Keys source: {variable.GetStringProperty("m_nKeysSource")}");
@@ -1537,7 +1622,6 @@ internal sealed class PulseGraphBuilder
             }
         }
 
-        // Resolve call nodes to display the target function name
         foreach (var (targetChunk, node, targetNamePrefix) in remoteNodesToResolve)
         {
             var methodNameToCall = chunkFunctionName.GetValueOrDefault(targetChunk, $"<INVALID CHUNK {targetChunk}>");
@@ -1550,14 +1634,11 @@ internal sealed class PulseGraphBuilder
         document.Legend.AddRange(PulseHues.Legend());
     }
 
-    #region Nodes
-    class Node(KVObject? data) : KVGraphNode(data)
+    class Node : KVGraphNode
     {
-        public GraphSocket CreateFlowIn(string text) => AddInput(text, GraphHue.Neutral);
-        public GraphSocket CreateFlowOut(string text) => AddOutput(text, GraphHue.Neutral);
-        public GraphSocket CreateSocketInFromValueType(string text, PulseValueType valueType) => AddInput(text, HueOfPval(valueType));
-        public GraphSocket CreateSocketOutFromValueType(string text, PulseValueType valueType) => AddOutput(text, HueOfPval(valueType));
+        public GraphSocket CreateFlowIn(string text) => AddInput(text, PulseHues.HueOf(PulseValueKind.Flow));
+        public GraphSocket CreateFlowOut(string text) => AddOutput(text, PulseHues.HueOf(PulseValueKind.Flow));
+        public GraphSocket CreateSocketInFromValueType(string text, PulseValueType valueType) => AddInput(text, HueOf(valueType));
+        public GraphSocket CreateSocketOutFromValueType(string text, PulseValueType valueType) => AddOutput(text, HueOf(valueType));
     }
-
-    #endregion Nodes
 }

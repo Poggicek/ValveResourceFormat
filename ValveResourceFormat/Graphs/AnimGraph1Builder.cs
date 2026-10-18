@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Linq;
 using ValveKeyValue;
 using ValveResourceFormat.IO;
@@ -7,10 +8,11 @@ using Node = ValveResourceFormat.Graphs.KVGraphNode;
 namespace ValveResourceFormat.Graphs;
 
 /// <summary>
-/// Builds the node graph of an AG1 animation graph, from either the compiled schema or the
-/// uncompiled editor one: one card per node, wired by the child links the node declares, with
-/// parameter, tag and component hubs beside them.
+/// Builds the node graph of an AG1 animation graph from the compiled or editor schema: one card
+/// per node, wired by the child links it declares, plus parameter, tag and component hubs.
 /// </summary>
+/// <seealso href="https://s2v.app/SchemaExplorer/cs2/animgraphlib/CAnimUpdateSharedData">CAnimUpdateSharedData</seealso>
+/// <seealso href="https://s2v.app/SchemaExplorer/hlvr/animationsystem/CAnimationGraph">CAnimationGraph</seealso>
 internal sealed class AnimGraph1Builder : IDisposable
 {
     /// <summary>Whether parameter feeds are drawn as wires instead of being named on the cards.</summary>
@@ -18,9 +20,6 @@ internal sealed class AnimGraph1Builder : IDisposable
 
     /// <summary>Whether the graph has any parameter consumer, set once a build has run.</summary>
     public bool HasParameterConsumers => parameterConsumers.Count > 0;
-
-    /// <summary>Receives diagnostics about nodes the schema could not be read cleanly from.</summary>
-    public IProgress<string>? ProgressReporter { get; set; }
 
     /// <summary>Creates a builder over one animation graph.</summary>
     /// <param name="data">The graph, compiled or in the editor schema.</param>
@@ -54,8 +53,6 @@ internal sealed class AnimGraph1Builder : IDisposable
     private readonly Dictionary<int, Node> nodeMap = [];
     private readonly Dictionary<int, KVObject> parameterIndexToObject = [];
     private readonly Dictionary<KVObject, List<Node>> parameterConsumers = [];
-    private readonly Dictionary<int, string> parameterIndexToName = [];
-    private readonly Dictionary<KVObject, int> parameterObjectToIndex = [];
     private readonly Dictionary<string, List<KVObject>> typeToParameters = [];
     private readonly List<KVObject> tags = [];
     private readonly Dictionary<int, string> tagIndexToName = [];
@@ -72,8 +69,7 @@ internal sealed class AnimGraph1Builder : IDisposable
     // rather than any category or data type colour.
     private static readonly GraphHue SubGraphHue = AnimGraphHues.HueOf(AnimGraphCategory.ExternalReference);
 
-    // Anim tag and component classes each render with a friendly label and a category hue;
-    // the two travel together, so one table carries both.
+    // Each anim tag and component class has a friendly label and a category hue, in one table.
     private static readonly Dictionary<string, (string Name, GraphHue Hue)> TagClasses = new(StringComparer.Ordinal)
     {
         ["CAudioAnimTag"] = ("Audio Tag", GraphHue.Orange),
@@ -177,16 +173,12 @@ internal sealed class AnimGraph1Builder : IDisposable
 
     private static GraphHue HueOfClass(string compiledClass)
         => AnimGraphHues.HueOf(AnimGraphHues.CategoryOfAG1(compiledClass));
-    private static readonly HashSet<string> GlobalPropertySkips = new(StringComparer.Ordinal)
-    {
-        "m_name",
-    };
 
-    // Structural keys of a compiled node: they are already drawn as wires, sockets or their own
-    // rows, so the generic property dump leaves them out.
+    // Structural keys of a compiled node are already drawn as the title, wires, sockets or rows,
+    // so the generic property dump skips them.
     private static readonly HashSet<string> CompiledStructureKeys = new(StringComparer.Ordinal)
     {
-        "_class", "m_nodePath", "m_children", "m_tags", "m_paramSpans", "m_stateMachine", "m_stateData", "m_transitionData",
+        "_class", "m_name", "m_nodePath", "m_children", "m_tags", "m_paramSpans", "m_stateMachine", "m_stateData", "m_transitionData",
     };
 
     /// <summary>
@@ -238,7 +230,6 @@ internal sealed class AnimGraph1Builder : IDisposable
         ["m_networkMode"] = "NetworkMode",
     };
 
-    // Properties to skip in generic display for specific classes
     private static readonly Dictionary<string, HashSet<string>> ClassPropertySkips = new(StringComparer.Ordinal)
     {
         ["CChoiceUpdateNode"] = new(StringComparer.Ordinal) { "m_weights", "m_blendTimes", "m_choiceMethod", "m_blendMethod", "m_choiceChangeMethod", "m_bCrossFade", "m_bResetChosen", "m_bDontResetSameSelection" },
@@ -258,25 +249,30 @@ internal sealed class AnimGraph1Builder : IDisposable
     {
         nodeMap.Clear();
         parameterConsumers.Clear();
-        parameterObjectToIndex.Clear();
 
+        document.Legend.AddRange(AnimGraphHues.Legend());
+
+        // HLA and SteamVR Home ship standalone vanmgrph files in the editor format, and CS2
+        // authors its player graphs the same way in vanmgrph/vsubgrph. The graph is laid out
+        // from its wires like the compiled path; the authored canvas positions are ignored.
         if (IsEditorGraph(animGraphData))
         {
-            // HLA and SteamVR Home ship standalone vanmgrph files in the editor format, and CS2
-            // authors its player graphs the same way in vanmgrph/vsubgrph. The graph is laid out
-            // from its wires like the compiled path; the authored canvas positions are ignored.
             BuildEditorGraph(document);
-            document.LayoutOptions.LongWireDummies = true;
-            document.LayoutOptions.TightenMinSpan = 1;
-            document.LayoutNodesPacked();
-
-            document.Legend.AddRange(AnimGraphHues.Legend());
-            return;
+        }
+        else
+        {
+            BuildCompiledGraph(document);
         }
 
-        LoadParameters(document);
-        LoadTags(document);
-        LoadComponents(document);
+        document.LayoutOptions.LongWireDummies = true;
+        document.LayoutNodesPacked();
+    }
+
+    private void BuildCompiledGraph(GraphDocument document)
+    {
+        LoadParameters();
+        LoadTags();
+        LoadComponents();
 
         var nodesContainer = ResolveContainer("m_nodes");
         compiledNodes = nodesContainer?.GetArray("m_nodes") ?? [];
@@ -284,14 +280,6 @@ internal sealed class AnimGraph1Builder : IDisposable
         CreateGraph(document);
         AddParameterAndTagNodes(document);
         AddComponentNodes(document);
-        // A pose graph is one connected DAG, where routing a long wire through dummy ranks keeps
-        // it between the cards of the ranks it spans rather than over them, and where closing
-        // every rank of slack pays off instead of costing the room the repair moves cards in.
-        document.LayoutOptions.LongWireDummies = true;
-        document.LayoutOptions.TightenMinSpan = 1;
-        document.LayoutNodesPacked();
-
-        document.Legend.AddRange(AnimGraphHues.Legend());
 
         foreach (var (name, hue) in drawnParameterTypes)
         {
@@ -311,8 +299,7 @@ internal sealed class AnimGraph1Builder : IDisposable
         document.Legend.Add(new("Client-simulated (body tint)", GraphHue.Purple, GraphLegendKind.BodyTint));
     }
 
-    // animgraph1 names a child by id, animgraph19 by connection; a node carries one vocabulary
-    // or the other, so both are tried against every node.
+    // animgraph1 names children by id, animgraph19 by connection; a node uses one, so try both.
     private static readonly (string Field, string Label)[] EditorChildFields =
     [
         ("m_childID", "child"),
@@ -336,9 +323,9 @@ internal sealed class AnimGraph1Builder : IDisposable
     };
 
     /// <summary>
-    /// Adds every node of a container to the view, recursing into the node manager a group
-    /// carries so the whole authored tree lands on one canvas, and records the group path and
-    /// the named outputs the connections in the container address.
+    /// Adds every node of a container, recursing into the node manager of groups so the whole
+    /// authored tree lands on one canvas. Records each node's group path and the named outputs
+    /// that connections address.
     /// </summary>
     private static void AddEditorNodes(
         GraphDocument document,
@@ -371,7 +358,7 @@ internal sealed class AnimGraph1Builder : IDisposable
             var friendly = ClassDisplayName.TryGetValue(compiledClass, out var display) ? display : className;
             var authoredName = value.GetStringProperty("m_sName");
 
-            var node = new Node(value)
+            var node = new Node
             {
                 Name = string.IsNullOrEmpty(authoredName) || authoredName == "Unnamed" ? friendly : authoredName,
                 NodeType = friendly,
@@ -466,18 +453,17 @@ internal sealed class AnimGraph1Builder : IDisposable
         return ResolveNestedEditorNodes(root);
     }
 
-    // Builds the graph straight from the uncompiled editor schema. Nodes are a key/value list
-    // of id to node. animgraph1 (HLA, SteamVR Home) wires children by plain id fields, while
-    // animgraph19 (CS2) wires them through m_inputConnection { m_nodeID, m_outputID } and nests
-    // groups in a node manager of their own; both are read here and flattened onto one canvas,
-    // with each node stamped with the group path it was authored in.
+    // Builds the graph from the editor schema, a key/value list of id to node. animgraph1 (HLA,
+    // SteamVR Home) wires children by plain id fields; animgraph19 (CS2) wires them through
+    // m_inputConnection { m_nodeID, m_outputID } and nests groups in a node manager. Both are
+    // flattened onto one canvas, each node stamped with its authored group path.
     private void BuildEditorGraph(GraphDocument document)
     {
         var rootNodes = ResolveRootEditorNodes(animGraphData);
 
         if (rootNodes == null || rootNodes.Count == 0)
         {
-            document.AddNode(new Node(null)
+            document.AddNode(new Node
             {
                 Name = "Empty animation graph",
                 NodeType = animGraphData.GetStringProperty("_class") ?? "CAnimationGraph",
@@ -532,12 +518,7 @@ internal sealed class AnimGraph1Builder : IDisposable
 
                 var outputName = outputNames.GetValueOrDefault((sourceId, outputId), string.Empty);
                 var output = source.GetOrAddOutput(outputName, PoseHue);
-                var input = parent.AddInput(inputName, PoseHue, allowMultiple: true);
-
-                if (!input.Wires.Exists(w => w.From == output))
-                {
-                    document.Connect(output, input);
-                }
+                document.ConnectOrMerge(output, parent.AddInput(inputName, PoseHue, allowMultiple: true));
             }
 
             void ConnectConnection(KVObject? connection, string inputName)
@@ -705,9 +686,8 @@ internal sealed class AnimGraph1Builder : IDisposable
         return animGraphData.ContainsKey(key) ? animGraphData : null;
     }
 
-    private void LoadParameters(GraphDocument document)
+    private void LoadParameters()
     {
-        parameterIndexToName.Clear();
         parameterIndexToObject.Clear();
         typeToParameters.Clear();
 
@@ -729,9 +709,7 @@ internal sealed class AnimGraph1Builder : IDisposable
             var name = param.GetStringProperty("m_name");
             if (!string.IsNullOrEmpty(name))
             {
-                parameterIndexToName[i] = name;
                 parameterIndexToObject[i] = param;
-                parameterObjectToIndex[param] = i;
 
                 var className = param.GetStringProperty("_class");
                 var type = ClassNameToParamType(className);
@@ -745,7 +723,7 @@ internal sealed class AnimGraph1Builder : IDisposable
         }
     }
 
-    private void LoadTags(GraphDocument document)
+    private void LoadTags()
     {
         tags.Clear();
         tagIndexToName.Clear();
@@ -774,17 +752,9 @@ internal sealed class AnimGraph1Builder : IDisposable
         }
     }
 
-    private string GetTagName(int tagIndex)
-    {
-        if (tagIndex < 0 || tagIndex >= tags.Count)
-        {
-            return $"Tag {tagIndex}";
-        }
+    private string GetTagName(int tagIndex) => tagIndexToName.TryGetValue(tagIndex, out var name) ? name : $"Tag {tagIndex}";
 
-        return tagIndexToName.TryGetValue(tagIndex, out var name) ? name : $"Tag {tagIndex}";
-    }
-
-    private void LoadComponents(GraphDocument document)
+    private void LoadComponents()
     {
         components.Clear();
 
@@ -866,11 +836,6 @@ internal sealed class AnimGraph1Builder : IDisposable
 
     private KVObject? ResolveParameterHandle(KVObject handle)
     {
-        if (handle == null)
-        {
-            return null;
-        }
-
         var type = handle.GetStringProperty("m_type");
         var index = handle.GetInt32Property("m_index", -1);
 
@@ -900,17 +865,9 @@ internal sealed class AnimGraph1Builder : IDisposable
             return "None";
         }
 
-        if (parameterIndexToObject.TryGetValue(index, out var paramObj))
-        {
-            return GetParameterDescriptionFromObject(paramObj);
-        }
-
-        if (parameterIndexToName.TryGetValue(index, out var name))
-        {
-            return name;
-        }
-
-        return $"Param {index}";
+        return parameterIndexToObject.TryGetValue(index, out var paramObj)
+            ? GetParameterDescriptionFromObject(paramObj)
+            : $"Param {index}";
     }
 
     private static string GetParameterDescriptionFromObject(KVObject paramObj)
@@ -944,7 +901,7 @@ internal sealed class AnimGraph1Builder : IDisposable
         else if (paramObj.ContainsKey("m_fDefaultValue"))
         {
             var def = paramObj.GetFloatProperty("m_fDefaultValue");
-            result += $" (default: {def:F2})";
+            result += string.Create(CultureInfo.InvariantCulture, $" (default: {def:F2})");
         }
         else if (paramObj.ContainsKey("m_defaultValue"))
         {
@@ -1095,11 +1052,6 @@ internal sealed class AnimGraph1Builder : IDisposable
 
     private void CreateGraph(GraphDocument document)
     {
-        if (compiledNodes == null || compiledNodes.Count == 0)
-        {
-            return;
-        }
-
         for (var i = 0; i < compiledNodes.Count; i++)
         {
             var compiledNode = compiledNodes[i];
@@ -1163,7 +1115,7 @@ internal sealed class AnimGraph1Builder : IDisposable
                                 var seqIdx = item.GetInt32Property("m_hSequence", -1);
                                 var seqDisplay = seqIdx >= 0 ? GetSequenceName(seqIdx) : "None";
                                 var pos = ParseVector2(item, "m_vPos");
-                                var label = $"Item {itemIdx} (Seq: {seqDisplay}) ({pos.x:F1}, {pos.y:F1})";
+                                var label = string.Create(CultureInfo.InvariantCulture, $"Item {itemIdx} (Seq: {seqDisplay}) ({pos.x:F1}, {pos.y:F1})");
                                 AddConnection(idx, label);
                             }
                         }
@@ -1221,8 +1173,8 @@ internal sealed class AnimGraph1Builder : IDisposable
                                 continue;
                             }
 
-                            // Compiled transitions keep their conditions in the state's script
-                            // rather than on the transition, so the wire carries no label.
+                            // Compiled transitions keep conditions in the state script,
+                            // so the wire has no label.
                             AnimGraphHues.ConnectTransition(document, srcNode, destNode);
                         }
                     }
@@ -1243,7 +1195,7 @@ internal sealed class AnimGraph1Builder : IDisposable
                     {
                         var w = (weights != null && c < weights.Length) ? weights[c] : 1.0f;
                         var bt = (blendTimes != null && c < blendTimes.Length) ? blendTimes[c] : 0.0f;
-                        newConnections.Add((idx, $"Item {c} (W:{w:F2} BT:{bt:F2})"));
+                        newConnections.Add((idx, string.Create(CultureInfo.InvariantCulture, $"Item {c} (W:{w:F2} BT:{bt:F2})")));
                     }
                 }
                 connections = newConnections;
@@ -1329,7 +1281,7 @@ internal sealed class AnimGraph1Builder : IDisposable
     {
         var speedFunc = damping.GetStringProperty("m_speedFunction", "Unknown");
         var speedScale = damping.GetFloatProperty("m_fSpeedScale", 1.0f);
-        return $"{speedFunc} (scale {speedScale:F2})";
+        return string.Create(CultureInfo.InvariantCulture, $"{speedFunc} (scale {speedScale:F2})");
     }
 
     private Node CreateNode(GraphDocument document, KVObject compiledNode, int index)
@@ -1361,7 +1313,7 @@ internal sealed class AnimGraph1Builder : IDisposable
             }
         }
 
-        var node = new Node(compiledNode)
+        var node = new Node
         {
             Name = $"({index}) {nodeName}",
             NodeType = displayName,
@@ -1381,7 +1333,6 @@ internal sealed class AnimGraph1Builder : IDisposable
             compiledNode,
             key => CompiledStructureKeys.Contains(key)
                 || key.StartsWith("m_pChild", StringComparison.Ordinal)
-                || GlobalPropertySkips.Contains(key)
                 || (skipKeys != null && skipKeys.Contains(key)),
             renderRow: (key, child) => key == "m_hSequence"
                 ? FormatIndexed("Sequence", child.ToInt32(), GetSequenceName)
@@ -1455,12 +1406,12 @@ internal sealed class AnimGraph1Builder : IDisposable
         {
             if (compiledNode.ContainsKey("m_duration"))
             {
-                node.AddText($"Duration: {compiledNode.GetFloatProperty("m_duration"):F2}");
+                node.AddText(string.Create(CultureInfo.InvariantCulture, $"Duration: {compiledNode.GetFloatProperty("m_duration"):F2}"));
             }
 
             if (compiledNode.ContainsKey("m_playbackSpeed"))
             {
-                node.AddText($"Speed: {compiledNode.GetFloatProperty("m_playbackSpeed"):F2}");
+                node.AddText(string.Create(CultureInfo.InvariantCulture, $"Speed: {compiledNode.GetFloatProperty("m_playbackSpeed"):F2}"));
             }
 
             if (compiledNode.ContainsKey("m_bLoop"))
@@ -1493,7 +1444,7 @@ internal sealed class AnimGraph1Builder : IDisposable
 
             if (compiledNode.ContainsKey("m_playbackSpeed"))
             {
-                node.AddText($"Playback Speed: {compiledNode.GetFloatProperty("m_playbackSpeed"):F2}");
+                node.AddText(string.Create(CultureInfo.InvariantCulture, $"Playback Speed: {compiledNode.GetFloatProperty("m_playbackSpeed"):F2}"));
             }
 
             if (compiledNode.ContainsKey("m_damping"))
@@ -1516,7 +1467,7 @@ internal sealed class AnimGraph1Builder : IDisposable
                     var seqDisplay = seqIdx >= 0 ? GetSequenceName(seqIdx) : "None";
                     var pos = ParseVector2(item, "m_vPos");
                     var dur = item.GetFloatProperty("m_flDuration");
-                    node.AddText($"  [{i}] Seq: {seqDisplay} ({pos.x:F1}, {pos.y:F1}) dur={dur:F2}s");
+                    node.AddText(string.Create(CultureInfo.InvariantCulture, $"  [{i}] Seq: {seqDisplay} ({pos.x:F1}, {pos.y:F1}) dur={dur:F2}s"));
                 }
             }
         }
@@ -1531,7 +1482,7 @@ internal sealed class AnimGraph1Builder : IDisposable
 
             if (compiledNode.ContainsKey("m_flRootMotionBlend"))
             {
-                node.AddText($"Root Motion Blend: {compiledNode.GetFloatProperty("m_flRootMotionBlend"):F2}");
+                node.AddText(string.Create(CultureInfo.InvariantCulture, $"Root Motion Blend: {compiledNode.GetFloatProperty("m_flRootMotionBlend"):F2}"));
             }
 
             if (compiledNode.ContainsKey("m_bUseBlendScale"))
@@ -1567,7 +1518,7 @@ internal sealed class AnimGraph1Builder : IDisposable
                 if (first.ContainsKey("m_blendDuration"))
                 {
                     var blend = first.GetSubCollection("m_blendDuration");
-                    node.AddText($"Blend Duration (first): {blend.GetFloatProperty("m_constValue"):F2}");
+                    node.AddText(string.Create(CultureInfo.InvariantCulture, $"Blend Duration (first): {blend.GetFloatProperty("m_constValue"):F2}"));
                 }
             }
         }
@@ -1671,12 +1622,12 @@ internal sealed class AnimGraph1Builder : IDisposable
 
                 if (settings.ContainsKey("m_flMaxYawAngle"))
                 {
-                    node.AddText($"Max Yaw Angle: {settings.GetFloatProperty("m_flMaxYawAngle"):F2}");
+                    node.AddText(string.Create(CultureInfo.InvariantCulture, $"Max Yaw Angle: {settings.GetFloatProperty("m_flMaxYawAngle"):F2}"));
                 }
 
                 if (settings.ContainsKey("m_flMaxPitchAngle"))
                 {
-                    node.AddText($"Max Pitch Angle: {settings.GetFloatProperty("m_flMaxPitchAngle"):F2}");
+                    node.AddText(string.Create(CultureInfo.InvariantCulture, $"Max Pitch Angle: {settings.GetFloatProperty("m_flMaxPitchAngle"):F2}"));
                 }
 
                 AddIndexedName(node, settings, "m_nBoneMaskIndex", "Bone Mask", GetWeightListName);
@@ -1693,12 +1644,12 @@ internal sealed class AnimGraph1Builder : IDisposable
 
                 if (settings.ContainsKey("m_flBiasAndClampYawOffset"))
                 {
-                    node.AddText($"Bias/Clamp Yaw Offset: {settings.GetFloatProperty("m_flBiasAndClampYawOffset"):F2}");
+                    node.AddText(string.Create(CultureInfo.InvariantCulture, $"Bias/Clamp Yaw Offset: {settings.GetFloatProperty("m_flBiasAndClampYawOffset"):F2}"));
                 }
 
                 if (settings.ContainsKey("m_flBiasAndClampPitchOffset"))
                 {
-                    node.AddText($"Bias/Clamp Pitch Offset: {settings.GetFloatProperty("m_flBiasAndClampPitchOffset"):F2}");
+                    node.AddText(string.Create(CultureInfo.InvariantCulture, $"Bias/Clamp Pitch Offset: {settings.GetFloatProperty("m_flBiasAndClampPitchOffset"):F2}"));
                 }
 
                 if (settings.ContainsKey("m_biasAndClampBlendCurve"))
@@ -1706,7 +1657,7 @@ internal sealed class AnimGraph1Builder : IDisposable
                     var curve = settings.GetSubCollection("m_biasAndClampBlendCurve");
                     var cp1 = curve.GetFloatProperty("m_flControlPoint1", 0f);
                     var cp2 = curve.GetFloatProperty("m_flControlPoint2", 1f);
-                    node.AddText($"Bias/Clamp Curve: ({cp1:F2}, {cp2:F2})");
+                    node.AddText(string.Create(CultureInfo.InvariantCulture, $"Bias/Clamp Curve: ({cp1:F2}, {cp2:F2})"));
                 }
             }
         }
@@ -1762,17 +1713,17 @@ internal sealed class AnimGraph1Builder : IDisposable
 
                 if (poseData.ContainsKey("m_flBlendTime"))
                 {
-                    node.AddText($"Blend Time: {poseData.GetFloatProperty("m_flBlendTime"):F2}");
+                    node.AddText(string.Create(CultureInfo.InvariantCulture, $"Blend Time: {poseData.GetFloatProperty("m_flBlendTime"):F2}"));
                 }
 
                 if (poseData.ContainsKey("m_flLockBreakDistance"))
                 {
-                    node.AddText($"Lock Break Distance: {poseData.GetFloatProperty("m_flLockBreakDistance"):F2}");
+                    node.AddText(string.Create(CultureInfo.InvariantCulture, $"Lock Break Distance: {poseData.GetFloatProperty("m_flLockBreakDistance"):F2}"));
                 }
 
                 if (poseData.ContainsKey("m_flMaxLegTwist"))
                 {
-                    node.AddText($"Max Leg Twist: {poseData.GetFloatProperty("m_flMaxLegTwist"):F2}");
+                    node.AddText(string.Create(CultureInfo.InvariantCulture, $"Max Leg Twist: {poseData.GetFloatProperty("m_flMaxLegTwist"):F2}"));
                 }
 
                 AddIndexedName(node, poseData, "m_nHipBoneIndex", "Hip Bone", GetBoneName);
@@ -1830,17 +1781,17 @@ internal sealed class AnimGraph1Builder : IDisposable
 
                             if (foot.ContainsKey("m_flMaxIKLength"))
                             {
-                                footLines.Add($"Max IK Length: {foot.GetFloatProperty("m_flMaxIKLength"):F2}");
+                                footLines.Add(string.Create(CultureInfo.InvariantCulture, $"Max IK Length: {foot.GetFloatProperty("m_flMaxIKLength"):F2}"));
                             }
 
                             if (foot.ContainsKey("m_flMaxRotationLeft"))
                             {
-                                footLines.Add($"Max Rotation Left: {foot.GetFloatProperty("m_flMaxRotationLeft"):F2}");
+                                footLines.Add(string.Create(CultureInfo.InvariantCulture, $"Max Rotation Left: {foot.GetFloatProperty("m_flMaxRotationLeft"):F2}"));
                             }
 
                             if (foot.ContainsKey("m_flMaxRotationRight"))
                             {
-                                footLines.Add($"Max Rotation Right: {foot.GetFloatProperty("m_flMaxRotationRight"):F2}");
+                                footLines.Add(string.Create(CultureInfo.InvariantCulture, $"Max Rotation Right: {foot.GetFloatProperty("m_flMaxRotationRight"):F2}"));
                             }
 
                             node.AddText($"  [{i}] {string.Join(", ", footLines)}");
@@ -1854,21 +1805,18 @@ internal sealed class AnimGraph1Builder : IDisposable
         return node;
     }
 
-    private static GraphHue GetParameterTypeHue(string type)
+    private static GraphHue GetParameterTypeHue(string type) => type switch
     {
-        return type switch
-        {
-            "BOOL" => GraphHue.Blue,
-            "INT" => GraphHue.Orange,
-            "FLOAT" => GraphHue.Olive,
-            "ENUM" => GraphHue.Purple,
-            "VECTOR" => GraphHue.Green,
-            "QUATERNION" => GraphHue.Maroon,
-            "SYMBOL" => GraphHue.Neutral,
-            "VIRTUAL" => GraphHue.Cyan,
-            _ => GraphHue.Red,
-        };
-    }
+        "BOOL" => AnimGraphHues.HueOf(AnimGraphValueKind.Bool),
+        "INT" => GraphHue.Orange,
+        "FLOAT" => AnimGraphHues.HueOf(AnimGraphValueKind.Float),
+        "ENUM" => GraphHue.Purple,
+        "VECTOR" => AnimGraphHues.HueOf(AnimGraphValueKind.Vector),
+        "QUATERNION" => AnimGraphHues.HueOf(AnimGraphValueKind.Quaternion),
+        "SYMBOL" => GraphHue.Neutral,
+        "VIRTUAL" => GraphHue.Cyan,
+        _ => GraphHue.Red,
+    };
 
     private void RecordParameterConsumer(KVObject? paramObj, Node node)
     {
@@ -1904,17 +1852,16 @@ internal sealed class AnimGraph1Builder : IDisposable
                 continue;
             }
 
-            var ordered = list.OrderBy(p => parameterObjectToIndex.TryGetValue(p, out var idx) ? idx : int.MaxValue).ToList();
             var friendlyName = ParameterTypeDisplayName.TryGetValue(type, out var display) ? display : type;
             drawnParameterTypes[friendlyName] = GetParameterTypeHue(type);
 
-            var node = new Node(null)
+            var node = new Node
             {
                 Name = $"{friendlyName} Parameters",
                 NodeType = "Parameter Group",
                 Category = GetParameterTypeHue(type),
             };
-            foreach (var p in ordered)
+            foreach (var p in list)
             {
                 if (DrawParameterWires && parameterConsumers.TryGetValue(p, out var consumers))
                 {
@@ -1939,8 +1886,6 @@ internal sealed class AnimGraph1Builder : IDisposable
 
         if (tags.Count > 0)
         {
-            var tagIndexMap = tags.Select((t, i) => new { t, i }).ToDictionary(x => x.t, x => x.i);
-
             var tagGroups = tags.GroupBy(t => t.GetStringProperty("_class") ?? "Unknown");
             foreach (var group in tagGroups)
             {
@@ -1948,15 +1893,13 @@ internal sealed class AnimGraph1Builder : IDisposable
                 var (friendlyName, tagHue) = TagClassInfo(className);
                 drawnTagClasses[friendlyName] = tagHue;
 
-                var ordered = group.OrderBy(t => tagIndexMap.TryGetValue(t, out var idx) ? idx : int.MaxValue).ToList();
-
-                var node = new Node(null)
+                var node = new Node
                 {
                     Name = $"{friendlyName}",
                     NodeType = "Tag Group",
                     Category = tagHue,
                 };
-                foreach (var t in ordered)
+                foreach (var t in group)
                 {
                     var name = t.GetStringProperty("m_name") ?? "Unnamed";
                     node.AddText(name);
@@ -1968,11 +1911,6 @@ internal sealed class AnimGraph1Builder : IDisposable
 
     private void AddComponentNodes(GraphDocument document)
     {
-        if (components.Count == 0)
-        {
-            return;
-        }
-
         foreach (var comp in components)
         {
             var className = comp.GetStringProperty("_class") ?? "Unknown";
@@ -1981,7 +1919,7 @@ internal sealed class AnimGraph1Builder : IDisposable
             var name = comp.GetStringProperty("m_name") ?? "";
             var displayName = string.IsNullOrEmpty(name) ? friendlyName : $"{friendlyName} ({name})";
 
-            var node = new Node(null)
+            var node = new Node
             {
                 Name = displayName,
                 NodeType = "Component",

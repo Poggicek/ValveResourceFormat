@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Linq;
 using Microsoft.Extensions.Logging;
 using ValveKeyValue;
+using ValveResourceFormat.Particles.Upgrade;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
 
@@ -74,7 +75,7 @@ internal record struct ParticleDefinitionParser(KVObject Data, ILogger Logger, i
             return NumberProvider(k)?.NextNumber() ?? 0f;
         }
 
-        return Data.GetFloatProperty(k);
+        return Data.GetFloat(k, 0f);
     }
 
     /// <summary>Reads a float property, returning <paramref name="default"/> if the key is absent.</summary>
@@ -250,13 +251,23 @@ internal record struct ParticleDefinitionParser(KVObject Data, ILogger Logger, i
                     return new PerParticleCountNormalizedNumberProvider(parse);
                 case "PF_TYPE_CONTROL_POINT_SPEED":
                     return new ControlPointSpeedNumberProvider(parse);
+                case "PF_TYPE_CONTROL_POINT_CHANGE_AGE":
+                    return new ControlPointChangeAgeNumberProvider(parse);
+                case "PF_TYPE_CONTROL_POINT_IS_SET":
+                    return new ControlPointIsSetNumberProvider(parse);
+                case "PF_TYPE_SNAPSHOT_COUNT":
+                    return new SnapshotCountNumberProvider(parse);
                 case "PF_TYPE_CONTROL_POINT_DISTANCE":
                     return new ControlPointDistanceNumberProvider(parse);
                 case "PF_TYPE_PARTICLE_NOISE":
                     return new NoiseNumberProvider(parse);
+                case "PF_TYPE_PARTICLE_ROPE_SEGMENT":
+                    return new RopeSegmentNumberProvider(parse);
+                case "PF_TYPE_PARTICLE_ROPE_SEGMENT_NORMALIZED":
+                    return new RopeSegmentNormalizedNumberProvider(parse);
                 // KNOWN TYPES WE DON'T SUPPORT:
-                // PF_TYPE_CONTROL_POINT_CHANGE_AGE, PF_TYPE_NAMED_VALUE (needs game VData),
-                // PF_TYPE_SNAPSHOT_COUNT, PF_TYPE_PARTICLE_ROPE_SEGMENT_NORMALIZED, PF_TYPE_RANGE
+                // PF_TYPE_NAMED_VALUE (needs game VData),
+                // PF_TYPE_CLOSEST_CAMERA_DISTANCE, PF_TYPE_CONCURRENT_DEF_COUNT, PF_TYPE_RANGE
                 default:
                     if (type == null)
                     {
@@ -272,12 +283,13 @@ internal record struct ParticleDefinitionParser(KVObject Data, ILogger Logger, i
                     }
 
                     Logger.LogWarning("Number provider of type {Type} is not supported, using its literal value", type);
-                    return new LiteralNumberProvider(pfParameters.GetFloatProperty("m_flLiteralValue"));
+                    return new LiteralNumberProvider(parse.Float("m_flLiteralValue"));
             }
         }
         else
         {
-            return new LiteralNumberProvider((float)pfParameters);
+            // A value that is not a block is a literal; a string that does not parse, empty included, is zero
+            return new LiteralNumberProvider(Data.GetFloat(key, 0f));
         }
     }
 

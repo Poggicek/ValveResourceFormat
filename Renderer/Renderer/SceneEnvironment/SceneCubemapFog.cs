@@ -6,6 +6,7 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment;
 /// <summary>
 /// Scene node representing cubemap-based volumetric fog.
 /// </summary>
+/// <seealso href="https://s2v.app/SchemaExplorer/cs2/server/CEnvCubemapFog">CEnvCubemapFog</seealso>
 public class SceneCubemapFog(Scene scene) : SceneNode(scene)
 {
     /// <summary>Gets or sets the distance at which fog begins.</summary>
@@ -78,9 +79,8 @@ public class SceneCubemapFog(Scene scene) : SceneNode(scene)
             exponent = HeightExponent;
         }
 
-        var value = new Vector4(offset, scale, exponent, Math.Min(7f, CubemapFogTexture.NumMipLevels)); // these latter two values are wrong on deskjob?
-
-        return value;
+        // The fog blurs down to the mip three levels above a single texel
+        return new Vector4(offset, scale, exponent, MathF.Log2(CubemapFogTexture.Width) - 3f);
     }
 
     /// <summary>

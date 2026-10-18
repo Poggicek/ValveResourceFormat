@@ -1,6 +1,8 @@
+using System.IO.Hashing;
+using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Extensions.Logging;
 using OpenTK.Graphics.OpenGL;
-using ValveResourceFormat.ThirdParty;
 
 namespace ValveResourceFormat.Renderer.Shaders
 {
@@ -10,7 +12,7 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <summary>Gets the shader name (typically a Source 2 <c>.vfx</c> shader name).</summary>
         public string Name { get; }
 
-        /// <summary>Gets the <see cref="MurmurHash2"/> hash of <see cref="Name"/>.</summary>
+        /// <summary>Gets a hash of <see cref="Name"/>, used to tell shaders apart in debug render modes.</summary>
         public uint NameHash { get; }
 
         /// <summary>Gets or sets the OpenGL program object handle.</summary>
@@ -209,7 +211,7 @@ namespace ValveResourceFormat.Renderer.Shaders
         public Shader(string name, RendererContext rendererContext)
         {
             Name = name;
-            NameHash = MurmurHash2.Hash(Name, StringToken.MURMUR2SEED);
+            NameHash = XxHash32.HashToUInt32(MemoryMarshal.AsBytes(Name.AsSpan()));
             RendererContext = rendererContext;
             Default = new RenderMaterial(this);
             MaterialLoader = rendererContext.MaterialLoader;
@@ -232,6 +234,7 @@ namespace ValveResourceFormat.Renderer.Shaders
 
                 GL.GetProgram(Program, GetProgramParameterName.LinkStatus, out var linkStatus);
                 IsValid = linkStatus == 1;
+                FailureLog = IsValid ? null : GetFailureLog();
 
                 DetachAndDeleteShaderObjects();
 
@@ -245,9 +248,36 @@ namespace ValveResourceFormat.Renderer.Shaders
                     VerifyGlobalsLayout();
 #endif
                 }
+                else
+                {
+                    ShaderLoader.ThrowLinkFailure(this);
+                }
             }
 
             return IsValid;
+        }
+
+        /// <summary>Gets the compile and link log of a program that failed to link, once <see cref="EnsureLoaded"/> has run.</summary>
+        public string? FailureLog { get; private set; }
+        private string GetFailureLog()
+        {
+            var log = new StringBuilder();
+
+            foreach (var obj in ShaderObjects)
+            {
+                GL.GetShader(obj, ShaderParameter.CompileStatus, out var compileStatus);
+
+                if (compileStatus != 1)
+                {
+                    GL.GetShaderInfoLog(obj, out var compileLog);
+                    log.AppendLine(compileLog);
+                }
+            }
+
+            GL.GetProgramInfoLog(Program, out var linkLog);
+            log.Append(linkLog);
+
+            return log.ToString();
         }
 
         private void DetachAndDeleteShaderObjects()
@@ -450,7 +480,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
 
             // Seeded from the source, where a sampler behind a combo the linker dropped still looks used.
-            ReservedTexturesUsed.RemoveWhere(reserved => GL.GetUniformLocation(Program, reserved) == -1);
+            ReservedTexturesUsed.RemoveWhere(reserved => ActiveUniformLocation(reserved) == -1);
         }
 
         /// <summary>Points every reserved texture sampler this program declares at its global texture unit.</summary>
@@ -459,7 +489,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             // Table driven: StoreUniformLocations does not classify array and shadow samplers.
             foreach (var (name, slot) in MaterialLoader.ReservedTextureSlotByName)
             {
-                var uniformLocation = GetUniformLocation(name);
+                var uniformLocation = ActiveUniformLocation(name);
 
                 if (uniformLocation > -1)
                 {
@@ -467,6 +497,9 @@ namespace ValveResourceFormat.Renderer.Shaders
                 }
             }
         }
+
+        private int ActiveUniformLocation(string name)
+            => Uniforms.TryGetValue(name, out var uniform) ? uniform.Location : -1;
 
         /// <summary>Installs this program and the constant buffer holding its own global uniforms.</summary>
         public void Use()
@@ -505,7 +538,7 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <inheritdoc cref="SetUniform(string, float)"/>
         public void SetUniform(string name, Matrix4x4 value) => Default.SetUniform(name, value);
 
-        /// <summary>Enumerates all active non-block uniforms in the program (uniforms belonging to uniform blocks are skipped), populating the internal uniform location cache.</summary>
+        /// <summary>Enumerates active uniforms outside uniform blocks, populating the uniform location cache.</summary>
         /// <returns>A sequence of tuples with each uniform's name, index, type, and array size.</returns>
         public IEnumerable<(string Name, int Index, ActiveUniformType Type, int Size)> GetAllUniformNames()
         {
@@ -592,6 +625,9 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <returns>The uniform location, or -1 if the uniform does not exist in the program.</returns>
         public int GetUniformLocation(string name)
         {
+            // Until it links, every uniform the source declares reads as -1
+            EnsureLoaded();
+
             if (Uniforms.TryGetValue(name, out var locationType))
             {
                 return locationType.Location;
@@ -722,7 +758,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
-        /// <summary>Sets a 3×4 matrix uniform (converted from a <see cref="Matrix4x4"/> by transposing and dropping the last (M14/M24/M34/M44) column).</summary>
+        /// <summary>Sets a 3x4 matrix uniform (converted from a <see cref="Matrix4x4"/> by transposing and dropping the last (M14/M24/M34/M44) column).</summary>
         public void SetUniform3x4(string name, Matrix4x4 value)
         {
             var uniformLocation = GetUniformLocation(name);
@@ -733,7 +769,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
-        /// <summary>Sets a 4×4 matrix uniform on this program.</summary>
+        /// <summary>Sets a 4x4 matrix uniform on this program.</summary>
         /// <param name="name">The uniform variable name.</param>
         /// <param name="value">The matrix value.</param>
         /// <param name="transpose">Whether to transpose the matrix before uploading.</param>

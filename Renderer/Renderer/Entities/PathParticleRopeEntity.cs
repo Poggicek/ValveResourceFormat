@@ -7,6 +7,8 @@ namespace ValveResourceFormat.Renderer.Entities;
 /// <c>path_particle_rope</c>, <c>path_particle_rope_clientside</c> and Deadlock's <c>citadel_zipline_path</c>:
 /// a cable hung along the entity's path nodes, which follows the entity.
 /// </summary>
+/// <seealso href="https://s2v.app/SchemaExplorer/cs2/server/CPathParticleRope">CPathParticleRope</seealso>
+/// <seealso href="https://s2v.app/SchemaExplorer/deadlock/server/CCitadelZiplinePath">CCitadelZiplinePath</seealso>
 public sealed class PathParticleRopeEntity : BaseEntity
 {
     /// <summary>Initializes a rope from its keyvalues.</summary>
@@ -22,7 +24,7 @@ public sealed class PathParticleRopeEntity : BaseEntity
         {
             if (!CableSceneNode.TryCreate(Scene, KeyValues, out var cable))
             {
-                EntitySystem.Logger.LogWarning("Skipped degenerate {Classname} '{Target}' at ({Origin})", Classname, TargetName, Origin);
+                EntitySystem.Logger.LogWarning("Skipped degenerate {Classname} '{Target}' at ({Origin})", Classname, TargetName, WorldOrigin);
                 return null;
             }
 

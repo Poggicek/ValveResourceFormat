@@ -12,6 +12,7 @@ using GUI.Types.GLViewers;
 using GUI.Types.PackageViewer;
 using GUI.Utils;
 using ValvePak;
+using ValveResourceFormat.IO;
 
 namespace GUI
 {
@@ -63,6 +64,11 @@ namespace GUI
         private void CloseToolStripMenuItem_Click(object sender, EventArgs e)
         {
             mainTabs.CloseTab(FetchToolstripTabContext(sender));
+        }
+
+        private void CloseOtherTabsToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            CloseOtherTabs(FetchToolstripTabContext(sender));
         }
 
         private void CloseToolStripMenuItemsToLeft_Click(object sender, EventArgs e)
@@ -142,6 +148,7 @@ namespace GUI
                 return;
             }
 
+            var packageLink = wantsFullPath ? context.GetVpkLink() : null;
             var sb = new StringBuilder();
 
             foreach (var selectedNode in selectedNodes)
@@ -151,29 +158,9 @@ namespace GUI
                     sb.AppendLine();
                 }
 
-                if (wantsFullPath)
+                if (packageLink != null)
                 {
-                    sb.Append("vpk:");
-
-                    var packageChain = new Stack<string>();
-
-                    for (var chainContext = context; chainContext != null; chainContext = chainContext.ParentGuiContext)
-                    {
-                        packageChain.Push(chainContext.FileName);
-                    }
-
-                    var firstSegment = true;
-
-                    foreach (var segment in packageChain)
-                    {
-                        if (!firstSegment)
-                        {
-                            sb.Append(':');
-                        }
-
-                        sb.Append(segment.Replace('\\', '/'));
-                        firstSegment = false;
-                    }
+                    sb.Append(packageLink);
                 }
 
                 if (!selectedNode.IsFolder)
@@ -186,7 +173,8 @@ namespace GUI
                     var packageEntry = selectedNode.PackageEntry;
                     if (packageEntry != null)
                     {
-                        sb.Append(packageEntry.GetFullPath());
+                        var entryPath = packageEntry.GetFullPath();
+                        sb.Append(wantsFullPath ? VpkLink.EscapePath(entryPath) : entryPath);
                     }
                 }
                 else
@@ -218,7 +206,7 @@ namespace GUI
 
                     while (stack.TryPop(out var name))
                     {
-                        sb.Append(name);
+                        sb.Append(wantsFullPath ? VpkLink.EscapePath(name) : name);
                         sb.Append(Package.DirectorySeparatorChar);
                     }
                 }
@@ -322,21 +310,21 @@ namespace GUI
                     continue;
                 }
 
-                context.CurrentPackage.ReadEntry(file, out var output, validateCrc: file.CRC32 > 0);
-
-                var tempPath = $"{Path.GetTempPath()}Source 2 Viewer - {Path.GetFileName(context.CurrentPackage.FileName)} - {file.GetFileName()}";
-                using (var stream = new FileStream(tempPath, FileMode.Create))
-                {
-                    stream.Write(output, 0, output.Length);
-                }
-
                 try
                 {
+                    context.CurrentPackage.ReadEntry(file, out var output, validateCrc: file.CRC32 > 0);
+
+                    var tempPath = $"{Path.GetTempPath()}Source 2 Viewer - {Path.GetFileName(context.CurrentPackage.FileName)} - {file.GetFileName()}";
+                    using (var stream = new FileStream(tempPath, FileMode.Create))
+                    {
+                        stream.Write(output, 0, output.Length);
+                    }
+
                     Process.Start(new ProcessStartInfo(tempPath) { UseShellExecute = true });
                 }
                 catch (Exception ex)
                 {
-                    Log.Error(nameof(MainForm), $"Failed to start process: {ex.Message}");
+                    ErrorReport.ShowError(ex, file.GetFullPath());
                 }
             }
         }
@@ -361,6 +349,10 @@ namespace GUI
                     mainTabs.TabPages.Add(tab);
                     mainTabs.SelectTab(tab);
                 }
+            }
+            catch (Exception ex)
+            {
+                ErrorReport.ShowError(ex, selectedNode.PackageEntry.GetFullPath());
             }
             finally
             {
@@ -462,7 +454,7 @@ namespace GUI
 
                     try
                     {
-                        await ExportFile.ExtractFileFromStream(Path.GetFileName(exportData.VrfGuiContext.FileName), fileStream, exportData.VrfGuiContext, decompile).ConfigureAwait(true);
+                        await ExportFile.ExtractFileFromStream(Path.GetFileName(exportData.VrfGuiContext.FileName), fileStream, exportData.VrfGuiContext, decompile, exportData.VrfGuiContext.DisplayPath).ConfigureAwait(true);
                         fileStream = null; // ExtractFileFromStream should dispose it when done, not `using` here in case there's some threading
                     }
                     finally

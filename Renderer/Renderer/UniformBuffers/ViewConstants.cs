@@ -13,11 +13,10 @@ namespace ValveResourceFormat.Renderer.Buffers
 
         /// <summary>Gets the distance to the near plane this view was projected with.</summary>
         /// <remarks>
-        /// Recovered from the projection rather than carried as a field, so it costs nothing in the layout
-        /// this class is marshalled to the GPU with. The reverse Z form
+        /// Recovered from the projection, so it adds nothing to the GPU layout. The reverse Z form
         /// <see cref="Camera.CreateProjectionMatrix"/> builds has <c>M33 = near / (far - near)</c> and
-        /// <c>M43 = near * far / (far - near)</c>, which inverts to this exactly and collapses to plain
-        /// <c>M43</c> when the far plane is infinite.
+        /// <c>M43 = near * far / (far - near)</c>, which inverts to this exactly and reduces to <c>M43</c>
+        /// when far is infinite.
         /// </remarks>
         public float NearPlane => ViewToProjection.M43 / (1f + ViewToProjection.M33);
 
@@ -57,7 +56,7 @@ namespace ValveResourceFormat.Renderer.Buffers
         public Matrix4x4 WorldToShadow = Matrix4x4.Identity;
         /// <summary>Transform into the second, wider sun shadow cascade. Forms <c>g_matWorldToShadow[1]</c>.</summary>
         public Matrix4x4 WorldToShadowCascade1 = Matrix4x4.Identity;
-        /// <summary>Index of the scene being drawn among the renderer's scenes, which the picking pass writes out.</summary>
+        /// <summary>Index of the drawn scene in <see cref="Renderer.Scenes"/>, written out by the picking pass.</summary>
         public uint SceneIndex;
         /// <summary>Whether this view draws the 3D skybox rather than the world.</summary>
         public bool IsSkybox;
@@ -102,6 +101,18 @@ namespace ValveResourceFormat.Renderer.Buffers
 
         /// <summary>Puddle ripple direction in X, over 0 to 1 for a full turn.</summary>
         public Vector4 EnvWetnessRipple;
+
+        /// <summary>
+        /// Scene depth texels per pixel of the target being drawn: one, except in a pass drawn below the
+        /// scene's resolution.
+        /// </summary>
+        public Vector2 SceneDepthFetchScale = Vector2.One;
+
+        /// <summary>Padding to satisfy alignment requirements.</summary>
+        public Vector2 Padding1;
+
+        /// <summary>Cull mask layout of the scene being drawn, from its <see cref="LightBinner"/>.</summary>
+        public LightCullConstants LightCull;
 
         /// <summary>Initializes a new <see cref="ViewConstants"/> with identity matrices and default values.</summary>
         public ViewConstants()

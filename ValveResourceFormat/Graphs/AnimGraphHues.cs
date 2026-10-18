@@ -2,9 +2,8 @@
 namespace ValveResourceFormat.Graphs;
 
 /// <summary>
-/// Functional bucket an animation graph node belongs to. AG1 and AG2 describe the same domain
-/// with different class vocabularies, so both map onto this one set and a node of a given kind
-/// reads the same colour in either viewer.
+/// Functional bucket of an animation graph node. AG1 and AG2 use different class vocabularies,
+/// so both map onto this set and a node of a kind reads the same colour in either viewer.
 /// </summary>
 internal enum AnimGraphCategory
 {
@@ -116,9 +115,8 @@ internal static class AnimGraphHues
     public const GraphHue TransitionHue = GraphHue.Slate;
 
     /// <summary>
-    /// Draws the dashed transition wire between two state cards, reusing the transition sockets
-    /// either card already carries. Transitions repeated between the same pair of states share
-    /// one wire and merge their labels onto it.
+    /// Draws a dashed transition wire between two state cards, reusing their existing sockets.
+    /// Repeated transitions between the same pair share one wire and merge their labels.
     /// </summary>
     public static void ConnectTransition(GraphDocument document, GraphNode source, GraphNode target, string? label = null)
     {
@@ -126,18 +124,7 @@ internal static class AnimGraphHues
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(target);
 
-        var from = source.GetOrAddOutput("Transitions", TransitionHue);
-        var to = target.GetOrAddInput("From", TransitionHue);
-        var existing = to.Wires.Find(wire => wire.From == from);
-
-        if (existing == null)
-        {
-            document.Connect(from, to, dashed: true, label: label);
-        }
-        else if (label != null)
-        {
-            existing.Label = existing.Label == null ? label : $"{existing.Label} | {label}";
-        }
+        document.ConnectOrMerge(source.GetOrAddOutput("Transitions", TransitionHue), target.GetOrAddInput("From", TransitionHue), dashed: true, label);
     }
 
     /// <summary>
@@ -208,10 +195,10 @@ internal static class AnimGraphHues
     };
 
     /// <summary>
-    /// The value kind an AG2 value node produces, from its type name (CNm prefix and
-    /// Node::CDefinition suffix already stripped). Every constructor bakes its pin's value type;
-    /// this mirrors the recovered table for the names shipped graphs use, and falls back to
-    /// Float, the commonest kind, when a name is not recognised.
+    /// The kind an AG2 node outputs, from its type name (CNm prefix and Node::CDefinition suffix
+    /// already stripped). Every constructor bakes its pin's value type; this mirrors the table for
+    /// every node definition the runtime registers, and falls back to Float, the commonest kind,
+    /// when a name is not recognised.
     /// </summary>
     public static AnimGraphValueKind AG2ValueKindOf(string nodeType)
     {
@@ -222,19 +209,33 @@ internal static class AnimGraphHues
 
         return nodeType switch
         {
-            "ConstBool" or "ControlParameterBool" or "VirtualParameterBool"
-                or "Not" or "And" or "Or" or "IsTargetSet" => AnimGraphValueKind.Bool,
+            "Clip" or "TimeControlledClip" or "AnimationPose" or "ReferencedGraph" or "ExternalPose"
+                or "ZeroPose" or "ReferencePose" or "StateMachine" or "State" or "Blend1D" or "Blend2D"
+                or "VelocityBlend" or "ParameterizedBlend" or "LayerBlend" or "Selector" or "ClipSelector"
+                or "ParameterizedSelector" or "ParameterizedClipSelector" or "IDBasedSelector"
+                or "IDBasedClipSelector" or "TargetSelector" or "SpeedScale" or "DurationScale"
+                or "VelocityBasedSpeedScale" or "Passthrough" or "Scale" or "TwoBoneIK" or "FootIK"
+                or "ChainLookat" or "FollowBone" or "RootMotionOverride" or "TargetWarp"
+                or "OrientationWarp" or "AimCS" or "SnapWeapon" or "BodyGroup" => AnimGraphValueKind.Pose,
+
+            "ConstBool" or "CachedBool" or "ControlParameterBool" or "VirtualParameterBool"
+                or "Not" or "And" or "Or" or "IsTargetSet" or "IsExternalGraphSlotFilled"
+                or "IsExternalPoseSet" => AnimGraphValueKind.Bool,
 
             "ConstID" or "CachedID" or "ControlParameterID" or "VirtualParameterID"
-                or "IDSwitch" or "CurrentSyncEventID" => AnimGraphValueKind.Id,
+                or "IDSwitch" or "IDSelector" or "IDEvent" or "CurrentSyncEventID"
+                or "FootstepEventID" => AnimGraphValueKind.Id,
 
-            "ConstTarget" or "ControlParameterTarget" or "VirtualParameterTarget"
-                or "TargetOffset" or "TargetPoint" => AnimGraphValueKind.Target,
+            "ConstTarget" or "CachedTarget" or "ControlParameterTarget" or "VirtualParameterTarget"
+                or "TargetOffset" => AnimGraphValueKind.Target,
 
-            "ConstVector" or "ControlParameterVector" or "VirtualParameterVector" => AnimGraphValueKind.Vector,
+            "ConstVector" or "CachedVector" or "ControlParameterVector" or "VirtualParameterVector"
+                or "VectorCreate" or "VectorNegate" or "TargetPoint" => AnimGraphValueKind.Vector,
 
-            "BoneMask" or "FixedWeightBoneMask" or "BoneMaskSwitch"
-                or "BoneMaskSelector" => AnimGraphValueKind.BoneMask,
+            "BoneMask" or "FixedWeightBoneMask" or "BoneMaskSwitch" or "BoneMaskSelector"
+                or "BoneMaskBlend" or "VirtualParameterBoneMask" => AnimGraphValueKind.BoneMask,
+
+            "Missing" => AnimGraphValueKind.Unknown,
 
             _ => AnimGraphValueKind.Float,
         };
@@ -261,7 +262,7 @@ internal static class AnimGraphHues
 
         return nodeType switch
         {
-            "Clip" or "ClipSelector" or "AnimationClipSelector" or "ParameterizedClipSelector"
+            "Clip" or "TimeControlledClip" or "ClipSelector" or "AnimationClipSelector" or "ParameterizedClipSelector"
                 or "ParameterizedAnimationClipSelector" or "AnimationPose" => AnimGraphCategory.Clip,
 
             "Blend1D" or "Blend2D" or "ParameterizedBlend" or "VelocityBlend"
@@ -277,11 +278,14 @@ internal static class AnimGraphHues
             "AimCS" => AnimGraphCategory.AimMatrix,
 
             "Selector" or "ParameterizedSelector" or "FloatSelector" or "IDSelector"
-                or "TargetSelector" or "BoneMaskSelectorNode" or "FloatSwitch" or "IDSwitch"
+                or "TargetSelector" or "FloatSwitch" or "IDSwitch"
                 or "IDBasedSelector" or "IDBasedClipSelector" => AnimGraphCategory.Selector,
 
-            "FloatMath" or "FloatCurve" or "FloatRemap" or "FloatEase" or "Scale"
-                or "Not" or "And" or "Or" or "IsTargetSet" => AnimGraphCategory.Value,
+            "FloatMath" or "FloatAngleMath" or "FloatCurve" or "FloatCurveEvent" or "FloatRemap"
+                or "FloatEase" or "FloatSpring" or "FloatClamp" or "IDToFloat" or "IDEvent"
+                or "IDEventPercentageThrough" or "FootstepEventID" or "FootstepEventPercentageThrough"
+                or "VectorCreate" or "VectorNegate" or "VectorInfo" or "IsExternalGraphSlotFilled"
+                or "IsExternalPoseSet" or "Scale" or "Not" or "And" or "Or" or "IsTargetSet" => AnimGraphCategory.Value,
 
             "StateMachine" or "State" or "Transition" or "EntryOverride"
                 or "EntryStateOverride" => AnimGraphCategory.StateMachine,
@@ -291,7 +295,7 @@ internal static class AnimGraphHues
 
             "ExternalPose" or "ZeroPose" or "ReferencePose" or "Passthrough" => AnimGraphCategory.Input,
 
-            "SpeedScale" or "VelocityBasedSpeedScale" or "DurationScale" or "TimeCondition"
+            "SpeedScale" or "VelocityBasedSpeedScale" or "DurationScale"
                 or "CurrentSyncEvent" or "CurrentSyncEventID" => AnimGraphCategory.Timing,
 
             "ReferencedGraph" => AnimGraphCategory.ExternalReference,

@@ -20,7 +20,7 @@ namespace ValveResourceFormat.Renderer
         protected void Upload(List<SimpleVertex> vertices)
             => lineBuffer.Upload(vertices);
 
-        /// <summary>Draws the uploaded lines, on top of everything when depth test is disabled.</summary>
+        /// <summary>Draws the uploaded lines where the scene does not hide them, or on top of everything when depth test is disabled.</summary>
         protected void RenderLines(bool disableDepthTest = false)
         {
             if (lineBuffer.VertexCount == 0)

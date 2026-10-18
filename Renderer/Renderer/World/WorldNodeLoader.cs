@@ -1,6 +1,8 @@
 using System.Diagnostics;
+using System.Linq;
 using System.Threading.Tasks;
 using ValveResourceFormat.Blocks;
+using ValveResourceFormat.Renderer.Decals;
 using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
@@ -56,13 +58,17 @@ namespace ValveResourceFormat.Renderer.World
                 });
             }
 
-            var i = 0;
             var defaultLightingOrigin = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
             var sceneObjectLayerIndices = node.SceneObjectLayerIndices;
+            var sceneObjects = node.SceneObjects;
+            var extraVertexStreams = new ExtraVertexStreams(RendererContext, node);
+            var materialOverrides = node.MaterialOverrides.ToLookup(static materialOverride => materialOverride.SceneObjectIndex);
+
             // Output is WorldNode_t we need to iterate m_sceneObjects inside it
-            foreach (var sceneObject in node.SceneObjects)
+            for (var sceneObjectIndex = 0; sceneObjectIndex < sceneObjects.Count; sceneObjectIndex++)
             {
-                var layerIndex = (int)(sceneObjectLayerIndices?[i++] ?? -1);
+                var sceneObject = sceneObjects[sceneObjectIndex];
+                var layerIndex = (int)(sceneObjectLayerIndices?[sceneObjectIndex] ?? -1);
 
                 // m_vCubeMapOrigin in older files
                 var lightingOrigin = sceneObject.ContainsKey("m_vLightingOrigin") ? sceneObject.GetSubCollection("m_vLightingOrigin").ToVector3() : defaultLightingOrigin;
@@ -74,6 +80,7 @@ namespace ValveResourceFormat.Renderer.World
                 var renderableModel = sceneObject.GetStringProperty("m_renderableModel");
                 var matrix = sceneObject.GetArray("m_vTransform").ToMatrix4x4() * root;
                 var flags = sceneObject.GetEnumValue<ObjectTypeFlags>("m_nObjectTypeFlags", normalize: true);
+                var visClusters = node.GetSceneObjectVisClusters(sceneObject);
 
                 // Per-placement forced LoD baked by the compiler (-1 = automatic).
                 var lodOverride = sceneObject.ContainsKey("m_nLODOverride") ? sceneObject.GetInt32Property("m_nLODOverride") : -1;
@@ -109,6 +116,7 @@ namespace ValveResourceFormat.Renderer.World
                         CubeMapPrecomputedHandshake = cubeMapPrecomputedHandshake,
                         LightProbeVolumePrecomputedHandshake = lightProbeVolumePrecomputedHandshake,
                         Flags = flags,
+                        PrecomputedVisClusters = visClusters,
                     };
 
                     if (lodOverride >= 0)
@@ -116,6 +124,8 @@ namespace ValveResourceFormat.Renderer.World
                         modelNode.SetOverrideLod(lodOverride);
                     }
 
+                    ApplyMaterialOverrides(modelNode, [.. materialOverrides[(uint)sceneObjectIndex]]);
+                    extraVertexStreams.Apply(modelNode, (uint)sceneObjectIndex);
                     scene.Add(modelNode, false);
                 }
 
@@ -141,6 +151,7 @@ namespace ValveResourceFormat.Renderer.World
                         CubeMapPrecomputedHandshake = cubeMapPrecomputedHandshake,
                         LightProbeVolumePrecomputedHandshake = lightProbeVolumePrecomputedHandshake,
                         Flags = flags,
+                        PrecomputedVisClusters = visClusters,
                     };
 
                     scene.Add(meshNode, false);
@@ -172,7 +183,182 @@ namespace ValveResourceFormat.Renderer.World
                     };
 
                     scene.Add(aggregate, false);
-                    aggregate.LoadFragments(sceneObject, root);
+                    aggregate.LoadFragments(sceneObject, root, node);
+                }
+            }
+
+            foreach (var clutterData in node.ClutterSceneObjects)
+            {
+                LoadClutter(scene, new WorldNode.ClutterSceneObject(clutterData), root);
+            }
+
+            LoadInfoOverlays(scene, root);
+        }
+
+        private void LoadInfoOverlays(Scene scene, Matrix4x4 root)
+        {
+            var decals = scene.ProjectedDecals;
+            Dictionary<(string Material, Vector4 Rect), int>? cropped = null;
+
+            // Decals draw in the order they are added
+            foreach (var overlay in node.InfoOverlays.OrderBy(static overlay => overlay.GetInt32Property("m_nRenderOrder")))
+            {
+                var material = overlay.GetStringProperty("m_pMaterial");
+                var size = new Vector3(overlay.GetFloatProperty("m_flWidth"), overlay.GetFloatProperty("m_flHeight"), overlay.GetFloatProperty("m_flDepth"));
+
+                if (string.IsNullOrEmpty(material) || size.X <= 0f || size.Y <= 0f || size.Z <= 0f)
+                {
+                    continue;
+                }
+
+                var uvStart = overlay.GetSubCollection("m_vUVStart").ToVector2();
+                var uvEnd = overlay.GetSubCollection("m_vUVEnd").ToVector2();
+                var uvMin = Vector2.Clamp(Vector2.Min(uvStart, uvEnd), Vector2.Zero, Vector2.One);
+                var uvMax = Vector2.Clamp(Vector2.Max(uvStart, uvEnd), Vector2.Zero, Vector2.One);
+                var rect = new Vector4(uvMin.X, uvMin.Y, uvMax.X, uvMax.Y);
+
+                int decal;
+
+                if (rect == new Vector4(0f, 0f, 1f, 1f))
+                {
+                    decal = decals.RegisterMaterial(material);
+                }
+                else if (cropped?.TryGetValue((material, rect), out decal) != true)
+                {
+                    var definition = ProjectedDecalDefinition.FromMaterial(RendererContext.FileLoader, material);
+                    decal = definition == null ? -1 : decals.Register(definition with { TextureRect = rect });
+
+                    cropped ??= [];
+                    cropped[(material, rect)] = decal;
+                }
+
+                var tint = overlay.GetSubCollection("m_vTintColor").ToVector4();
+                tint = new Vector4(ColorSpace.SrgbGammaToLinear(tint.AsVector3()), tint.W);
+
+                // The transform places a box a unit on each side, which its width, height and depth stretch
+                var box = Matrix4x4.CreateScale(size) * overlay.GetSubCollection("m_transform").ToMatrix4x4() * root;
+
+                decals.Add(decal, box, tint, permanent: true);
+            }
+        }
+
+        private void LoadClutter(Scene scene, WorldNode.ClutterSceneObject clutter, Matrix4x4 root)
+        {
+            if (RendererContext.FileLoader.LoadFileCompiled(clutter.RenderableModel)?.DataBlock is not Model model)
+            {
+                return;
+            }
+
+            var instancesByTint = clutter.Tiles
+                .SelectMany(tile => Enumerable.Range(tile.FirstInstance, tile.EndInstance - tile.FirstInstance).Select(instance => (Index: instance, Tile: tile)))
+                .GroupBy(instance => clutter.InstanceTints[instance.Index]);
+
+            foreach (var instances in instancesByTint)
+            {
+                var sceneInstances = instances
+                    .Select(instance => new SceneClutter.Instance(
+                        clutter.GetInstanceTransform(instance.Index) * root,
+                        clutter.InstanceScales[instance.Index],
+                        instance.Index - instance.Tile.FirstInstance,
+                        instance.Tile.EndInstance - instance.Tile.FirstInstance))
+                    .ToArray();
+
+                scene.Add(new SceneClutter(scene, model, clutter.MaterialGroup, clutter.BeginCullSize, clutter.EndCullSize, sceneInstances)
+                {
+                    LayerName = LayerNames[clutter.Layer],
+                    Name = clutter.RenderableModel,
+                    Flags = clutter.Flags,
+                    AllFlags = clutter.Flags,
+                    AnyFlags = clutter.Flags,
+                    Tint = instances.Key / 255f,
+                }, false);
+            }
+        }
+
+        private static void ApplyMaterialOverrides(ModelSceneNode modelNode, WorldNode.MaterialOverride[] materialOverrides)
+        {
+            foreach (var materialOverride in materialOverrides)
+            {
+                if (!materialOverride.IsWholeModel || string.IsNullOrEmpty(materialOverride.Material))
+                {
+                    continue;
+                }
+
+                foreach (var mesh in modelNode.AllRenderableMeshes)
+                {
+                    foreach (var drawCall in mesh.DrawCalls)
+                    {
+                        mesh.ReplaceMaterial(drawCall, materialOverride.Material);
+                    }
+                }
+
+                return;
+            }
+
+            foreach (var materialOverride in materialOverrides)
+            {
+                var (mesh, drawCall) = FindDrawCall(modelNode, materialOverride.SubSceneObject, materialOverride.DrawCallIndex);
+
+                if (mesh != null && drawCall != null)
+                {
+                    mesh.ReplaceMaterial(drawCall, materialOverride.Material);
+                }
+            }
+        }
+
+        private static (RenderableMesh? Mesh, DrawCall? DrawCall) FindDrawCall(ModelSceneNode modelNode, uint subSceneObject, uint drawCallIndex)
+        {
+            foreach (var mesh in modelNode.AllRenderableMeshes)
+            {
+                if (mesh.MeshIndex != subSceneObject)
+                {
+                    continue;
+                }
+
+                var drawCall = mesh.DrawCalls.FirstOrDefault(call => call.Index == drawCallIndex);
+
+                if (drawCall != null)
+                {
+                    return (mesh, drawCall);
+                }
+            }
+
+            return (null, null);
+        }
+
+        private sealed class ExtraVertexStreams
+        {
+            private readonly ILookup<uint, WorldNode.ExtraVertexStreamOverride> OverridesBySceneObject;
+            private readonly VBIB Streams;
+            private readonly GPUMeshBuffers Buffers;
+
+            public ExtraVertexStreams(RendererContext rendererContext, WorldNode node)
+            {
+                OverridesBySceneObject = node.ExtraVertexStreamOverrides.ToLookup(static streamOverride => streamOverride.SceneObjectIndex);
+                Streams = node.GetExtraVertexStreams();
+                Buffers = rendererContext.MeshBufferCache.CreateVertexIndexBuffers($"{node.Resource.FileName} extra vertex streams", Streams);
+            }
+
+            public void Apply(ModelSceneNode modelNode, uint sceneObjectIndex)
+            {
+                foreach (var streamOverride in OverridesBySceneObject[sceneObjectIndex])
+                {
+                    var stream = Streams.VertexBuffers[streamOverride.BufferIndex];
+                    var (_, drawCall) = FindDrawCall(modelNode, streamOverride.SubSceneObject, streamOverride.DrawCallIndex);
+
+                    // Streams painted on an older version of the model no longer match its vertex count
+                    if (drawCall?.VertexCount != stream.ElementCount)
+                    {
+                        continue;
+                    }
+
+                    drawCall.AddVertexBuffer(new VertexDrawBuffer
+                    {
+                        Handle = Buffers.VertexBuffers[streamOverride.BufferIndex],
+                        BufferIndex = streamOverride.BufferIndex,
+                        ElementSizeInBytes = stream.ElementSizeInBytes,
+                        InputLayoutFields = stream.InputLayoutFields,
+                    });
                 }
             }
         }

@@ -18,9 +18,6 @@ namespace GUI.Types.Graphs;
 /// </summary>
 internal class EntityIOGraphViewer : GLGraphViewer
 {
-    private const GraphHue OutputHue = EntityIOGraphBuilder.OutputHue;
-    private const GraphHue InputHue = EntityIOGraphBuilder.InputHue;
-
     private readonly List<List<GraphNode>> islands;
     private string? focusedIslandName;
     private readonly Action<IReadOnlyList<EntityLump.Entity>>? showInMap;
@@ -28,13 +25,13 @@ internal class EntityIOGraphViewer : GLGraphViewer
     private readonly int entityCount;
 
     public EntityIOGraphViewer(VrfGuiContext vrfGuiContext, RendererContext rendererContext, EntityLump entityLump)
-        : this(vrfGuiContext, rendererContext, CollectEntities(entityLump, rendererContext), showInMap: null)
+        : this(vrfGuiContext, rendererContext, CollectEntities(vrfGuiContext, entityLump, rendererContext), showInMap: null)
     {
     }
 
     // A lump opened on its own still references entities of its child lumps (templates,
     // spawners), so resolve targets across the whole lump tree.
-    private static List<EntityLump.Entity> CollectEntities(EntityLump entityLump, RendererContext rendererContext)
+    private static List<EntityLump.Entity> CollectEntities(VrfGuiContext vrfGuiContext, EntityLump entityLump, RendererContext rendererContext)
     {
         try
         {
@@ -49,7 +46,7 @@ internal class EntityIOGraphViewer : GLGraphViewer
         }
         catch (Exception e)
         {
-            Log.Warn(nameof(EntityIOGraphViewer), $"Failed to traverse child entity lumps: {e.Message}");
+            Log.Warn(nameof(EntityIOGraphViewer), $"Failed to traverse child entity lumps of \"{entityLump.Name}\" in {vrfGuiContext.DisplayPath}: {e.Message}");
             return entityLump.GetEntities();
         }
     }
@@ -64,8 +61,8 @@ internal class EntityIOGraphViewer : GLGraphViewer
 
         View.Legend.AddRange(
         [
-            new("Output", OutputHue, GraphLegendKind.Wire),
-            new("Input", InputHue, GraphLegendKind.Wire),
+            new("Output", EntityIOGraphBuilder.OutputHue, GraphLegendKind.Wire),
+            new("Input", EntityIOGraphBuilder.InputHue, GraphLegendKind.Wire),
             // Closes the line samples, meeting the point_template swatch that opens the node rows.
             new("Template spawn", EntityIOGraphBuilder.TemplateSpawnHue, GraphLegendKind.DashedWire),
         ]);

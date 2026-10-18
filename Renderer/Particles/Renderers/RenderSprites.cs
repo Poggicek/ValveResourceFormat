@@ -61,15 +61,17 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         private readonly Vector4 outlineRanges = new(0.5f, 0.7f, 0.6f, 0.8f);
         private int vertexBufferHandle;
 
-        public RenderSprites(ParticleDefinitionParser parse, RendererContext rendererContext) : base(parse)
+        public RenderSprites(ParticleDefinitionParser parse, RendererContext rendererContext, Scene scene) : base(parse, scene)
         {
             blendMode = parse.Enum<ParticleBlendMode>("m_nOutputBlendMode", blendMode);
 
             (layers, var textureName) = ParticleTextureLayer.Build(parse, rendererContext, DefaultTextureName, srgbRead: OutputIsColor);
 
-            shader = rendererContext.ShaderLoader.LoadShader(ShaderName,
-                ("S_TEXTURE_LAYERS", (byte)(layers.Length - 1)),
-                ("S_PARTICLE_INSTANCED", (byte)1));
+            var shaderArguments = CreateShaderArguments();
+            shaderArguments["S_TEXTURE_LAYERS"] = (byte)(layers.Length - 1);
+            shaderArguments["S_PARTICLE_INSTANCED"] = 1;
+
+            shader = rendererContext.ShaderLoader.LoadShader(ShaderName, shaderArguments);
 
             instanceLayout = BuildInstanceLayout(layers.Length);
 
@@ -112,8 +114,8 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         public override Texture.SpritesheetData? SpriteSheet => ParticleTextureLayer.FindSpriteSheet(layers);
 
         /// <inheritdoc/>
-        // The override stands in for the card's base texture; the layers composited over it keep their
-        // own textures along with the channels and blend settings that fold them together.
+        // Replaces the card's base texture. Layers composited over it keep their own textures,
+        // channels and blend settings.
         public override void SetTextureOverride(RenderTexture texture)
         {
             layers[0].Texture = texture;
@@ -217,7 +219,14 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             return (image.UncroppedMin + (window.Min * size), image.UncroppedMin + (window.Max * size));
         }
 
-        /// <summary>The frames a layer's own sheet is showing, or null when it carries no sequence.</summary>
+        /// <summary>
+        /// The frames a layer's own sheet is showing, or null when it carries no sequence.
+        /// </summary>
+        /// <remarks>
+        /// Layer 0 plays the particle's sequence, later layers the second sequence (0 unless set).
+        /// Sequence numbers outside the sheet play sequence 0. Layer N of a multi-image frame uses
+        /// image N, and the last image covers any layers beyond that.
+        /// </remarks>
         private LayerFrames? GetLayerFrames(int layer, ref Particle particle)
         {
             var spriteSheetData = layers[layer].Texture.SpriteSheetData;
@@ -227,7 +236,8 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 return null;
             }
 
-            var sequence = spriteSheetData.Sequences[particle.SequenceNumber % spriteSheetData.Sequences.Length];
+            var sequenceNumber = layer > 0 ? particle.SecondSequenceNumber : particle.SequenceNumber;
+            var sequence = spriteSheetData.Sequences[(uint)sequenceNumber < (uint)spriteSheetData.Sequences.Length ? sequenceNumber : 0];
 
             if (sequence.Frames.Length == 0)
             {
@@ -236,9 +246,11 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
             var (frame, nextFrame, blend) = GetSheetFrame(ref particle, sequence, animationRate, animationType, animateInFps);
 
-            // TODO: Support more than one image per frame?
-            return new LayerFrames(sequence.Frames[frame].Images[0], sequence.Frames[nextFrame].Images[0], blend);
+            return new LayerFrames(LayerImage(sequence.Frames[frame], layer), LayerImage(sequence.Frames[nextFrame], layer), blend);
         }
+
+        private static Texture.SpritesheetData.Sequence.Frame.Image LayerImage(Texture.SpritesheetData.Sequence.Frame frame, int layer)
+            => frame.Images[Math.Min(layer, frame.Images.Length - 1)];
 
         /// <summary>
         /// The window the card shrinks to, covering the art of both frames it is blending so neither is
@@ -274,22 +286,10 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             return (uvMin, uvMax, nextMin, nextMax);
         }
 
-        // One corner of a uv rectangle, in the quad's winding order (top-left, bottom-left,
-        // bottom-right, top-right) with v increasing downward.
-        /// <summary>The card-space coordinate of one quad corner, before any layer transform.</summary>
-        internal static Vector2 CardUv(int corner) => corner switch
-        {
-            0 => new Vector2(0f, 1f),
-            1 => new Vector2(0f, 0f),
-            2 => new Vector2(1f, 0f),
-            3 => new Vector2(1f, 1f),
-            _ => throw new ArgumentOutOfRangeException(nameof(corner)),
-        };
-
-        // A quad orientation matrix from a base (right, up) pair with the particle roll folded in, matching the
+        // The quad's (right, up) axes from a base pair with the particle roll folded in, matching the
         // spritecard vertex shader. The axes are intentionally not re-normalized (some modes rely on that, e.g.
-        // SCREEN_Z foreshortens as the camera tilts). The face row is only the normal and does not affect corners.
-        private static Matrix4x4 QuadBasis(Vector3 baseRight, Vector3 baseUp, float roll, float yaw)
+        // SCREEN_Z foreshortens as the camera tilts).
+        private static (Vector3 Right, Vector3 Up) QuadBasis(Vector3 baseRight, Vector3 baseUp, float roll, float yaw)
         {
             var c = MathF.Cos(roll);
             var s = MathF.Sin(roll);
@@ -303,14 +303,11 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 right = Vector3.Transform(right, Matrix4x4.CreateFromAxisAngle(Vector3.Normalize(up), yaw));
             }
 
-            var face = Vector3.Cross(right, up);
-            face = MathUtils.SafeNormalize(face, Vector3.UnitZ, ParticleMath.MinimumLengthSquared);
-            return new Matrix4x4(
-                right.X, right.Y, right.Z, 0f,
-                up.X, up.Y, up.Z, 0f,
-                face.X, face.Y, face.Z, 0f,
-                0f, 0f, 0f, 1f);
+            return (right, up);
         }
+
+        private static (Vector3 Right, Vector3 Up) RotationBasis(Matrix4x4 rotation)
+            => (rotation.GetRow(0).AsVector3(), rotation.GetRow(1).AsVector3());
 
         // World-space camera forward (into the scene): the billboard maps local +Z to the toward-camera axis.
         private static Vector3 CameraForward(Matrix4x4 billboard)
@@ -318,25 +315,25 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
         // SCREEN_ALIGNED: the plain camera billboard, built from the camera's own right and up axes. The
         // particle's pitch never enters, so a normal-setting operator cannot tilt the card out of plane.
-        private static Matrix4x4 ScreenAlignedBasis(Matrix4x4 billboard, float roll, float yaw)
+        private static (Vector3 Right, Vector3 Up) ScreenAlignedBasis(Matrix4x4 billboard, float roll, float yaw)
             => QuadBasis(
                 billboard.GetRow(0).AsVector3(),
                 billboard.GetRow(1).AsVector3(), roll, yaw);
 
         // SCREEN_Z_ALIGNED: up locked to world +Z, right = cross(worldZ, forward) left un-normalized, so the
         // sprite yaws about vertical to face the camera and foreshortens as the view tilts off-horizontal.
-        private static Matrix4x4 ScreenZAlignedBasis(Matrix4x4 billboard, float roll, float yaw)
+        private static (Vector3 Right, Vector3 Up) ScreenZAlignedBasis(Matrix4x4 billboard, float roll, float yaw)
             => QuadBasis(Vector3.Cross(Vector3.UnitZ, CameraForward(billboard)), Vector3.UnitZ, roll, yaw);
 
         // WORLD_Z_ALIGNED: the quad lies flat in the world XY plane (normal = +Z), rolling about vertical,
         // independent of the camera.
-        private static Matrix4x4 WorldZAlignedBasis(float roll, float yaw)
+        private static (Vector3 Right, Vector3 Up) WorldZAlignedBasis(float roll, float yaw)
             => QuadBasis(new Vector3(0f, -1f, 0f), new Vector3(1f, 0f, 0f), roll, yaw);
 
         // ALIGN_TO_PARTICLE_NORMAL: quad plane perpendicular to the particle normal, with the shader's canonical
         // tangent frame. The reference axis is world -Y once the normal tilts at all off horizontal, and world
         // +Z only while it is nearly horizontal; either choice stays clear of the normal.
-        private static Matrix4x4 ParticleNormalBasis(Vector3 normal, float roll, float yaw)
+        private static (Vector3 Right, Vector3 Up) ParticleNormalBasis(Vector3 normal, float roll, float yaw)
         {
             var reference = MathF.Abs(normal.Z) > 0.1f ? new Vector3(0f, -1f, 0f) : new Vector3(0f, 0f, 1f);
             var up = Vector3.Normalize(Vector3.Cross(normal, reference));
@@ -346,13 +343,13 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
         // SCREENALIGN_TO_PARTICLE_NORMAL: the quad's right edge follows the particle normal while it turns toward
         // the camera about that normal. Falls back to a billboard when the normal points at the camera.
-        private static Matrix4x4 ScreenAlignToNormalBasis(Matrix4x4 billboard, Vector3 normal, float roll, float yaw)
+        private static (Vector3 Right, Vector3 Up) ScreenAlignToNormalBasis(Matrix4x4 billboard, Vector3 normal, float roll, float yaw)
         {
             var n = Vector3.Normalize(normal);
             var w = Vector3.Cross(n, CameraForward(billboard));
             if (w.LengthSquared() < ParticleMath.MinimumLengthSquared)
             {
-                return billboard;
+                return RotationBasis(billboard);
             }
 
             return QuadBasis(n, Vector3.Normalize(w), roll, yaw);
@@ -384,12 +381,25 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             // reused across renderers.
             var instanceFloats = instanceLayout.Stride / sizeof(float);
 
+            var sorted = SortsByDistance(blendMode) && particles.Count > 1;
+
             using (var vertexBuffer = new RentedBuffer<float>(particles.Count * instanceFloats))
+            using (var drawOrder = new RentedBuffer<ulong>(sorted ? particles.Count : 0))
             {
                 var instances = vertexBuffer.Span;
+                var current = particles.Current;
                 var i = 0;
-                foreach (ref var particle in particles.Current)
+
+                var order = drawOrder.Span;
+
+                if (sorted)
                 {
+                    SortBackToFront(current, camera.Location, order);
+                }
+
+                for (var n = 0; n < current.Length; n++)
+                {
+                    ref var particle = ref current[sorted ? (int)(uint)order[n] : n];
                     var radiusScale = RadiusScale.NextNumber(ref particle, systemState);
 
                     // Scales rgb and alpha alike, matching the shader's fade of the whole vertex colour.
@@ -446,25 +456,25 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                     // roll and yaw and none of them read pitch; only FULL_3AXIS_ROTATION uses the full basis.
                     var roll = particle.Rotation.Z;
                     var yaw = particle.Rotation.X;
-                    var modelMatrix = orientationType switch
+                    var (right, up) = orientationType switch
                     {
-                        ParticleOrientation.PARTICLE_ORIENTATION_SCREEN_ALIGNED => ScreenAlignedBasis(billboardMatrix, roll, yaw) * particle.GetTransformationMatrix(radiusScale),
-                        ParticleOrientation.PARTICLE_ORIENTATION_SCREEN_Z_ALIGNED => ScreenZAlignedBasis(billboardMatrix, roll, yaw) * particle.GetTransformationMatrix(radiusScale),
-                        ParticleOrientation.PARTICLE_ORIENTATION_WORLD_Z_ALIGNED => WorldZAlignedBasis(roll, yaw) * particle.GetTransformationMatrix(radiusScale),
-                        ParticleOrientation.PARTICLE_ORIENTATION_ALIGN_TO_PARTICLE_NORMAL => ParticleNormalBasis(particle.Normal, roll, yaw) * particle.GetTransformationMatrix(radiusScale),
-                        ParticleOrientation.PARTICLE_ORIENTATION_SCREENALIGN_TO_PARTICLE_NORMAL => ScreenAlignToNormalBasis(billboardMatrix, particle.Normal, roll, yaw) * particle.GetTransformationMatrix(radiusScale),
-                        _ => particle.GetRotationMatrix() * particle.GetTransformationMatrix(radiusScale),
+                        ParticleOrientation.PARTICLE_ORIENTATION_SCREEN_ALIGNED => ScreenAlignedBasis(billboardMatrix, roll, yaw),
+                        ParticleOrientation.PARTICLE_ORIENTATION_SCREEN_Z_ALIGNED => ScreenZAlignedBasis(billboardMatrix, roll, yaw),
+                        ParticleOrientation.PARTICLE_ORIENTATION_WORLD_Z_ALIGNED => WorldZAlignedBasis(roll, yaw),
+                        ParticleOrientation.PARTICLE_ORIENTATION_ALIGN_TO_PARTICLE_NORMAL => ParticleNormalBasis(particle.Normal, roll, yaw),
+                        ParticleOrientation.PARTICLE_ORIENTATION_SCREENALIGN_TO_PARTICLE_NORMAL => ScreenAlignToNormalBasis(billboardMatrix, particle.Normal, roll, yaw),
+                        _ => RotationBasis(particle.GetRotationMatrix()),
                     };
 
-                    // The corner map is corner.x * row0 + corner.y * row1 + translation, so the first two
-                    // rows are already the card's axes with the radius folded in. Handing those over
-                    // replaces four Vector4.Transform calls here and three duplicate vertices.
-                    var right = modelMatrix.GetRow(0).AsVector3();
-                    var up = modelMatrix.GetRow(1).AsVector3();
+                    // The corner map is corner.x * right + corner.y * up + origin, so the card's axes carry
+                    // the radius. Handing those over replaces four Vector4.Transform calls here and three
+                    // duplicate vertices.
+                    right *= halfWidth;
+                    up *= halfWidth;
 
-                    // The centre offset shifts the corners before the model matrix scales them, so it is
+                    // The centre offset shifts the corners before the radius scales them, so it is
                     // measured in half-widths and folds into the origin along those same two axes.
-                    var origin = modelMatrix.Translation
+                    var origin = particle.Position
                         + (centerOffset.X * right)
                         + (centerOffset.Y * up);
 
@@ -536,7 +546,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 return;
             }
 
-            using var _ = SpritecardStateScope(GraphicsContext.RenderState, blendMode);
+            using var _ = SpritecardStateScope(blendMode);
 
             shader.Use();
             VertexArray.Bind(vaoHandle, shader);

@@ -231,7 +231,7 @@ vec4 GetTintColorLinear(vec4 vTint)
     return TintFade;
 }
 
-#if (F_DETAIL_TEXTURE > 0)
+#if defined(detail_texture_vfx_common) || CS2_CHARACTER_ADJUSTMENTS
 
     uniform float g_flDetailTexCoordRotation = 0.0;
     uniform vec2 g_vDetailTexCoordOffset = vec2(0.0);
@@ -249,9 +249,8 @@ vec4 GetTintColorLinear(vec4 vTint)
 // Firstperson legs distortion parameters
 uniform int g_bFirstpersonLegsDistortion = 0;
 
-// Apply firstperson legs distortion effect to clip space position and normal.
-// This creates a fish-eye warping effect on player legs in first-person view,
-// preventing clipping when looking down by scaling outward and pulling back.
+// Fish-eye warp of first-person legs, applied to clip space position and normal.
+// Scales outward and pulls back so legs do not clip when looking down.
 void ApplyFirstpersonLegsDistortion(
     in vec3 vertexPosOS,
     in vec3 vertexPosWS,
@@ -261,9 +260,7 @@ void ApplyFirstpersonLegsDistortion(
     out vec4 outClipSpacePos,
     out vec3 outNormal)
 {
-    // Calculate distortion factor based on:
-    // 1. Vertex Z height (legs height) - normalized and clamped
-    // 2. Camera pitch (looking down) - squared for sharper falloff
+    // Vertex Z height (normalized, clamped) times camera pitch looking down, squared for sharper falloff
     float heightFactor = saturate((vertexPosOS.z + 1.0) * 0.0125) * 0.5;
     float pitchFactor = pow2(saturate(-viewDirZ));
     float distortionAmount = pow(heightFactor * pitchFactor, 1.5);
@@ -365,7 +362,7 @@ void main()
     vTexCoord2 = vTEXCOORD1.xy;
 #endif
 
-#if (F_DETAIL_TEXTURE > 0)
+#if defined(detail_texture_vfx_common) || CS2_CHARACTER_ADJUSTMENTS
     #if (F_SECONDARY_UV == 1) || (F_FORCE_UV2 == 1)
         vec2 detailCoords = (g_bUseSecondaryUvForDetailTexture || (F_FORCE_UV2 == 1)) ? vTexCoord2 : vTexCoordOut;
     #else

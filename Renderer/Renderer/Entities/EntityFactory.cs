@@ -11,17 +11,14 @@ namespace ValveResourceFormat.Renderer.Entities;
 public delegate BaseEntity EntityCreator(EntitySystem system, EntitySpawnInfo spawnInfo);
 
 /// <summary>
-/// Turns a classname into a live entity. Source's entity factory dictionary: every simulated classname
-/// registers here, and anything absent from the table is not one the entity system implements.
+/// Creates entities from classnames. Classnames absent from the table are not implemented.
 /// </summary>
 /// <remarks>
-/// The table is filled in statically rather than by scanning types, to stay trim-safe and AOT-compatible.
+/// Filled in statically rather than by scanning types, to stay trim-safe and AOT-compatible.
 /// </remarks>
 public static class EntityFactory
 {
-    // Concurrent for the same reason the input tables are: the registrations themselves all happen in the
-    // static constructor, but the map loads that read this run on several threads at once, and nothing in
-    // the type stops a caller registering a classname of its own later
+    // Concurrent because map loads read this from several threads and classnames may be registered later
     private static readonly ConcurrentDictionary<string, EntityCreator> Creators = new(StringComparer.OrdinalIgnoreCase);
 
     static EntityFactory()
@@ -30,23 +27,30 @@ public static class EntityFactory
         EntityInputTable.Bind<GenericEntity>();
         EntityInputTable.Bind<GenericModelEntity>();
 
-        Register<WorldEntity>("worldspawn", static (system, spawnInfo) => new WorldEntity(system, spawnInfo));
         Register<InfoWorldLayer>("info_world_layer", static (system, spawnInfo) => new InfoWorldLayer(system, spawnInfo));
+        Register<InfoVisibilityBox>("info_visibility_box", static (system, spawnInfo) => new InfoVisibilityBox(system, spawnInfo));
 
         Register<FuncBrush>("func_brush", static (system, spawnInfo) => new FuncBrush(system, spawnInfo));
+        Register<FuncWater>("func_water", static (system, spawnInfo) => new FuncWater(system, spawnInfo));
         Register<FuncCombineBarrier>("func_combine_barrier", static (system, spawnInfo) => new FuncCombineBarrier(system, spawnInfo));
         Register<FuncButton>("func_button", static (system, spawnInfo) => new FuncButton(system, spawnInfo));
         Register<FuncDoor>("func_door", static (system, spawnInfo) => new FuncDoor(system, spawnInfo));
         Register<FuncDoorRotating>("func_door_rotating", static (system, spawnInfo) => new FuncDoorRotating(system, spawnInfo));
         Register<FuncMoveLinear>("func_movelinear", static (system, spawnInfo) => new FuncMoveLinear(system, spawnInfo));
         Register<FuncRotating>("func_rotating", static (system, spawnInfo) => new FuncRotating(system, spawnInfo));
+        Register<FuncTrackTrain>("func_tracktrain", static (system, spawnInfo) => new FuncTrackTrain(system, spawnInfo));
+        Register<PathTrack>("path_track", static (system, spawnInfo) => new PathTrack(system, spawnInfo));
         Register<PropDoorRotating>("prop_door_rotating", static (system, spawnInfo) => new PropDoorRotating(system, spawnInfo));
         Register<PropDoorRotating>("prop_door_rotating_physics", static (system, spawnInfo) => new PropDoorRotating(system, spawnInfo));
         Register<PropDynamic>("prop_dynamic", static (system, spawnInfo) => new PropDynamic(system, spawnInfo));
         Register<PropDynamic>("prop_dynamic_override", static (system, spawnInfo) => new PropDynamic(system, spawnInfo));
         Register<FuncBreakable>("func_breakable", static (system, spawnInfo) => new FuncBreakable(system, spawnInfo));
         Register<XenFloraAnimatedMover>("xen_flora_animatedmover", static (system, spawnInfo) => new XenFloraAnimatedMover(system, spawnInfo));
+        Register<TriggerMultiple>("trigger_multiple", static (system, spawnInfo) => new TriggerMultiple(system, spawnInfo));
+        Register<TriggerOnce>("trigger_once", static (system, spawnInfo) => new TriggerOnce(system, spawnInfo));
+        Register<TriggerLook>("trigger_look", static (system, spawnInfo) => new TriggerLook(system, spawnInfo));
         Register<TriggerTeleport>("trigger_teleport", static (system, spawnInfo) => new TriggerTeleport(system, spawnInfo));
+        Register<PointTeleport>("point_teleport", static (system, spawnInfo) => new PointTeleport(system, spawnInfo));
 
         // lights
         Register<LightEntity>("light_barn", static (system, spawnInfo) => new LightEntity(system, spawnInfo));
@@ -110,11 +114,15 @@ public static class EntityFactory
 
         // logic
         Register<LogicAuto>("logic_auto", static (system, spawnInfo) => new LogicAuto(system, spawnInfo));
+        Register<LogicBranch>("logic_branch", static (system, spawnInfo) => new LogicBranch(system, spawnInfo));
+        Register<LogicBranchListener>("logic_branch_listener", static (system, spawnInfo) => new LogicBranchListener(system, spawnInfo));
         Register<LogicCase>("logic_case", static (system, spawnInfo) => new LogicCase(system, spawnInfo));
+        Register<LogicCompare>("logic_compare", static (system, spawnInfo) => new LogicCompare(system, spawnInfo));
         Register<LogicRelay>("logic_relay", static (system, spawnInfo) => new LogicRelay(system, spawnInfo));
         Register<LogicTimer>("logic_timer", static (system, spawnInfo) => new LogicTimer(system, spawnInfo));
         Register<MathCounter>("math_counter", static (system, spawnInfo) => new MathCounter(system, spawnInfo));
         Register<FilterActivatorModel>("filter_activator_model", static (system, spawnInfo) => new FilterActivatorModel(system, spawnInfo));
+        Register<FilterActivatorTeam>("filter_activator_team", static (system, spawnInfo) => new FilterActivatorTeam(system, spawnInfo));
         Register<InfoSpawnGroupLoadUnload>("info_spawngroup_load_unload", static (system, spawnInfo) => new InfoSpawnGroupLoadUnload(system, spawnInfo));
 
         // sounds
@@ -123,12 +131,16 @@ public static class EntityFactory
         Register<PointSoundEvent>("snd_event_point", static (system, spawnInfo) => new PointSoundEvent(system, spawnInfo));
         Register<EnvSoundscape>("snd_soundscape", static (system, spawnInfo) => new EnvSoundscape(system, spawnInfo));
         Register<AmbientGeneric>("ambient_generic", static (system, spawnInfo) => new AmbientGeneric(system, spawnInfo));
+
+        // panorama world panels
+        Register<PointClientUIWorldPanel>("point_clientui_world_panel", static (system, spawnInfo) => new PointClientUIWorldPanel(system, spawnInfo));
+        Register<PointClientUIWorldPanel>("point_clientui_world_text_panel", static (system, spawnInfo) => new PointClientUIWorldPanel(system, spawnInfo));
+        Register<PointClientUIWorldPanel>("point_clientui_world_movie_panel", static (system, spawnInfo) => new PointClientUIWorldPanel(system, spawnInfo));
     }
 
     /// <summary>
-    /// Registers a classname the entity system should simulate, and builds the entity class's table of
-    /// <see cref="EntityInputAttribute"/> handlers. Safe to call while maps are loading, though the static
-    /// constructor below is where the entity system's own classnames are declared.
+    /// Registers a classname and builds its entity class's table of <see cref="EntityInputAttribute"/>
+    /// handlers. Safe to call while maps are loading.
     /// </summary>
     /// <typeparam name="T">The entity class the classname spawns.</typeparam>
     /// <param name="classname">The classname to link, matched case-insensitively.</param>
@@ -142,17 +154,19 @@ public static class EntityFactory
     }
 
     /// <summary>
-    /// Creates and spawns the entity for a classname. The entity is fully set up when this returns, but
-    /// is not in the world yet; <see cref="EntitySystem.CreateEntity"/> is what puts it there. A classname
-    /// that is not implemented spawns a <see cref="GenericModelEntity"/> when it has a model, and a
-    /// <see cref="GenericEntity"/> when it does not.
+    /// Creates the entity for a classname, which <see cref="EntitySystem.CreateEntity"/> then spawns and
+    /// adds to the world. An unimplemented classname gives a
+    /// <see cref="GenericModelEntity"/> when it has a model, otherwise a <see cref="GenericEntity"/>.
     /// </summary>
-    /// <returns>The spawned entity, or <see langword="null"/> when the keyvalues name no classname.</returns>
+    /// <returns>
+    /// The entity, or <see langword="null"/> when the keyvalues name no classname or a <c>worldspawn</c>.
+    /// </returns>
     public static BaseEntity? Create(EntitySystem system, EntitySpawnInfo spawnInfo)
     {
         var classname = spawnInfo.Data.GetStringProperty("classname");
 
-        if (classname == null)
+        // worldspawn keyvalues are the map's world settings; the world entity belongs to the entity system
+        if (classname == null || classname.Equals("worldspawn", StringComparison.OrdinalIgnoreCase))
         {
             return null;
         }
@@ -171,8 +185,6 @@ public static class EntityFactory
         {
             entity = new GenericModelEntity(system, spawnInfo);
         }
-
-        entity.Spawn();
 
         return entity;
     }

@@ -37,16 +37,16 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
         /// <summary>Gets the toe denominator of the tonemapping curve.</summary>
         public float ToeDenom { get; init; }
 
-        /// <summary>Gets the white point value; passed through the tonemapper before GPU upload.</summary>
-        public float WhitePoint { get; init; } // This is run through the tonemapper before being given to the shader
+        /// <summary>Gets the white point in stops, the scene value that displays as white being two to its power.</summary>
+        public float WhitePoint { get; init; }
 
         /// <summary>
         /// The scale the shader applies to the exposed scene before the curve.
         /// </summary>
         public const float PreTonemapScale = 2.8f;
 
-        /// <summary>Gets the white point the curve is actually normalized against: <see cref="WhitePoint"/> scaled by <see cref="PreTonemapScale"/>.</summary>
-        public readonly float EffectiveWhitePoint => WhitePoint * PreTonemapScale;
+        /// <summary>Gets the white point the curve clamps to and is normalized against: two to the power of <see cref="WhitePoint"/>.</summary>
+        public readonly float EffectiveWhitePoint => MathF.Pow(2f, WhitePoint);
         // The following params aren't used, I think?
         /*float LuminanceSource; // CS2
         float ExposureBiasShadows; // CS2
@@ -70,19 +70,19 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
             WhitePoint = 4.0f;
         }
 
-        /// <summary>Returns a <see cref="TonemapSettings"/> intended for linear (non-filmic) tonemapping. Note: <see cref="ApplyTonemapping"/> returns a constant 0 with these values, so they are not a true passthrough curve.</summary>
+        /// <summary>The nearly linear curve the game uses where no post processing gives one, when its game sets it to.</summary>
         public static TonemapSettings Linear()
         {
             return new TonemapSettings()
             {
                 ExposureBias = 0.0f,
                 ShoulderStrength = 0.0f,
-                LinearStrength = 0.0f,
-                LinearAngle = 0.0f,
+                LinearStrength = 0.001f,
+                LinearAngle = 0.001f,
                 ToeStrength = 1.0f,
                 ToeNum = 1.0f,
                 ToeDenom = 1.0f,
-                WhitePoint = 2.83f,
+                WhitePoint = 1.5f,
             };
         }
         /// <summary>Initializes a new <see cref="TonemapSettings"/> by reading values from a KV object.</summary>
@@ -146,8 +146,7 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
         /// </summary>
         /// <param name="displayValue">The desired displayed value, in the 0-1 range the shader outputs.</param>
         /// <returns>
-        /// The exposed linear scene value that displays as <paramref name="displayValue"/>,
-        /// or <see cref="float.NaN"/> if this curve cannot be inverted.
+        /// The exposed linear scene value, or <see cref="float.NaN"/> if this curve cannot be inverted.
         /// </returns>
         public readonly float InvertTonemapping(float displayValue)
         {
@@ -479,6 +478,7 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
     /// <summary>
     /// Spatial volume that applies post-processing effects to the camera view.
     /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/server/CPostProcessingVolume">CPostProcessingVolume</seealso>
     public class ScenePostProcessVolume(Scene scene) : SceneNode(scene)
     {
         /// <summary>Gets the fade time in seconds when transitioning into this volume.</summary>
@@ -498,7 +498,7 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
         public PostProcessing? PostProcessingResource { get; set; }
 
         /// <summary>Gets or sets the model used as the trigger volume shape.</summary>
-        public Model? ModelVolume { get; set; } // dumb
+        public Model? ModelVolume { get; set; }
 
         /// <summary>Gets or sets the collider built from the volume model's physics, used to test whether the camera is inside.</summary>
         public EntityCollider? Collider { get; set; }
@@ -509,7 +509,7 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
         /// </summary>
         public float Weight { get; set; }
 
-        /// <summary>Gets or sets whether this post-processing resource uses the newer post-Half-Life: Alyx format (detected via the presence of local contrast parameters).</summary>
+        /// <summary>Whether this resource uses the newer post-Half-Life: Alyx format, detected by local contrast parameters.</summary>
         public bool IsPostHLA { get; set; }
 
         /// <summary>Gets or sets whether this volume has tonemapping curve data.</summary>

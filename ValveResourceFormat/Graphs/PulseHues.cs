@@ -1,10 +1,7 @@
 
 namespace ValveResourceFormat.Graphs;
 
-/// <summary>
-/// The role a pulse graph node plays. Cell roles follow the pulse editor's own node palettes in
-/// scripts/tools/pulse_scene_styles_v2; the instruction roles have no editor counterpart.
-/// </summary>
+/// <summary>The role a pulse graph node plays.</summary>
 internal enum PulseCategory
 {
     /// <summary>The graph info card, and any cell class the table does not name.</summary>
@@ -31,16 +28,28 @@ internal enum PulseCategory
     Variable,
 }
 
+/// <summary>The value buckets pulse sockets and wires are coloured by.</summary>
+internal enum PulseValueKind
+{
+    /// <summary>Cursor flow between steps.</summary>
+    Flow,
+    /// <summary>Integer, float and game time values.</summary>
+    Number,
+    /// <summary>String values.</summary>
+    String,
+    /// <summary>Boolean values.</summary>
+    Bool,
+    /// <summary>Every other value type.</summary>
+    Other,
+}
+
 /// <summary>
 /// The pulse graph palette: node headers are coloured by <see cref="PulseCategory"/>, sockets and
 /// wires by the value type they carry.
 /// </summary>
 internal static class PulseHues
 {
-    /// <summary>
-    /// Colour slot a node category is drawn in. Entry point, yielding, value and flow control take
-    /// the colours the pulse editor gives those roles in scripts/tools/pulse_scene_styles_v2.
-    /// </summary>
+    /// <summary>Colour slot a node category is drawn in.</summary>
     /// <param name="category">The category to colour.</param>
     public static GraphHue HueOf(PulseCategory category) => category switch
     {
@@ -57,20 +66,31 @@ internal static class PulseHues
         _ => GraphHue.Red,
     };
 
+    /// <summary>Colour slot a value bucket is drawn in.</summary>
+    /// <param name="kind">The bucket to colour.</param>
+    public static GraphHue HueOf(PulseValueKind kind) => kind switch
+    {
+        PulseValueKind.Flow => GraphHue.Neutral,
+        PulseValueKind.Number => GraphHue.Amber,
+        PulseValueKind.String => GraphHue.Green,
+        PulseValueKind.Bool => GraphHue.Orange,
+        _ => GraphHue.Teal,
+    };
+
     /// <summary>Hue the dashed variable read and write links and their sockets share.</summary>
     public const GraphHue VariableLinkHue = GraphHue.Indigo;
 
     /// <summary>
-    /// The legend the pulse viewer advertises: the line samples first, then the node colour
-    /// swatches, matching the two sub-sections the legend panel draws.
+    /// Legend entries: line samples first, then node colour swatches, matching the legend panel's
+    /// two sub-sections.
     /// </summary>
     public static IEnumerable<GraphLegendEntry> Legend()
     {
-        yield return new("Flow", GraphHue.Neutral, GraphLegendKind.Wire);
-        yield return new("String value", GraphHue.Green, GraphLegendKind.Wire);
-        yield return new("Number value", GraphHue.Amber, GraphLegendKind.Wire);
-        yield return new("Bool value", GraphHue.Orange, GraphLegendKind.Wire);
-        yield return new("Other value", GraphHue.Teal, GraphLegendKind.Wire);
+        yield return new("Flow", HueOf(PulseValueKind.Flow), GraphLegendKind.Wire);
+        yield return new("String value", HueOf(PulseValueKind.String), GraphLegendKind.Wire);
+        yield return new("Number value", HueOf(PulseValueKind.Number), GraphLegendKind.Wire);
+        yield return new("Bool value", HueOf(PulseValueKind.Bool), GraphLegendKind.Wire);
+        yield return new("Other value", HueOf(PulseValueKind.Other), GraphLegendKind.Wire);
         yield return new("Variable link", VariableLinkHue, GraphLegendKind.DashedWire);
         yield return new("Entry point", HueOf(PulseCategory.EntryPoint));
         yield return new("Action / step", HueOf(PulseCategory.Step));
@@ -88,7 +108,7 @@ internal static class PulseHues
     /// <summary>
     /// Buckets a compiled cell class. Yielding is the class's ancestry, which the compiled graph
     /// does not record - a yielding cell serialises its resume points under per-class names that
-    /// read as ordinary outflows - so the set is named here, from the CS2, Dota 2 and Deadlock schema.
+    /// read as ordinary outflows - so the set is named here.
     /// </summary>
     /// <param name="cellClass">The cell's _class value.</param>
     public static PulseCategory CategoryOf(string cellClass) => cellClass switch
@@ -106,6 +126,7 @@ internal static class PulseHues
             or "CPulseCell_BooleanSwitchState" or "CPulseCell_CursorQueue"
             or "CPulseCell_FireCursors" or "CPulseCell_Inflow_Wait" or "CPulseCell_Inflow_Yield"
             or "CPulseCell_IntervalTimer" or "CPulseCell_LerpCameraSettings"
+            or "CPulseCell_ObservableSwitchState"
             or "CPulseCell_Outflow_ListenForAnimgraphTag"
             or "CPulseCell_Outflow_ListenForEntityOutput" or "CPulseCell_Outflow_PlayDynamicVCD"
             or "CPulseCell_Outflow_PlaySceneBase" or "CPulseCell_Outflow_PlaySequence"

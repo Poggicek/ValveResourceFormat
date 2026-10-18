@@ -29,7 +29,9 @@ public sealed class SoundscapeBank
 {
     private readonly SoundEventBank eventBank;
 
-    // Soundscape names are referenced by map entities as plain strings, matched case-insensitively like everything else here
+    internal SoundEventBank EventBank => eventBank;
+
+    // Map entities reference soundscapes by plain string name, matched case-insensitively
     private readonly Dictionary<string, KVObject> soundscapes = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, SoundscapeEvent[]> resolved = new(StringComparer.OrdinalIgnoreCase);
 
@@ -130,13 +132,11 @@ public sealed class SoundscapeBank
     }
 
     /// <summary>
-    /// Wraps an inline "playrandom"/"playlooping" operator block as an anonymous entry in the main
-    /// <see cref="SoundEventBank"/>, under a synthetic name unique to this soundscape, tagged with a
-    /// "type" so <see cref="SoundEvent.Build"/> dispatches it like any authored vsndevt. The operator's
-    /// own key-values are nested under "operator" rather than merged into the wrapper directly: they use
-    /// the same key names ("volume", "pitch", "position", ...) as the base vsndevt schema but with
-    /// incompatible shapes (e.g. "position" "random" instead of a 3-float vector), which would otherwise
-    /// trip up <see cref="SoundEventDefinition"/>'s own eager parsing of those keys.
+    /// Wraps an inline "playrandom"/"playlooping" operator as an anonymous <see cref="SoundEventBank"/>
+    /// entry under a name unique to its soundscape, tagged with a "type" so <see cref="SoundEvent.Build"/>
+    /// dispatches it like any vsndevt. The operator's key-values are nested under "operator" because their
+    /// names match the vsndevt keys with incompatible shapes (e.g. "position" "random" instead of a 3-float
+    /// vector), which would trip up <see cref="SoundEventDefinition"/>'s eager parsing.
     /// </summary>
     private string RegisterSynthetic(string ownerName, string operatorName, string type, KVObject data, ref int syntheticIndex)
     {

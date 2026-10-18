@@ -4,7 +4,9 @@ namespace ValveResourceFormat
     /// Resource file types.
     /// </summary>
     /// <remarks>
-    /// Friendly names are used
+    /// Members use friendly names rather than file extensions. Each member's <c>Extension</c> attribute
+    /// holds the extension without the compiled <c>_c</c> suffix.
+    /// <see cref="Resource.ResourceType"/> holds the type of a resource that was read.
     /// </remarks>
     public enum ResourceType
     {
@@ -32,7 +34,7 @@ namespace ValveResourceFormat
         AnimationGraph,
 
         /// <summary>
-        /// Animgraph 2 graph for animation behavior. Graph variations have a vnmgraph.+variationname suffix.
+        /// Animgraph 2 graph for animation behavior. Graph variations are named like name.vnmgraph+variation.vnmvar.
         /// </summary>
         [Extension("vnmgraph")]
         NmGraph,
@@ -150,6 +152,18 @@ namespace ValveResourceFormat
         /// </summary>
         [Extension("vvis")]
         WorldVisibility,
+
+        /// <summary>
+        /// World lighting with the global illumination method and irradiance volumes. Legacy, only found in older map compiles.
+        /// </summary>
+        [Extension("vwrlt")]
+        WorldLighting,
+
+        /// <summary>
+        /// World environment maps. Legacy, only found in older map compiles.
+        /// </summary>
+        [Extension("vwenvmap")]
+        WorldEnvironmentMaps,
 
         /// <summary>
         /// Entity lump containing map entities.
@@ -355,12 +369,6 @@ namespace ValveResourceFormat
         /// </remarks>
         [Extension("sbox")]
         SboxManagedResource,
-
-        /// <summary>
-        /// S&amp;box shader.
-        /// </summary>
-        [Extension("shader")]
-        SboxShader,
 
         /// <summary>
         /// Compiled shader. Stored in shaders_{platform}_dir.vpk.

@@ -6,14 +6,18 @@ using ValveResourceFormat.ResourceTypes;
 namespace ValveResourceFormat.Renderer.Particles.Renderers
 {
     /// <summary>
-    /// Renders the particles of a system as one continuous ribbon threaded through them, textured
-    /// along its own arc length in world units.
+    /// Renders the particles of a system as a ribbon threaded through them, textured along its own
+    /// arc length in world units.
     /// </summary>
     /// <remarks>
     /// The chain is a Catmull-Rom spline whose control points are consecutive particles, subdivided
     /// per segment by a screen size driven tesselation level. Unlike a cable the ribbon is a flat
     /// strip rather than a tube, and it tiles its texture by world distance rather than stretching
     /// one copy over the whole run.
+    ///
+    /// <para>The ribbon breaks wherever the <c>m_nSplitField</c> value changes between neighbours,
+    /// and each piece splines only through its own particles. With <c>m_bSortBySegmentID</c> the
+    /// particles are first grouped by that value, in the order each value first appears.</para>
     /// </remarks>
     /// <seealso href="https://s2v.app/SchemaExplorer/cs2/particles/C_OP_RenderRopes">C_OP_RenderRopes</seealso>
     internal class RenderRopes : ParticleFunctionRenderer
@@ -63,6 +67,8 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
         private readonly bool reverseOrder;
         private readonly bool closedLoop;
+        private readonly ParticleField splitField = ParticleField.RopeSegmentId;
+        private readonly bool sortBySegmentId;
         private readonly bool drawAsOpaque;
 
         private readonly bool enableFadingAndClamping;
@@ -74,9 +80,12 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         private readonly float endFadeDot = 2f;
 
         private RopeNode[] nodeScratch = [];
+        private long[] sortKeyScratch = [];
+        private readonly Dictionary<float, int> segmentRanks = [];
 
         private struct RopeNode
         {
+            public float Segment;
             public Vector3 Position;
             public float Radius;
             public Vector3 Color;
@@ -94,7 +103,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             public Vector4 Color { get; init; }
         }
 
-        public RenderRopes(ParticleDefinitionParser parse, RendererContext rendererContext) : base(parse)
+        public RenderRopes(ParticleDefinitionParser parse, RendererContext rendererContext, Scene scene) : base(parse, scene)
         {
             this.rendererContext = rendererContext;
 
@@ -102,7 +111,10 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
             (layers, var textureName) = ParticleTextureLayer.Build(parse, rendererContext, DefaultTextureName, srgbRead: OutputIsColor);
 
-            shader = rendererContext.ShaderLoader.LoadShader(ShaderName, ("S_TEXTURE_LAYERS", (byte)(layers.Length - 1)));
+            var shaderArguments = CreateShaderArguments();
+            shaderArguments["S_TEXTURE_LAYERS"] = (byte)(layers.Length - 1);
+
+            shader = rendererContext.ShaderLoader.LoadShader(ShaderName, shaderArguments);
             (vaoHandle, vertexBufferHandle) = SetupQuadBuffer($"{nameof(RenderRopes)}: {System.IO.Path.GetFileName(textureName)}");
 
             orientationType = parse.Enum("m_nOrientationType", orientationType);
@@ -135,6 +147,8 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
             reverseOrder = parse.Boolean("m_bReverseOrder", reverseOrder);
             closedLoop = parse.Boolean("m_bClosedLoop", closedLoop);
+            splitField = parse.ParticleField("m_nSplitField", splitField);
+            sortBySegmentId = parse.Boolean("m_bSortBySegmentID", sortBySegmentId);
             drawAsOpaque = parse.Boolean("m_bDrawAsOpaque", drawAsOpaque);
 
             enableFadingAndClamping = parse.Boolean("m_bEnableFadingAndClamping", enableFadingAndClamping);
@@ -145,7 +159,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             startFadeDot = parse.Float("m_flStartFadeDot", startFadeDot);
             endFadeDot = parse.Float("m_flEndFadeDot", endFadeDot);
 
-            // Anything outside 0..4 becomes 5, which the engine's own shader folds back onto 4.
+            // Anything outside 0..4 becomes 4.
             if ((uint)orientationType > (uint)ParticleOrientation.PARTICLE_ORIENTATION_SCREENALIGN_TO_PARTICLE_NORMAL)
             {
                 orientationType = ParticleOrientation.PARTICLE_ORIENTATION_SCREENALIGN_TO_PARTICLE_NORMAL;
@@ -191,41 +205,10 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             return Math.Clamp(index, 0, count - 1);
         }
 
-        private static Vector3 CatmullRom(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
-        {
-            var t2 = t * t;
-            var t3 = t2 * t;
-
-            return 0.5f * ((2f * p1)
-                + ((-p0 + p2) * t)
-                + (((2f * p0) - (5f * p1) + (4f * p2) - p3) * t2)
-                + ((-p0 + (3f * p1) - (3f * p2) + p3) * t3));
-        }
-
-        private static float CatmullRom(float p0, float p1, float p2, float p3, float t)
-        {
-            var t2 = t * t;
-            var t3 = t2 * t;
-
-            return 0.5f * ((2f * p1)
-                + ((-p0 + p2) * t)
-                + (((2f * p0) - (5f * p1) + (4f * p2) - p3) * t2)
-                + ((-p0 + (3f * p1) - (3f * p2) + p3) * t3));
-        }
-
-        private static Vector3 CatmullRomTangent(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
-        {
-            var t2 = t * t;
-
-            return 0.5f * ((-p0 + p2)
-                + (((4f * p0) - (10f * p1) + (8f * p2) - (2f * p3)) * t)
-                + (((-3f * p0) + (9f * p1) - (9f * p2) + (3f * p3)) * t2));
-        }
-
         /// <summary>
-        /// Picks one subdivision level for the whole collection from its projected size, as the engine
-        /// does. The ceiling is lowered to the measured value before the floor is applied, so a
-        /// ceiling above 128 or below 1 both leave the count pinned rather than following the floor.
+        /// Picks one subdivision level for the whole collection from its projected size. The ceiling
+        /// is lowered to the measured value before the floor is applied, so a ceiling above 128 or
+        /// below 1 both leave the count pinned rather than following the floor.
         /// </summary>
         private int ComputeTessellationLevel(ReadOnlySpan<RopeNode> nodes, Camera camera)
         {
@@ -335,6 +318,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
             var startFadeSlope = startFadeSize.NextNumber(systemState);
             var endFadeSlope = endFadeSize.NextNumber(systemState);
+            var splits = splitField is >= 0 and not ParticleField.NoneDisabled;
 
             for (var i = 0; i < count; i++)
             {
@@ -359,6 +343,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
                 nodeScratch[i] = new RopeNode
                 {
+                    Segment = splits ? particle.GetScalar(splitField) : 0f,
                     Position = particle.Position,
                     Radius = radius,
                     Color = particle.Color,
@@ -370,13 +355,46 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 };
             }
 
+            if (sortBySegmentId)
+            {
+                GroupBySegment(nodeScratch.AsSpan(0, count));
+            }
+
             return count;
+        }
+
+        /// <summary>
+        /// Stably groups the nodes by segment, ordering the groups by where each segment first appears.
+        /// </summary>
+        private void GroupBySegment(Span<RopeNode> nodes)
+        {
+            if (sortKeyScratch.Length < nodes.Length)
+            {
+                sortKeyScratch = new long[nodes.Length];
+            }
+
+            var keys = sortKeyScratch.AsSpan(0, nodes.Length);
+            segmentRanks.Clear();
+
+            for (var i = 0; i < nodes.Length; i++)
+            {
+                if (!segmentRanks.TryGetValue(nodes[i].Segment, out var rank))
+                {
+                    rank = segmentRanks.Count;
+                    segmentRanks.Add(nodes[i].Segment, rank);
+                }
+
+                keys[i] = ((long)rank << 32) | (uint)i;
+            }
+
+            keys.Sort(nodes);
         }
 
         /// <summary>
         /// Builds the ribbon into the shared vertex buffer and returns how many quads were written.
         /// V is raw world arc length measured between the particles themselves, so subdividing a
-        /// segment keeps the same V span as the straight chord it replaces.
+        /// segment keeps the same V span as the straight chord it replaces. A segment joining two
+        /// rope segments is not drawn, but its length still advances V.
         /// </summary>
         private int UpdateVertices(ParticleCollection particleBag, ParticleSystemState systemState, Camera camera)
         {
@@ -414,14 +432,23 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
                 for (var segment = 0; segment < segmentCount && quadCount < maxQuads; segment++)
                 {
-                    ref readonly var n0 = ref nodes[ResolveIndex(segment - 1, nodeCount)];
                     ref readonly var n1 = ref nodes[ResolveIndex(segment, nodeCount)];
                     ref readonly var n2 = ref nodes[ResolveIndex(segment + 1, nodeCount)];
-                    ref readonly var n3 = ref nodes[ResolveIndex(segment + 2, nodeCount)];
 
                     var vStart = arcLength;
                     var vEnd = arcLength + Vector3.Distance(n1.Position, n2.Position);
                     arcLength = vEnd;
+
+                    if (n1.Segment != n2.Segment)
+                    {
+                        stripAxis = Vector3.Zero;
+                        continue;
+                    }
+
+                    ref readonly var before = ref nodes[ResolveIndex(segment - 1, nodeCount)];
+                    ref readonly var after = ref nodes[ResolveIndex(segment + 2, nodeCount)];
+                    ref readonly var n0 = ref before.Segment == n1.Segment ? ref before : ref n1;
+                    ref readonly var n3 = ref after.Segment == n2.Segment ? ref after : ref n2;
 
                     if (useScalarForTextureCoordinate)
                     {
@@ -470,10 +497,10 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
         /// </summary>
         private RopeSample EvaluateSample(in RopeNode n0, in RopeNode n1, in RopeNode n2, in RopeNode n3, float t, Camera camera)
         {
-            var position = CatmullRom(n0.Position, n1.Position, n2.Position, n3.Position, t);
-            var radius = CatmullRom(n0.Radius, n1.Radius, n2.Radius, n3.Radius, t);
+            var position = CableMeshBuilder.CatmullRom(n0.Position, n1.Position, n2.Position, n3.Position, t);
+            var radius = CableMeshBuilder.CatmullRom(n0.Radius, n1.Radius, n2.Radius, n3.Radius, t);
 
-            var tangent = CatmullRomTangent(n0.Position, n1.Position, n2.Position, n3.Position, t);
+            var tangent = CableMeshBuilder.CatmullRomTangent(n0.Position, n1.Position, n2.Position, n3.Position, t);
             tangent = MathUtils.SafeNormalize(tangent, Vector3.UnitX, ParticleMath.MinimumLengthSquared);
 
             var planeNormal = orientationType switch
@@ -606,7 +633,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             }
 
             ref var head = ref particleBag.Current[0];
-            var sequence = spriteSheetData.Sequences[head.SequenceNumber % spriteSheetData.Sequences.Length];
+            var sequence = spriteSheetData.Sequences[(uint)head.SequenceNumber < (uint)spriteSheetData.Sequences.Length ? head.SequenceNumber : 0];
 
             if (sequence.Frames.Length == 0)
             {
@@ -648,7 +675,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                 return;
             }
 
-            using var _ = SpritecardStateScope(GraphicsContext.RenderState, blendMode, drawAsOpaque);
+            using var _ = SpritecardStateScope(blendMode, drawAsOpaque);
 
             shader.Use();
             VertexArray.Bind(vaoHandle, shader);

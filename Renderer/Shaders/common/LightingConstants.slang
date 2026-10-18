@@ -7,10 +7,10 @@
 
 layout(std140, binding = 1) uniform LightingConstants {
     vec2 g_vLightmapUvScale;
-    uint _lightingPadding1;
+    uint g_nEnvMapDebugColors;       // reflections take each env map's debug colour from its data
     uint g_nNumBarnLights;
     uvec4 g_nNumLights;
-    vec4 g_vSunDirection;            // xyz: surface-to-sun, zero when the scene has no sun
+    vec4 g_vSunDirection;            // xyz: surface-to-sun, zero when the scene has no sun. w: min roughness
     vec4 g_vSunColor;                // rgb: color * brightness, a: flags
     vec4 g_vSunLightBakedShadowMask; // V2: one-hot baked shadow channel mask. V1: baked light index in x (-1 none)
     vec4[MAX_LIGHTS] g_vLightPosition_Type;
@@ -21,6 +21,8 @@ layout(std140, binding = 1) uniform LightingConstants {
     vec4[MAX_LIGHTS] g_vLightFallOff;
 
     vec4 g_vEnvMapSizeConstants;
+
+    vec4 g_vAmbientLightingSH[3];    // per color channel, xyz: against the normal, w: constant
 };
 
 #endif

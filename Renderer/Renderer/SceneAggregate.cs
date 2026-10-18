@@ -10,6 +10,7 @@ namespace ValveResourceFormat.Renderer
     /// <summary>
     /// Scene node for instanced rendering of aggregated world geometry.
     /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/worldrenderer/AggregateSceneObject_t">AggregateSceneObject_t</seealso>
     public class SceneAggregate : SceneNode
     {
         /// <summary>Gets the shared renderable mesh for all fragments in this aggregate.</summary>
@@ -26,9 +27,6 @@ namespace ValveResourceFormat.Renderer
 
         /// <summary>Gets or sets the compaction buffer index used for GPU-driven draw count, or -1 if not compacted.</summary>
         public int CompactionIndex { get; set; } = -1;
-
-        /// <summary>Gets whether any fragment of this aggregate is visible this frame.</summary>
-        public bool AnyChildrenVisible { get; internal set; }
 
         /// <summary>Gets the per-instance transform matrices used for instanced drawing.</summary>
         public List<OpenTK.Mathematics.Matrix3x4> InstanceTransforms { get; } = [];
@@ -47,6 +45,7 @@ namespace ValveResourceFormat.Renderer
         /// <param name="MaxObjectScale">Largest instance scale in the cluster, scales the projected size metric.</param>
         /// <param name="SwitchDistances">Ascending per-level thresholds, first entry 0, compared against a
         /// screen-size derived distance metric rather than raw world distance.</param>
+        /// <seealso href="https://s2v.app/SchemaExplorer/cs2/worldrenderer/AggregateLODSetup_t">AggregateLODSetup_t</seealso>
         public readonly record struct LodSetup(Vector3 Origin, float MaxObjectScale, float[] SwitchDistances);
 
         /// <summary>Gets the baked per-cluster LOD setups, empty when this aggregate has no LOD switching.</summary>
@@ -60,6 +59,7 @@ namespace ValveResourceFormat.Renderer
         /// <summary>
         /// Single drawable fragment within an aggregate with independent bounds.
         /// </summary>
+        /// <seealso href="https://s2v.app/SchemaExplorer/cs2/worldrenderer/AggregateMeshInfo_t">AggregateMeshInfo_t</seealso>
         public sealed class Fragment : SceneNode
         {
             /// <summary>Gets the aggregate that owns this fragment.</summary>
@@ -90,10 +90,12 @@ namespace ValveResourceFormat.Renderer
             }
         }
 
-        /// <summary>Initializes the scene aggregate, loading or resolving the mesh from the model.</summary>
+        /// <summary>Initializes the scene aggregate with replacements for the materials of its model.</summary>
         /// <param name="scene">Owning scene.</param>
         /// <param name="model">Model resource providing the embedded or referenced mesh.</param>
-        public SceneAggregate(Scene scene, Model model)
+        /// <param name="materialTable">Maps materials of the model to the ones drawn instead, or <see langword="null"/> to draw the model's own.</param>
+        /// <param name="shaderArguments">Shader combos set on every draw call, or <see langword="null"/> for the scene's.</param>
+        public SceneAggregate(Scene scene, Model model, Dictionary<string, string>? materialTable = null, IReadOnlyDictionary<string, byte>? shaderArguments = null)
             : base(scene)
         {
             var embeddedMeshes = model.GetEmbeddedMeshes().ToList();
@@ -101,7 +103,7 @@ namespace ValveResourceFormat.Renderer
             // TODO: Perhaps use ModelSceneNode.LoadMeshes
             if (embeddedMeshes.Count != 0)
             {
-                RenderMesh = new RenderableMesh(embeddedMeshes.First().Mesh, 0, Scene, model, isAggregate: true);
+                RenderMesh = new RenderableMesh(embeddedMeshes.First().Mesh, 0, Scene, model, materialTable, isAggregate: true, shaderArguments: shaderArguments);
 
                 if (embeddedMeshes.Count > 1)
                 {
@@ -125,7 +127,7 @@ namespace ValveResourceFormat.Renderer
                     throw new InvalidDataException($"Failed to load {refMesh.MeshName}");
                 }
 
-                RenderMesh = new RenderableMesh(meshData, refMesh.MeshIndex, Scene, model, isAggregate: true);
+                RenderMesh = new RenderableMesh(meshData, refMesh.MeshIndex, Scene, model, materialTable, isAggregate: true, shaderArguments: shaderArguments);
             }
 
             LocalBoundingBox = RenderMesh.BoundingBox;
@@ -140,10 +142,11 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Parses fragment data from the scene object and adds each fragment to the scene.</summary>
         /// <param name="aggregateSceneObject">KV3 object describing the aggregate's fragment list.</param>
         /// <param name="rootTransform">Where the world node this aggregate belongs to is placed.</param>
-        public void LoadFragments(KVObject aggregateSceneObject, Matrix4x4 rootTransform)
+        /// <param name="worldNode">The world node this aggregate belongs to, which holds precomputed fragment visibility.</param>
+        public void LoadFragments(KVObject aggregateSceneObject, Matrix4x4 rootTransform, WorldNode? worldNode = null)
         {
             LoadLodSetups(aggregateSceneObject, rootTransform);
-            Fragments.AddRange(CreateFragments(aggregateSceneObject, rootTransform));
+            Fragments.AddRange(CreateFragments(aggregateSceneObject, rootTransform, worldNode));
             foreach (var fragment in Fragments)
             {
                 Scene.Add(fragment, false);
@@ -267,8 +270,8 @@ namespace ValveResourceFormat.Renderer
             drawCall.FirstMeshlet = RenderMesh.Meshlets.Count;
             drawCall.NumMeshlets = 1;
 
-            // Packed meshlet bounds are normalized within the parent draw bounds, so a min of zero and a
-            // max of 1023 in every component unpacks back to exactly the draw call's own bounding box.
+            // Packed bounds are normalized to the draw bounds, so min 0 and max 1023 in every component
+            // unpack to the draw call's own box.
             const uint PackedBoundsMax = (1023u << 20) | (1023u << 10) | 1023u;
 
             RenderMesh.Meshlets.Add(new Meshlet
@@ -282,7 +285,7 @@ namespace ValveResourceFormat.Renderer
             });
         }
 
-        private IEnumerable<Fragment> CreateFragments(KVObject aggregateSceneObject, Matrix4x4 rootTransform)
+        private IEnumerable<Fragment> CreateFragments(KVObject aggregateSceneObject, Matrix4x4 rootTransform, WorldNode? worldNode)
         {
             var aggregateMeshes = aggregateSceneObject.GetArray("m_aggregateMeshes");
 
@@ -314,6 +317,7 @@ namespace ValveResourceFormat.Renderer
                         LightProbeVolumePrecomputedHandshake = lightProbeVolumePrecomputedHandshake,
                         Flags = flags,
                         Transform = rootTransform,
+                        PrecomputedVisClusters = worldNode?.GetAggregateMeshVisClusters(fragmentData),
                     };
 
                     yield return fragment;
@@ -352,6 +356,7 @@ namespace ValveResourceFormat.Renderer
                     Flags = flags,
                     LodGroupMask = lodGroupMask,
                     LodSetupIndex = lodSetupIndex,
+                    PrecomputedVisClusters = worldNode?.GetAggregateMeshVisClusters(fragmentData),
                     Transform = fragmentTransform != null
                         ? fragmentTransform.ToMatrix4x4() * rootTransform
                         : rootTransform,

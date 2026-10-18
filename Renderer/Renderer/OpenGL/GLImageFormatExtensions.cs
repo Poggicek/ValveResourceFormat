@@ -3,10 +3,9 @@ using OpenTK.Graphics.OpenGL;
 namespace ValveResourceFormat.Renderer
 {
     /// <summary>
-    /// Maps <see cref="ImageFormat"/>, the engine format vocabulary, to the OpenGL equivalents.
-    ///
-    /// This makes the renderer unaware of graphics API specific formats, and we can later map these to anything else.
-    /// The facts that hold for every API live on <see cref="Utils.ImageFormatExtensions"/> instead.
+    /// Maps <see cref="ImageFormat"/> to OpenGL equivalents, keeping the renderer
+    /// unaware of API specific formats so they can later map to anything else.
+    /// Facts that hold for every API live on <see cref="Utils.ImageFormatExtensions"/>.
     /// </summary>
     public static class GLImageFormatExtensions
     {
@@ -33,7 +32,7 @@ namespace ValveResourceFormat.Renderer
 
             (_, true) => throw new NotImplementedException($"Format {format} has no sRGB variant"),
 
-            (ImageFormat.I8, _) => SizedInternalFormat.R8,
+            (ImageFormat.I8 or ImageFormat.R8_UNORM, _) => SizedInternalFormat.R8,
             (ImageFormat.R16, _) => SizedInternalFormat.R16,
             (ImageFormat.RG1616, _) => SizedInternalFormat.Rg16,
             (ImageFormat.RGBA16161616, _) => SizedInternalFormat.Rgba16,
@@ -61,7 +60,7 @@ namespace ValveResourceFormat.Renderer
         {
             ImageFormat.RGBA8888 => PixelFormat.Rgba,
             ImageFormat.BGRA8888 => PixelFormat.Bgra,
-            ImageFormat.I8 => PixelFormat.Red,
+            ImageFormat.I8 or ImageFormat.R8_UNORM => PixelFormat.Red,
             ImageFormat.R16 => PixelFormat.Red,
             ImageFormat.RG1616 => PixelFormat.Rg,
             ImageFormat.RGBA16161616 => PixelFormat.Rgba,
@@ -84,7 +83,7 @@ namespace ValveResourceFormat.Renderer
         {
             ImageFormat.RGBA8888 => PixelType.UnsignedByte,
             ImageFormat.BGRA8888 => PixelType.UnsignedByte,
-            ImageFormat.I8 => PixelType.UnsignedByte,
+            ImageFormat.I8 or ImageFormat.R8_UNORM => PixelType.UnsignedByte,
             ImageFormat.R16 => PixelType.UnsignedShort,
             ImageFormat.RG1616 => PixelType.UnsignedShort,
             ImageFormat.RGBA16161616 => PixelType.UnsignedShort,

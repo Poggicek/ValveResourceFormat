@@ -13,13 +13,16 @@ namespace ValveResourceFormat.Renderer.Buffers
 
         /// <summary>UV scale applied when sampling the lightmap atlas.</summary>
         public Vector2 LightmapUvScale;
-        /// <summary>Padding to maintain 16-byte struct alignment.</summary>
-        public uint _LightingPadding1;
+        /// <summary>Non-zero to shade reflections with each environment map's debug colour instead of its texture.</summary>
+        public uint EnvMapDebugColors;
         /// <summary>Number of active barn lights in the scene.</summary>
         public uint NumBarnLights;
         /// <summary>Per-type light counts (index matches light type enum).</summary>
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] private readonly uint[] NumLights;
-        /// <summary>Surface-to-sun direction (XYZ) of the environment light, or zero when the scene has none.</summary>
+        /// <summary>
+        /// Surface-to-sun direction (XYZ) of the environment light, or zero when the scene has none, and the roughness its
+        /// specular highlight is no sharper than (W).
+        /// </summary>
         public Vector4 SunDirection;
         /// <summary>Sun color: linear color premultiplied by brightness (RGB), render-specular flag (W).</summary>
         public Vector4 SunColor;
@@ -43,6 +46,13 @@ namespace ValveResourceFormat.Renderer.Buffers
 
         /// <summary>Mip level and size constants used when sampling environment maps.</summary>
         public Vector4 EnvMapSizeConstants;
+
+        /// <summary>Red channel of the ambient lighting: weights against the normal (XYZ) and a constant (W).</summary>
+        public Vector4 AmbientLightingSHR;
+        /// <summary>Green channel of the ambient lighting.</summary>
+        public Vector4 AmbientLightingSHG;
+        /// <summary>Blue channel of the ambient lighting.</summary>
+        public Vector4 AmbientLightingSHB;
 
         /// <summary>Gets or sets the number of lightmapped lights in the scene.</summary>
         public uint StaticLightCount { get => NumLights[0]; set => NumLights[0] = value; }

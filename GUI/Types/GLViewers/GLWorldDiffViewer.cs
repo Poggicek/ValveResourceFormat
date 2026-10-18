@@ -7,6 +7,7 @@ using GUI.Utils;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Blocks;
 using ValveResourceFormat.Renderer;
+using ValveResourceFormat.Renderer.Editor.Entities;
 using ValveResourceFormat.Renderer.Materials;
 using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.Renderer.Shaders;
@@ -92,6 +93,10 @@ namespace GUI.Types.GLViewers
             {
                 Camera = Renderer.Camera,
             };
+            OldRenderer.EntitySystem.ToolVisuals = new HammerEntityVisuals();
+
+            // Each build compiles its own visibility, which would hide different geometry in each and show up as changes
+            Scene.EnablePvsCulling = false;
         }
 
         public override void Dispose()
@@ -317,23 +322,13 @@ namespace GUI.Types.GLViewers
         // A layer or collision group that only the old build has must still be listed, or it could not be shown
         protected override IEnumerable<SceneNode> NodesForLayerLists => base.NodesForLayerLists.Concat(OldRenderer.Scene.AllNodes);
 
-        protected override void ShowPhysicsGroups(HashSet<string> physicsGroups, bool renderTranslucent)
+        protected override void ApplyVisibility()
         {
-            base.ShowPhysicsGroups(physicsGroups, renderTranslucent);
-            ShowPhysicsGroups(OldRenderer, physicsGroups, renderTranslucent);
+            base.ApplyVisibility();
+            ApplyVisibilityTo(OldRenderer);
 
-            shownPhysicsGroups = [.. physicsGroups.Select(static group => group.Trim())];
+            shownPhysicsGroups = [.. ChosenPhysicsGroups.Select(static group => group.Trim())];
             changedCollisionDirty = true;
-        }
-
-        protected override void SetEnabledLayers(HashSet<string> layers)
-        {
-            base.SetEnabledLayers(layers);
-
-            foreach (var scene in OldRenderer.Scenes)
-            {
-                scene.SetEnabledLayers(layers);
-            }
         }
 
         /// <summary>Carries the settings the sidebar changes on the new build over to the old one.</summary>
@@ -465,7 +460,7 @@ namespace GUI.Types.GLViewers
                 depthTest: true, depthWrite: true, depthFunc: RsComparison.CloserEqual, blend: false);
 
             triangles.Shader.Use();
-            triangles.Draw(primitive: PrimitiveType.Triangles);
+            triangles.Draw(0, triangles.VertexCount, primitive: PrimitiveType.Triangles);
         }
 
         /// <summary>Boxes the selected difference, over everything.</summary>
@@ -702,8 +697,6 @@ namespace GUI.Types.GLViewers
         /// <summary>Flies the camera to a difference and selects what it is about, in whichever build has it.</summary>
         public void FocusDiffEntry(MapDiffEntry entry)
         {
-            Debug.Assert(SelectedNodeRenderer != null);
-
             focusedEntry = entry;
 
             if (entry.NewEntity != null && LoadedWorld != null
@@ -713,7 +706,7 @@ namespace GUI.Types.GLViewers
                 return;
             }
 
-            SelectedNodeRenderer.SelectNode(null);
+            Selection.Clear();
 
             var bounds = entry.Bounds;
 

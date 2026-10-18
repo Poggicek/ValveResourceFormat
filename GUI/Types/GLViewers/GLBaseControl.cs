@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Windows.Forms;
 using GUI.Controls;
@@ -37,6 +38,12 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
     /// <summary>Whether the mouse has moved while a button was held since the last mouse down.</summary>
     protected bool MouseDragged;
 
+    /// <summary>
+    /// Set when the viewport lets go of the cursor (focus lost, or escape in walk mode) so mouse look
+    /// does not take it straight back; cleared by clicking back into the viewport.
+    /// </summary>
+    protected bool MouseReleased;
+
     private readonly Lock inputStateLock = new();
     private Point pendingMouseDelta;
     private int pendingMouseWheelDelta;
@@ -58,6 +65,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
                 if (value)
                 {
                     mouseLookNeedsRebase = true;
+                    GLControl?.BeginInvoke(() => HideCursorForMouseLook(Cursor.Position, touch: false));
                 }
                 else
                 {
@@ -233,8 +241,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
     /// <summary>
     /// Intercepts the GL control's high-frequency input messages before WinForms translates each one
     /// into freshly allocated event args (MouseEventArgs, KeyEventArgs, PreviewKeyDownEventArgs).
-    /// Swallowing them here also sinks all shortcuts into the control, which the previous event-based
-    /// path did via PreviewKeyDown.IsInputKey and KeyEventArgs.SuppressKeyPress.
+    /// Swallowing them here also sinks all shortcuts into the control.
     /// </summary>
     public bool PreFilterMessage(ref Message m)
     {
@@ -362,6 +369,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         MouseDelta = Point.Empty;
         currentDragIsTouch = false;
         mouseLookNeedsRebase = true;
+        MouseReleased = true;
         GrabbedMouse = false;
         RestoreCursorAfterDrag();
     }
@@ -467,6 +475,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         InitialMousePosition = new Point(e.X, e.Y);
         MouseDelta = Point.Empty;
         MouseDragged = false;
+        MouseReleased = false;
         currentDragIsTouch = IsTouchOrPenInput();
         mouseLookNeedsRebase = true;
 
@@ -511,6 +520,26 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
                 RestoreCursorAfterDrag();
             }
         }
+    }
+
+    private void HideCursorForMouseLook(Point restorePosition, bool touch)
+    {
+        if (cursorHiddenForDrag || GLControl == null)
+        {
+            return;
+        }
+
+        cursorHiddenForDrag = true;
+        mouseLookRestorePosition = restorePosition;
+        mouseLookNeedsRebase = true;
+
+        if (!touch)
+        {
+            Cursor.Clip = GLControl.RectangleToScreen(GLControl.ClientRectangle);
+            BeginRawMouseLook();
+        }
+
+        SetCursorVisible(false);
     }
 
     private void RestoreCursorAfterDrag()
@@ -575,9 +604,8 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         }
     }
 
-    // Cursor visibility is a counter Windows also writes to, resetting it when a mouse is added or
-    // removed, so hiding cannot assume its own show will be what brings it back. Drive it to the state
-    // that is wanted instead of stepping it once and trusting the arithmetic.
+    // Windows resets the cursor visibility counter when a mouse is added or removed, so a hide cannot
+    // count on its own show to undo it. Drive the counter to the wanted state instead of stepping it once.
     private static void SetCursorVisible(bool visible)
     {
         for (var attempt = 0; attempt < 8; attempt++)
@@ -690,21 +718,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         if (delta != Point.Empty)
         {
             MouseDragged = true;
-
-            if (!cursorHiddenForDrag)
-            {
-                cursorHiddenForDrag = true;
-                mouseLookRestorePosition = MousePreviousPosition;
-                mouseLookNeedsRebase = true;
-
-                if (!touch)
-                {
-                    Cursor.Clip = GLControl.RectangleToScreen(GLControl.ClientRectangle);
-                    BeginRawMouseLook();
-                }
-
-                SetCursorVisible(false);
-            }
+            HideCursorForMouseLook(MousePreviousPosition, touch);
         }
 
         // Touch and pen are absolute digitizers: warping the cursor doesn't move the contact point
@@ -932,6 +946,9 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
             RenderLoopThread.SetCurrentGLControl(this);
             prewarmed.Wait();
             RenderLoopThread.UnsetCurrentGLControl(this);
+
+            // The warm-up runs on the render loop thread, rethrow its failure to whoever is loading this viewer
+            PrewarmFailure?.Throw();
         }
     }
 
@@ -983,6 +1000,8 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         MainFramebuffer.Initialize();
 
         OnGLLoad();
+
+        RendererContext.ShaderLoader.LinkLoadedShaders();
     }
 
     /// <summary>Reports how long the buffer swap blocked the render thread.</summary>
@@ -1004,6 +1023,8 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
     private bool PrewarmPending { get; set; }
 
+    private ExceptionDispatchInfo? PrewarmFailure;
+
     /// <summary>Runs the warm-up loading is waiting on, if any, and reports whether it did. Called by the
     /// render loop thread, which is the one the driver has to see the draws come from.</summary>
     public bool TryPrewarm()
@@ -1017,6 +1038,10 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         {
             using var lockedGl = MakeCurrent();
             PrewarmRenderer();
+        }
+        catch (Exception e)
+        {
+            PrewarmFailure = ExceptionDispatchInfo.Capture(e);
         }
         finally
         {
@@ -1037,13 +1062,6 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         var message = System.Runtime.InteropServices.Marshal.PtrToStringUTF8(pMessage, length);
         var error = $"[{severityStr} {sourceStr} {typeStr}] {message}";
 
-#if DEBUG
-        if (type is DebugType.DebugTypePerformance or DebugType.DebugTypeUndefinedBehavior)
-        {
-            error += $" ({DescribeObject(ObjectLabelIdentifier.Program, GL.GetInteger(GetPName.CurrentProgram))}, {DescribeObject(ObjectLabelIdentifier.Framebuffer, GL.GetInteger(GetPName.DrawFramebufferBinding))})";
-        }
-#endif
-
         switch (type)
         {
             case DebugType.DebugTypeError: Log.Error("OpenGL", error); break;
@@ -1057,21 +1075,6 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         }
 #endif
     }
-
-#if DEBUG
-    private static string DescribeObject(ObjectLabelIdentifier identifier, int name)
-    {
-        var kind = identifier == ObjectLabelIdentifier.Program ? "program" : "framebuffer";
-
-        if (name == 0)
-        {
-            return $"{kind} 0";
-        }
-
-        GL.GetObjectLabel(identifier, name, 256, out _, out var label);
-        return string.IsNullOrEmpty(label) ? $"{kind} {name}" : $"{kind} {name} '{label}'";
-    }
-#endif
 
     protected static readonly DebugProc OpenGLDebugMessageDelegate = OnDebugMessage;
 

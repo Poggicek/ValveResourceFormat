@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using OpenTK.Graphics.OpenGL;
@@ -13,6 +15,8 @@ internal enum Counter
     SceneObjectInView,
     SceneObjectCulledByPvs,
     ShadowCasterCulledByPvs,
+    SceneObjectCulledByVisibilityBox,
+    ShadowCasterCulledByVisibilityBox,
     DrawCall,
     MeshletDispatch,
     MaterialChange,
@@ -59,7 +63,7 @@ public class PerfStats
     private static readonly string[] LightGroupNames = ["omni", "spot", "barn", "rect", "directional"];
     private static readonly string[] LightCostLabels = ["Static Lights:    ", "Stationary Lights:", "Dynamic Lights:   "];
 
-    // Declared after LightGroupNames so the instance created here sees it initialized (static initializers run in textual order).
+    // Must follow LightGroupNames, as static initializers run in textual order.
     /// <summary>Counters for the frame currently being rendered. Collects nothing while <see cref="Capture"/> is off.</summary>
     internal static PerfStats Active { get; private set; } = new();
 
@@ -119,7 +123,7 @@ public class PerfStats
         public bool Pending { get; set; }
     }
 
-    // The CPU runs ahead of the GPU, so results take a few frames to land and the displayed count lags accordingly.
+    // The CPU runs ahead of the GPU, so the displayed count lags a few frames.
     private const int TriangleFrameCount = 4;
     private readonly TriangleQueryFrame[] triangleFrames = CreateTriangleFrames();
     private int triangleFrameWrite;
@@ -381,8 +385,8 @@ public class PerfStats
     /// </summary>
     /// <param name="textRenderer">Text renderer to use for display.</param>
     /// <param name="camera">Camera for positioning text.</param>
-    /// <param name="scenes">Every scene drawn, main scene first, used to compute map totals.</param>
-    /// <param name="lightBinner">The main view's light binner, or <see langword="null"/> before the first frame.</param>
+    /// <param name="scenes">Every scene drawn, main scene first.</param>
+    /// <param name="lightBinner">Light binner of the main view, or <see langword="null"/> before the first frame.</param>
     /// <param name="x">X position (0-1 as fraction of screen width).</param>
     /// <param name="y">Y position (0-1 as fraction of screen height).</param>
     /// <param name="scale">Text scale.</param>
@@ -419,34 +423,41 @@ public class PerfStats
 
         AddLine("Render Stats", new Color32(255, 200, 0));
 
-        AddLine($"Triangles:        rendered {trianglesRendered:N0} of {totalTriangles:N0}", valueColor);
-        AddLine($"Scene objects:    drawn {counts[(int)Counter.SceneObjectInView] - counts[(int)Counter.SceneObjectCulledByPvs]:N0} of {totalSceneObjects:N0} scene objects ({counts[(int)Counter.SceneObjectCulledByPvs]:N0} vis) in {counts[(int)Counter.DrawCall]:N0} draw calls and {counts[(int)Counter.MeshletDispatch]:N0} meshlet dispatches ({totalDrawCalls:N0} total draw calls)", valueColor);
-        AddLine($"Shadow casters:   {counts[(int)Counter.ShadowCasterCulledByPvs]:N0} rejected by the sun visibility row", valueColor);
-        AddLine($"Materials:        {counts[(int)Counter.MaterialChange]:N0} changes between drawcalls, {totalMaterials:N0} total materials in scene", valueColor);
-        AddLine($"VAOs:             {counts[(int)Counter.VaoChange]:N0} binds this frame, {scene.RendererContext.MeshBufferCache.VertexArrayObjectCount:N0} cached", valueColor);
-        AddLine($"Render state:     {counts[(int)Counter.RenderStateApply]:N0} applies, {counts[(int)Counter.RenderStateGroupEmit]:N0} actual changes, {counts[(int)Counter.RenderStateDriverCall]:N0} driver calls this frame", valueColor);
+        AddLine(string.Create(CultureInfo.InvariantCulture, $"Triangles:        rendered {trianglesRendered:N0} of {totalTriangles:N0}"), valueColor);
+        AddLine(string.Create(CultureInfo.InvariantCulture, $"Scene objects:    drawn {counts[(int)Counter.SceneObjectInView] - counts[(int)Counter.SceneObjectCulledByPvs] - counts[(int)Counter.SceneObjectCulledByVisibilityBox]:N0} of {totalSceneObjects:N0} scene objects ({counts[(int)Counter.SceneObjectCulledByPvs]:N0} vis) in {counts[(int)Counter.DrawCall]:N0} draw calls and {counts[(int)Counter.MeshletDispatch]:N0} meshlet dispatches ({totalDrawCalls:N0} total draw calls)"), valueColor);
+        AddLine(string.Create(CultureInfo.InvariantCulture, $"Shadow casters:   {counts[(int)Counter.ShadowCasterCulledByPvs]:N0} rejected by the sun visibility row"), valueColor);
+
+        if (scenes.Any(static scene => scene.VisibilityBoxes.Count > 0))
+        {
+            var insideBoxes = scenes.Sum(static scene => scene.VisibilityBoxes.View.InsideCount);
+            var outsideBoxes = scenes.Sum(static scene => scene.VisibilityBoxes.View.OutsideCount);
+
+            AddLine(string.Create(CultureInfo.InvariantCulture, $"Visibility boxes: {counts[(int)Counter.SceneObjectCulledByVisibilityBox]:N0} scene objects and {counts[(int)Counter.ShadowCasterCulledByVisibilityBox]:N0} shadow casters culled by {insideBoxes:N0} inside and {outsideBoxes:N0} outside boxes"), valueColor);
+        }
+
+        AddLine(string.Create(CultureInfo.InvariantCulture, $"Materials:        {counts[(int)Counter.MaterialChange]:N0} changes between drawcalls, {totalMaterials:N0} total materials in scene"), valueColor);
+        AddLine(string.Create(CultureInfo.InvariantCulture, $"VAOs:             {counts[(int)Counter.VaoChange]:N0} binds this frame, {scene.RendererContext.MeshBufferCache.VertexArrayObjectCount:N0} cached"), valueColor);
+        AddLine(string.Create(CultureInfo.InvariantCulture, $"Render state:     {counts[(int)Counter.RenderStateApply]:N0} applies, {counts[(int)Counter.RenderStateGroupEmit]:N0} actual changes, {counts[(int)Counter.RenderStateDriverCall]:N0} driver calls this frame"), valueColor);
 
         for (var cost = 0; cost < LightCostLabels.Length; cost++)
         {
             AddLine($"{LightCostLabels[cost]} in view {FormatLightCounts(lightsInView[cost], totalLights[cost])} out of total {FormatLightCounts(totalLights[cost], totalLights[cost])}", valueColor);
         }
 
-        AddLine($"Shadow maps:      {counts[(int)Counter.DirectionalShadowMap]:N0} directional, {counts[(int)Counter.BarnShadowMap]:N0} barn, {counts[(int)Counter.ShadowFaceSubmitted]:N0} faces binned, {counts[(int)Counter.ShadowFaceMaskCulled]:N0} gpu culled, {floatMetrics[(int)Metric.ShadowAtlasUsage]:0%} atlas utilization", valueColor);
-        AddLine($"Particle Systems: {counts[(int)Counter.ParticleSystem]:N0} particle systems rendered in {counts[(int)Counter.ParticleDraw]:N0} draw calls out of {totalParticleSystems:N0} total particle systems", valueColor);
+        AddLine(string.Create(CultureInfo.InvariantCulture, $"Shadow maps:      {counts[(int)Counter.DirectionalShadowMap]:N0} directional, {counts[(int)Counter.BarnShadowMap]:N0} barn, {counts[(int)Counter.ShadowFaceSubmitted]:N0} faces binned, {counts[(int)Counter.ShadowFaceMaskCulled]:N0} gpu culled, {floatMetrics[(int)Metric.ShadowAtlasUsage]:0%} atlas utilization"), valueColor);
+        AddLine(string.Create(CultureInfo.InvariantCulture, $"Particle Systems: {counts[(int)Counter.ParticleSystem]:N0} particle systems rendered in {counts[(int)Counter.ParticleDraw]:N0} draw calls out of {totalParticleSystems:N0} total particle systems"), valueColor);
         if (lightBinner != null)
         {
             AddLine($"Light binning:    {FormatBinnerStats(lightBinner.Stats)}", valueColor);
         }
 
-        AddLine($"Sound cache:      {counts[(int)Counter.SoundCacheMegabytes]:N0} MB decoded, {counts[(int)Counter.SoundDecodeQueue]:N0} queued to decode", valueColor);
+        AddLine(string.Create(CultureInfo.InvariantCulture, $"Sound cache:      {counts[(int)Counter.SoundCacheMegabytes]:N0} MB decoded, {counts[(int)Counter.SoundDecodeQueue]:N0} queued to decode"), valueColor);
         AddLine($"Tonemapping:      {FormatTonemapStats()}", valueColor);
     }
 
     /// <summary>
-    /// One line of what auto exposure decided: what the frame metered at, what it was aiming for, and
-    /// the exposure it reached within the range the post process volume allows. Exposure resting on one
-    /// of those bounds is called out, because a pinned exposure means the metering has no say in how
-    /// bright the image ends up and only the scene's own brightness does.
+    /// Auto exposure state: the metered luminance, its target, and the exposure within the post process
+    /// volume's range. Exposure pinned to a bound is flagged, as the scene's own brightness then decides.
     /// </summary>
     private string FormatTonemapStats()
     {
@@ -458,7 +469,7 @@ public class PerfStats
 
         if (max <= 0f)
         {
-            return $"scene luminance {luminance:0.0000}, fixed exposure, tonemap scalar {scalar:0.00}, gamma {gamma:0.00}";
+            return string.Create(CultureInfo.InvariantCulture, $"scene luminance {luminance:0.0000}, fixed exposure, tonemap scalar {scalar:0.00}, gamma {gamma:0.00}");
         }
 
         var exposure = floatMetrics[(int)Metric.Exposure];
@@ -466,13 +477,13 @@ public class PerfStats
             : exposure >= max * 0.999f ? " (pinned high)"
             : string.Empty;
 
-        return $"scene luminance {luminance:0.0000} aiming at {floatMetrics[(int)Metric.ExposureTargetLuminance]:0.0000}, "
-            + $"exposure {exposure:0.00} of [{min:0.00}-{max:0.00}]{pinned}, tonemap scalar {scalar:0.00}, gamma {gamma:0.00}";
+        return string.Create(CultureInfo.InvariantCulture, $"scene luminance {luminance:0.0000} aiming at {floatMetrics[(int)Metric.ExposureTargetLuminance]:0.0000}, "
+            + $"exposure {exposure:0.00} of [{min:0.00}-{max:0.00}]{pinned}, tonemap scalar {scalar:0.00}, gamma {gamma:0.00}");
     }
 
     /// <summary>
-    /// One line of what binning produced. Counts are per barn light face, the unit the binner works in,
-    /// which is not the set the shadow line reports - that counts faces submitted for shadow rendering.
+    /// Binning results, counted per barn light face, the unit the binner works in. Not the same set as
+    /// the shadow line, which counts faces submitted for shadow rendering.
     /// </summary>
     private static string FormatBinnerStats(LightBinner.BinnerStats stats)
     {
@@ -481,7 +492,7 @@ public class PerfStats
             return "off, all masks visible";
         }
 
-        return $"{stats.Faces:N0} of {stats.FaceSlots:N0} barn faces, {stats.Probes:N0} of {stats.ProbeSlots:N0} probes binned, {stats.HullVertices:N0} hull verts, {stats.MaskBytes / 1024.0:0.#} KB masks, slices to {stats.SliceFar:N0} at {stats.SliceWidth:N0} each";
+        return string.Create(CultureInfo.InvariantCulture, $"{stats.Faces:N0} of {stats.FaceSlots:N0} barn faces, {stats.Probes:N0} of {stats.ProbeSlots:N0} probes binned, {stats.HullVertices:N0} hull verts, {stats.MaskBytes / 1024.0:0.#} KB masks, slices to {stats.SliceFar:N0} at {stats.SliceWidth:N0} each");
     }
 
     /// <summary>Resets per-frame counters, reads back the previous frame's results.</summary>

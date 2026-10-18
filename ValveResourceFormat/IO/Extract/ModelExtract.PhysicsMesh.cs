@@ -11,8 +11,8 @@ using RnShapes = ValveResourceFormat.ResourceTypes.RubikonPhysics.Shapes;
 namespace ValveResourceFormat.IO;
 
 /// <summary>
-/// Writes a model's collision shapes out as DMX: the hulls and meshes each physics part carries, and
-/// the surface and collision tag markup naming the material they compile against.
+/// Writes each physics part's hulls and meshes as DMX, with the surface and collision tag markup
+/// naming the material.
 /// </summary>
 partial class ModelExtract
 {
@@ -97,13 +97,13 @@ partial class ModelExtract
             var parentBone = physAggregateData.GetParentBoneName(partIndex);
             var bindPose = partIndex < bindPoses.Length ? bindPoses[partIndex] : Matrix4x4.Identity;
 
-            foreach (var hull in physicsPart.Shape.Hulls)
+            foreach (var hull in physicsPart.Shape.GetAllHulls())
             {
                 PhysHullsToExtract.Add((hull, GetDmxFileName_ForEmbeddedMesh("hull", i++), parentBone, bindPose));
                 StoreSurfaceTagCombo(hull);
             }
 
-            foreach (var mesh in physicsPart.Shape.Meshes)
+            foreach (var mesh in physicsPart.Shape.GetAllMeshes())
             {
                 PhysMeshesToExtract.Add((mesh, GetDmxFileName_ForEmbeddedMesh("phys", i++), parentBone, bindPose));
 

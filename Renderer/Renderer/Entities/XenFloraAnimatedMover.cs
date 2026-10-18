@@ -9,6 +9,7 @@ namespace ValveResourceFormat.Renderer.Entities;
 /// HL:A's <c>xen_flora_animatedmover</c>: a creature that travels a chain of <c>path_corner</c> entities,
 /// optionally trailing <c>particle_effect</c>.
 /// </summary>
+/// <seealso href="https://s2v.app/SchemaExplorer/hlvr/server/CXenFloraAnimatedMover">CXenFloraAnimatedMover</seealso>
 public sealed class XenFloraAnimatedMover : BaseModelEntity
 {
     /// <summary>A stop along the path, in the mover's own space.</summary>
@@ -91,13 +92,13 @@ public sealed class XenFloraAnimatedMover : BaseModelEntity
             return;
         }
 
-        localOffset = KeyValues.GetBooleanProperty("uselocaloffset") ? Origin - path[0].Position : Vector3.Zero;
+        localOffset = KeyValues.GetBooleanProperty("uselocaloffset") ? WorldOrigin - path[0].Position : Vector3.Zero;
 
-        SetOriginAndAngles(path[0].Position + localOffset, Angles);
+        SetWorldOriginAndAngles(path[0].Position + localOffset, WorldAngles);
         SnapInterpolation();
     }
 
-    /// <summary>Moves along the path by one tick, waiting at stops and turning to face the way it goes.</summary>
+    /// <summary>Moves along the path, pausing at stops.</summary>
     protected override void PhysicsSimulate(float tickInterval)
     {
         if (path.Count < 2 || finished)
@@ -152,9 +153,9 @@ public sealed class XenFloraAnimatedMover : BaseModelEntity
 
         var angles = faceForward
             ? EntityTransformHelper.ForwardDirectionToEulerAngles(segment)
-            : Angles;
+            : WorldAngles;
 
-        SetOriginAndAngles(Vector3.Lerp(fromNode.Position, toNode.Position, distanceIntoSegment / segmentLength) + localOffset, angles);
+        SetWorldOriginAndAngles(Vector3.Lerp(fromNode.Position, toNode.Position, distanceIntoSegment / segmentLength) + localOffset, angles);
     }
 
     private void ArriveAt(int index)
@@ -163,21 +164,13 @@ public sealed class XenFloraAnimatedMover : BaseModelEntity
         distanceIntoSegment = 0f;
         waitTimer = path[index].Wait;
 
-        SetOriginAndAngles(path[index].Position + localOffset, Angles);
+        SetWorldOriginAndAngles(path[index].Position + localOffset, WorldAngles);
     }
 
-    // Walks the target chain starting at the path_corner named startName, in the same way path_track/
-    // func_tracktrain follow theirs. The loop back index is set when the chain itself points back to an
-    // already-visited node (an authored closed loop), so a looping mover can honor that entry point
-    // instead of always restarting from the first node.
+    // Follows the target chain from the path_corner named startName. A chain pointing back to a visited
+    // node is an authored loop: that node becomes the loop back index, so a looping mover re-enters there.
     private void ResolvePath(string? startName)
     {
-        // Stops are placed in the world, the mover's origin is in the space its spawner put it in
-        if (!Matrix4x4.Invert(ParentTransform, out var worldToLocal))
-        {
-            return;
-        }
-
         var visited = new Dictionary<BaseEntity, int>();
         var current = FindPathCorner(startName);
 
@@ -191,15 +184,14 @@ public sealed class XenFloraAnimatedMover : BaseModelEntity
 
             visited[current] = path.Count;
             path.Add(new PathNode(
-                Vector3.Transform(current.Transform.Translation, worldToLocal),
-                current.Data?.GetFloatProperty("speed") ?? 0f,
-                current.Data?.GetFloatProperty("wait") ?? 0f));
+                current.WorldOrigin,
+                current.SpawnData?.GetFloatProperty("speed") ?? 0f,
+                current.SpawnData?.GetFloatProperty("wait") ?? 0f));
 
-            current = FindPathCorner(current.Data?.GetStringProperty("target"));
+            current = FindPathCorner(current.SpawnData?.GetStringProperty("target"));
         }
     }
 
-    // Only in this entity's own spawn group: a 3D sky shares names with the map it is placed in
     private BaseEntity? FindPathCorner(string? targetName)
     {
         if (string.IsNullOrEmpty(targetName))
@@ -207,7 +199,7 @@ public sealed class XenFloraAnimatedMover : BaseModelEntity
             return null;
         }
 
-        var candidate = EntitySystem.FindAllByTargetName(targetName, Scene).FirstOrDefault();
+        var candidate = EntitySystem.FindByTargetName(targetName);
 
         return candidate?.Classname.Equals("path_corner", StringComparison.OrdinalIgnoreCase) == true ? candidate : null;
     }

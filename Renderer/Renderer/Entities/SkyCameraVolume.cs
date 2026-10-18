@@ -59,7 +59,7 @@ public sealed class SkyCameraVolume : BaseEntity
             return;
         }
 
-        Target = EntitySystem.FindByTargetName(targetName, Scene) as SkyCameraVolumeTarget;
+        Target = EntitySystem.FindByTargetName(targetName) as SkyCameraVolumeTarget;
 
         if (Target == null)
         {

@@ -38,10 +38,12 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         private readonly RenderMaterial material;
         private readonly float spriteSize;
 
+        public override bool IsPointMarker => true;
+
         public SpriteSceneNode(Scene scene, RendererContext renderContext, Resource resource, Vector3 position)
             : base(scene)
         {
-            material = renderContext.MaterialLoader.LoadMaterial(resource);
+            material = renderContext.MaterialLoader.LoadMaterial(resource, scene.LightingInfo.CreateShaderArguments());
 
             // Forcefully clamp sprites so they don't render extra pixels on edges
             foreach (var texture in material.Textures.Values)

@@ -10,6 +10,7 @@ using GUI.Controls;
 using GUI.Forms;
 using GUI.Utils;
 using ValvePak;
+using ValveResourceFormat.IO;
 
 namespace GUI.Types.PackageViewer
 {
@@ -185,7 +186,7 @@ namespace GUI.Types.PackageViewer
                 {
                     var fileName = $"{VrfGuiContext.CurrentPackage.FileName}{(VrfGuiContext.CurrentPackage.IsDirVPK ? "_dir" : "")}.vpk";
 
-                    progressDialog.SetProgress($"Searching '{fileName}'");
+                    progressDialog.SetProgress($"Searching '{Path.GetFileName(fileName)}'");
 
                     var archiveMatches = SearchForContentsInFile(fileName, pattern, sortedEntriesInDirVpk);
                     results.AddRange(archiveMatches);
@@ -205,9 +206,16 @@ namespace GUI.Types.PackageViewer
                         },
                         archiveIndex =>
                         {
-                            var fileName = $"{VrfGuiContext.CurrentPackage.FileName}_{archiveIndex:D3}.vpk";
+                            // Archives that only hold empty entries are never read
+                            if (!sortedEntriesPerArchive.TryGetValue(archiveIndex, out var archiveEntries))
+                            {
+                                Interlocked.Increment(ref archivesScanned);
+                                return;
+                            }
 
-                            var archiveMatches = SearchForContentsInFile(fileName, pattern, sortedEntriesPerArchive[archiveIndex]);
+                            var fileName = PackageFileNames.GetArchiveChunkFile(VrfGuiContext.CurrentPackage.FileName!, archiveIndex);
+
+                            var archiveMatches = SearchForContentsInFile(fileName, pattern, archiveEntries);
 
                             if (archiveMatches.Count > 0)
                             {
