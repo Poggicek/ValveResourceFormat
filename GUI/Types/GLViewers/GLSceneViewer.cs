@@ -108,6 +108,10 @@ namespace GUI.Types.GLViewers
 
         private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer fpsText = new("FPS: 10000  CPU: 10000.0ms  GPU: 10000.0ms");
         private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer speedText = new("Speed: 100000.0 u/s");
+        private const string ShowPosTemplate = "pos: -100000.00 -100000.00 -100000.00";
+        private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer showPosText = new(ShowPosTemplate);
+        private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer showAngText = new(ShowPosTemplate);
+        private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer showVelText = new(ShowPosTemplate);
         private int frametimeQuery1;
         private int frametimeQuery2;
 
@@ -753,6 +757,37 @@ namespace GUI.Types.GLViewers
             });
         }
 
+        /// <summary>Draws the view position, angles and speed in the top right corner, like cl_showpos.</summary>
+        private void DrawShowPos()
+        {
+            const float Scale = 14f;
+            const float LineHeight = 16f;
+
+            var camera = Renderer.Camera;
+            var position = camera.Location;
+            var angles = camera.GetQAngle();
+
+            // Placed by the widest line it can show rather than its own width, so it does not shift as digits change
+            var x = camera.WindowSize.X - ValveResourceFormat.Renderer.TextRenderer.MeasureTextWidth(ShowPosTemplate, Scale) - 4f;
+            var y = 18f;
+
+            void AddLine(ValveResourceFormat.Renderer.TextRenderer.TextMemory text)
+            {
+                TextRenderer.AddText(new ValveResourceFormat.Renderer.TextRenderer.TextRenderRequest
+                {
+                    X = x,
+                    Y = y,
+                    Scale = Scale,
+                    Text = text,
+                });
+                y += LineHeight;
+            }
+
+            AddLine(showPosText.Format($"pos: {position.X,10:0.00} {position.Y,10:0.00} {position.Z,10:0.00}"));
+            AddLine(showAngText.Format($"ang: {angles.X,10:0.00} {angles.Y,10:0.00} {angles.Z,10:0.00}"));
+            AddLine(showVelText.Format($"vel: {Input.Velocity.Length(),10:0.00}"));
+        }
+
         /// <summary>Draws viewer specific lines over the scene, after the frame's camera is final.</summary>
         protected virtual void RenderOverlayLines(Scene.RenderContext renderContext)
         {
@@ -1001,6 +1036,8 @@ namespace GUI.Types.GLViewers
                     CenterHorizontal = true,
                 }, Renderer.Camera);
             }
+
+            DrawShowPos();
 
             if (showVisDebug && Scene.VoxelVisibility != null)
             {
