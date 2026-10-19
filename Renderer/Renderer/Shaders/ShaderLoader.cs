@@ -47,6 +47,13 @@ namespace ValveResourceFormat.Renderer.Shaders
         public int ShaderCount => CachedShaders.Count;
 
         /// <summary>
+        /// Gets or sets whether loaded shaders are compiled into GPU programs. When <see langword="false"/>, a shader only
+        /// carries what is read from its source, such as its uniforms and render modes, for loading scenes that are never
+        /// drawn. Drawing with such a shader draws nothing.
+        /// </summary>
+        public bool CompileShaders { get; set; } = true;
+
+        /// <summary>
         /// Gets every reserved texture sampler declared by the loaded shaders. Read from the source, so it is known before
         /// linking. Unlike <see cref="Shader.ReservedTexturesUsed"/>, it keeps samplers behind dropped combos. Only grows,
         /// so a renderer can poll it for additions; see <see cref="MaterialLoader.ShaderTextures"/>.
@@ -271,19 +278,24 @@ namespace ValveResourceFormat.Renderer.Shaders
                     sources.Remove(ShaderProgramType.Fragment);
                 }
 
-                var shaderObjects = new int[sources.Count];
-                var shaderSources = new string[sources.Count];
-                var s = 0;
-                foreach (var (stage, source) in sources)
+                var compile = CompileShaders;
+                var shaderObjects = compile ? new int[sources.Count] : [];
+
+                if (compile)
                 {
-                    shaderObjects[s] = GraphicsDevice.CreateShader(stage, shaderFileName);
-                    shaderSources[s] = source!;
-                    s++;
+                    var shaderSources = new string[sources.Count];
+                    var s = 0;
+                    foreach (var (stage, source) in sources)
+                    {
+                        shaderObjects[s] = GraphicsDevice.CreateShader(stage, shaderFileName);
+                        shaderSources[s] = source!;
+                        s++;
+                    }
+
+                    CompileShaderObjects(shaderObjects, shaderSources, shaderName, arguments, parsedData);
                 }
 
-                CompileShaderObjects(shaderObjects, shaderSources, shaderName, arguments, parsedData);
-
-                var shaderProgram = GraphicsDevice.CreateProgram(shaderFileName);
+                var shaderProgram = compile ? GraphicsDevice.CreateProgram(shaderFileName) : 0;
 
                 // Known before linking, as the renderer binds textures before the first draw that samples them.
                 // Only grows.
@@ -299,6 +311,7 @@ namespace ValveResourceFormat.Renderer.Shaders
                     Defines = parsedData.Defines,
                     GlobalsLayout = parsedData.GlobalsLayout,
                     Program = shaderProgram,
+                    IsCompiled = compile,
                     ShaderObjects = shaderObjects,
                     RenderModes = parsedData.RenderModes,
                     IgnoreMaterialData = parsedData.IgnoreMaterialData,
@@ -310,6 +323,11 @@ namespace ValveResourceFormat.Renderer.Shaders
                     // linker trims each variant's own set down to what its combos kept.
                     ReservedTexturesUsed = [.. parsedData.ReservedTextures],
                 };
+
+                if (!compile)
+                {
+                    return shader;
+                }
 
                 foreach (var shaderObj in shaderObjects)
                 {
