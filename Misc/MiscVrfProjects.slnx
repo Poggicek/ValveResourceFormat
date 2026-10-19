@@ -1,6 +1,7 @@
 <Solution>
   <Project Path="VrfFgdParser/VrfFgdParser.csproj" />
   <Project Path="RenderTest/RenderTest.csproj" />
+  <Project Path="MapSmokeTest/MapSmokeTest.csproj" />
   <Project Path="SchemaConverter/SchemaConverter.csproj" />
   <Project Path="ShaderValidator/ShaderValidator.csproj" />
   <Project Path="SourceGenerators/SourceGenerators.csproj" />

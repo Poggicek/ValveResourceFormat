@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="OpenTK.Windowing.Desktop" Version="4.9.4" />
+    <ProjectReference Include="..\..\ValveResourceFormat\ValveResourceFormat.csproj" />
+    <ProjectReference Include="..\..\Renderer\Renderer.csproj" />
+  </ItemGroup>
+</Project>
