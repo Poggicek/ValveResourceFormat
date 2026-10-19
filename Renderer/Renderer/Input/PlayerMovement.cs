@@ -14,6 +14,10 @@ public sealed class PlayerMovement : IPlayerController
     // Frame times are clamped to this, so a stall is not owed back
     private const float MaxFrameTime = 0.1f;
 
+    // cl_pitchup and cl_pitchdown, in degrees
+    private const float PitchUp = 89f;
+    private const float PitchDown = 89f;
+
     // The landing dip: how far the eye sinks and comes back, and over how long
     private const float LandingDipDepth = 3f;
     private const float LandingDipTime = 0.2f;
@@ -165,6 +169,9 @@ public sealed class PlayerMovement : IPlayerController
         Collision.Entities = Input.EntitySystem;
 
         var held = MapButtons(Input.Keys);
+
+        // The aim itself is clamped, so mouse movement past the limit is lost rather than wound back first
+        camera.Pitch = Math.Clamp(camera.Pitch, float.DegreesToRadians(-PitchUp), float.DegreesToRadians(PitchDown));
         var viewAngles = camera.GetQAngle();
 
         if (Initialize)
