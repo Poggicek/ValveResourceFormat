@@ -3,8 +3,8 @@ using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
-using OpenTK.Windowing.Common;
-using OpenTK.Windowing.Desktop;
+using OpenTK.Graphics.OpenGL;
+using OpenTK.Windowing.GraphicsLibraryFramework;
 using ValvePak;
 using ValveResourceFormat.IO;
 using ValveResourceFormat.Renderer;
@@ -370,16 +370,7 @@ internal static partial class MapSmokeTest
     {
         var logger = new ConsoleErrorLogger();
 
-        using var window = new NativeWindow(new()
-        {
-            APIVersion = GLEnvironment.RequiredVersion,
-            Flags = ContextFlags.ForwardCompatible | ContextFlags.Offscreen,
-            Profile = ContextProfile.Core,
-            StartVisible = false,
-            Title = "Map Smoke Test",
-        });
-
-        window.MakeCurrent();
+        using var window = HiddenGLWindow.Create();
 
         GLEnvironment.Initialize(logger);
 
@@ -486,6 +477,9 @@ internal static partial class MapSmokeTest
     {
         using var context = new RendererContext(fileLoader, logger);
 
+        // Nothing is drawn, and a shader that does not compile is not what fails a map
+        context.ShaderLoader.CompileShaders = false;
+
         var graphicsContext = context.Device.CreateContext();
         graphicsContext.Begin();
         GLEnvironment.SetDefaultRenderState();
@@ -521,7 +515,6 @@ internal static partial class MapSmokeTest
                 renderer.Camera.SetFromTransformMatrix(spawn);
             }
 
-            input.TryLoadViewmodel(scene, entitySystem);
             input.EntitySystem = entitySystem;
             entitySystem.SpawnPlayer(input.PlayerMovement, scene);
 
@@ -571,6 +564,54 @@ internal sealed class NestedMapFileLoader(Package addonPackage, string addonPath
         }
 
         return base.FindFile(file, logNotFound);
+    }
+}
+
+/// <summary>
+/// A hidden window whose GL context is current on the creating thread. Made through GLFW directly, because OpenTK's
+/// <c>NativeWindow</c> also enumerates joysticks, which takes longer than loading a small map.
+/// </summary>
+internal sealed unsafe class HiddenGLWindow : IDisposable
+{
+    private readonly Window* Handle;
+
+    private HiddenGLWindow(Window* handle)
+    {
+        Handle = handle;
+    }
+
+    public static HiddenGLWindow Create()
+    {
+        if (!GLFW.Init())
+        {
+            throw new InvalidOperationException("Failed to initialize GLFW.");
+        }
+
+        GLFW.WindowHint(WindowHintBool.Visible, false);
+        GLFW.WindowHint(WindowHintClientApi.ClientApi, ClientApi.OpenGlApi);
+        GLFW.WindowHint(WindowHintInt.ContextVersionMajor, GLEnvironment.RequiredVersion.Major);
+        GLFW.WindowHint(WindowHintInt.ContextVersionMinor, GLEnvironment.RequiredVersion.Minor);
+        GLFW.WindowHint(WindowHintOpenGlProfile.OpenGlProfile, OpenGlProfile.Core);
+        GLFW.WindowHint(WindowHintBool.OpenGLForwardCompat, true);
+
+        var handle = GLFW.CreateWindow(1, 1, "Map Smoke Test", null, null);
+
+        if (handle == null)
+        {
+            GLFW.Terminate();
+            throw new InvalidOperationException($"Failed to create an OpenGL {GLEnvironment.RequiredVersion} context.");
+        }
+
+        GLFW.MakeContextCurrent(handle);
+        GL.LoadBindings(new GLFWBindingsContext());
+
+        return new HiddenGLWindow(handle);
+    }
+
+    public void Dispose()
+    {
+        GLFW.DestroyWindow(Handle);
+        GLFW.Terminate();
     }
 }
 

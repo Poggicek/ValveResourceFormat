@@ -18,6 +18,9 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <summary>Gets or sets the OpenGL program object handle.</summary>
         public int Program { get; set; }
 
+        /// <summary>Gets a value indicating whether a GPU program was compiled for this shader. See <see cref="ShaderLoader.CompileShaders"/>.</summary>
+        public bool IsCompiled { get; init; } = true;
+
         /// <summary>Gets a value indicating whether the shader link status has been checked.</summary>
         public bool IsLoaded { get; private set; }
 
@@ -228,6 +231,11 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <returns><see langword="true"/> if the shader linked successfully; otherwise <see langword="false"/>.</returns>
         public bool EnsureLoaded()
         {
+            if (!IsCompiled)
+            {
+                return false;
+            }
+
             if (!IsLoaded)
             {
                 IsLoaded = true;

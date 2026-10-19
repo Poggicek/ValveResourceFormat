@@ -1,4 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="OpenTK.Windowing.Desktop" Version="4.9.4" />
     <ProjectReference Include="..\..\ValveResourceFormat\ValveResourceFormat.csproj" />
