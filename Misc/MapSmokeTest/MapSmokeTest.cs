@@ -37,6 +37,7 @@ internal static partial class MapSmokeTest
         public TimeSpan Timeout { get; set; } = TimeSpan.FromMinutes(10);
         public float SimulateSeconds { get; set; } = 5f;
         public string? LogDirectory { get; set; }
+        public string? GameInfo { get; set; }
         public bool InProcess { get; set; }
     }
 
@@ -77,7 +78,7 @@ internal static partial class MapSmokeTest
         }
 
         return options.InProcess
-            ? RunInProcess([.. vpks.Select(vpk => vpk.Path)], options.SimulateSeconds)
+            ? RunInProcess([.. vpks.Select(vpk => vpk.Path)], options.SimulateSeconds, options.GameInfo)
             : RunIsolated(vpks, options).GetAwaiter().GetResult();
     }
 
@@ -90,6 +91,8 @@ internal static partial class MapSmokeTest
               --timeout <sec>    kill a vpk's process after this long (default 600)
               --seconds <sec>    simulated entity time after loading (default 5)
               --logs <folder>    write the full output of every vpk that did not pass
+              --game <folder>    mount this game for vpks outside of it, such as downloaded workshop items
+                                 (the game folder, a mod folder, or its gameinfo.gi)
               --in-process       load in this process, one vpk after another, to debug a failure
             """);
     }
@@ -117,6 +120,9 @@ internal static partial class MapSmokeTest
                 case "--logs":
                     options.LogDirectory = NextValue();
                     break;
+                case "--game":
+                    options.GameInfo = FindGameInfo(NextValue());
+                    break;
                 case InProcessFlag:
                     options.InProcess = true;
                     break;
@@ -139,6 +145,36 @@ internal static partial class MapSmokeTest
         }
 
         return options;
+    }
+
+    /// <summary>
+    /// Finds the gameinfo.gi of a game, given the file itself, the mod folder holding it, or the game folder above
+    /// its mods, where the one that is not core is the game.
+    /// </summary>
+    private static string FindGameInfo(string path)
+    {
+        const string GameInfoName = "gameinfo.gi";
+
+        if (File.Exists(path))
+        {
+            return Path.GetFullPath(path);
+        }
+
+        var inFolder = Path.Join(path, GameInfoName);
+
+        if (File.Exists(inFolder))
+        {
+            return Path.GetFullPath(inFolder);
+        }
+
+        var inMod = Directory.Exists(path)
+            ? Directory.EnumerateDirectories(path)
+                .Where(mod => !Path.GetFileName(mod).Equals("core", StringComparison.OrdinalIgnoreCase))
+                .Select(mod => Path.Join(mod, GameInfoName))
+                .FirstOrDefault(File.Exists)
+            : null;
+
+        return inMod != null ? Path.GetFullPath(inMod) : throw new ArgumentException($"No {GameInfoName} found in {path}.");
     }
 
     /// <summary>Finds the vpks to load, each named relative to the folder it was found in.</summary>
@@ -273,6 +309,13 @@ internal static partial class MapSmokeTest
         process.StartInfo.ArgumentList.Add(InProcessFlag);
         process.StartInfo.ArgumentList.Add("--seconds");
         process.StartInfo.ArgumentList.Add(options.SimulateSeconds.ToString(CultureInfo.InvariantCulture));
+
+        if (options.GameInfo != null)
+        {
+            process.StartInfo.ArgumentList.Add("--game");
+            process.StartInfo.ArgumentList.Add(options.GameInfo);
+        }
+
         process.StartInfo.ArgumentList.Add(vpk);
 
         // Both streams go to one buffer, so a crash trace lands after the map it happened on
@@ -366,7 +409,7 @@ internal static partial class MapSmokeTest
 
     private const string MapStartPrefix = "loading ";
 
-    private static int RunInProcess(List<string> vpks, float simulateSeconds)
+    private static int RunInProcess(List<string> vpks, float simulateSeconds, string? gameInfo)
     {
         var logger = new ConsoleErrorLogger();
 
@@ -380,7 +423,7 @@ internal static partial class MapSmokeTest
         {
             try
             {
-                mapsLoaded += LoadVpk(vpk, logger, simulateSeconds);
+                mapsLoaded += LoadVpk(vpk, logger, simulateSeconds, gameInfo);
             }
             catch (Exception e)
             {
@@ -397,13 +440,19 @@ internal static partial class MapSmokeTest
     }
 
     /// <returns>The number of maps in the vpk, including those in the map vpks it holds.</returns>
-    private static int LoadVpk(string vpk, ConsoleErrorLogger logger, float simulateSeconds)
+    private static int LoadVpk(string vpk, ConsoleErrorLogger logger, float simulateSeconds, string? gameInfo)
     {
         using var package = new Package();
         package.OptimizeEntriesForBinarySearch(StringComparison.OrdinalIgnoreCase);
         package.Read(vpk);
 
         using var fileLoader = new NestedMapFileLoader(package, vpk, logger);
+
+        // Mounted on top of anything found by walking up from the vpk, which finds nothing for a downloaded item
+        if (gameInfo != null)
+        {
+            fileLoader.FindAndLoadSearchPaths(gameInfo);
+        }
 
         var mapCount = 0;
 
@@ -499,11 +548,6 @@ internal static partial class MapSmokeTest
             var entitySystem = renderer.EntitySystem;
 
             var world = WorldLoader.LoadMap(mapPath, scene, entitySystem);
-
-            foreach (var spawnGroup in world.SpawnGroups)
-            {
-                renderer.AddSpawnGroup(spawnGroup);
-            }
 
             NavMeshSceneNode.AddNavNodesToScene(world.NavMesh, scene, world.NavigationHullNames);
             NavSpaceSceneNode.AddToScene(world.NavSpace, scene);
