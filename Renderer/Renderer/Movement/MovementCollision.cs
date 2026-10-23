@@ -95,9 +95,11 @@ internal sealed class MovementCollision
             CastEntities(center, delta, halfExtents, collisionName);
         }
 
+        // A trace that hits nothing keeps the end it was given, which start + delta can miss by a unit in
+        // the last place
         if (Candidates.Count == 0)
         {
-            return Miss(start, delta);
+            return new GameTrace { StartPos = start, EndPos = end, Fraction = 1f };
         }
 
         // Start-solid hits first, then the nearest. Entity filtering never rejects anything here, as
