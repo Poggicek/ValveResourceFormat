@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
@@ -69,6 +70,9 @@ namespace GUI.Types.GLViewers
         protected bool ShowSpeed { get; set; }
         private bool showPhysicsTraces;
         private PhysicsTraceDebugRenderer? physicsTraceRenderer;
+        private DemoPlaybackDebugRenderer? demoPlaybackRenderer;
+        private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer demoProgressText = new(96);
+        private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer demoErrorText = new(96);
 
         private enum PerfDisplay
         {
@@ -111,6 +115,8 @@ namespace GUI.Types.GLViewers
         private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer showPosText = new(ShowPosTemplate);
         private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer showAngText = new(ShowPosTemplate);
         private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer showVelText = new(ShowPosTemplate);
+        private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer showMaxVelText = new(ShowPosTemplate);
+        private float showPosMaxSpeed;
         private int frametimeQuery1;
         private int frametimeQuery2;
 
@@ -140,6 +146,9 @@ namespace GUI.Types.GLViewers
             // Delete GL resources before the base disposes the GL context
             physicsTraceRenderer?.Delete();
             physicsTraceRenderer = null;
+
+            demoPlaybackRenderer?.Delete();
+            demoPlaybackRenderer = null;
 
             selectionVisuals?.Delete();
             selectionVisuals = null;
@@ -742,7 +751,48 @@ namespace GUI.Types.GLViewers
 
             AddLine(showPosText.Format($"pos: {position.X,10:0.00} {position.Y,10:0.00} {position.Z,10:0.00}"));
             AddLine(showAngText.Format($"ang: {angles.X,10:0.00} {angles.Y,10:0.00} {angles.Z,10:0.00}"));
-            AddLine(showVelText.Format($"vel: {Input.Velocity.Length(),10:0.00}"));
+            // Horizontal speed only, so jumping and falling do not count
+            var speed = Input.Velocity.AsVector2().Length();
+
+            // The max starts over from the take-off speed whenever a jump leaves the ground
+            showPosMaxSpeed = Input.PlayerMovement.Jumped ? speed : MathF.Max(showPosMaxSpeed, speed);
+
+            AddLine(showVelText.Format($"vel: {speed,10:0.00}"));
+            AddLine(showMaxVelText.Format($"max: {showPosMaxSpeed,10:0.00}"));
+        }
+
+        /// <summary>Draws how far a demo playback has got and how far it is from where the server had the player.</summary>
+        private void DrawDemoPlaybackStatus()
+        {
+            if (Input.PlayerMovement.Playback is not { } playback)
+            {
+                return;
+            }
+
+            var state = playback.Finished ? "  finished" : playback.Paused ? "  paused" : string.Empty;
+            var mismatch = playback.FirstMismatchTick is { } tick
+                ? string.Create(CultureInfo.InvariantCulture, $"first mismatch at tick {tick}")
+                : "exact so far";
+
+            TextRenderer.AddTextRelative(new ValveResourceFormat.Renderer.TextRenderer.TextRenderRequest
+            {
+                X = 0.5f,
+                Y = 0.07f,
+                Scale = 14f,
+                Color = Color32.White,
+                Text = demoProgressText.Format($"demo tick {playback.ServerTick}  {playback.CommandsPlayed} / {playback.CommandsPlayable}{state}"),
+                CenterHorizontal = true,
+            }, Renderer.Camera);
+
+            TextRenderer.AddTextRelative(new ValveResourceFormat.Renderer.TextRenderer.TextRenderRequest
+            {
+                X = 0.5f,
+                Y = 0.1f,
+                Scale = 14f,
+                Color = playback.FirstMismatchTick == null ? Color32.Green : new Color32(1f, 0.5f, 0f, 1f),
+                Text = demoErrorText.Format($"off by {playback.OriginError:0.000} u, {playback.VelocityError:0.000} u/s  {mismatch}"),
+                CenterHorizontal = true,
+            }, Renderer.Camera);
         }
 
         /// <summary>Draws viewer specific lines over the scene, after the frame's camera is final.</summary>
@@ -890,6 +940,12 @@ namespace GUI.Types.GLViewers
                     Scene.OcclusionDebug.Render();
                 }
 
+                if (Input.PlayerMovement.Playback != null)
+                {
+                    demoPlaybackRenderer ??= new DemoPlaybackDebugRenderer(Scene.RendererContext);
+                    demoPlaybackRenderer.Render(Input.PlayerMovement, drawPlayerHull: !Input.WalkMode);
+                }
+
                 if (showPhysicsTraces && !Renderer.EntitySystem.PhysicsWorld.IsEmpty)
                 {
                     physicsTraceRenderer ??= new PhysicsTraceDebugRenderer(Scene.RendererContext);
@@ -987,6 +1043,7 @@ namespace GUI.Types.GLViewers
             }
 
             DrawShowPos();
+            DrawDemoPlaybackStatus();
 
             if (showVisDebug && Scene.VoxelVisibility != null)
             {

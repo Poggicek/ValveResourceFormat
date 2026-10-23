@@ -293,6 +293,8 @@ public class UserInput
 
         Camera.Roll = 0f;
 
+        var playerMoved = false;
+
         if (following && OrbitTarget is { } followTarget)
         {
             HandleFollowOrbit(followTarget);
@@ -307,6 +309,8 @@ public class UserInput
         }
         else
         {
+            playerMoved = true;
+
             PlayerMovement.WeaponMaxSpeed = Viewmodel?.WeaponMaxSpeed;
 
             // The view turns before movement samples it, so this frame's command carries this frame's aim
@@ -317,6 +321,12 @@ public class UserInput
             PlayerMovement.ProcessMovement(Camera, deltaTime);
 
             Velocity = PlayerMovement.Velocity;
+        }
+
+        // A demo plays on while the camera is off the player
+        if (!playerMoved)
+        {
+            PlayerMovement.UpdateDetachedPlayback(deltaTime);
         }
 
         Viewmodel?.ProcessInput(this, Renderer.Uptime);

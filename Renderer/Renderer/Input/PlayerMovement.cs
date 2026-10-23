@@ -1,5 +1,6 @@
 using ValveResourceFormat.Renderer.Entities;
 using ValveResourceFormat.Renderer.Movement;
+using ValveResourceFormat.Renderer.Movement.Demo;
 
 namespace ValveResourceFormat.Renderer.Input;
 
@@ -42,6 +43,11 @@ public sealed class PlayerMovement : IPlayerController
 
     private Vector3 WeaponPunch;
     private SurfacePropertyTable? surfaces;
+    private WeaponSpeedTable? weaponSpeeds;
+
+    // The playback the player was last placed for, and the aim of the command it last played
+    private DemoPlayback? StartedPlayback;
+    private Vector3 PlaybackViewAngles;
 
     // Buttons seen since the entity tick last collected them, and what it collected that time
     private TrackedKeys PendingButtons;
@@ -67,6 +73,29 @@ public sealed class PlayerMovement : IPlayerController
 
     /// <summary>Gets or sets whether the player is placed at the camera on the next frame.</summary>
     public bool Initialize { get; set; }
+
+    /// <summary>
+    /// Gets or sets a demo whose commands move the player instead of the input, or null to walk.
+    /// The player is placed where the demo starts on the next frame.
+    /// </summary>
+    public DemoPlayback? Playback { get; set; }
+
+    /// <summary>
+    /// Plays the demo on without placing the camera, for watching it from a camera flying freely.
+    /// </summary>
+    /// <param name="deltaTime">Seconds since the last frame.</param>
+    public void UpdateDetachedPlayback(float deltaTime)
+    {
+        if (Playback is not { } playback)
+        {
+            return;
+        }
+
+        Collision.World = Input.PhysicsWorld;
+        Collision.Entities = Input.EntitySystem;
+
+        ProcessPlayback(null, deltaTime, playback);
+    }
 
     /// <summary>Gets or sets the held weapon's max speed, or null when holding nothing.</summary>
     public float? WeaponMaxSpeed
@@ -168,6 +197,15 @@ public sealed class PlayerMovement : IPlayerController
         Collision.World = Input.PhysicsWorld;
         Collision.Entities = Input.EntitySystem;
 
+        if (Playback is { } playback)
+        {
+            Initialize = false;
+            ProcessPlayback(camera, deltaTime, playback);
+            return;
+        }
+
+        StartedPlayback = null;
+
         var held = MapButtons(Input.Keys);
 
         // The aim itself is clamped, so mouse movement past the limit is lost rather than wound back first
@@ -204,6 +242,80 @@ public sealed class PlayerMovement : IPlayerController
         SoundEffects.Update();
     }
 
+    private void ProcessPlayback(Camera? camera, float deltaTime, DemoPlayback playback)
+    {
+        if (StartedPlayback != playback && !BeginPlayback(playback))
+        {
+            Playback = null;
+            return;
+        }
+
+        WeaponPunch *= MathF.Exp(-Vars.ViewPunchDecay * deltaTime);
+        Jumped = false;
+
+        if (!playback.Paused)
+        {
+            Accumulator += Math.Clamp(deltaTime, 0.0001f, MaxFrameTime);
+            var ticks = (int)(Accumulator / TickInterval);
+            Accumulator = MathF.Max(0f, Accumulator - (float)(ticks * TickInterval));
+
+            for (var i = 0; i < ticks && !playback.Finished; i++)
+            {
+                PreviousOrigin = Services.AbsOrigin;
+                PreviousViewOffset = Services.ViewOffsetZ;
+                PreviousDuckAmount = Services.DuckAmount;
+
+                if (playback.Step() is { } command)
+                {
+                    PlaybackViewAngles = command.ViewAngles;
+                    Jumped |= Services.Jumped;
+                }
+            }
+
+            // Held on the last tick once it is over, not between it and the one before
+            if (playback.Finished)
+            {
+                Accumulator = 0f;
+                PreviousOrigin = Services.AbsOrigin;
+                PreviousViewOffset = Services.ViewOffsetZ;
+                PreviousDuckAmount = Services.DuckAmount;
+            }
+        }
+
+        // The view is the recorded player's
+        camera?.SetFromQAngle(PlaybackViewAngles);
+
+        PlaceCamera(camera);
+        SoundEffects.Update();
+    }
+
+    private bool BeginPlayback(DemoPlayback playback)
+    {
+        surfaces ??= SurfacePropertyTable.Load(Input.RendererContext.FileLoader);
+        weaponSpeeds ??= WeaponSpeedTable.Load(Input.RendererContext.FileLoader);
+        Services.Surfaces = surfaces;
+
+        if (playback.Begin(Services, weaponSpeeds.Get) is not { } viewAngles)
+        {
+            return false;
+        }
+
+        StartedPlayback = playback;
+        PlaybackViewAngles = viewAngles;
+        Recorder.Mark("demo");
+
+        Accumulator = 0f;
+        InLandingDip = false;
+        LastFrameFallVelocity = 0f;
+        PreviousOrigin = Services.AbsOrigin;
+        PreviousViewOffset = Services.ViewOffsetZ;
+        PreviousDuckAmount = Services.DuckAmount;
+        WeaponPunch = Vector3.Zero;
+
+        CacheSounds();
+        return true;
+    }
+
     private void RunTick()
     {
         PreviousOrigin = Services.AbsOrigin;
@@ -219,7 +331,7 @@ public sealed class PlayerMovement : IPlayerController
     /// Draws the player one tick behind the newest simulated state, blended between the last two ticks by
     /// how far the frame is into the next. The view angles are the newest ones, not blended.
     /// </summary>
-    private void PlaceCamera(Camera camera)
+    private void PlaceCamera(Camera? camera)
     {
         var fraction = TickFraction;
 
@@ -233,6 +345,13 @@ public sealed class PlayerMovement : IPlayerController
         ClampEyeUnderCeiling(ref eye);
 
         EyePosition = eye;
+
+        // Without a camera the player is only placed for drawing
+        if (camera == null)
+        {
+            return;
+        }
+
         camera.Location = eye;
 
         var punch = Services.GetViewPunchAngle(RenderTime);

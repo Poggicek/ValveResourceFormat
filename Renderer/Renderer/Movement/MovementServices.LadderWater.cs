@@ -17,10 +17,15 @@ internal sealed partial class MovementServices
     /// <returns>Whether the player is on a ladder.</returns>
     private bool LadderMove(MoveData mv)
     {
+        if (ActualMoveType == MoveType.NoClip)
+        {
+            return false;
+        }
+
         // Already on a ladder keep pressing into it, else look for one where the player is heading
         Vector3 wishDirection;
 
-        if (MoveType == MoveType.Ladder)
+        if (ActualMoveType == MoveType.Ladder)
         {
             wishDirection = -LadderNormal;
         }
@@ -40,7 +45,7 @@ internal sealed partial class MovementServices
             VectorNormalize(ref wishDirection);
         }
 
-        var distance = MoveType == MoveType.Ladder ? 10f : 2f;
+        var distance = ActualMoveType == MoveType.Ladder ? 10f : 2f;
         var end = new Vector3(
             (wishDirection.X * distance) + mv.AbsOrigin.X,
             (wishDirection.Y * distance) + mv.AbsOrigin.Y,
@@ -53,7 +58,7 @@ internal sealed partial class MovementServices
         if (trace.Fraction == 1f || !IsLadderTrace(trace))
         {
             // Not pressing into a ladder: grab one just walked off the top of, looking back along the velocity
-            if (!HasWalkMovedSinceLastJump || MoveType == MoveType.Ladder || OnGround)
+            if (!HasWalkMovedSinceLastJump || ActualMoveType == MoveType.Ladder || OnGround)
             {
                 return false;
             }
@@ -95,7 +100,7 @@ internal sealed partial class MovementServices
             }
         }
 
-        if (MoveType != MoveType.Ladder)
+        if (ActualMoveType != MoveType.Ladder)
         {
             // Jumping off is ignored for a moment after mounting
             IgnoreLadderJumpTime = CurTime + 0.2f;
@@ -485,7 +490,7 @@ internal sealed partial class MovementServices
     private void UpdateStepSound(uint surfacePropertyHash, Vector3 origin, Vector3 velocity)
     {
         // Walking pace and the walk key are silent
-        if (MoveType == MoveType.Walk)
+        if (ActualMoveType == MoveType.Walk)
         {
             var speedSquared = ((velocity.X * velocity.X) + (velocity.Y * velocity.Y)) + (velocity.Z * velocity.Z);
 
@@ -521,7 +526,7 @@ internal sealed partial class MovementServices
         const float WalkVelocity = 135f;
         const float RunVelocity = 220f;
 
-        if (IsWalking || !(speed >= WalkVelocity) || !(MoveType == MoveType.Ladder || (OnGround && groundSpeed > 0.000099999997f)))
+        if (IsWalking || !(speed >= WalkVelocity) || !(ActualMoveType == MoveType.Ladder || (OnGround && groundSpeed > 0.000099999997f)))
         {
             return;
         }
@@ -530,7 +535,7 @@ internal sealed partial class MovementServices
         float volume;
         var onLadder = false;
 
-        if (MoveType == MoveType.Ladder)
+        if (ActualMoveType == MoveType.Ladder)
         {
             volume = 0.5f;
             onLadder = true;

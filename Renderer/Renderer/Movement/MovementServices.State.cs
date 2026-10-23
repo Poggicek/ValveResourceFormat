@@ -38,6 +38,8 @@ internal sealed partial class MovementServices
         visitor.Visit(nameof(MoveType), ref moveType);
         MoveType = (MoveType)moveType;
 
+        visitor.Visit(nameof(NoClip), ref NoClip);
+
         var weaponMaxSpeed = WeaponMaxSpeed ?? float.NaN;
         visitor.Visit(nameof(WeaponMaxSpeed), ref weaponMaxSpeed);
         WeaponMaxSpeed = float.IsNaN(weaponMaxSpeed) ? null : weaponMaxSpeed;
@@ -143,5 +145,5 @@ internal sealed partial class MovementServices
 
     /// <summary>The player as the recorder keeps them at each recorded moment.</summary>
     private MovementState CaptureState(Vector3 origin, Vector3 velocity)
-        => new(origin, velocity, BaseVelocity, Flags, MoveType, GroundEntity, Ducked, DuckAmount, SurfaceFriction, WaterLevel);
+        => new(origin, velocity, BaseVelocity, Flags, ActualMoveType, GroundEntity, Ducked, DuckAmount, SurfaceFriction, WaterLevel);
 }

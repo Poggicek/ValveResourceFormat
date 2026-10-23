@@ -12,6 +12,9 @@ public enum MoveType : byte
     /// <summary>Walks and falls.</summary>
     Walk = 2,
 
+    /// <summary>Flies through everything, which a player's controller turns on with <c>noclip</c>.</summary>
+    NoClip = 7,
+
     /// <summary>Climbs a ladder.</summary>
     Ladder = 9,
 }
@@ -95,6 +98,9 @@ internal sealed partial class MovementServices
     public PlayerFlags Flags;
     public MoveType MoveType = MoveType.Walk;
 
+    /// <summary>Whether the player's controller has noclip on, which overrides the move type.</summary>
+    public bool NoClip;
+
     /// <summary>The entity stood on, while <see cref="PlayerFlags.OnGround"/> is set. Null for the world without an entity world.</summary>
     public BaseEntity? GroundEntity;
 
@@ -117,6 +123,9 @@ internal sealed partial class MovementServices
     public float ViewPunchTime;
 
     public bool OnGround => (Flags & PlayerFlags.OnGround) != 0;
+
+    /// <summary>Gets the move type movement runs with: noclip while the controller has it on, else <see cref="MoveType"/>.</summary>
+    public MoveType ActualMoveType => NoClip ? MoveType.NoClip : MoveType;
 
     public ButtonState Buttons;
     private ulong QueuedButtonDownMask;
@@ -820,7 +829,7 @@ internal sealed partial class MovementServices
         }
 
         // Split exactly where the vertical velocity crosses zero, the top of the jump
-        if (JumpApexPending && !OnGround && MoveType == MoveType.Walk)
+        if (JumpApexPending && !OnGround && ActualMoveType == MoveType.Walk)
         {
             var velocityZ = mv.Velocity.Z;
 
@@ -888,7 +897,7 @@ internal sealed partial class MovementServices
 
         var maxSpeed = 1f;
 
-        if (MoveType != MoveType.None)
+        if (ActualMoveType != MoveType.None)
         {
             var speed = Vars.MaxSpeed;
 
@@ -950,14 +959,14 @@ internal sealed partial class MovementServices
             return;
         }
 
-        if (WaterLevel >= 3 && MoveType == MoveType.Walk)
+        if (WaterLevel >= 3 && ActualMoveType == MoveType.Walk)
         {
             CheckParameters(mv);
             FullWaterMove(mv);
             return;
         }
 
-        switch (MoveType)
+        switch (ActualMoveType)
         {
             case MoveType.Walk:
                 CheckParameters(mv);
@@ -972,7 +981,7 @@ internal sealed partial class MovementServices
                     return;
                 }
 
-                if (MoveType == MoveType.Walk)
+                if (ActualMoveType == MoveType.Walk)
                 {
                     // The ladder code just let go
                     FullWalkMove(mv, skipMoveInit: true);
@@ -980,6 +989,18 @@ internal sealed partial class MovementServices
                 else
                 {
                     FullLadderMove(mv);
+                }
+
+                break;
+
+            case MoveType.NoClip:
+                CheckParameters(mv);
+
+                if (MoveInit(mv))
+                {
+                    Duck(mv);
+                    FullNoClipMove(mv, Vars.NoclipSpeed, Vars.NoclipAccelerate);
+                    PostMove(mv, retryMove: false);
                 }
 
                 break;
@@ -1043,30 +1064,34 @@ internal sealed partial class MovementServices
             IsWalking = false;
         }
 
-        var speedScale = Surfaces.Get(SurfacePropertyHash).MaxSpeedFactor;
-
-        if (OnGround)
+        // Noclip flies at its own speed, which nothing on the ground slows
+        if (ActualMoveType != MoveType.NoClip)
         {
-            speedScale *= VelocityModifier;
-        }
+            var speedScale = Surfaces.Get(SurfacePropertyHash).MaxSpeedFactor;
 
-        var maxSpeed = speedScale * mv.MaxSpeed;
-        mv.MaxSpeed = maxSpeed;
+            if (OnGround)
+            {
+                speedScale *= VelocityModifier;
+            }
 
-        // Stamina slows the player down
-        var stamina = Stamina;
+            var maxSpeed = speedScale * mv.MaxSpeed;
+            mv.MaxSpeed = maxSpeed;
 
-        if (stamina > 0f)
-        {
-            var scale = Clamp(1f - (stamina / 100f), 0f, 1f);
-            mv.MaxSpeed = (scale * scale) * maxSpeed;
-        }
+            // Stamina slows the player down
+            var stamina = Stamina;
 
-        // A hard landing caps the speed for a while
-        if (!Vars.LegacyJump && OnGround)
-        {
-            var now = new TickFraction(mv.TickCount, mv.SubtickStartFraction);
-            mv.MaxSpeed = GetLandingSpeedScale(now) * mv.MaxSpeed;
+            if (stamina > 0f)
+            {
+                var scale = Clamp(1f - (stamina / 100f), 0f, 1f);
+                mv.MaxSpeed = (scale * scale) * maxSpeed;
+            }
+
+            // A hard landing caps the speed for a while
+            if (!Vars.LegacyJump && OnGround)
+            {
+                var now = new TickFraction(mv.TickCount, mv.SubtickStartFraction);
+                mv.MaxSpeed = GetLandingSpeedScale(now) * mv.MaxSpeed;
+            }
         }
 
         if ((Flags & PlayerFlags.Frozen) != 0)
@@ -1077,7 +1102,7 @@ internal sealed partial class MovementServices
         }
 
         var angles = mv.Angles + GetViewPunchAngle();
-        mv.Angles = angles with { Z = CalcRoll(angles, mv.Velocity, Vars.RollAngle, Vars.RollSpeed) };
+        mv.Angles = angles with { Z = ActualMoveType != MoveType.NoClip ? CalcRoll(angles, mv.Velocity, Vars.RollAngle, Vars.RollSpeed) : 0f };
         mv.Angles.Y = AngleNormalize(mv.Angles.Y);
 
         // Movement input is -1 to 1; scale it to speed
@@ -1131,13 +1156,13 @@ internal sealed partial class MovementServices
 
         AngleVectors(mv.ViewAngles, out Forward, out Left, out Up);
 
-        if (MoveType != MoveType.None && CheckStuck(mv))
+        if (ActualMoveType is not (MoveType.None or MoveType.NoClip) && CheckStuck(mv))
         {
             Recorder?.Note("stuck, move skipped", mv.AbsOrigin, mv.Velocity);
             return false;
         }
 
-        if (MoveType == MoveType.Walk && !mv.GameCodeMovedPlayer && Vars.OptimizedMovement)
+        if (ActualMoveType == MoveType.Walk && !mv.GameCodeMovedPlayer && Vars.OptimizedMovement)
         {
             // The ground state carries over from the last move; only launching off it is checked
             if (mv.Velocity.Z > 250f)
@@ -1154,7 +1179,7 @@ internal sealed partial class MovementServices
 
         if (!OnGround)
         {
-            if (MoveType == MoveType.Walk)
+            if (ActualMoveType == MoveType.Walk)
             {
                 FallVelocity = FallVelocity > 0f ? MathF.Max(FallVelocity, -mv.Velocity.Z) : -mv.Velocity.Z;
             }
@@ -1166,7 +1191,7 @@ internal sealed partial class MovementServices
 
         UpdateStepSound(LastGroundSurfacePropertyHash, mv.AbsOrigin, mv.Velocity);
 
-        if (!LadderMove(mv) && MoveType == MoveType.Ladder)
+        if (!LadderMove(mv) && ActualMoveType == MoveType.Ladder)
         {
             // Let go of the ladder; it is grabbed again next step if still pressed into
             MoveType = MoveType.Walk;

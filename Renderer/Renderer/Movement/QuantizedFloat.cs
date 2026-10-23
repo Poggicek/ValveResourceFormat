@@ -27,6 +27,7 @@ internal sealed class QuantizedFloat
     private readonly double HighLowMultiplier;
     private readonly double DecodeMultiplier;
     private readonly EncodeFlags ExactFlags;
+    private readonly int Bits;
     private readonly bool NoScale;
 
     public QuantizedFloat(int bits, EncodeFlags flags, float low, float high)
@@ -41,6 +42,7 @@ internal sealed class QuantizedFloat
 
         Low = low;
         High = high;
+        Bits = bits;
 
         if ((low == 0f && flags.HasFlag(EncodeFlags.RoundDown)) || (high == 0f && flags.HasFlag(EncodeFlags.RoundUp)))
         {
@@ -103,6 +105,7 @@ internal sealed class QuantizedFloat
             if (widerBits > bits)
             {
                 bits = widerBits;
+                Bits = bits;
                 steps = 1 << bits;
             }
 
@@ -176,11 +179,38 @@ internal sealed class QuantizedFloat
         return QuantizeNoSpecial(value);
     }
 
+    /// <summary>Reads a value encoded with these settings from a network bit stream.</summary>
+    public float Decode(Demo.BitReader reader)
+    {
+        if (NoScale)
+        {
+            return reader.ReadFloat();
+        }
+
+        if (ExactFlags.HasFlag(EncodeFlags.RoundDown) && reader.ReadBit())
+        {
+            return Low;
+        }
+
+        if (ExactFlags.HasFlag(EncodeFlags.RoundUp) && reader.ReadBit())
+        {
+            return High;
+        }
+
+        if (ExactFlags.HasFlag(EncodeFlags.EncodeZeroExactly) && reader.ReadBit())
+        {
+            return 0f;
+        }
+
+        return MathF.Min(DecodeSteps((int)reader.ReadBits(Bits)), High);
+    }
+
     private float QuantizeNoSpecial(float value)
     {
         var quantized = (int)(((double)(value - Low) * HighLowMultiplier) + 0.5);
-        var decoded = (quantized * DecodeMultiplier * (High - Low)) + Low;
 
-        return MathF.Min((float)decoded, High);
+        return MathF.Min(DecodeSteps(quantized), High);
     }
+
+    private float DecodeSteps(int quantized) => (float)((quantized * DecodeMultiplier * (High - Low)) + Low);
 }

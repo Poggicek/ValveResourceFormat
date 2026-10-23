@@ -31,6 +31,13 @@ internal sealed partial class MovementServices
 
         CheckWater(mv);
 
+        // Noclip has no ground
+        if (ActualMoveType == MoveType.NoClip)
+        {
+            SetGroundEntity(mv, null);
+            return;
+        }
+
         var origin = mv.AbsOrigin;
         var point = mv.AbsOrigin;
         var velocityZ = mv.Velocity.Z;
@@ -47,7 +54,7 @@ internal sealed partial class MovementServices
         var probe = false;
 
         // Grounded players probe a full step down, which keeps them on the ground going down stairs
-        if ((MoveType == MoveType.Walk && OnGround && !fullyUnderwater) || stayOnGround)
+        if ((ActualMoveType == MoveType.Walk && OnGround && !fullyUnderwater) || stayOnGround)
         {
             probe = true;
             point.Z -= Vars.StepSize;
@@ -57,7 +64,7 @@ internal sealed partial class MovementServices
             point.Z += -2f;
         }
 
-        var movingUpOnLadder = MoveType == MoveType.Ladder && velocityZ > 0.02f;
+        var movingUpOnLadder = ActualMoveType == MoveType.Ladder && velocityZ > 0.02f;
 
         if (movingUpRapidly || movingUpOnLadder)
         {
@@ -83,7 +90,7 @@ internal sealed partial class MovementServices
             {
                 SetGroundEntity(mv, null);
 
-                if (mv.Velocity.Z > 0f)
+                if (mv.Velocity.Z > 0f && ActualMoveType != MoveType.NoClip)
                 {
                     SurfaceFriction = 0.25f;
                 }
@@ -197,7 +204,10 @@ internal sealed partial class MovementServices
             mv.AddToTouched(ground);
         }
 
-        mv.SetVelocityAxis(2, 0f);
+        if (ActualMoveType != MoveType.NoClip)
+        {
+            mv.SetVelocityAxis(2, 0f);
+        }
     }
 
     private static Vector3 GetGroundVelocity(BaseEntity? ground)

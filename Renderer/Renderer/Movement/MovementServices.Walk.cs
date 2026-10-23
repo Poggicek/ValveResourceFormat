@@ -437,6 +437,70 @@ internal sealed partial class MovementServices
         CheckVelocity(mv);
     }
 
+    /// <summary>Flies without touching anything: accelerates, then moves the whole way.</summary>
+    private void FullNoClipMove(MoveData mv, float maxSpeed, float acceleration)
+    {
+        NoClipAccelerate(mv, maxSpeed, acceleration);
+
+        var frametime = FrameTime;
+        mv.AbsOrigin.X = (frametime * mv.Velocity.X) + mv.AbsOrigin.X;
+        mv.AbsOrigin.Y = (frametime * mv.Velocity.Y) + mv.AbsOrigin.Y;
+        mv.AbsOrigin.Z = (frametime * mv.Velocity.Z) + mv.AbsOrigin.Z;
+
+        if (acceleration < 0f)
+        {
+            mv.ZeroVelocity();
+        }
+    }
+
+    /// <summary>
+    /// Accelerates towards the input in the full 3D view direction, and bleeds speed as friction does on
+    /// the ground. Without acceleration the velocity is the input itself.
+    /// </summary>
+    private void NoClipAccelerate(MoveData mv, float maxSpeed, float acceleration)
+    {
+        if (Buttons.IsHeld(InputButtons.Speed))
+        {
+            maxSpeed *= 0.5f;
+        }
+
+        var move = new Vector3(mv.ForwardMove, mv.SideMove, mv.UpMove);
+        VectorNormalize(ref move);
+        move = new Vector3(move.X * maxSpeed, move.Y * maxSpeed, move.Z * maxSpeed);
+
+        AngleVectors(mv.ViewAngles, out var forward, out var left, out _);
+        VectorNormalize(ref forward);
+        VectorNormalize(ref left);
+
+        var wishVelocity = new Vector3(
+            (left.X * move.Y) + (forward.X * move.X),
+            (left.Y * move.Y) + (forward.Y * move.X),
+            ((left.Z * move.Y) + (forward.Z * move.X)) + move.Z);
+
+        var wishDirection = wishVelocity;
+        var wishSpeed = VectorNormalize(ref wishDirection);
+
+        if (!(acceleration > 0f))
+        {
+            mv.Velocity = wishVelocity;
+            return;
+        }
+
+        Accelerate(mv, wishDirection, wishSpeed, acceleration);
+
+        var speed = Length(mv.Velocity);
+
+        if (!(speed >= 1f))
+        {
+            mv.ZeroVelocity();
+            return;
+        }
+
+        var control = MathF.Max(Vars.MaxSpeed * 0.25f, speed);
+        var newSpeed = MathF.Max(0f, speed - (((Vars.Friction * SurfaceFriction) * control) * FrameTime)) / speed;
+        mv.Velocity = new Vector3(newSpeed * mv.Velocity.X, newSpeed * mv.Velocity.Y, newSpeed * mv.Velocity.Z);
+    }
+
     private void AirMove(MoveData mv)
     {
         CheckVelocity(mv);
@@ -645,7 +709,7 @@ internal sealed partial class MovementServices
             planeCount++;
 
             // Only the first impact while airborne reflects: anything more gets stuck in acute corners
-            if (planeCount == 1 && MoveType == MoveType.Walk && !OnGround)
+            if (planeCount == 1 && ActualMoveType == MoveType.Walk && !OnGround)
             {
                 float backoff;
 

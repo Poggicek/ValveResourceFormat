@@ -4,6 +4,12 @@ internal sealed partial class MovementServices
 {
     private bool CanUnduck(MoveData mv)
     {
+        // Noclip stands up through anything
+        if (ActualMoveType == MoveType.NoClip)
+        {
+            return true;
+        }
+
         var newOrigin = mv.AbsOrigin;
 
         if (OnGround)
@@ -49,7 +55,7 @@ internal sealed partial class MovementServices
     {
         Vector3 offset;
 
-        if (OnGround || MoveType == MoveType.Ladder)
+        if (OnGround || ActualMoveType == MoveType.Ladder)
         {
             offset = DuckHullMin - HullMin;
         }
@@ -78,7 +84,7 @@ internal sealed partial class MovementServices
     {
         Vector3 offset;
 
-        if (OnGround || MoveType == MoveType.Ladder || WaterLevel >= 3)
+        if (OnGround || ActualMoveType == MoveType.Ladder || WaterLevel >= 3)
         {
             offset = -(DuckHullMin - HullMin);
         }
@@ -108,7 +114,7 @@ internal sealed partial class MovementServices
     private void Duck(MoveData mv)
     {
         var touchingGround = OnGround;
-        var inAir = !touchingGround && MoveType != MoveType.Ladder;
+        var inAir = !touchingGround && ActualMoveType != MoveType.Ladder;
         var duckHeld = Buttons.IsHeld(InputButtons.Duck);
 
         // A new duck can only start at enough duck speed and not too soon after the last one

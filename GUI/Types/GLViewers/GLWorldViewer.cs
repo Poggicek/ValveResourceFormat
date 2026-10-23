@@ -3,6 +3,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using GUI.Controls;
 using GUI.Forms;
@@ -15,6 +16,7 @@ using ValveResourceFormat.Renderer.Editor.Entities;
 using ValveResourceFormat.Renderer.Editor.Picking;
 using ValveResourceFormat.Renderer.Input;
 using ValveResourceFormat.Renderer.Movement;
+using ValveResourceFormat.Renderer.Movement.Demo;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.Renderer.Utils;
@@ -49,6 +51,7 @@ namespace GUI.Types.GLViewers
         private volatile HashSet<string> chosenPhysicsGroups = [];
         private SimulationState simulationState;
         private int simulationRequest;
+        private DemoPlayback? pendingPlayback;
         private bool ignoreLayersChangeEvents = true;
         private List<Matrix4x4> CameraMatrices = [];
         private WorldNodeLoader? LoadedWorldNode;
@@ -1257,6 +1260,7 @@ namespace GUI.Types.GLViewers
             playPauseButton = UiControl.AddToolbarButton(playImage, "Play", () => RequestSimulation(SimulationRequest.PlayOrPause), centered: true);
             stopButton = UiControl.AddToolbarButton(stopImage, "Stop", () => RequestSimulation(SimulationRequest.Stop), centered: true);
             UiControl.AddToolbarButton("Export Movement", ExportMovementRecording, centered: true);
+            UiControl.AddToolbarButton("Replay Demo", ReplayDemo, centered: true);
 
             toolEntitiesButton = UiControl.AddToolbarToggle("Tool Entities", tools.ShowToolEntities, v =>
             {
@@ -1302,6 +1306,51 @@ namespace GUI.Types.GLViewers
             }
 
             Log.Info(nameof(GLWorldViewer), string.Create(CultureInfo.InvariantCulture, $"Exported {recorder.TickCount} ticks of movement to {fileName}"));
+            GLControl?.Focus();
+        }
+
+        // A demo's user commands run through the movement, to compare it with where the server had the player
+        private void ReplayDemo()
+        {
+            var fileName = AppFileDialogs.OpenFile("Replay demo movement", "CS2 demo (*.dem)|*.dem");
+
+            if (fileName != null)
+            {
+                _ = LoadDemoAsync(fileName);
+            }
+        }
+
+        private async Task LoadDemoAsync(string fileName)
+        {
+            DemoPlayback playback;
+
+            try
+            {
+                playback = await Task.Run(() =>
+                {
+                    using var stream = File.OpenRead(fileName);
+                    return DemoPlayback.Load(stream);
+                }).ConfigureAwait(true);
+            }
+            catch (Exception e) when (e is InvalidDataException or IOException)
+            {
+                await AppMessageDialogs.ShowMessageAsync($"Could not read the demo: {e.Message}", "Replay demo", MessageIcon.Error).ConfigureAwait(true);
+                return;
+            }
+
+            var mapName = LoadedWorld?.MapName is { } map ? Path.GetFileNameWithoutExtension(map) : null;
+
+            if (playback.MapName != null && mapName != null && !string.Equals(playback.MapName, mapName, StringComparison.OrdinalIgnoreCase))
+            {
+                await AppMessageDialogs.ShowMessageAsync(
+                    $"The demo was recorded on {playback.MapName}, but {mapName} is open. It plays anyway, through the wrong world.",
+                    "Replay demo", MessageIcon.Warning).ConfigureAwait(true);
+            }
+
+            Log.Info(nameof(GLWorldViewer), string.Create(CultureInfo.InvariantCulture,
+                $"Replaying {playback.CommandCount} commands of {playback.PlayerName} from {Path.GetFileName(fileName)}"));
+
+            Interlocked.Exchange(ref pendingPlayback, playback);
             GLControl?.Focus();
         }
 
@@ -1356,7 +1405,17 @@ namespace GUI.Types.GLViewers
         }
 
         private void ApplySimulationRequest()
-            => ApplySimulation((SimulationRequest)Interlocked.Exchange(ref simulationRequest, (int)SimulationRequest.None));
+        {
+            // A demo starts from a fresh world played from the start, as it was when recorded
+            if (Interlocked.Exchange(ref pendingPlayback, null) is { } playback)
+            {
+                ApplySimulation(SimulationRequest.Stop);
+                ApplySimulation(SimulationRequest.Play);
+                Input.PlayerMovement.Playback = playback;
+            }
+
+            ApplySimulation((SimulationRequest)Interlocked.Exchange(ref simulationRequest, (int)SimulationRequest.None));
+        }
 
         // On the render thread, which owns the entity world and the scene
         private void ApplySimulation(SimulationRequest request)
@@ -1396,6 +1455,7 @@ namespace GUI.Types.GLViewers
                 case (SimulationRequest.Stop, SimulationState.Playing or SimulationState.Paused):
                     SetSimulationState(SimulationState.Stopped);
                     entitySystem.Enabled = false;
+                    Input.PlayerMovement.Playback = null;
                     Input.SetWalkMode(false);
                     ResetScene();
                     break;
@@ -1405,6 +1465,9 @@ namespace GUI.Types.GLViewers
             }
 
             var state = simulationState;
+
+            // A demo playing pauses with the world
+            Input.PlayerMovement.Playback?.Paused = state == SimulationState.Paused;
 
             if (UiControl is { IsHandleCreated: true } control)
             {
