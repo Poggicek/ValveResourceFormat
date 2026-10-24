@@ -86,6 +86,12 @@ namespace ValveResourceFormat.Renderer
             /// <summary>Gets or sets the fallback counting shader, set for the pass that counts quad overdraw.</summary>
             public Shader? OverdrawShader { get; set; }
 
+            /// <summary>
+            /// Gets or sets whether the renderer draws the fills of shapes with <see cref="ShapeSceneNode.HasOrderIndependentFill"/>
+            /// with order independent transparency after the translucent layer, so they skip them in it.
+            /// </summary>
+            internal bool OrderIndependentTranslucency { get; set; }
+
             /// <summary>Gets the list of scene-level textures bound to reserved texture slots.</summary>
             public required List<(ReservedTextureSlots Slot, string Name, RenderTexture Texture)> Textures { get; init; }
         }
@@ -127,11 +133,6 @@ namespace ValveResourceFormat.Renderer
 
         /// <summary>Gets or sets the transform from scene space into the space <see cref="VoxelVisibility"/> was compiled in.</summary>
         public Matrix4x4 WorldToVisibility { get; set; } = Matrix4x4.Identity;
-
-        /// <summary>
-        /// Gets or sets whether PVS culling is enabled. Only the value on the main scene is read, for every scene.
-        /// </summary>
-        public bool EnablePvsCulling { get; set; } = true;
 
         /// <summary>Gets the <c>info_visibility_box</c> volumes spawned in this scene.</summary>
         public VisibilityBoxSet VisibilityBoxes { get; } = new();
@@ -202,33 +203,11 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Gets the flat spatial set holding dynamic scene nodes.</summary>
         public SpatialNodeSet DynamicOctree { get; } = new();
 
-        /// <summary>Gets or sets whether materials flagged as tools-only are rendered.</summary>
-        public bool ShowToolsMaterials { get; set; }
-
-        /// <summary>Gets or sets whether scene fog is applied during rendering.</summary>
-        public bool FogEnabled { get; set; } = true;
-
-        /// <summary>Gets or sets whether a depth-only prepass is performed before the opaque pass to reduce overdraw.</summary>
-        public bool EnableDepthPrepass { get; set; }
-
-        /// <summary>Gets or sets whether GPU occlusion culling is enabled.</summary>
-        public bool EnableOcclusionCulling { get; set; } = true;
-
-        /// <summary>Gets or sets whether occlusion culling debug visualization is active.</summary>
-        public bool OcclusionDebugEnabled { get; set; }
+        /// <summary>Gets the rendering toggles.</summary>
+        public RenderSettings Settings { get; internal set; } = new();
 
         /// <summary>Gets or sets the occlusion debug renderer, or <see langword="null"/> if not initialized.</summary>
         public OcclusionDebugRenderer? OcclusionDebug { get; set; }
-
-        /// <summary>Gets or sets whether GPU indirect drawing is used for eligible aggregate scene nodes.</summary>
-        public bool EnableIndirectDraws { get; set; } = true;
-
-        /// <summary>Gets or sets whether GPU draw compaction is applied after frustum culling to remove empty indirect draw commands.</summary>
-        public bool EnableCompaction { get; set; } = true;
-
-        /// <summary>Gets or sets whether lights are binned to screen tiles so shaders iterate only what reaches them.</summary>
-        /// <remarks>Only the value on the main scene is read, for every scene.</remarks>
-        public bool EnableTiledLightCulling { get; set; } = true;
 
         internal bool DrawMeshletsIndirect { get; private set; }
         internal bool CompactMeshletDraws { get; private set; }
@@ -507,7 +486,7 @@ namespace ValveResourceFormat.Renderer
             foreach (var node in AllNodes)
             {
                 node.LightProbeBinding = null;
-                node.EnvMaps.Clear();
+                node.EnvMapBinding = null;
             }
 
             UpdateOctrees();
@@ -683,6 +662,8 @@ namespace ValveResourceFormat.Renderer
             }
 
             pendingRemovals.Clear();
+
+            LightingInfo.StoreChangedLights();
 
             foreach (var node in dynamicNodes)
             {
@@ -1015,7 +996,9 @@ namespace ValveResourceFormat.Renderer
             }
 
             var transforms = CollectionsMarshal.AsSpan(transformDataCpu);
-            var rebindProbes = boundLightProbes is { Count: > 0 };
+            var readsNodeBindings = LightingInfo.LightmapGameVersionNumber < 2;
+            var rebindProbes = readsNodeBindings && boundLightProbes is { Count: > 0 };
+            var rebindEnvMaps = readsNodeBindings && LightingInfo.EnvMaps.Count > 0;
 
             foreach (var node in dynamicNodes)
             {
@@ -1025,9 +1008,9 @@ namespace ValveResourceFormat.Renderer
                     continue;
                 }
 
-                if (rebindProbes && node.LightProbeVolumePrecomputedHandshake == 0)
+                if (rebindProbes || rebindEnvMaps)
                 {
-                    node.LightProbeBinding = ChooseLightProbeVolume(LightingPosition(node))!;
+                    RebindMovedNodeLighting(node, rebindProbes, rebindEnvMaps);
                 }
 
                 objectDataCpu[node.Id] = ObjectEntry(node);
@@ -1074,6 +1057,28 @@ namespace ValveResourceFormat.Renderer
             transformUploadStart = int.MaxValue;
         }
 
+        private void RebindMovedNodeLighting(SceneNode node, bool rebindProbes, bool rebindEnvMaps)
+        {
+            var lightingPosition = LightingPosition(node);
+
+            if (node.LightingBindPosition == lightingPosition)
+            {
+                return;
+            }
+
+            node.LightingBindPosition = lightingPosition;
+
+            if (rebindProbes && node.LightProbeVolumePrecomputedHandshake == 0)
+            {
+                node.LightProbeBinding = ChooseLightProbeVolume(lightingPosition)!;
+            }
+
+            if (rebindEnvMaps && node.CubeMapPrecomputedHandshake == 0)
+            {
+                node.EnvMapBinding = ChooseEnvironmentMap(lightingPosition);
+            }
+        }
+
         private static void UploadRange<T>(StorageBuffer buffer, ReadOnlySpan<T> data, int start, int end) where T : unmanaged
         {
             if (end > start)
@@ -1082,11 +1087,16 @@ namespace ValveResourceFormat.Renderer
             }
         }
 
-        private static ObjectDataStandard ObjectEntry(SceneNode node) => new()
+        private static ObjectDataStandard ObjectEntry(SceneNode node)
         {
-            VisibleLPV = (uint)(node.LightProbeBinding?.ShaderIndex ?? 0) | (node.ShaderEnvMapVisibility.GetFirstShaderIndex() << 16),
-            EnvMapVisibility = node.ShaderEnvMapVisibility,
-        };
+            var envMapIndex = node.EnvMapBinding is { } envMap ? (uint)envMap.ShaderIndex : node.ShaderEnvMapVisibility.GetFirstShaderIndex();
+
+            return new()
+            {
+                VisibleLPV = (uint)(node.LightProbeBinding?.ShaderIndex ?? 0) | (envMapIndex << 16),
+                EnvMapVisibility = node.ShaderEnvMapVisibility,
+            };
+        }
 
         // A fragment is a single draw call, so its node entry carries that draw's tint along with its own
         private static uint EntryTint(SceneNode node)
@@ -1462,13 +1472,13 @@ namespace ValveResourceFormat.Renderer
                         continue;
                     }
 
-                    var sunVisibility = shadowMapSize != -1 && scene.EnablePvsCulling && scene.VoxelVisibility != null
+                    var sunVisibility = shadowMapSize != -1 && scene.Settings.EnablePvsCulling && scene.VoxelVisibility != null
                         ? scene.VoxelVisibility.SunVisibility
                         : default;
 
                     scene.CollectShadowDrawCalls(sun.SunLightFrustums[cascade],
-                        includeStatic: !scene.LightingInfo.HasBakedShadowsFromLightmap,
-                        includeDynamic: true, skipFlags: ObjectTypeFlags.NoShadows,
+                        includeStatic: !scene.LightingInfo.HasBakedShadowsFromLightmap || !scene.LightingInfo.IsSunShadowBaked,
+                        includeDynamic: true, skipFlags: ObjectTypeFlags.NoShadows | ObjectTypeFlags.NoSunShadows,
                         scene.CulledShadowDrawCallsCascades[cascade],
                         sun.SunCastDirection, out var sceneDepthMin, out var sceneDepthMax,
                         sunVisibility);
@@ -1564,7 +1574,6 @@ namespace ValveResourceFormat.Renderer
                 }
 
                 List<RenderableMesh> meshes;
-                DrawCall? singleCall = null;
 
                 if (node is MeshCollectionNode meshCollection)
                 {
@@ -1587,9 +1596,9 @@ namespace ValveResourceFormat.Renderer
                         continue;
                     }
 
-                    listWithSingleMesh[0] = fragment.RenderMesh;
-                    meshes = listWithSingleMesh;
-                    singleCall = fragment.DrawCall;
+                    AccumulateDepthFit(node);
+                    AddShadowDrawCall(fragment.RenderMesh, fragment.DrawCall, node, drawBuckets);
+                    continue;
                 }
                 else if (node is SceneAggregate aggregate)
                 {
@@ -1627,24 +1636,7 @@ namespace ValveResourceFormat.Renderer
                 {
                     foreach (var opaqueCall in mesh.DrawCallsOpaque)
                     {
-                        if (singleCall != null && opaqueCall != singleCall)
-                        {
-                            continue;
-                        }
-
-                        if (opaqueCall.Material.DoNotCastShadows)
-                        {
-                            continue;
-                        }
-
-                        var bucket = GetDepthOnlyBucket(opaqueCall);
-
-                        drawBuckets[bucket].Add(new MeshBatchRenderer.Request
-                        {
-                            Mesh = mesh,
-                            Call = opaqueCall,
-                            Node = node,
-                        });
+                        AddShadowDrawCall(mesh, opaqueCall, node, drawBuckets);
                     }
                 }
             }
@@ -1653,6 +1645,23 @@ namespace ValveResourceFormat.Renderer
 
             casterDepthMin = depthMin;
             casterDepthMax = depthMax;
+        }
+
+        private static void AddShadowDrawCall(RenderableMesh mesh, DrawCall opaqueCall, SceneNode node, Dictionary<DepthOnlyBucket, List<MeshBatchRenderer.Request>> drawBuckets)
+        {
+            if (opaqueCall.Material.DoNotCastShadows)
+            {
+                return;
+            }
+
+            var bucket = GetDepthOnlyBucket(opaqueCall);
+
+            drawBuckets[bucket].Add(new MeshBatchRenderer.Request
+            {
+                Mesh = mesh,
+                Call = opaqueCall,
+                Node = node,
+            });
         }
 
         // The skinning variant is picked per draw, so the bucket only says which shader draws it
@@ -1674,11 +1683,11 @@ namespace ValveResourceFormat.Renderer
         internal void UpdateIndirectRenderingState()
         {
             CompactMeshletDraws = false;
-            DrawMeshletsIndirect = EnableIndirectDraws && SceneMeshletCount > 0 && IndirectDrawTemplate != null;
+            DrawMeshletsIndirect = Settings.EnableIndirectDraws && SceneMeshletCount > 0 && IndirectDrawTemplate != null;
 
             if (DrawMeshletsIndirect)
             {
-                CompactMeshletDraws = GLEnvironment.IndirectCountSupported && EnableCompaction;
+                CompactMeshletDraws = GLEnvironment.IndirectCountSupported && Settings.EnableCompaction;
             }
         }
 
@@ -1747,6 +1756,13 @@ namespace ValveResourceFormat.Renderer
             }
         }
 
+        /// <summary>
+        /// Gets whether a layer is internal to the renderer. Internal layers are switched one at a time rather
+        /// than by <see cref="SetEnabledLayers"/>, and are not offered to the user.
+        /// </summary>
+        /// <param name="layerName">The layer name of a node.</param>
+        internal static bool IsInternalLayer(string layerName) => layerName.StartsWith("Internal -", StringComparison.Ordinal);
+
         private void ApplyLayerVisibility(SceneNode node)
         {
             if (enabledLayers == null)
@@ -1760,7 +1776,7 @@ namespace ValveResourceFormat.Renderer
                 return;
             }
 
-            if (node.LayerName.StartsWith("Internal -", StringComparison.Ordinal))
+            if (IsInternalLayer(node.LayerName))
             {
                 return;
             }
@@ -1886,7 +1902,7 @@ namespace ValveResourceFormat.Renderer
         {
             ArgumentNullException.ThrowIfNull(fog);
 
-            fog.SetFogUniforms(viewConstants, FogEnabled, fogSpace);
+            fog.SetFogUniforms(viewConstants, Settings.FogEnabled, fogSpace);
 
             viewConstants.EnvWetness = EnvironmentWetness;
             viewConstants.EnvWetnessRipple = new Vector4(PuddleWindDirection, 0f, 0f, 0f);
@@ -1905,48 +1921,12 @@ namespace ValveResourceFormat.Renderer
             }
 
             LightingInfo.LightProbes.Sort((a, b) => a.HandShake.CompareTo(b.HandShake));
-
-            foreach (var node in AllNodes)
-            {
-                if (node.EntityData is { } entityData
-                    && LightingInfo.LightProbes.Find(p => ReferenceEquals(p.EntityData, entityData)) is { } selfProbe)
-                {
-                    node.LightProbeBinding = selfProbe;
-                    continue;
-                }
-
-                var precomputedHandshake = node.LightProbeVolumePrecomputedHandshake;
-                if (precomputedHandshake == 0)
-                {
-                    continue;
-                }
-
-                if (LightingInfo.LightmapGameVersionNumber == 0 && precomputedHandshake <= LightingInfo.LightProbes.Count)
-                {
-                    // SteamVR Home node handshake as probe index
-                    node.LightProbeBinding = LightingInfo.LightProbes[precomputedHandshake - 1];
-                    continue;
-                }
-
-                if (LightingInfo.ProbeHandshakes.TryGetValue(precomputedHandshake, out var precomputedProbe))
-                {
-                    node.LightProbeBinding = precomputedProbe;
-                    continue;
-                }
-            }
-
-            var isAtlas = LightingInfo.LightProbeType == LightProbeType.ProbeAtlas;
-
-            static bool IsValid(SceneLightProbe probe, bool isAtlas) => isAtlas switch
-            {
-                true => probe is { Irradiance: not null, DirectLightShadows: not null },
-                false => true,
-            };
+            LightingInfo.BuildProbeAtlas();
 
             var sortedLightProbes = LightingInfo.LightProbes
-                .Where(probe => IsValid(probe, isAtlas))
+                .Where(LightingInfo.IsInProbeAtlas)
                 .OrderByDescending(static lpv => lpv.IndoorOutdoorLevel)
-                .ThenBy(static lpv => lpv.AtlasSize.LengthSquared())
+                .ThenBy(static lpv => lpv.LocalBoundingBox.Size.X * lpv.LocalBoundingBox.Size.Y * lpv.LocalBoundingBox.Size.Z)
                 .Take(LightProbeVolumeArray.MAX_PROBES)
                 .ToList();
 
@@ -1954,7 +1934,7 @@ namespace ValveResourceFormat.Renderer
             foreach (var probe in sortedLightProbes)
             {
                 probe.ShaderIndex = i;
-                lpvBuffer.Data.Probes[i] = probe.CalculateGpuProbeData(isAtlas);
+                lpvBuffer.Data.Probes[i] = probe.CalculateGpuProbeData();
                 i++;
             }
 
@@ -1966,14 +1946,49 @@ namespace ValveResourceFormat.Renderer
                 return;
             }
 
+            // A node is only bound to a volume that can be sampled, and is otherwise given the one around it
+            var boundSet = sortedLightProbes.ToHashSet();
+
             foreach (var node in AllNodes)
             {
-                node.LightProbeBinding ??= ChooseLightProbeVolume(LightingPosition(node));
+                node.LightingBindPosition = new Vector3(float.NaN);
+
+                if (FindPrecomputedLightProbe(node) is { } probe && boundSet.Contains(probe))
+                {
+                    node.LightProbeBinding = probe;
+                }
+                else if (node.LightProbeBinding == null || !boundSet.Contains(node.LightProbeBinding))
+                {
+                    node.LightProbeBinding = ChooseLightProbeVolume(LightingPosition(node));
+                }
             }
         }
 
+        private SceneLightProbe? FindPrecomputedLightProbe(SceneNode node)
+        {
+            if (node.EntityData is { } entityData
+                && LightingInfo.LightProbes.Find(p => ReferenceEquals(p.EntityData, entityData)) is { } selfProbe)
+            {
+                return selfProbe;
+            }
+
+            var precomputedHandshake = node.LightProbeVolumePrecomputedHandshake;
+            if (precomputedHandshake == 0)
+            {
+                return null;
+            }
+
+            if (LightingInfo.LightmapGameVersionNumber == 0 && precomputedHandshake <= LightingInfo.LightProbes.Count)
+            {
+                // SteamVR Home node handshake as probe index
+                return LightingInfo.LightProbes[precomputedHandshake - 1];
+            }
+
+            return LightingInfo.ProbeHandshakes.GetValueOrDefault(precomputedHandshake);
+        }
+
         internal IReadOnlyList<SceneLightProbe> ProbeAtlasVolumes
-            => LightingInfo.LightProbeType == LightProbeType.ProbeAtlas && boundLightProbes != null ? (IReadOnlyList<SceneLightProbe>)boundLightProbes : [];
+            => boundLightProbes != null ? boundLightProbes : [];
 
         /// <summary>
         /// Returns the environment map that best covers a position: one whose volume contains it, the
@@ -1985,70 +2000,82 @@ namespace ValveResourceFormat.Renderer
         public SceneEnvMap? ChooseEnvironmentMap(Vector3 position)
         {
             SceneEnvMap? best = null;
-            var bestInside = false;
             var bestPriority = int.MinValue;
             var bestScore = float.MaxValue;
 
-            foreach (var envMap in LightingInfo.EnvMaps)
+            // Only the uploaded ones, which have their inverse transform and a shader index
+            var envMaps = CollectionsMarshal.AsSpan(LightingInfo.EnvMaps);
+            envMaps = envMaps[..Math.Min(envMaps.Length, EnvMapArray.MAX_ENVMAPS)];
+
+            foreach (var envMap in envMaps)
             {
-                if (!Matrix4x4.Invert(envMap.Transform, out var worldToLocal))
+                // The world bounds enclose the volume, so outside them the position cannot be inside it
+                if (!envMap.BoundingBox.Contains(position))
                 {
                     continue;
                 }
 
-                var local = Vector3.Transform(position, worldToLocal);
-                var score = local.LengthSquared();
-                bool inside;
+                var score = EnvMapDistanceSquared(envMap, position, out var inside);
 
-                if (envMap.ProjectionMode == 0)
-                {
-                    // A sphere's bounds are its influence radius on every side
-                    var radius = envMap.LocalBoundingBox.Max.X;
-                    inside = score < radius * radius;
-
-                    if (!inside)
-                    {
-                        var outside = MathF.Sqrt(score) - radius;
-                        score = outside * outside;
-                    }
-                }
-                else
-                {
-                    var distance = envMap.LocalBoundingBox.DistanceSquared(local);
-                    inside = distance == 0f;
-
-                    if (!inside)
-                    {
-                        score = distance;
-                    }
-                }
-
-                if (inside != bestInside)
-                {
-                    if (!inside)
-                    {
-                        continue;
-                    }
-                }
-                else if (inside && envMap.IndoorOutdoorLevel != bestPriority)
-                {
-                    if (envMap.IndoorOutdoorLevel < bestPriority)
-                    {
-                        continue;
-                    }
-                }
-                else if (score > bestScore)
+                if (!inside
+                    || envMap.IndoorOutdoorLevel < bestPriority
+                    || (envMap.IndoorOutdoorLevel == bestPriority && score > bestScore))
                 {
                     continue;
                 }
 
                 best = envMap;
-                bestInside = inside;
                 bestPriority = envMap.IndoorOutdoorLevel;
                 bestScore = score;
             }
 
+            if (best != null)
+            {
+                return best;
+            }
+
+            // No volume contains it, so choose the nearest one
+            foreach (var envMap in envMaps)
+            {
+                var score = EnvMapDistanceSquared(envMap, position, out _);
+
+                if (score > bestScore)
+                {
+                    continue;
+                }
+
+                best = envMap;
+                bestScore = score;
+            }
+
             return best;
+        }
+
+        // Squared distance from the env map's volume, or from its origin when the volume contains the position
+        private static float EnvMapDistanceSquared(SceneEnvMap envMap, Vector3 position, out bool inside)
+        {
+            var local = Vector3.Transform(position, envMap.WorldToLocal);
+            var originDistance = local.LengthSquared();
+
+            if (envMap.ProjectionMode == 0)
+            {
+                // A sphere's bounds are its influence radius on every side
+                var radius = envMap.LocalBoundingBox.Max.X;
+                inside = originDistance < radius * radius;
+
+                if (inside)
+                {
+                    return originDistance;
+                }
+
+                var outside = MathF.Sqrt(originDistance) - radius;
+                return outside * outside;
+            }
+
+            var distance = envMap.LocalBoundingBox.DistanceSquared(local);
+            inside = distance == 0f;
+
+            return inside ? originDistance : distance;
         }
 
         /// <summary>
@@ -2118,26 +2145,13 @@ namespace ValveResourceFormat.Renderer
             return best;
         }
 
-        /// <summary>
-        /// Adds the environment maps a node is shaded with: the first one assigned to it for individual
-        /// cubemaps, or every one its visibility mask selects for a cubemap array.
-        /// </summary>
+        /// <summary>Adds the environment maps a node is shaded with, every one its visibility mask selects.</summary>
         /// <param name="node">A node in this scene.</param>
         /// <param name="envMaps">The list the environment maps are added to.</param>
         public void GetEnvMapsUsedBy(SceneNode node, List<SceneEnvMap> envMaps)
         {
             ArgumentNullException.ThrowIfNull(node);
             ArgumentNullException.ThrowIfNull(envMaps);
-
-            if (LightingInfo.CubemapType != CubemapType.CubemapArray)
-            {
-                if (node.EnvMaps.Count > 0)
-                {
-                    envMaps.Add(node.EnvMaps[0]);
-                }
-
-                return;
-            }
 
             // Shader indices are assigned in order over the sorted list
             foreach (var shaderIndex in node.ShaderEnvMapVisibility.GetVisibleShaderIndices())
@@ -2154,30 +2168,40 @@ namespace ValveResourceFormat.Renderer
         /// </summary>
         public void CalculateEnvironmentMaps()
         {
+            LightingInfo.BuildEnvMapArray();
+
             if (LightingInfo.EnvMaps.Count == 0)
             {
+                // Zero environment maps tells the shaders to use a flat reflection
+                LightingInfo.LightingData.EnvMapSizeConstants = Vector4.Zero;
                 return;
             }
 
             var firstTexture = LightingInfo.EnvMaps.First().EnvMapTexture;
 
-            LightingInfo.LightingData.EnvMapSizeConstants = new Vector4(firstTexture.NumMipLevels - 1, firstTexture.Depth, 0, 0);
+            var isRgbm = LightingInfo.LightmapVersionNumber > 0 && LightingInfo.LightmapGameVersionNumber == 0;
+
+            LightingInfo.LightingData.EnvMapSizeConstants = new Vector4(firstTexture.NumMipLevels - 1, firstTexture.Depth, isRgbm ? 1 : 0, 0);
 
             static int IndoorPriorityCompare(SceneEnvMap a, SceneEnvMap b)
             {
                 var indoor = b.IndoorOutdoorLevel.CompareTo(a.IndoorOutdoorLevel);
-                return indoor != 0 ? indoor : a.ArrayIndex.CompareTo(b.ArrayIndex);
+                if (indoor != 0)
+                {
+                    return indoor;
+                }
+
+                var volume = a.InfluenceVolume.CompareTo(b.InfluenceVolume);
+                return volume != 0 ? volume : a.ArrayIndex.CompareTo(b.ArrayIndex);
             }
 
             static int HandShakeCompare(SceneEnvMap a, SceneEnvMap b) => a.HandShake.CompareTo(b.HandShake);
 
-            LightingInfo.EnvMaps.Sort(LightingInfo.CubemapType switch
-            {
-                CubemapType.CubemapArray => IndoorPriorityCompare,
-                _ => HandShakeCompare
-            });
+            // SteamVR Home nodes name their environment map by its index in handshake order
+            LightingInfo.EnvMaps.Sort(LightingInfo.LightmapGameVersionNumber == 0 ? HandShakeCompare : IndoorPriorityCompare);
 
             var nodes = new List<SceneNode>();
+            var overlapping = new Dictionary<SceneNode, List<SceneEnvMap>>();
             var i = 0;
 
             foreach (var envMap in LightingInfo.EnvMaps)
@@ -2190,14 +2214,14 @@ namespace ValveResourceFormat.Renderer
 
                 StaticOctree.Query(envMap.BoundingBox, nodes);
 
-                if (LightingInfo.CubemapType != CubemapType.CubemapArray)
-                {
-                    DynamicOctree.Query(envMap.BoundingBox, nodes);
-                }
-
                 foreach (var node in nodes)
                 {
-                    node.EnvMaps.Add(envMap);
+                    if (!overlapping.TryGetValue(node, out var envMaps))
+                    {
+                        overlapping[node] = envMaps = [];
+                    }
+
+                    envMaps.Add(envMap);
                 }
 
                 UpdateGpuEnvmapData(envMap, i);
@@ -2209,7 +2233,8 @@ namespace ValveResourceFormat.Renderer
 
             foreach (var node in AllNodes)
             {
-                AssignEnvironmentMaps(node);
+                node.LightingBindPosition = new Vector3(float.NaN);
+                AssignEnvironmentMaps(node, overlapping.GetValueOrDefault(node) ?? []);
             }
         }
 
@@ -2226,17 +2251,14 @@ namespace ValveResourceFormat.Renderer
                 return;
             }
 
-            node.EnvMaps.Clear();
-            node.EnvMaps.AddRange(LightingInfo.EnvMaps.Take(EnvMapArray.MAX_ENVMAPS).Where(envMap => envMap.BoundingBox.Intersects(node.BoundingBox)));
-
-            AssignEnvironmentMaps(node);
+            AssignEnvironmentMaps(node, [.. LightingInfo.EnvMaps.Take(EnvMapArray.MAX_ENVMAPS).Where(envMap => envMap.BoundingBox.Intersects(node.BoundingBox))]);
         }
 
         // Where a node samples lighting from: its lighting origin, or else its bounds center
         private static Vector3 LightingPosition(SceneNode node) => node.LightingOrigin ?? node.BoundingBox.Center;
 
         // Narrows the env maps a node overlaps to the ones it samples, and builds the visibility the shader reads
-        private void AssignEnvironmentMaps(SceneNode node)
+        private void AssignEnvironmentMaps(SceneNode node, List<SceneEnvMap> envMaps)
         {
             var precomputedHandshake = node.CubeMapPrecomputedHandshake;
             SceneEnvMap? preComputed = default;
@@ -2244,22 +2266,21 @@ namespace ValveResourceFormat.Renderer
             if (node.EntityData is { } entityData
                 && LightingInfo.EnvMaps.Find(e => ReferenceEquals(e.EntityData, entityData)) is { } selfEnvMap)
             {
-                node.EnvMaps.Clear();
-                node.EnvMaps.Add(selfEnvMap);
+                envMaps.Clear();
+                envMaps.Add(selfEnvMap);
             }
             else if (precomputedHandshake > 0)
             {
-                if (LightingInfo.CubemapType == CubemapType.IndividualCubemaps
-                    && precomputedHandshake <= LightingInfo.EnvMaps.Count)
+                if (LightingInfo.LightmapGameVersionNumber == 0 && precomputedHandshake <= LightingInfo.EnvMaps.Count)
                 {
                     // SteamVR Home node handshake as envmap index
-                    node.EnvMaps.Clear();
-                    node.EnvMaps.Add(LightingInfo.EnvMaps[precomputedHandshake - 1]);
+                    envMaps.Clear();
+                    envMaps.Add(LightingInfo.EnvMaps[precomputedHandshake - 1]);
                 }
                 else if (LightingInfo.EnvMapHandshakes.TryGetValue(precomputedHandshake, out preComputed))
                 {
-                    node.EnvMaps.Clear();
-                    node.EnvMaps.Add(preComputed);
+                    envMaps.Clear();
+                    envMaps.Add(preComputed);
                 }
                 else
                 {
@@ -2274,12 +2295,12 @@ namespace ValveResourceFormat.Renderer
             {
                 if (LightingInfo.LightmapGameVersionNumber <= 1)
                 {
-                    node.EnvMaps.Clear();
+                    envMaps.Clear();
                     foreach (var envMap in LightingInfo.EnvMaps)
                     {
                         if (envMap.BoundingBox.Contains(lightingOrigin))
                         {
-                            node.EnvMaps.Add(envMap);
+                            envMaps.Add(envMap);
                         }
                     }
                 }
@@ -2290,15 +2311,15 @@ namespace ValveResourceFormat.Renderer
                     {
                         if (Vector3.DistanceSquared(envMap.Transform.Translation, lightingOrigin) < 0.01f)
                         {
-                            node.EnvMaps.Clear();
-                            node.EnvMaps.Add(envMap);
+                            envMaps.Clear();
+                            envMaps.Add(envMap);
                             break;
                         }
                     }
                 }
             }
 
-            node.EnvMaps.Sort((a, b) =>
+            envMaps.Sort((a, b) =>
             {
                 var result = b.IndoorOutdoorLevel.CompareTo(a.IndoorOutdoorLevel);
                 if (result != 0)
@@ -2312,14 +2333,14 @@ namespace ValveResourceFormat.Renderer
                 return aDistance.CompareTo(bDistance);
             });
 
-            node.ShaderEnvMapVisibility = node.EnvMaps.Count > 0
-                ? default(SceneEnvMap.EnvMapVisibility128).Store(node.EnvMaps)
+            node.ShaderEnvMapVisibility = envMaps.Count > 0
+                ? default(SceneEnvMap.EnvMapVisibility128).Store(envMaps)
                 : SceneEnvMap.EnvMapVisibility128.Full;
 
 #if DEBUG
             if (preComputed != default)
             {
-                var vrfComputed = node.EnvMaps.FirstOrDefault();
+                var vrfComputed = envMaps.FirstOrDefault();
                 if (vrfComputed is null)
                 {
                     RendererContext.Logger.LogDebug("Could not find any envmaps for node {DebugName}. Valve precomputed envmap is at {Center} [{Handshake}]", node.DebugName, preComputed.BoundingBox.Center, precomputedHandshake);
@@ -2334,18 +2355,13 @@ namespace ValveResourceFormat.Renderer
                 var vrfDistance = Vector3.Distance(lightingOrigin, vrfComputed.BoundingBox.Center);
                 var preComputedDistance = Vector3.Distance(lightingOrigin, LightingInfo.EnvMapHandshakes[precomputedHandshake].BoundingBox.Center);
 
-                var anyIndex = node.EnvMaps.FindIndex(x => x.HandShake == precomputedHandshake);
+                var anyIndex = envMaps.FindIndex(x => x.HandShake == precomputedHandshake);
 
                 RendererContext.Logger.LogDebug("Topmost calculated envmap doesn't match with the precomputed one (dists: vrf={VrfDistance} s2={PreComputedDistance}) for node at {Center} [{Handshake}]{IterateInfo}",
                     vrfDistance, preComputedDistance, node.BoundingBox.Center, precomputedHandshake,
                     anyIndex > 0 ? $" (however it's still binned at a higher iterate index {anyIndex})" : string.Empty);
             }
 #endif
-            if (LightingInfo.CubemapType == CubemapType.CubemapArray)
-            {
-                node.EnvMaps.Clear(); // no longer needed
-                node.EnvMaps.TrimExcess();
-            }
         }
 
         private void UpdateGpuEnvmapData(SceneEnvMap envMap, int index)
@@ -2357,6 +2373,8 @@ namespace ValveResourceFormat.Renderer
                 throw new InvalidOperationException("Matrix invert failed");
             }
 
+            envMap.WorldToLocal = worldToLocal;
+
             var boundsExtend = new Vector3(SceneEnvMap.BoundsExtend);
 
             envMapBuffer.Data.EnvMaps[index] = new EnvMapData
@@ -2365,12 +2383,26 @@ namespace ValveResourceFormat.Renderer
                 BoxMins = envMap.LocalBoundingBox.Min - boundsExtend,
                 ArrayIndex = (uint)envMap.ArrayIndex,
                 BoxMaxs = envMap.LocalBoundingBox.Max + boundsExtend,
-                InvEdgeWidth = new Vector4(Vector3.One / (envMap.EdgeFadeDists + boundsExtend), 0),
+                InvEdgeWidth = new Vector4(SceneEnvMap.GetInverseEdgeFade(envMap.EdgeFadeDists), 0),
                 Origin = envMap.Transform.Translation,
                 ProjectionType = (uint)envMap.ProjectionMode,
                 Color = envMap.Tint,
+                AssociatedLPV = GetBoundLightProbeIndex(LightingInfo.ProbeHandshakes.GetValueOrDefault(envMap.HandShake)),
                 NormalizationSH = envMap.NormalizationSH
             };
+        }
+
+        private int GetBoundLightProbeIndex(SceneLightProbe? probe)
+        {
+            if (probe == null || boundLightProbes == null)
+            {
+                return -1;
+            }
+
+            var index = probe.ShaderIndex;
+            var isBound = index < boundLightProbes.Count && boundLightProbes[index] == probe;
+
+            return isBound ? index : -1;
         }
 
         /// <summary>
@@ -2434,6 +2466,8 @@ namespace ValveResourceFormat.Renderer
                 envMapBuffer?.Dispose();
                 simulationDispatch.Dispose();
                 LightingInfo.DisposeBarnLights();
+                LightingInfo.DeleteProbeAtlas();
+                LightingInfo.DeleteEnvMapArray();
 
                 DeleteIndirectDrawBuffers();
                 ClutterCuller?.Delete();

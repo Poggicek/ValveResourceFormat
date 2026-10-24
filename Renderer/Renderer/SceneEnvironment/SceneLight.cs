@@ -147,6 +147,9 @@ public class SceneLight(Scene scene) : SceneNode(scene)
     /// <summary>Gets or sets the additional brightness scale multiplier.</summary>
     public float BrightnessScale { get; set; } = 1.0f;
 
+    /// <summary>Gets or sets the brightness multiplier of the current light style.</summary>
+    public float StyleBrightness { get; set; } = 1.0f;
+
     /// <summary>Gets or sets the maximum range of the light in world units.</summary>
     public float Range { get; set; } = 512.0f;
 
@@ -254,7 +257,17 @@ public class SceneLight(Scene scene) : SceneNode(scene)
     public Vector3 PrecomputedObbAngles { get; set; }
 
     /// <summary>Gets or sets the axis-aligned precomputed world bounds.</summary>
-    public AABB PrecomputedBounds { get; set; }
+    public AABB PrecomputedBounds
+    {
+        get;
+        set
+        {
+            field = value;
+            PrecomputedBoundsDiagonal = Vector3.Distance(value.Min, value.Max);
+        }
+    }
+
+    private float PrecomputedBoundsDiagonal;
 
     /// <summary>Gets or sets the number of precomputed sub-frusta for omni lights.</summary>
     public int PrecomputedSubfrusta { get; set; }
@@ -593,7 +606,7 @@ public class SceneLight(Scene scene) : SceneNode(scene)
     internal static float GetShapeExponent(float shape) => shape > 0f ? MathF.Min(shape, 1f) * 0.875f + 0.125f : 0f;
 
     /// <summary>Distance, in world units, in front of the luminaire at which a light reaches its <see cref="LinearBrightness"/>.</summary>
-    private const float LinearBrightnessDistance = 100f;
+    internal const float LinearBrightnessDistance = 100f;
 
     // Mirrored by the BARN_LIGHT_FLAG_ constants in lighting.barn.slang
     private const uint RectLuminaireFlag = 0x1000u;
@@ -875,10 +888,15 @@ public class SceneLight(Scene scene) : SceneNode(scene)
     /// <summary>
     /// Calculates the effective solid angle of a spotlight cone, clamped to a maximum of 4pi steradians (full sphere).
     /// </summary>
-    public float ComputeConeSolidAngle()
+    public float ComputeConeSolidAngle() => ComputeConeSolidAngle(SpotOuterAngle, SpotInnerAngle);
+
+    /// <inheritdoc cref="ComputeConeSolidAngle()"/>
+    /// <param name="spotOuterAngle">The outer cone angle, in degrees.</param>
+    /// <param name="spotInnerAngle">The inner cone angle, in degrees.</param>
+    public static float ComputeConeSolidAngle(float spotOuterAngle, float spotInnerAngle)
     {
-        var outerRad = float.DegreesToRadians(Math.Clamp(SpotOuterAngle, 1f, 180f));
-        var innerRad = float.DegreesToRadians(Math.Clamp(SpotInnerAngle, 0f, SpotOuterAngle));
+        var outerRad = float.DegreesToRadians(Math.Clamp(spotOuterAngle, 1f, 180f));
+        var innerRad = float.DegreesToRadians(Math.Clamp(spotInnerAngle, 0f, spotOuterAngle));
 
         var avgCos = (MathF.Cos(outerRad) + MathF.Cos(innerRad)) * 0.5f;
         return MathF.Min(MathF.Tau * (1f - avgCos), 4f * MathF.PI);
@@ -892,7 +910,7 @@ public class SceneLight(Scene scene) : SceneNode(scene)
     internal (float Light, float Shadow) ComputeScreenSizeFades(Vector3 cameraPosition, float tanHalfHorizontalFov)
     {
         var bounds = PrecomputedFieldsValid ? PrecomputedBounds : new AABB(Position, Range);
-        var diagonal = Vector3.Distance(bounds.Min, bounds.Max);
+        var diagonal = PrecomputedFieldsValid ? PrecomputedBoundsDiagonal : Vector3.Distance(bounds.Min, bounds.Max);
         var distanceSq = Vector3.DistanceSquared(cameraPosition, bounds.Center);
 
         // Covers the whole screen with the camera close enough to be inside the bounds

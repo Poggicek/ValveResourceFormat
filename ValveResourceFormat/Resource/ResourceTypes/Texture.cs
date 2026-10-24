@@ -761,7 +761,7 @@ namespace ValveResourceFormat.ResourceTypes
         /// <param name="depth">The depth to extract.</param>
         /// <param name="face">The face to extract for cube textures.</param>
         /// <param name="mipLevel">The mip level to extract.</param>
-        /// <param name="decodeFlags">The preferred codec to use when decoding the texture.</param>
+        /// <param name="decodeFlags">The preferred codec to use when decoding the texture. Flags set alongside <see cref="TextureCodec.Auto"/> are added to the detected ones.</param>
         /// <returns>Skia bitmap.</returns>
         public SKBitmap GenerateBitmap(uint depth = 0, CubemapFace face = 0, uint mipLevel = 0, TextureCodec decodeFlags = TextureCodec.Auto)
         {
@@ -800,12 +800,12 @@ namespace ValveResourceFormat.ResourceTypes
             }
 
             var isHdrBitmap = IsHighDynamicRange && !decodeFlags.HasFlag(TextureCodec.ForceLDR);
-            var removeDecodeFlags = isHdrBitmap
+            var removeDecodeFlags = IsHighDynamicRange
                 ? (TextureCodec.ColorSpaceLinear | TextureCodec.ColorSpaceSrgb)
                 : TextureCodec.None;
 
-            decodeFlags = decodeFlags == TextureCodec.Auto
-                ? RetrieveCodecFromResourceEditInfo() & ~removeDecodeFlags
+            decodeFlags = decodeFlags.HasFlag(TextureCodec.Auto)
+                ? (RetrieveCodecFromResourceEditInfo() & ~removeDecodeFlags) | (decodeFlags & ~TextureCodec.Auto)
                 : decodeFlags;
 
             var colorType = isHdrBitmap
@@ -1379,18 +1379,47 @@ namespace ValveResourceFormat.ResourceTypes
 
             var textureCompilerDependencies = Resource.EditInfo.SpecialDependencies
                 .Where(static dependency => dependency.CompilerIdentifier == "CompileTexture");
+            var isNormalMap = false;
+            var isAnisoRoughness_RG = false;
 
             foreach (var processorAlgorithm in textureCompilerDependencies)
             {
+                isNormalMap |= processorAlgorithm.String == "Texture Compiler Version Image NormalizeNormals";
+                isAnisoRoughness_RG |= processorAlgorithm.String == "Texture Compiler Version Mip AnisoRoughness_RG";
+
                 codec |= processorAlgorithm.String switch
                 {
                     // Image processor algorithms
                     "Texture Compiler Version Image YCoCg Conversion" => TextureCodec.YCoCg,
-                    "Texture Compiler Version Image NormalizeNormals" => TextureCodec.NormalizeNormals,
 
                     // Mipmap processor algorithms
+                    "Texture Compiler Version Mip HemiOctNormal" => TextureCodec.HemiOctNormal,
                     "Texture Compiler Version Mip HemiOctIsoRoughness_RG_B" => TextureCodec.HemiOctRB,
                     "Texture Compiler Version Mip HemiOctAnisoRoughness" => TextureCodec.HemiOctRB, // do we lose one of the roughness components? (anisotropic is xy)
+                    _ => TextureCodec.None,
+                };
+            }
+
+            // Roughness generated from a normal map lists the normal map's processors, but only holds roughness in red and green
+            if (isAnisoRoughness_RG)
+            {
+                isNormalMap = false;
+                codec &= ~TextureCodec.HemiOctRB;
+            }
+
+            // BC5 blue channel is always 0, it is not roughness
+            if (Format == VTexFormat.ATI2N)
+            {
+                codec &= ~TextureCodec.BlueToAlpha;
+            }
+
+            // The normalize processor runs on the source image, but normal maps in these formats only store X and Y
+            if (isNormalMap && !codec.HasFlag(TextureCodec.HemiOctNormal))
+            {
+                codec |= Format switch
+                {
+                    VTexFormat.DXT5 => TextureCodec.Dxt5nm | TextureCodec.NormalizeNormals,
+                    VTexFormat.ATI2N => TextureCodec.NormalizeNormals,
                     _ => TextureCodec.None,
                 };
             }
@@ -1399,16 +1428,6 @@ namespace ValveResourceFormat.ResourceTypes
             {
                 // Skybox cubemaps store YCoCg in sRGB gamma space; flat panorama textures are raw (issue #1127).
                 codec |= TextureCodec.ColorSpaceSrgb;
-            }
-
-            if (Format == VTexFormat.DXT5 && codec.HasFlag(TextureCodec.NormalizeNormals))
-            {
-                codec |= TextureCodec.Dxt5nm;
-            }
-            else if (Format == VTexFormat.BC7 && codec.HasFlag(TextureCodec.HemiOctRB)
-                                              && codec.HasFlag(TextureCodec.NormalizeNormals))
-            {
-                codec &= ~TextureCodec.NormalizeNormals;
             }
 
             if (IsHighDynamicRange)

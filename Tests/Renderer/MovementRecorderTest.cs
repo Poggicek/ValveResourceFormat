@@ -2,6 +2,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
+using TUnit.Assertions.Enums;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.Movement;
 
@@ -93,7 +94,7 @@ namespace Tests.Renderer
             var ticks = document.RootElement.GetProperty("ticks").EnumerateArray().Select(static tick => tick.GetProperty("tick").GetInt32()).ToList();
 
             await Assert.That(recorder.TickCount).IsEqualTo(10);
-            await Assert.That(ticks).IsEquivalentTo(Enumerable.Range(16, 10));
+            await Assert.That(ticks).IsEquivalentTo(Enumerable.Range(16, 10), EqualityComparer<int>.Default, CollectionOrdering.Matching);
         }
 
         [Test]

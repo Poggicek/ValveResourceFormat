@@ -25,6 +25,8 @@ namespace ValveResourceFormat.Particles.Operators
         }
         public override void Operate(ParticleCollection particles, float frameTime, ParticleSystemState particleSystemState, float strength)
         {
+            var (min, max) = outputField.SetFloatRange();
+
             foreach (ref var particle in particles.Current)
             {
                 var value = this.value.NextNumber(ref particle, particleSystemState);
@@ -38,18 +40,24 @@ namespace ValveResourceFormat.Particles.Operators
                     value = float.DegreesToRadians(value);
                 }
 
-                var target = particle.ModifyScalarBySetMethod(particles, outputField, value, setMethod);
                 var currentValue = particle.GetScalar(outputField);
 
-                var (min, max) = outputField.SetFloatRange();
-                var blended = Math.Clamp(float.Lerp(currentValue, target, lerp), min, max);
+                // A ramp takes the strength into its rate instead of blending toward the result
+                if (setMethod == ParticleSetMethod.PARTICLE_SET_RAMP_CURRENT_VALUE)
+                {
+                    particle.SetScalar(outputField, Math.Clamp((lerp * (strength * frameTime) * value) + currentValue, min, max));
+                    continue;
+                }
+
+                var target = particle.ModifyScalarBySetMethod(particles, outputField, value, setMethod);
+                var blended = Math.Clamp(MathUtils.Lerp(currentValue, target, lerp), min, max);
 
                 // Strength lerps from the spawn initial for the two initial-value set methods
                 var strengthBase = setMethod is ParticleSetMethod.PARTICLE_SET_SCALE_INITIAL_VALUE or ParticleSetMethod.PARTICLE_SET_ADD_TO_INITIAL_VALUE
                     ? particle.GetInitialScalar(particles, outputField)
                     : currentValue;
 
-                particle.SetScalar(outputField, float.Lerp(strengthBase, blended, strength));
+                particle.SetScalar(outputField, BlendByStrength(strengthBase, blended, strength));
             }
         }
     }

@@ -9,32 +9,6 @@ using ValveResourceFormat.ResourceTypes;
 
 namespace ValveResourceFormat.Renderer.World
 {
-    /// <summary>
-    /// Storage format for environment map cubemap textures.
-    /// </summary>
-    public enum CubemapType : byte
-    {
-        /// <summary>No environment cubemap data.</summary>
-        None,
-        /// <summary>Each probe has its own individual cubemap texture.</summary>
-        IndividualCubemaps,
-        /// <summary>All probe cubemaps are packed into a single texture array.</summary>
-        CubemapArray,
-    }
-
-    /// <summary>
-    /// Storage format for light probe irradiance data.
-    /// </summary>
-    public enum LightProbeType : byte
-    {
-        /// <summary>No light probe data.</summary>
-        None,
-        /// <summary>Each probe has its own individual irradiance texture.</summary>
-        IndividualProbes,
-        /// <summary>All probe irradiance data is packed into a single atlas texture.</summary>
-        ProbeAtlas,
-    }
-
     /// <summary>Which light face a binned barn light slot holds, so a cull bit read back later traces to
     /// the light it was about. Rebuilt every frame, so it only holds against the frame that produced it.</summary>
     /// <param name="Light">Light owning the slot.</param>
@@ -50,6 +24,8 @@ namespace ValveResourceFormat.Renderer.World
         public Dictionary<string, RenderTexture> Lightmaps { get; } = [];
         /// <summary>Gets the list of scene light probes.</summary>
         public List<SceneLightProbe> LightProbes { get; } = [];
+        /// <summary>Gets the atlas the light probes sample, once <see cref="BuildProbeAtlas"/> has run.</summary>
+        public LightProbeAtlas? ProbeAtlas { get; private set; }
         /// <summary>Gets the list of environment map probes.</summary>
         public List<SceneEnvMap> EnvMaps { get; } = [];
         /// <summary>Gets the list of real-time barn lights.</summary>
@@ -69,19 +45,10 @@ namespace ValveResourceFormat.Renderer.World
         /// <summary>Gets or sets the GPU lighting constants buffer for the scene.</summary>
         public LightingConstants LightingData { get; set; } = new();
 
-        /// <summary>Gets or sets the storage format used for environment map cubemaps in this scene.</summary>
-        public CubemapType CubemapType
-        {
-            get => (CubemapType)scene.RenderAttributes.GetValueOrDefault("S_SCENE_CUBEMAP_TYPE");
-            set => scene.RenderAttributes["S_SCENE_CUBEMAP_TYPE"] = (byte)value;
-        }
-
-        /// <summary>Gets or sets the storage format used for light probe irradiance data in this scene.</summary>
-        public LightProbeType LightProbeType
-        {
-            get => (LightProbeType)scene.RenderAttributes.GetValueOrDefault("S_SCENE_PROBE_TYPE");
-            set => scene.RenderAttributes["S_SCENE_PROBE_TYPE"] = (byte)value;
-        }
+        /// <inheritdoc/>
+        /// <remarks>A scene without baked lighting answers white, as the particle shaders light it; one with baked lighting answers a flat grey.</remarks>
+        public Vector3 SampleAmbientLight(Vector3 position)
+            => HasValidLightProbes || HasValidLightmaps ? new Vector3(0.3f) : Vector3.One;
 
         /// <summary>
         /// Creates baked lighting combo args for an object, based on object and scene lighting state.
@@ -107,7 +74,7 @@ namespace ValveResourceFormat.Renderer.World
         }
 
         /// <summary>Gets a value indicating whether the lightmap contains baked shadow data.</summary>
-        public bool HasBakedShadowsFromLightmap => scene.RenderAttributes.GetValueOrDefault("S_LIGHTMAP_VERSION_MINOR") > 0;
+        public bool HasBakedShadowsFromLightmap => HasValidLightmaps && scene.RenderAttributes.GetValueOrDefault("S_LIGHTMAP_VERSION_MINOR") > 0;
         /// <summary>Gets or sets a value indicating whether dynamic shadow rendering is enabled.</summary>
         public bool EnableDynamicShadows { get; set; } = true;
 
@@ -158,6 +125,7 @@ namespace ValveResourceFormat.Renderer.World
         private RenderTexture? DefaultCookieAtlas;
         private int CookieSamplerClampBorder;
         private int CookieSamplerWrap;
+        private bool WarnedAboutTooManyLights;
 
         /// <summary>Binds the scene's lightmap, light probe atlas, and barn light cookie textures to their reserved units.</summary>
         public void BindLightmapTextures()
@@ -173,10 +141,19 @@ namespace ValveResourceFormat.Renderer.World
                 GL.BindTextureUnit((int)lightmapSlot, texture.Handle);
             }
 
-            if (LightProbeType == LightProbeType.ProbeAtlas && LightProbes.Count > 0)
+            // Shaders always declare the array, and sample nothing from it in a scene without environment maps
+            var envMapArray = EnvMapArray ?? scene.RendererContext.MaterialLoader.GetDefaultCubeArray();
+            GL.BindTextureUnit((int)ReservedTextureSlots.EnvironmentMap, envMapArray.Handle);
+
+            if (ProbeAtlas != null)
             {
-                BindProbeTexture("g_tLPV_Irradiance", LightProbes[0].Irradiance);
-                BindProbeTexture("g_tLPV_Shadows", LightProbes[0].DirectLightShadows);
+                // A texture no volume has is still sampled, and reads as no direct light and no shadow
+                var noDirectLight = scene.RendererContext.MaterialLoader.GetDefaultBlackVolume();
+
+                BindProbeTexture("g_tLPV_Irradiance", ProbeAtlas.Irradiance);
+                BindProbeTexture("g_tLPV_Indices", ProbeAtlas.DirectLightIndices ?? noDirectLight);
+                BindProbeTexture("g_tLPV_Scalars", ProbeAtlas.DirectLightScalars ?? noDirectLight);
+                BindProbeTexture("g_tLPV_Shadows", ProbeAtlas.DirectLightShadows ?? noDirectLight);
             }
 
             // Always bind something, even when the scene has no cookies: the cookie samplers are 2D arrays,
@@ -195,25 +172,103 @@ namespace ValveResourceFormat.Renderer.World
             GL.BindSampler((int)ReservedTextureSlots.LightCookieTextureWrap, CookieSamplerWrap);
         }
 
-        /// <summary>Binds the per-draw light probe volume textures. Individual-probe scenes only.</summary>
-        public void BindInstanceLightProbeTextures(SceneLightProbe lightProbe)
+        /// <summary>
+        /// Sets up the atlas the light probes sample: the one the map baked, or else one packed from the volumes that
+        /// were each baked into textures of their own. Only volumes in it are lit by, see <see cref="IsInProbeAtlas"/>.
+        /// </summary>
+        internal void BuildProbeAtlas()
         {
-            if (LightProbeType != LightProbeType.IndividualProbes)
+            if (ProbeAtlas != null || LightProbes.Count == 0)
             {
                 return;
             }
 
-            BindProbeTexture("g_tLPV_Irradiance", lightProbe.Irradiance);
+            // Shaders read one atlas, so volumes with textures of their own are not packed with a baked one
+            if (LightProbes.Find(static volume => IsInBakedAtlas(volume) && volume.Irradiance != null) is { } bakedVolume)
+            {
+                ProbeAtlas = LightProbeAtlas.FromBaked(bakedVolume);
 
-            if (LightmapGameVersionNumber == 1)
-            {
-                BindProbeTexture("g_tLPV_Indices", lightProbe.DirectLightIndices);
-                BindProbeTexture("g_tLPV_Scalars", lightProbe.DirectLightScalars);
+                if (LightProbes.Count(static volume => !IsInBakedAtlas(volume)) is > 0 and var ownTextures)
+                {
+                    scene.RendererContext.Logger.LogWarning("{Count} light probe volumes with textures of their own are left out, the map baked the others into an atlas", ownTextures);
+                }
+
+                return;
             }
-            else if (LightmapGameVersionNumber >= 2)
+
+            var rendererContext = scene.RendererContext;
+            ProbeAtlas = LightProbeAtlas.Pack(LightProbes, rendererContext.MaterialLoader, rendererContext.Logger);
+        }
+
+        /// <summary>Gets the cubemap array the environment maps sample, once <see cref="BuildEnvMapArray"/> has run.</summary>
+        public RenderTexture? EnvMapArray { get; private set; }
+
+        private RenderTexture? packedEnvMapArray;
+
+        /// <summary>
+        /// Sets up the cubemap array the environment maps sample: the one the map baked, or else one packed from the
+        /// cubemaps baked as separate textures. Environment maps not in it are removed.
+        /// </summary>
+        internal void BuildEnvMapArray()
+        {
+            if (EnvMapArray != null || EnvMaps.Count == 0)
             {
-                BindProbeTexture("g_tLPV_Shadows", lightProbe.DirectLightShadows);
+                return;
             }
+
+            // Shaders read one array, so separate cubemaps are not packed with a baked one
+            var array = EnvMaps.Find(static envMap => envMap.EnvMapTexture.Target == TextureTarget.TextureCubeMapArray)?.EnvMapTexture;
+
+            if (array == null)
+            {
+                var rendererContext = scene.RendererContext;
+                array = packedEnvMapArray = EnvironmentMapArray.Pack(EnvMaps, rendererContext.MaterialLoader, rendererContext.Logger);
+            }
+
+            if (array == null)
+            {
+                EnvMaps.Clear();
+                EnvMapHandshakes.Clear();
+                return;
+            }
+
+            if (EnvMaps.RemoveAll(envMap => envMap.EnvMapTexture != array) is > 0 and var removed)
+            {
+                scene.RendererContext.Logger.LogWarning("{Count} environment maps are not in the cubemap array and are left out", removed);
+
+                foreach (var (handshake, envMap) in EnvMapHandshakes.ToList())
+                {
+                    if (envMap.EnvMapTexture != array)
+                    {
+                        EnvMapHandshakes.Remove(handshake);
+                    }
+                }
+            }
+
+            EnvMapArray = array;
+        }
+
+        /// <summary>Deletes the cubemap array, when it was packed for the scene.</summary>
+        internal void DeleteEnvMapArray()
+        {
+            packedEnvMapArray?.Delete();
+            packedEnvMapArray = null;
+            EnvMapArray = null;
+        }
+
+        // A volume placed in an atlas the map baked, rather than with textures of its own
+        private static bool IsInBakedAtlas(SceneLightProbe volume) => volume.AtlasSize != Vector3.Zero;
+
+        /// <summary>Gets whether a light probe volume has a place in <see cref="ProbeAtlas"/>, and so can be sampled.</summary>
+        /// <param name="volume">The volume.</param>
+        internal bool IsInProbeAtlas(SceneLightProbe volume)
+            => ProbeAtlas != null && volume.Irradiance != null && volume.AtlasSize != Vector3.Zero;
+
+        /// <summary>Deletes the light probe atlas, when it was packed for the scene.</summary>
+        internal void DeleteProbeAtlas()
+        {
+            ProbeAtlas?.Delete();
+            ProbeAtlas = null;
         }
 
         /// <summary>Binds a light probe volume texture to the unit its sampler reads.</summary>
@@ -229,34 +284,12 @@ namespace ValveResourceFormat.Renderer.World
         }
 
         /// <summary>
-        /// Registers an environment map with the scene, setting the cubemap type on the first entry.
+        /// Registers an environment map with the scene. Separate cubemaps are packed into an array before they are
+        /// sampled, see <see cref="BuildEnvMapArray"/>.
         /// </summary>
         /// <param name="envmap">The environment map to add.</param>
         public void AddEnvironmentMap(SceneEnvMap envmap)
         {
-            if (EnvMaps.Count == 0)
-            {
-                CubemapType = envmap.EnvMapTexture.Target switch
-                {
-                    TextureTarget.TextureCubeMapArray => CubemapType.CubemapArray,
-                    TextureTarget.TextureCubeMap => CubemapType.IndividualCubemaps,
-                    _ => CubemapType.None,
-                };
-
-                if (CubemapType == CubemapType.CubemapArray)
-                {
-                    Lightmaps.TryAdd("g_tEnvironmentMap", envmap.EnvMapTexture);
-                }
-            }
-            else
-            {
-                var first = EnvMaps[0];
-                if (envmap.EnvMapTexture.Target != first.EnvMapTexture.Target)
-                {
-                    scene.RendererContext.Logger.LogError("Envmap texture type mismatch {EnvMapType} != {FirstType}", envmap.EnvMapTexture.Target, first.EnvMapTexture.Target);
-                }
-            }
-
             EnvMaps.Add(envmap);
 
             if (envmap.HandShake > 0)
@@ -272,6 +305,8 @@ namespace ValveResourceFormat.Renderer.World
             EnvMapHandshakes.Clear();
             LightProbes.Clear();
             ProbeHandshakes.Clear();
+            DeleteProbeAtlas();
+            DeleteEnvMapArray();
         }
 
         /// <summary>
@@ -289,7 +324,7 @@ namespace ValveResourceFormat.Renderer.World
             {
                 (_, { Irradiance: null }) => false,
                 (1, { DirectLightIndices: null } or { DirectLightScalars: null }) => false,
-                (2 or 3 or 4, { DirectLightShadows: null }) => false,
+                (2 or 3 or 4 or 5, { DirectLightShadows: null }) => false,
                 _ => true,
             };
 
@@ -299,7 +334,7 @@ namespace ValveResourceFormat.Renderer.World
 
             if (lightProbe.HandShake > 0)
             {
-                scene.LightingInfo.ProbeHandshakes.Add(lightProbe.HandShake, lightProbe);
+                scene.LightingInfo.ProbeHandshakes[lightProbe.HandShake] = lightProbe;
             }
         }
 
@@ -476,11 +511,34 @@ namespace ValveResourceFormat.Renderer.World
             if (usesUniformLightStore)
             {
                 StoreLightMappedLights_V1(lights);
+
+                // Not in the store itself, which light styles run every tick
+                scene.RendererContext.Logger.LogDebug(
+                    "Lightmap version {Major}.{Minor}: {Stationary} stationary and {Dynamic} per-pixel lights of {Total} light entities",
+                    LightmapVersionNumber, LightmapGameVersionNumber, LightingData.StaticLightCount,
+                    LightingData.DynamicLightCount - LightingData.StaticLightCount, lights.Count);
             }
             else
             {
                 StoreLightMappedLights_V2(lights);
             }
+        }
+
+        private bool storedLightsChanged;
+
+        /// <summary>Marks the stored lights for <see cref="StoreChangedLights"/>.</summary>
+        public void MarkStoredLightsChanged() => storedLightsChanged = true;
+
+        /// <summary>Stores the lights again if they changed since they were last stored.</summary>
+        public void StoreChangedLights()
+        {
+            if (!storedLightsChanged)
+            {
+                return;
+            }
+
+            storedLightsChanged = false;
+            UpdateGpuLightBuffers();
         }
 
         /// <summary>Re-stores the GPU light properties.</summary>
@@ -522,7 +580,7 @@ namespace ValveResourceFormat.Renderer.World
                 // The strength texels hold plain sqrt(saturate(attenuation) * visibility); lights that
                 // look far dimmer than their surroundings in baked cubemaps (like the "light_disabled"
                 // prefabs) are scripted to raise their brightness at runtime, not scaled at load.
-                var premultipliedColor = ColorSpace.SrgbGammaToLinear(light.Color) * light.Brightness * light.BrightnessScale;
+                var premultipliedColor = ColorSpace.SrgbGammaToLinear(light.Color) * light.Brightness * light.BrightnessScale * light.StyleBrightness;
                 LightingData.LightColor_Brightness[index] = new Vector4(premultipliedColor, light.RenderSpecular ? 1f : 0f);
 
                 // zw carry the remaining render gates (diffuse, transmissive); specular sits in the color
@@ -587,7 +645,12 @@ namespace ValveResourceFormat.Renderer.World
             {
                 if (currentLightIndex >= LightingConstants.MAX_LIGHTS)
                 {
-                    scene.RendererContext.Logger.LogWarning("Too many lights in scene. Some lights were removed");
+                    if (!WarnedAboutTooManyLights)
+                    {
+                        WarnedAboutTooManyLights = true;
+                        scene.RendererContext.Logger.LogWarning("Too many lights in scene. Some lights were removed");
+                    }
+
                     break;
                 }
 
@@ -595,11 +658,6 @@ namespace ValveResourceFormat.Renderer.World
             }
 
             LightingData.DynamicLightCount = currentLightIndex;
-
-            scene.RendererContext.Logger.LogDebug(
-                "Lightmap version {Major}.{Minor}: {Stationary} stationary and {Dynamic} per-pixel lights of {Total} light entities",
-                LightmapVersionNumber, LightmapGameVersionNumber, LightingData.StaticLightCount,
-                currentLightIndex - LightingData.StaticLightCount, lights.Count);
 
             var envLight = lights.FirstOrDefault(static l => l.Entity == SceneLight.EntityType.Environment);
             if (envLight != null)
@@ -655,7 +713,7 @@ namespace ValveResourceFormat.Renderer.World
         /// </summary>
         private void StoreSunLight(SceneLight envLight, Vector4 bakedShadowData)
         {
-            var premultipliedColor = ColorSpace.SrgbGammaToLinear(envLight.Color) * envLight.Brightness * envLight.BrightnessScale;
+            var premultipliedColor = ColorSpace.SrgbGammaToLinear(envLight.Color) * envLight.Brightness * envLight.BrightnessScale * envLight.StyleBrightness;
 
             LightingData.SunDirection = new Vector4(-envLight.Direction, GetSunMinRoughness(envLight.MinRoughness));
             LightingData.SunColor = new Vector4(premultipliedColor, envLight.RenderSpecular ? 1f : 0f);
@@ -666,11 +724,18 @@ namespace ValveResourceFormat.Renderer.World
             UpdateAmbientLighting();
 
             HasOwnSun = true;
+            IsSunShadowBaked = envLight.StationaryLightIndex >= 0 && envLight.CastShadows == 1;
             isSunBorrowed = false;
         }
 
         /// <summary>Gets whether the source map has an environment light.</summary>
         public bool HasOwnSun { get; private set; }
+
+        /// <summary>
+        /// Gets whether the map's own sun is a mixed light. Static geometry's shadows from it are baked,
+        /// so static geometry stays out of its shadow cascades.
+        /// </summary>
+        public bool IsSunShadowBaked { get; private set; }
 
         private bool isSunBorrowed;
 
@@ -797,6 +862,8 @@ namespace ValveResourceFormat.Renderer.World
                     continue;
                 }
 
+                var colorScale = lightFade * light.StyleBrightness;
+
                 var anyFaceDropped = false;
                 var hasRangeCutoff = light.UsesOmni2Faces && light.FallOff > 0f;
 
@@ -825,7 +892,7 @@ namespace ValveResourceFormat.Renderer.World
                         data.BarnLightShadowScale = shadowFade;
                     }
 
-                    data.BarnLightColor_flCookie *= new Vector4(lightFade, lightFade, lightFade, 1f);
+                    data.BarnLightColor_flCookie *= new Vector4(colorScale, colorScale, colorScale, 1f);
 
                     BinnedBarnLightFaceSlots[LightingData.NumBarnLights] = new BarnLightFaceSlot(light, faceIndex);
 

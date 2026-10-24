@@ -17,6 +17,7 @@ using ValveResourceFormat.Renderer.Input;
 using ValveResourceFormat.Renderer.Materials;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.SceneNodes;
+using ValveResourceFormat.Renderer.Utils;
 
 namespace GUI.Types.GLViewers
 {
@@ -28,10 +29,10 @@ namespace GUI.Types.GLViewers
         public ValveResourceFormat.Renderer.TextRenderer TextRenderer { get; protected set; }
         private readonly CrosshairRenderer crosshairRenderer;
 
-        protected ScenePicker? Picker { get; private set; }
+        protected internal ScenePicker? Picker { get; private set; }
 
         /// <summary>The nodes selected in this viewer, drawn with an outline and helpers.</summary>
-        protected SelectionSet Selection { get; } = new();
+        protected internal SelectionSet Selection { get; } = new();
 
         /// <summary>Text drawn in the top-left corner of the viewport, such as stats for the selection.</summary>
         protected ValveResourceFormat.Renderer.TextRenderer.TextMemory ScreenDebugText { get; set; }
@@ -196,13 +197,7 @@ namespace GUI.Types.GLViewers
                 UiControl.AddCheckBox("Show Dynamic Octree", showDynamicOctree, (v) => showDynamicOctree = v);
                 if (!HasToolsVisibilityControls)
                 {
-                    UiControl.AddCheckBox("Show Tool Materials", Scene.ShowToolsMaterials, (v) =>
-                    {
-                        foreach (var scene in Renderer.Scenes)
-                        {
-                            scene.ShowToolsMaterials = v;
-                        }
-                    });
+                    UiControl.AddCheckBox("Show Tool Materials", Renderer.Settings.ShowToolsMaterials, (v) => Renderer.Settings.ShowToolsMaterials = v);
                 }
 
                 if (Renderer.Scenes.Any(static scene => scene.LightingInfo.LightProbes.Count > 0))
@@ -245,7 +240,7 @@ namespace GUI.Types.GLViewers
 
                 if (this is GLWorldViewer)
                 {
-                    UiControl.AddCheckBox("Show Occluded Bounds", Scene.OcclusionDebugEnabled, (v) => Scene.OcclusionDebugEnabled = v);
+                    UiControl.AddCheckBox("Show Occluded Bounds", Renderer.Settings.OcclusionDebugEnabled, (v) => Renderer.Settings.OcclusionDebugEnabled = v);
 
                     if (Scene.VoxelVisibility != null)
                     {
@@ -359,9 +354,58 @@ namespace GUI.Types.GLViewers
 
         protected abstract void LoadScene();
 
-        /// <summary>Handles a pick resolved on the render thread. Viewers that do nothing with picks leave this empty.</summary>
+        /// <summary>Handles a resolved pick, with the GL context current. Viewers that do nothing with picks leave this empty.</summary>
         protected virtual void OnPicked(PickResult result)
         {
+        }
+
+        /// <summary>Collects the per frame counters and the CPU and GPU timings even while the performance overlay does not show them.</summary>
+        internal bool CaptureStats { get; set; }
+
+        /// <summary>Sets the field of view of the rendered camera, and of the input camera that frames objects with it.</summary>
+        internal void SetFieldOfView(float fieldOfView)
+        {
+            RendererContext.FieldOfView = fieldOfView;
+            Renderer.Camera.FieldOfView = fieldOfView;
+            Renderer.Camera.CreateProjectionMatrix();
+            Input.Camera.FieldOfView = fieldOfView;
+            Input.Camera.CreateProjectionMatrix();
+        }
+
+        internal static AABB SelectionBounds(SceneNode node)
+        {
+            var bbox = node.BoundingBox;
+            var maxSpan = bbox.Size.MaxComponent();
+
+            // Empty or degenerate bounds (e.g. a particle system that finished playing)
+            // would put the camera inside the node or at a garbage position.
+            if (!float.IsFinite(maxSpan) || maxSpan < 1f)
+            {
+                bbox = PointBounds(node.Transform.Translation);
+            }
+
+            // Bounds of a 3D sky node are mapped to where the sky appears in the world
+            return bbox.Transform(node.Scene.ToViewerWorld);
+        }
+
+        internal static AABB PointBounds(Vector3 point) => new(point, 32f);
+
+        internal void FocusCameraOnBounds(in AABB bbox)
+        {
+            var center = bbox.Center;
+
+            var size = bbox.Size * 1.25f;
+
+            // Framed by what the bounds cover from where the camera will be: their longest axis would
+            // stand a cable or a trigger brush off by its own length. The floor keeps something player
+            // sized from filling the view with nothing around it to place it by.
+            var framing = Input.Camera.GetFramingDistance(size, -CameraPlacement.PreferredDirection(size));
+            var distance = Math.Max(framing, 192f);
+            var location = CameraPlacement.FindOrbitPosition(Renderer.EntitySystem.PhysicsWorld, center, distance, size);
+
+            Input.SaveCameraForTransition();
+            Input.Camera.SetLocation(location);
+            Input.Camera.LookAt(center);
         }
 
         protected override void OnResize(int w, int h)
@@ -521,7 +565,10 @@ namespace GUI.Types.GLViewers
             Debug.Assert(MainFramebuffer != null);
 
             Scene.RendererContext.ShaderLoader.LinkLoadedShaders();
-            Renderer.DisableAllCulling = true;
+
+            // Culling is off, but hidden layers stay out, as their nodes may build their geometry on first draw
+            ApplyPendingVisibility();
+            Renderer.Settings.DisableAllCulling = true;
 
             Renderer.Camera.CopyFrom(Input.Camera);
             Renderer.Prewarming = true;
@@ -543,7 +590,7 @@ namespace GUI.Types.GLViewers
             {
                 decals.Remove(prewarmDecal);
 
-                Renderer.DisableAllCulling = false;
+                Renderer.Settings.DisableAllCulling = false;
                 Renderer.Prewarming = false;
             }
         }
@@ -625,11 +672,7 @@ namespace GUI.Types.GLViewers
 
             Input.EnableMouseLook = true;
 
-            if (visibilityDirty)
-            {
-                visibilityDirty = false;
-                ApplyVisibility();
-            }
+            ApplyPendingVisibility();
 
             if (loadedDefaultLighting && Input.NoClip && (CurrentlyPressedKeys & TrackedKeys.Control) != 0)
             {
@@ -837,8 +880,8 @@ namespace GUI.Types.GLViewers
             Debug.Assert(Picker != null);
             Debug.Assert(selectionVisuals != null);
 
-            Renderer.PerfStats.Capture = perfDisplay == PerfDisplay.Stats;
-            Renderer.PerfStats.Timings.Capture = perfDisplay == PerfDisplay.Timings;
+            Renderer.PerfStats.Capture = perfDisplay == PerfDisplay.Stats || CaptureStats;
+            Renderer.PerfStats.Timings.Capture = perfDisplay == PerfDisplay.Timings || CaptureStats;
             Renderer.PerfStats.Allocations.Capture = perfDisplay == PerfDisplay.Allocations;
 
             Renderer.PerfStats.MarkFrameBegin();
@@ -854,10 +897,18 @@ namespace GUI.Types.GLViewers
 
             using (new GLDebugGroup("Update Loop"))
             {
+                var timestep = frameTime;
+
+#if DEBUG
+                // Automation can hold the simulation still or step it by exact amounts, and then holds
+                // the dither still too, so that identical frames are identical to the pixel
+                Renderer.Postprocess.AnimateDither = !Automation.AutomationClock.Advance(ref timestep);
+#endif
+
                 var updateContext = new Scene.UpdateContext
                 {
                     TextRenderer = TextRenderer,
-                    Timestep = frameTime,
+                    Timestep = timestep,
                     Camera = Renderer.Camera,
                 };
 
@@ -935,7 +986,7 @@ namespace GUI.Types.GLViewers
                     Scene.DynamicOctree.DebugRenderer.Render();
                 }
 
-                if (Scene.OcclusionDebugEnabled && Scene.OcclusionDebug != null)
+                if (Renderer.Settings.OcclusionDebugEnabled && Scene.OcclusionDebug != null)
                 {
                     Scene.OcclusionDebug.Render();
                 }
@@ -1265,6 +1316,15 @@ namespace GUI.Types.GLViewers
         /// </summary>
         protected void RequestVisibilityUpdate() => visibilityDirty = true;
 
+        private void ApplyPendingVisibility()
+        {
+            if (visibilityDirty)
+            {
+                visibilityDirty = false;
+                ApplyVisibility();
+            }
+        }
+
         /// <summary>Applies the chosen layers. Runs on the render thread.</summary>
         protected virtual void ApplyVisibility()
         {
@@ -1304,10 +1364,7 @@ namespace GUI.Types.GLViewers
 
             Renderer.Postprocess.Enabled = Renderer.ViewBuffer.Data.RenderMode == 0;
 
-            foreach (var scene in Renderer.Scenes)
-            {
-                scene.EnableCompaction = renderMode != "Meshlets";
-            }
+            Renderer.Settings.EnableCompaction = renderMode != "Meshlets";
 
             Picker.Texture.SetRenderMode(renderMode);
             QuadOverdrawRenderer?.SetRenderMode(renderMode);

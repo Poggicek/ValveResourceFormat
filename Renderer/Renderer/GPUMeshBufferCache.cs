@@ -150,9 +150,25 @@ namespace ValveResourceFormat.Renderer
         /// buffer GL later reuses that handle for.</summary>
         /// <param name="bufferHandles">Vertex and/or index buffer handles about to be freed.</param>
         public void InvalidateVertexArrayObjectsForFreedBuffers(params int[] bufferHandles)
-            => DeleteVertexArrayObjects(key
-                => Array.IndexOf(bufferHandles, key.IndexBuffer) >= 0
-                || key.VertexBuffers.Any(handle => Array.IndexOf(bufferHandles, handle) >= 0));
+            => DeleteVertexArrayObjects(key => UsesAnyBuffer(key, bufferHandles));
+
+        private static bool UsesAnyBuffer(VAOKey key, int[] bufferHandles)
+        {
+            if (Array.IndexOf(bufferHandles, key.IndexBuffer) >= 0)
+            {
+                return true;
+            }
+
+            foreach (var handle in key.VertexBuffers)
+            {
+                if (Array.IndexOf(bufferHandles, handle) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
 
         private void DeleteVertexArrayObjects(Func<VAOKey, bool> predicate)
         {
@@ -264,7 +280,7 @@ namespace ValveResourceFormat.Renderer
         private VertexDrawBuffer[] AddMissingAttributes(VertexDrawBuffer[] vertexBuffers)
         {
             // Shaders read white where a mesh has no COLOR stream, matching the engine default
-            if (!vertexBuffers.Any(vb => vb.InputLayoutFields.Any(f => f.SemanticName == "COLOR")))
+            if (!vertexBuffers.Any(vb => vb.InputLayoutFields.Any(f => f.SemanticName == "COLOR" && f.SemanticIndex == 0)))
             {
                 var defaultColor = new VertexDrawBuffer
                 {

@@ -1,3 +1,4 @@
+using System.Globalization;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 
 namespace ValveResourceFormat.Renderer.World
@@ -23,6 +24,12 @@ namespace ValveResourceFormat.Renderer.World
         /// <summary>Gets or sets the active cubemap fog parameters.</summary>
         public SceneCubemapFog? CubemapFog { get; set; }
 
+        /// <summary>
+        /// Gets or sets the fog of an <c>env_fog_controller</c> the 2D sky is fogged with, or
+        /// <see langword="null"/> to leave the sky without it.
+        /// </summary>
+        public LinearFog? LinearFog { get; set; }
+
         /*
         // VOLUMETRIC FOG
         // Volumetric fog is a vital part of the look of Half-Life: Alyx, and it's very much possible to implement... but it's hard.
@@ -35,7 +42,7 @@ namespace ValveResourceFormat.Renderer.World
             var fogStrength = entity.GetFloatProperty("fogstrength");
             var boxMins = entity.GetStringProperty("box_mins");
             var boxMaxs = entity.GetStringProperty("box_maxs");
-            var indirectVoxelDim = float.Parse(entity.GetStringProperty("indirectvoxeldim"));
+            var indirectVoxelDim = float.Parse(entity.GetStringProperty("indirectvoxeldim"), CultureInfo.InvariantCulture);
             var indirectStrength = entity.GetFloatProperty("indirectstrength");
             var indirectEnabled = entity.GetBooleanProperty("indirectenabled");
 
@@ -60,7 +67,7 @@ namespace ValveResourceFormat.Renderer.World
             {
                 var fogVol = new FogVolume
                 {
-                    Shape = int.Parse(entity.GetStringProperty("shape")),
+                    Shape = int.Parse(entity.GetStringProperty("shape"), CultureInfo.InvariantCulture),
                     Strength = entity.GetFloatProperty("fogstrength"),
                     Exponent = entity.GetFloatProperty("falloffexponent"),
                     //Transform = SceneLightingInfo.BoxToTransform(entity)

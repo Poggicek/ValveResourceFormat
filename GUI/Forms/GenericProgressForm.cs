@@ -4,6 +4,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using GUI.Utils;
+using Windows.Win32;
+using Windows.Win32.Foundation;
 
 namespace GUI.Forms
 {
@@ -17,6 +19,7 @@ namespace GUI.Forms
         private long startTimestamp;
         private string? baseTitle;
         private bool completed;
+        private bool workFinished;
         private Task? workCompletion;
 
         public Func<CancellationToken, Task>? OnProcess { get; set; }
@@ -25,6 +28,25 @@ namespace GUI.Forms
         /// When set, the dialog stays open after the work completes and shows a completed state instead of closing itself.
         /// </summary>
         public bool StayOpenOnCompletion { get; set; }
+
+        /// <summary>
+        /// When set, cancelling asks the work to stop and keeps the dialog open until it has, instead of closing right away.
+        /// </summary>
+        public bool WaitForWorkToStop { get; set; }
+
+        /// <summary>
+        /// When cleared, the dialog can not be cancelled and closes once the work completes.
+        /// </summary>
+        public bool CanCancel
+        {
+            get;
+            set
+            {
+                field = value;
+                ControlBox = value;
+                cancelButton.Visible = value;
+            }
+        } = true;
 
         /// <summary>
         /// Time elapsed since the dialog was shown.
@@ -90,7 +112,7 @@ namespace GUI.Forms
             // A single unit of work has no meaningful progression, keep the marquee
             if (barMax > 1)
             {
-                extractProgressBar.Style = ProgressBarStyle.Blocks;
+                ShowDeterminateBar();
                 extractProgressBar.Maximum = barMax;
             }
 
@@ -102,6 +124,22 @@ namespace GUI.Forms
             }
 
             UpdateTitle();
+        }
+
+        private void ShowDeterminateBar()
+        {
+            if (extractProgressBar.Style == ProgressBarStyle.Blocks)
+            {
+                return;
+            }
+
+            extractProgressBar.Style = ProgressBarStyle.Blocks;
+
+            // Changing the style recreates the handle with a visual style, which ignores the bar colors
+            if (Application.IsDarkModeEnabled)
+            {
+                PInvoke.SetWindowTheme((HWND)extractProgressBar.Handle, " ", " ");
+            }
         }
 
         private void UpdateTitle()
@@ -182,6 +220,8 @@ namespace GUI.Forms
 
         private void OnWorkFinished()
         {
+            workFinished = true;
+
             // Cancelling already closed the dialog, there is no completed state to show for work that did not finish
             if (cancellationTokenSource.IsCancellationRequested || !StayOpenOnCompletion)
             {
@@ -200,7 +240,7 @@ namespace GUI.Forms
             // Flush the last reported text and render the completed title
             ApplyPendingUpdate();
 
-            extractProgressBar.Style = ProgressBarStyle.Blocks;
+            ShowDeterminateBar();
             extractProgressBar.Value = extractProgressBar.Maximum;
             cancelButton.Text = "Close";
 
@@ -210,6 +250,20 @@ namespace GUI.Forms
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            if (!workFinished && workCompletion != null && (!CanCancel || WaitForWorkToStop))
+            {
+                e.Cancel = true;
+
+                if (CanCancel)
+                {
+                    cancellationTokenSource.Cancel();
+                    cancelButton.Enabled = false;
+                    SetProgress("Cancelling…");
+                }
+
+                return;
+            }
+
             updateTimer.Stop();
             cancellationTokenSource.Cancel();
             base.OnFormClosing(e);

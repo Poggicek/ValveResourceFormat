@@ -246,20 +246,27 @@ namespace ValveResourceFormat.ResourceTypes
 
             if (connections.Count > 0)
             {
-                entity.Connections = connections.Select((connection) => new Connection
+                var entityConnections = new List<Connection>(connections.Count);
+
+                foreach (var connection in connections)
                 {
-                    SourceEntity = entity,
-                    TargetName = connection.GetStringProperty("m_targetName"),
-                    OutputName = connection.GetStringProperty("m_outputName"),
-                    InputName = connection.GetStringProperty("m_inputName"),
-                    OverrideParam = connection.GetStringProperty("m_overrideParam"),
-                    Delay = connection.GetFloatProperty("m_flDelay"),
-                    TimesToFire = connection.GetInt32Property("m_nTimesToFire"),
-                    TargetType = connection.GetEnumValue<EntityIOTargetType>("m_targetType"),
-                    ParamMap = connection.TryGetValue("m_paramMap", out var paramMap) && paramMap.ValueType == KVValueType.Collection
-                        ? paramMap
-                        : null,
-                }).ToList();
+                    entityConnections.Add(new Connection
+                    {
+                        SourceEntity = entity,
+                        TargetName = connection.GetStringProperty("m_targetName"),
+                        OutputName = connection.GetStringProperty("m_outputName"),
+                        InputName = connection.GetStringProperty("m_inputName"),
+                        OverrideParam = connection.GetStringProperty("m_overrideParam"),
+                        Delay = connection.GetFloatProperty("m_flDelay"),
+                        TimesToFire = connection.GetInt32Property("m_nTimesToFire"),
+                        TargetType = connection.GetEnumValue<EntityIOTargetType>("m_targetType"),
+                        ParamMap = connection.TryGetValue("m_paramMap", out var paramMap) && paramMap.ValueType == KVValueType.Collection
+                            ? paramMap
+                            : null,
+                    });
+                }
+
+                entity.Connections = entityConnections;
             }
 
             return entity;
@@ -289,7 +296,7 @@ namespace ValveResourceFormat.ResourceTypes
         private static string ToPropertyKey(string name) => name.ToLowerInvariant();
 
         private static KVObject MakeColor32(byte[] bytes)
-            => KVObject.Array(bytes.Select(b => (KVObject)(long)b));
+            => KVObject.PackedArray(Array.ConvertAll(bytes, static b => (long)b));
 
         private static void ReadValues(Entity entity, KVObject? values)
         {
@@ -389,9 +396,7 @@ namespace ValveResourceFormat.ResourceTypes
         /// <returns>A formatted string containing all entities and their properties.</returns>
         public string ToEntityDumpString()
         {
-            var knownKeys = StringToken.InvertedTable;
             var builder = new StringBuilder();
-            var unknownKeys = new Dictionary<uint, uint>();
 
             using var valueStream = new MemoryStream();
 
@@ -457,17 +462,6 @@ namespace ValveResourceFormat.ResourceTypes
                 }
 
                 builder.AppendLine();
-            }
-
-            if (unknownKeys.Count > 0)
-            {
-                builder.AppendLine($"@@@@@ UNKNOWN KEY LOOKUPS:");
-                builder.AppendLine($"If you know what these are, add them to EntityLumpKnownKeys.cs");
-
-                foreach (var unknownKey in unknownKeys)
-                {
-                    builder.AppendLine(CultureInfo.InvariantCulture, $"key={unknownKey.Key} hits={unknownKey.Value}");
-                }
             }
 
             return builder.ToString();

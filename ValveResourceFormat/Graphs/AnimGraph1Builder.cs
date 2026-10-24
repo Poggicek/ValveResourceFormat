@@ -476,7 +476,7 @@ internal sealed class AnimGraph1Builder : IDisposable
         foreach (var parameters in new[]
         {
             animGraphData.GetSubCollection("m_pParameterList")?.GetArray("m_Parameters"),
-            animGraphData.ContainsKey("m_localParameters") ? animGraphData.GetArray("m_localParameters") : null,
+            animGraphData.GetArray("m_localParameters"),
         })
         {
             if (parameters == null)
@@ -652,7 +652,7 @@ internal sealed class AnimGraph1Builder : IDisposable
 
                 // animgraph19 wraps the conditions in a container; animgraph1 lists them inline.
                 var conditions = transition.GetSubCollection("m_conditionList")?.GetArray("m_conditions")
-                    ?? (transition.ContainsKey("m_conditions") ? transition.GetArray("m_conditions") : null);
+                    ?? transition.GetArray("m_conditions");
 
                 string? label = null;
 
@@ -903,9 +903,8 @@ internal sealed class AnimGraph1Builder : IDisposable
             var def = paramObj.GetFloatProperty("m_fDefaultValue");
             result += string.Create(CultureInfo.InvariantCulture, $" (default: {def:F2})");
         }
-        else if (paramObj.ContainsKey("m_defaultValue"))
+        else if (paramObj.TryGetValue("m_defaultValue", out var def))
         {
-            var def = paramObj["m_defaultValue"];
             if (def.ValueType == KVValueType.Int32 || def.ValueType == KVValueType.UInt32)
             {
                 result += $" (default: {def.ToInt32()})";
@@ -1011,7 +1010,7 @@ internal sealed class AnimGraph1Builder : IDisposable
         if (value.ValueType == KVValueType.Array)
         {
             var array = obj.GetFloatArray(key);
-            if (array != null && array.Length >= 2)
+            if (array.Length >= 2)
             {
                 return (array[0], array[1]);
             }
@@ -1087,9 +1086,8 @@ internal sealed class AnimGraph1Builder : IDisposable
 
             foreach (var prop in ChildProperties)
             {
-                if (compiledNode.ContainsKey(prop))
+                if (compiledNode.TryGetValue(prop, out var childRef))
                 {
-                    var childRef = compiledNode[prop];
                     if (childRef.ValueType == KVValueType.Collection && childRef.ContainsKey("m_nodeIndex"))
                     {
                         var idx = childRef.GetInt32Property("m_nodeIndex");
@@ -1146,7 +1144,7 @@ internal sealed class AnimGraph1Builder : IDisposable
                         }
 
                         var childRef = stateData.GetSubCollection("m_pChild");
-                        return childRef.ContainsKey("m_nodeIndex") ? childRef.GetInt32Property("m_nodeIndex") : -1;
+                        return childRef.GetInt32Property("m_nodeIndex", -1);
                     }
 
                     for (var s = 0; s < stateDataArray.Count; s++)
@@ -1184,8 +1182,8 @@ internal sealed class AnimGraph1Builder : IDisposable
             if (className == "CChoiceUpdateNode" && compiledNode.ContainsKey("m_children"))
             {
                 var children = compiledNode.GetArray("m_children");
-                var weights = compiledNode.ContainsKey("m_weights") ? compiledNode.GetFloatArray("m_weights") : null;
-                var blendTimes = compiledNode.ContainsKey("m_blendTimes") ? compiledNode.GetFloatArray("m_blendTimes") : null;
+                var weights = compiledNode.GetFloatArray("m_weights");
+                var blendTimes = compiledNode.GetFloatArray("m_blendTimes");
 
                 var newConnections = new List<(int, string)>();
                 for (var c = 0; c < children.Count; c++)
@@ -1193,8 +1191,8 @@ internal sealed class AnimGraph1Builder : IDisposable
                     var idx = GetChildNodeIndex(children[c]);
                     if (idx >= 0)
                     {
-                        var w = (weights != null && c < weights.Length) ? weights[c] : 1.0f;
-                        var bt = (blendTimes != null && c < blendTimes.Length) ? blendTimes[c] : 0.0f;
+                        var w = c < weights.Length ? weights[c] : 1.0f;
+                        var bt = c < blendTimes.Length ? blendTimes[c] : 0.0f;
                         newConnections.Add((idx, string.Create(CultureInfo.InvariantCulture, $"Item {c} (W:{w:F2} BT:{bt:F2})")));
                     }
                 }
@@ -1355,9 +1353,8 @@ internal sealed class AnimGraph1Builder : IDisposable
             node.AddText($"Tag Behavior: {compiledNode.GetStringProperty("m_eTagBehavior")}");
         }
 
-        if (compiledNode.ContainsKey("m_tags"))
+        if (compiledNode.TryGetValue("m_tags", out var tagsValue))
         {
-            var tagsValue = compiledNode["m_tags"];
             if (tagsValue.ValueType == KVValueType.Array)
             {
                 var tagIndices = compiledNode.GetIntegerArray("m_tags");
@@ -1512,9 +1509,9 @@ internal sealed class AnimGraph1Builder : IDisposable
                     node.AddText($"Transitions: {stateMachine.GetArray("m_transitions").Count}");
                 }
             }
-            if (compiledNode.ContainsKey("m_transitionData") && compiledNode.GetArray("m_transitionData").Count > 0)
+            if (compiledNode.GetArray("m_transitionData") is { Count: > 0 } transitionData)
             {
-                var first = compiledNode.GetArray("m_transitionData")[0];
+                var first = transitionData[0];
                 if (first.ContainsKey("m_blendDuration"))
                 {
                     var blend = first.GetSubCollection("m_blendDuration");
@@ -1570,9 +1567,8 @@ internal sealed class AnimGraph1Builder : IDisposable
             string[] extraProps = ["m_bAlwaysUseFallbackHinge", "m_vLsFallbackHingeAxis", "m_bMatchTargetOrientation", "m_bConstrainTwist", "m_flMaxTwist"];
             foreach (var prop in extraProps)
             {
-                if (opFixedData.ContainsKey(prop))
+                if (opFixedData.TryGetValue(prop, out var val))
                 {
-                    var val = opFixedData[prop];
                     if (!val.IsCollection && !val.IsArray)
                     {
                         node.AddText($"{prop}: {val}");

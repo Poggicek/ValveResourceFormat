@@ -47,6 +47,9 @@ namespace ValveResourceFormat.Renderer.World
         /// <summary>Visibility layer of the entities a <c>point_template</c> spawns, and of the template itself.</summary>
         public const string TemplateLayerName = "Template Entities";
 
+        /// <summary>Visibility layer of the entities that start disabled, which the game keeps hidden until enabled.</summary>
+        public const string DisabledEntitiesLayerName = "Entities (disabled)";
+
         /// <summary>Layer names that should be visible by default, populated during loading.</summary>
         public HashSet<string> DefaultEnabledLayers { get; } = ["No layer", "Entities", Scene.ParticlesLayerName, PhysicsDebugLayerName];
 
@@ -527,6 +530,7 @@ namespace ValveResourceFormat.Renderer.World
             {"directional_irradiance_sh2_r", "g_tDirectionalIrradianceR"},
             {"directional_irradiance_sh2_g", "g_tDirectionalIrradianceG"},
             {"directional_irradiance_sh2_b", "g_tDirectionalIrradianceB"},
+            {"directional_irradiance_sh2_lum", "g_tDirectionalIrradianceLum"},
             {"direct_light_shadows", "g_tDirectLightShadows"},
             {"direct_light_indices", "g_tDirectLightIndices"},
             {"direct_light_strengths", "g_tDirectLightStrengths"},
@@ -537,6 +541,7 @@ namespace ValveResourceFormat.Renderer.World
         private readonly string[] LightmapSetV81 = ["g_tIrradiance", "g_tDirectionalIrradiance", "g_tDirectLightIndices", "g_tDirectLightStrengths"];
         private readonly string[] LightmapSetV82 = ["g_tIrradiance", "g_tDirectionalIrradiance", "g_tDirectLightShadows"];
         private readonly string[] LightmapSetV83 = ["g_tIrradiance", "g_tDirectionalIrradianceR", "g_tDirectionalIrradianceG", "g_tDirectionalIrradianceB", "g_tDirectLightShadows"];
+        private readonly string[] LightmapSetV85 = ["g_tIrradiance", "g_tDirectionalIrradianceLum", "g_tDirectLightShadows"];
 
         /// <summary>
         /// Loads lightmap and lighting information from the world into the scene.
@@ -589,6 +594,7 @@ namespace ValveResourceFormat.Renderer.World
                 (8, 1) => LightmapSetV81.All(lightmapPresent),
                 (8, 2) => LightmapSetV82.All(lightmapPresent),
                 (8, 3 or 4) => LightmapSetV83.All(lightmapPresent),
+                (8, 5) => LightmapSetV85.All(lightmapPresent),
                 _ => false,
             };
 
@@ -607,13 +613,6 @@ namespace ValveResourceFormat.Renderer.World
 
         private void LoadEntitiesFromLump(EntityLump entityLump, string originalLayerName, Matrix4x4 lumpTransform, EntityNameFixup lumpNameFixup)
         {
-            // Cubemaps and probes spawn before everything else. Meshes copy the scene's render attributes into
-            // their shader combos as they are built, and three of those come from these entities:
-            // S_SCENE_CUBEMAP_TYPE from the first cubemap's texture (a cube or a cube array),
-            // S_SCENE_PROBE_TYPE from whether a probe volume is an atlas, and HasValidLightProbes, which
-            // picks D_BAKED_LIGHTING_FROM_PROBE. A model spawned before them compiles the wrong combos.
-            // Everything else about them binds after load, in Scene.Initialize, so only this order matters.
-            // A read-only pass settling those three values from the keyvalues first would make it unneeded.
             static bool IsCubemapOrProbe(string cls)
                 => cls == "env_combined_light_probe_volume"
                 || cls == "env_light_probe_volume"
@@ -659,7 +658,7 @@ namespace ValveResourceFormat.Renderer.World
 
                     if (disabled && layerName == "Entities")
                     {
-                        layerName = "Entities (disabled)";
+                        layerName = DisabledEntitiesLayerName;
                     }
 
                     // Every entity joins the entity system, so it can be named and targeted, and draws itself

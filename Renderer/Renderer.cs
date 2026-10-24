@@ -1,9 +1,11 @@
 using System.Diagnostics;
 using System.Reflection;
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Renderer.Editor.Picking;
 using ValveResourceFormat.Renderer.Entities;
 using ValveResourceFormat.Renderer.PostProcess;
 using ValveResourceFormat.Renderer.SceneEnvironment;
+using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.Renderer.World;
 using ValveResourceFormat.ResourceTypes;
 using Color4 = OpenTK.Mathematics.Color4;
@@ -110,6 +112,21 @@ public class Renderer : ISpawnGroupHost
         return null;
     }
 
+    /// <summary>Finds the node a pick found.</summary>
+    /// <param name="result">The result of the pick.</param>
+    /// <returns>The node, or <see langword="null"/> when the pick hit none.</returns>
+    internal SceneNode? FindPickedNode(PickResult result)
+    {
+        var pixel = result.Pixel;
+
+        if (result.HitNothing || pixel.SceneIndex >= scenes.Count)
+        {
+            return null;
+        }
+
+        return scenes[(int)pixel.SceneIndex].Find(pixel.ObjectId);
+    }
+
     /// <summary>Finds a node by its entity's <c>targetname</c>, in whichever scene it went into.</summary>
     /// <param name="pattern">The target name to match.</param>
     /// <returns>The first matching node, or <see langword="null"/> when there is none.</returns>
@@ -206,6 +223,13 @@ public class Renderer : ISpawnGroupHost
 
     private Shader depthDownsampleShader = null!;
 
+    // Per pixel, the nearest and second nearest order independent fragments, and how many there are in all
+    private RenderTexture? orderIndependentLayers;
+    private Shader orderIndependentCompositeShader = null!;
+
+    // The image unit both order independent shaders declare the layers at
+    private const int OrderIndependentLayersImageUnit = 0;
+
     /// <summary>Scene pixels per water effects texel, horizontally and vertically.</summary>
     public static (int X, int Y) WaterEffectsDownsample { get; } = (4, 2); // 6:3 in low settings
 
@@ -263,12 +287,6 @@ public class Renderer : ISpawnGroupHost
     /// </summary>
     public Vector3? LockedCullPosition { get; set; }
 
-    /// <summary>
-    /// When <see langword="true"/>, every form of culling (CPU frustum, GPU meshlet, occlusion, PVS, shadow
-    /// frustum) is bypassed so the whole scene is submitted.
-    /// </summary>
-    public bool DisableAllCulling { get; set; }
-
     // Reused so the frustum cull results stay cached across pre-warm calls
     private readonly Frustum noCullFrustum = Frustum.CreateEmpty();
 
@@ -292,6 +310,9 @@ public class Renderer : ISpawnGroupHost
     private readonly Dictionary<SpawnGroup, Entities.SkyCamera?> skyCameras = [];
     private readonly List<Scene> sunCasters = [];
 
+    /// <summary>Gets the rendering toggles for all scenes.</summary>
+    public RenderSettings Settings { get; } = new();
+
     /// <summary>
     /// Width and height in texels of the shadow depth buffers.
     /// </summary>
@@ -301,16 +322,6 @@ public class Renderer : ISpawnGroupHost
     /// When <see langword="true"/>, geometry is rendered as wireframe lines.
     /// </summary>
     public bool IsWireframe { get; set; }
-
-    /// <summary>
-    /// When <see langword="true"/>, the 3D sky is drawn. Does not affect the 2D skybox.
-    /// </summary>
-    public bool ShowSkybox { get; set; } = true;
-
-    /// <summary>
-    /// Enable barn light types in shaders.
-    /// </summary>
-    public bool EnableBarnLights { get; set; } = true;
 
     /// <summary>
     /// Whether scene nodes simulate across the thread pool. Off runs them in scene order.
@@ -330,7 +341,7 @@ public class Renderer : ISpawnGroupHost
         Camera = new Camera(rendererContext.FieldOfView);
         ViewmodelCamera = new Camera();
         SkyCamera = new Camera();
-        Scene = new Scene(rendererContext);
+        Scene = new Scene(rendererContext) { Settings = Settings };
         EntitySystem = new EntitySystem(rendererContext)
         {
             SpawnGroupHost = this,
@@ -346,6 +357,7 @@ public class Renderer : ISpawnGroupHost
     {
         ArgumentNullException.ThrowIfNull(group);
 
+        group.Scene.Settings = Settings;
         spawnGroups.Add(group);
         group.Scene.PhysicsWorld ??= EntitySystem.GetPhysicsWorld(group.Scene.WorldGroup);
         scenes.Add(group.Scene);
@@ -491,7 +503,7 @@ public class Renderer : ISpawnGroupHost
     }
 
     /// <summary>The frustum a view's CPU cull runs against, or <see langword="null"/> for the camera's own.</summary>
-    private Frustum? CullFrustumFor(in SceneView view) => DisableAllCulling ? noCullFrustum : view.LockedCullFrustum;
+    private Frustum? CullFrustumFor(in SceneView view) => Settings.DisableAllCulling ? noCullFrustum : view.LockedCullFrustum;
 
     /// <summary>
     /// The frustum a view's GPU meshlet cull runs against, or <see langword="null"/> to leave its
@@ -500,7 +512,7 @@ public class Renderer : ISpawnGroupHost
     /// </summary>
     private Frustum? MeshletCullFrustumFor(in SceneView view)
     {
-        if (DisableAllCulling)
+        if (Settings.DisableAllCulling)
         {
             return noCullFrustum;
         }
@@ -625,6 +637,7 @@ public class Renderer : ISpawnGroupHost
 
         depthOnlyShader = Scene.RendererContext.ShaderLoader.LoadShader("depth_only");
         depthDownsampleShader = Scene.RendererContext.ShaderLoader.LoadShader("depth_downsample");
+        orderIndependentCompositeShader = Scene.RendererContext.ShaderLoader.LoadShader("oit_composite");
 
         histogramShaders[0] = Scene.RendererContext.ShaderLoader.LoadShader("histogram");
         histogramShaders[1] = Scene.RendererContext.ShaderLoader.LoadShader("histogram", ("D_HISTOGRAM_MODE", 1));
@@ -838,7 +851,7 @@ public class Renderer : ISpawnGroupHost
         var cullHeight = (int)ViewBuffer.Data.ViewportSize.Y;
 
         // The main scene's tile culling toggle applies to every view
-        state.LightBinner.Update(ViewBuffer.Data, cullWidth, cullHeight, Scene.EnableTiledLightCulling);
+        state.LightBinner.Update(ViewBuffer.Data, cullWidth, cullHeight, Settings.EnableTiledLightCulling);
 
         UploadViewConstants(view, state);
 
@@ -921,6 +934,12 @@ public class Renderer : ISpawnGroupHost
     // Translucents sort per scene, so a later scene draws over an earlier one
     private void RenderTranslucentLayer(in SceneView view, ref Scene.RenderContext renderContext)
     {
+        // Not the 3D sky, which draws in its own depth range, nor the passes that replace or count the shaders
+        var orderIndependent = view.Sky == null
+            && renderContext.ReplacementShader == null
+            && renderContext.OverdrawShader == null
+            && ReferenceEquals(renderContext.Framebuffer, MainFramebuffer);
+
         foreach (var state in view.States)
         {
             DrawThrough(view, state, ref renderContext);
@@ -930,8 +949,65 @@ public class Renderer : ISpawnGroupHost
 
             using var _ = GraphicsContext.RenderState.Scope(depthWrite: false, blend: true);
 
-            state.RenderTranslucentLayer(renderContext);
+            state.RenderTranslucentLayer(renderContext with { OrderIndependentTranslucency = orderIndependent });
+
+            if (orderIndependent && state.HasOrderIndependentFills)
+            {
+                RenderOrderIndependentFills(state, renderContext.Framebuffer);
+            }
         }
+    }
+
+    /// <summary>
+    /// Draws the fills that skipped the sorted translucent layer in one pass that keeps the two nearest fragments
+    /// of each pixel and counts them all, and then blends them over the scene as sorted layers of
+    /// <see cref="PhysSceneNode.FillAlpha"/> would. The shapes' edge lines go over them last.
+    /// </summary>
+    private void RenderOrderIndependentFills(SceneViewState state, Framebuffer sceneFramebuffer)
+    {
+        using var _ = new GLDebugGroup("Order Independent Fills");
+
+        var layers = PrepareOrderIndependentLayers(sceneFramebuffer.Width, sceneFramebuffer.Height);
+        GL.BindImageTexture(OrderIndependentLayersImageUnit, layers.Handle, 0, true, 0, TextureAccess.ReadWrite, SizedInternalFormat.R32ui);
+
+        // The fills only write the layers, still testing against the scene depth
+        using (GraphicsContext.RenderState.Scope(colorWriteMask: RsColorWriteEnableBits.None))
+        {
+            state.RenderOrderIndependentFills();
+        }
+
+        GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit);
+
+        // The composite outputs the layers' color premultiplied, and what they let through of the scene as alpha
+        using (GraphicsContext.RenderState.Scope(fillMode: RsFillMode.Solid, cullMode: RsCullMode.None, depthTest: false, srcBlend: RsBlendMode.One, dstBlend: RsBlendMode.SrcAlpha))
+        {
+            orderIndependentCompositeShader.Use();
+            orderIndependentCompositeShader.SetUniform("g_flLayerAlpha", PhysSceneNode.FillAlpha);
+
+            GL.BindVertexArray(RendererContext.MeshBufferCache.EmptyVAO);
+            GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
+        }
+
+        // The lines go over the composite, and read the layers to fade behind the fills in front of them
+        using (new GLDebugGroup("Order Independent Lines"))
+        using (GraphicsContext.RenderState.Scope(srcBlend: RsBlendMode.SrcAlpha, dstBlend: RsBlendMode.InvSrcAlpha))
+        {
+            state.RenderOrderIndependentLines();
+        }
+    }
+
+    /// <summary>Clears the order independent layers, created or recreated to match the scene size.</summary>
+    private RenderTexture PrepareOrderIndependentLayers(int width, int height)
+    {
+        if (orderIndependentLayers == null || orderIndependentLayers.Width != width || orderIndependentLayers.Height != height)
+        {
+            orderIndependentLayers?.Delete();
+            orderIndependentLayers = RenderTexture.Create3D(TextureTarget.Texture2DArray, width, height, 3, ImageFormat.R32_UINT, 1, "OrderIndependentLayers");
+        }
+
+        GL.ClearTexImage(orderIndependentLayers.Handle, 0, PixelFormat.RedInteger, PixelType.UnsignedInt, IntPtr.Zero);
+
+        return orderIndependentLayers;
     }
 
     /// <summary>
@@ -1152,7 +1228,7 @@ public class Renderer : ISpawnGroupHost
         {
             GraphicsContext.RenderState.SetDepthRange(DepthRange.Sky);
 
-            SceneView? skyView = ShowSkybox && views.Length > 1 ? views[1] : null;
+            SceneView? skyView = Settings.ShowSkybox && views.Length > 1 ? views[1] : null;
             var copyColor = false;
             var copyDepth = ForceResolveSceneDepth;
 
@@ -1175,11 +1251,12 @@ public class Renderer : ISpawnGroupHost
 
             DrawThrough(mainView, mainState, ref renderContext);
 
-            if (!isWireframe)
+            // The sky draws with its own shader, which would write colors into the ids of a replacement pass
+            if (!isWireframe && renderContext.ReplacementShader == null)
             {
                 using (new GLDebugGroup("2D Sky Render"))
                 {
-                    BackgroundFor(views)?.Render();
+                    BackgroundFor(views)?.Render(Settings.FogEnabled ? Scene.FogInfo.LinearFog : null, mainView.Camera);
                 }
             }
 
@@ -1187,15 +1264,15 @@ public class Renderer : ISpawnGroupHost
 
             if (isMainFramebuffer)
             {
-                var generateDepthPyramid = Scene.EnableOcclusionCulling
+                var generateDepthPyramid = Settings.EnableOcclusionCulling
                     && Scene.DrawMeshletsIndirect
                     && LockedCullFrustum == null
-                    && !DisableAllCulling
+                    && !Settings.DisableAllCulling
                     && Uptime >= OcclusionCullWarmupSeconds;
 
                 copyDepth |= generateDepthPyramid || NeedsWaterEffectsMap(mainView) || NeedsEffectsBloomMap(mainView);
 
-                var depthPyramidValid = !DisableAllCulling && (generateDepthPyramid || LockedCullFrustum != null);
+                var depthPyramidValid = !Settings.DisableAllCulling && (generateDepthPyramid || LockedCullFrustum != null);
 
                 foreach (var view in views)
                 {
@@ -1896,6 +1973,7 @@ public class Renderer : ISpawnGroupHost
         ResolvedSceneDepth?.Delete();
         TranslucentDepthBuffer?.Delete();
         OutlineMaskBuffer?.Delete();
+        orderIndependentLayers?.Delete();
         ShadowDepthBuffer?.Delete();
         BarnLightShadowBuffer?.Delete();
         histogramBuffers[0]?.Delete();
@@ -1949,7 +2027,7 @@ public class Renderer : ISpawnGroupHost
                 if (scenesUpdated.Add(state.Scene))
                 {
                     state.Scene.Update(updateContext with { Camera = view.Camera });
-                    state.Scene.VisibilityBoxes.PrepareView(DisableAllCulling ? null : view.Sky?.ToSky(boxEye) ?? boxEye);
+                    state.Scene.VisibilityBoxes.PrepareView(Settings.DisableAllCulling || !Settings.EnableVisBoxCulling ? null : view.Sky?.ToSky(boxEye) ?? boxEye);
                 }
             }
         }
@@ -1971,9 +2049,9 @@ public class Renderer : ISpawnGroupHost
 
         LendSun(views[0]);
 
-        Scene.SetupSunShadows(Scene.LightingInfo, SceneCasters(views[0]), updateContext.Camera, DisableAllCulling ? -1 : ShadowDepthBuffer.Width);
+        Scene.SetupSunShadows(Scene.LightingInfo, SceneCasters(views[0]), updateContext.Camera, Settings.DisableAllCulling ? -1 : ShadowDepthBuffer.Width);
 
-        if (EnableBarnLights)
+        if (Settings.EnableBarnLights)
         {
             Scene.LightingInfo.BinBarnLights(Camera, ShadowTextureSize);
         }
@@ -1983,7 +2061,7 @@ public class Renderer : ISpawnGroupHost
         }
 
         var pvsPosition = LockedCullPosition ?? updateContext.Camera.Location;
-        var pvsEnabled = !DisableAllCulling && Scene.EnablePvsCulling;
+        var pvsEnabled = !Settings.DisableAllCulling && Settings.EnablePvsCulling;
 
         foreach (var view in views)
         {

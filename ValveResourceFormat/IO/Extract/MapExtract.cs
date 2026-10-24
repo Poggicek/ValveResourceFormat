@@ -258,12 +258,13 @@ public sealed partial class MapExtract
 
         foreach (var streamOverride in streamOverrides)
         {
+            if (streamOverride.DrawCallIndex > int.MaxValue)
+            {
+                continue;
+            }
+
             var stream = streams.VertexBuffers[streamOverride.BufferIndex];
-            var drawCall = model.GetEmbeddedMeshes()
-                .Where(mesh => mesh.MeshIndex == streamOverride.SubSceneObject)
-                .SelectMany(static mesh => mesh.Mesh.Data.GetArray("m_sceneObjects"))
-                .SelectMany(static meshSceneObject => meshSceneObject.GetArray("m_drawCalls"))
-                .ElementAtOrDefault(streamOverride.DrawCallIndex);
+            var drawCall = FindEmbeddedDrawCall(model, streamOverride);
 
             // Streams painted on an older version of the model no longer match its vertex count
             if (drawCall is null || drawCall.GetInt32Property("m_nVertexCount") != stream.ElementCount
@@ -280,8 +281,8 @@ public sealed partial class MapExtract
 
             var extraStream = new CDmExtraVertexStream
             {
-                MeshIndex = streamOverride.SubSceneObject,
-                DrawCallIndex = streamOverride.DrawCallIndex,
+                MeshIndex = (int)streamOverride.SubSceneObject,
+                DrawCallIndex = (int)streamOverride.DrawCallIndex,
             };
 
             var indices = Enumerable.Range(0, (int)stream.ElementCount).ToArray();
@@ -308,6 +309,34 @@ public sealed partial class MapExtract
         return extraVertexData.ExtraStreams.Count > 0 ? extraVertexData : null;
     }
 
+    private static KVObject? FindEmbeddedDrawCall(Model model, WorldNode.ExtraVertexStreamOverride streamOverride)
+    {
+        var remaining = (int)streamOverride.DrawCallIndex;
+
+        foreach (var embeddedMesh in model.GetEmbeddedMeshes())
+        {
+            if (embeddedMesh.MeshIndex != streamOverride.SubSceneObject)
+            {
+                continue;
+            }
+
+            foreach (var meshSceneObject in embeddedMesh.Mesh.Data.GetArray("m_sceneObjects"))
+            {
+                foreach (var drawCall in meshSceneObject.GetArray("m_drawCalls"))
+                {
+                    if (remaining == 0)
+                    {
+                        return drawCall;
+                    }
+
+                    remaining--;
+                }
+            }
+        }
+
+        return null;
+    }
+
     private readonly Dictionary<string, Material.VsInputSignature> ExtraVertexStreamInputSignatures = [];
 
     /// <summary>
@@ -316,6 +345,14 @@ public sealed partial class MapExtract
     /// </summary>
     private string? GetWholeModelMaterialOverride(string modelName, WorldNode.MaterialOverride[] materialOverrides)
     {
+        foreach (var materialOverride in materialOverrides)
+        {
+            if (materialOverride.IsWholeModel && !string.IsNullOrEmpty(materialOverride.Material))
+            {
+                return materialOverride.Material;
+            }
+        }
+
         if (materialOverrides.Length == 0 || materialOverrides.Any(materialOverride => materialOverride.Material != materialOverrides[0].Material))
         {
             return null;
@@ -740,8 +777,8 @@ public sealed partial class MapExtract
 
     private List<CMapRootElement> SplitLargeMapDocument()
     {
-        const int OneGiB = 1024 * 1024 * 1024;
-        var accumulatedMapMeshSize = 0;
+        const long OneGiB = 1024 * 1024 * 1024;
+        var accumulatedMapMeshSize = 0L;
 
         List<CMapRootElement> additionalMaps = [];
 
@@ -834,7 +871,6 @@ public sealed partial class MapExtract
                 + GetArraySize(mesh.MeshData.EdgeOppositeIndices)
                 + GetArraySize(mesh.MeshData.EdgeNextIndices)
                 + GetArraySize(mesh.MeshData.EdgeFaceIndices)
-                + GetArraySize(mesh.MeshData.EdgeDataIndices)
                 + GetArraySize(mesh.MeshData.EdgeVertexDataIndices);
             GetTotalDataStreamSizes(mesh.MeshData.EdgeData.Streams, ref meshSize);
 
@@ -1087,7 +1123,7 @@ public sealed partial class MapExtract
                 }
 
                 var tintColor = sceneObject.GetSubCollection("m_vTintColor").ToVector4();
-                var renderOrder = (int)sceneObject.GetIntegerProperty("m_nOverlayRenderOrder");
+                var renderOrder = sceneObject.GetInt32Property("m_nOverlayRenderOrder");
                 var group = new OverlayGroup(material, renderOrder, tintColor, objectFlags & OverlayFlags);
 
                 if (!WorldOverlayGeometry.TryGetValue(group, out var pieces))
@@ -1810,7 +1846,7 @@ public sealed partial class MapExtract
 
             foreach (var mesh in meshes)
             {
-                var deletedTriangles = PhysTriangleMatcher?.PhysicsMeshes.FirstOrDefault(physicsMesh => physicsMesh.Mesh == mesh)?.DeletedTriangles;
+                var deletedTriangles = PhysTriangleMatcher?.GetDeletedTriangles(mesh);
                 physicsMeshBuilder.AddPhysMesh(mesh, phys, GetAndExportAutoPhysicsMaterialName, deletedTriangles, transform, materialOverride);
             }
 
@@ -2092,12 +2128,12 @@ public sealed partial class MapExtract
                 propStatic.EntityProperties["disablemerging"] = StringBool(true);
             }
 
-            if (GetWholeModelMaterialOverride(modelName!, [.. materialOverrides[sceneObjectIndex]]) is { } materialOverride)
+            if (GetWholeModelMaterialOverride(modelName!, [.. materialOverrides[(uint)sceneObjectIndex]]) is { } materialOverride)
             {
                 propStatic.EntityProperties["materialoverride"] = materialOverride;
             }
 
-            if (GetExtraVertexData(modelName!, [.. extraVertexStreamOverrides[sceneObjectIndex]], extraVertexStreams) is { } extraVertexData)
+            if (GetExtraVertexData(modelName!, [.. extraVertexStreamOverrides[(uint)sceneObjectIndex]], extraVertexStreams) is { } extraVertexData)
             {
                 propStatic["extra_vertex_data"] = extraVertexData;
             }
@@ -2120,9 +2156,7 @@ public sealed partial class MapExtract
             var drawCenters = Array.Empty<Vector3>();
 
             var transformIndex = 0;
-            var fragmentTransforms = agg.ContainsKey("m_fragmentTransforms")
-                ? agg.GetArray("m_fragmentTransforms")
-                : [];
+            var fragmentTransforms = agg.GetArray("m_fragmentTransforms") ?? [];
 
             var aggregateHasTransforms = fragmentTransforms.Count > 0;
 
@@ -2150,7 +2184,7 @@ public sealed partial class MapExtract
             {
                 if (!aggregateHasTransforms)
                 {
-                    drawCenters = (sceneObject.ContainsKey("m_drawBounds") ? sceneObject.GetArray("m_drawBounds") : [])
+                    drawCenters = (sceneObject.GetArray("m_drawBounds") ?? [])
                         .Select(aabb => (aabb.GetSubCollection("m_vMinBounds").ToVector3() + aabb.GetSubCollection("m_vMaxBounds").ToVector3()) / 2f)
                         .ToArray();
                 }
@@ -2280,7 +2314,7 @@ public sealed partial class MapExtract
 
         foreach (var aggregateSceneObject in node.AggregateSceneObjects)
         {
-            var layerIndex = (int)aggregateSceneObject.GetIntegerProperty("m_nLayer");
+            var layerIndex = aggregateSceneObject.GetInt32Property("m_nLayer");
             ProcessAggregate(aggregateSceneObject, layerIndex, layerNodes);
         }
 
@@ -2722,7 +2756,7 @@ public sealed partial class MapExtract
                 var hammerUniqueIdString = compiledEntity.TryGetValue(key, out var hammerValue) ? ToEditString(hammerValue) : null;
                 if (!string.IsNullOrEmpty(hammerUniqueIdString))
                 {
-                    lineage = Array.ConvertAll(hammerUniqueIdString.Split(':'), int.Parse);
+                    lineage = Array.ConvertAll(hammerUniqueIdString.Split(':'), static part => int.Parse(part, CultureInfo.InvariantCulture));
                 }
             }
             catch (FormatException)
@@ -2784,7 +2818,7 @@ public sealed partial class MapExtract
                 return element;
 
             case KVValueType.Array:
-                var items = (IReadOnlyList<KVObject>)value.Values;
+                var items = value.Elements;
 
                 if (ToDmeTypedArray(items) is { } typedArray)
                 {
@@ -2815,17 +2849,7 @@ public sealed partial class MapExtract
                 // The compiler prefixes entity names used as literals, like it does targetnames
                 var text = ApplyNameFixup((string)value, string.Empty, string.Empty);
 
-                // TODO: Use value.Flag.SerializeFlagName() once ValveKeyValue with KVFlagExtensions is released
-                var specificType = value.Flag switch
-                {
-                    KVFlag.Resource => "resource",
-                    KVFlag.ResourceName => "resource_name",
-                    KVFlag.Panorama => "panorama",
-                    KVFlag.SoundEvent => "soundevent",
-                    KVFlag.SubClass => "subclass",
-                    KVFlag.EntityName => "entity_name",
-                    _ => null,
-                };
+                var specificType = value.Flag.SerializeFlagName();
 
                 if (specificType == null)
                 {
@@ -2896,7 +2920,7 @@ public sealed partial class MapExtract
                 return null;
             }
 
-            var components = (IReadOnlyList<KVObject>)item.Values;
+            var components = item.Elements;
 
             if ((vectors.Count > 0 && components.Count != vectors[0].Length) || !components.All(static component => IsKeyValues3Float(component.ValueType)))
             {
@@ -2951,7 +2975,7 @@ public sealed partial class MapExtract
 
             using var ms = new MemoryStream();
             KVSerializer.Create(KVSerializationFormat.KeyValues1Text).Serialize(ms, new KVDocument(null, null, kvObject));
-            return System.Text.Encoding.UTF8.GetString(ms.ToArray());
+            return System.Text.Encoding.UTF8.GetString(ms.GetBuffer(), 0, (int)ms.Length);
         }
 
         return data switch

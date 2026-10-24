@@ -36,16 +36,16 @@ namespace ValveResourceFormat.Particles.Initializers
             var particleSpeed = speed.NextNumber(ref particle, particleSystemState);
             var particleOffset = offset.NextNumber(ref particle, particleSystemState);
 
-            var halfAngle = float.DegreesToRadians(float.Lerp(inner, outer, particleSystemState.Random.Next())) * 0.5f;
+            var halfAngle = float.DegreesToRadians(MathUtils.Lerp(inner, outer, particleSystemState.Random.Next())) * 0.5f;
 
             // The ring is placed at least one unit along the axis so a zero offset still yields a
             // direction at the drawn angle; a negative offset flips the cone backwards.
             var axialDistance = MathF.Max(MathF.Abs(particleOffset), 1f) * (particleOffset < 0f ? -1f : 1f);
             var radius = axialDistance * MathF.Tan(halfAngle);
 
-            var (sin, cos) = MathF.SinCos(particleSystemState.Random.Next() * MathF.Tau);
-
             var transform = transformInput.NextTransformAtTime(ref particle, particleSystemState, particle.CreationTime);
+
+            var (sin, cos) = MathF.SinCos(particleSystemState.Random.Next() * MathF.Tau);
             var forward = Vector3.TransformNormal(Vector3.UnitX, transform);
             var ringOffset = Vector3.TransformNormal(new Vector3(0f, radius * cos, radius * sin), transform);
 
@@ -58,8 +58,7 @@ namespace ValveResourceFormat.Particles.Initializers
 
             var direction = Vector3.Normalize((forward * axialDistance) + ringOffset);
 
-            particle.SetVector(ParticleField.Position, position);
-            particle.Velocity = direction * particleSpeed;
+            SetSpawnPosition(ref particle, particleSystemState, position, position - (direction * (particleSpeed * particles.PreviousFrameTime)));
 
             return particle;
         }

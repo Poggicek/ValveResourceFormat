@@ -4,8 +4,7 @@
 #define VRF_LIGHTING_PARTICLE_INCLUDE
 
 #include "features.slang"
-
-#define S_SCENE_PROBE_TYPE 0 // 1 = Individual, 2 = Atlas
+#include "texturing.slang"
 
 float GetParticleCosine(vec3 normalWs, vec3 lightDir, float directionality)
 {
@@ -36,17 +35,17 @@ struct ParticleLight_t
     vec3 Direct; // The sun behind its baked and cascade shadows, plus the culled barn lights
 };
 
-// Unlit, as ambient 1 and no direct light, in scenes without probes and in fullbright
+// Ambient 1 and the unshadowed sun in scenes without probes, ambient 1 alone in fullbright
 ParticleLight_t CalculateParticleLighting(vec3 positionWs, vec3 normalWs, float directionality)
 {
     ParticleLight_t light = ParticleLight_t(vec3(1.0), vec3(0.0));
 
-#if (D_BAKED_LIGHTING_FROM_PROBE == 1)
     if (g_iRenderMode == renderMode_FullBright)
     {
         return light;
     }
 
+#if (D_BAKED_LIGHTING_FROM_PROBE == 1)
     light.Ambient = vec3(0.0);
 
     if (directionality < 1.0)
@@ -72,7 +71,7 @@ ParticleLight_t CalculateParticleLighting(vec3 positionWs, vec3 normalWs, float 
 
     light.Direct = g_vSunColor.rgb * sunVisibility;
 
-    #if (S_LIGHTMAP_VERSION_MINOR != 1)
+    #if !(BAKED_LIGHT_INDICES)
         MaterialProperties_t mat;
         mat.PositionWS = positionWs;
         mat.Normal = normalWs;
@@ -85,6 +84,8 @@ ParticleLight_t CalculateParticleLighting(vec3 positionWs, vec3 normalWs, float 
 
         light.Direct += barnLighting.DiffuseDirect;
     #endif
+#else
+    light.Direct = g_vSunColor.rgb * GetParticleCosine(normalWs, g_vSunDirection.xyz, directionality);
 #endif
 
     return light;

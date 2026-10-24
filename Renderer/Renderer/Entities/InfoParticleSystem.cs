@@ -1,6 +1,8 @@
 using System.Globalization;
 using Microsoft.Extensions.Logging;
 using ValveResourceFormat.Blocks;
+using ValveResourceFormat.Particles;
+using ValveResourceFormat.Renderer.Particles;
 using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
@@ -9,7 +11,8 @@ namespace ValveResourceFormat.Renderer.Entities;
 
 /// <summary>
 /// <c>info_particle_system</c>, and Dota's <c>dota_world_particle_system</c>: plays <c>effect_name</c> at
-/// the entity, with its control points bound to the entities the <c>cpointN</c> keys name.
+/// the entity, with its control points bound to the entities the <c>cpointN</c> keys name and carrying
+/// their models.
 /// </summary>
 /// <seealso href="https://s2v.app/SchemaExplorer/cs2/server/CParticleSystem">CParticleSystem</seealso>
 /// <seealso href="https://s2v.app/SchemaExplorer/dota2/client/C_DOTAWorldParticleSystem">C_DOTAWorldParticleSystem</seealso>
@@ -115,6 +118,13 @@ public class InfoParticleSystem : BaseEntity
         else
         {
             effect.SetControlPoint(index, target.Transform);
+        }
+
+        if (target is BaseModelEntity { LoadedModel: { } model } modelEntity)
+        {
+            effect.GetControlPoint(index).ModelObject = modelEntity.ModelNode is { } modelNode
+                ? new ParticleModelNodeObject(model, modelNode, EntitySystem.RendererContext.FileLoader)
+                : new BindPoseModelObject(model) { Transform = target.Transform };
         }
     }
 

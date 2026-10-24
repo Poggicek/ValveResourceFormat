@@ -25,10 +25,13 @@ namespace ValveResourceFormat.Renderer.Materials
         private readonly Dictionary<(RsTextureAddressMode AddressU, RsTextureAddressMode AddressV, bool Mipmaps, bool AnisotropicFiltering), int> Samplers = [];
         private readonly RendererContext RendererContext;
         private RenderTexture? ErrorTexture;
+        private RenderMaterial? ErrorMaterial;
         private RenderTexture? DefaultNormal;
         private RenderTexture? DefaultMask;
         private RenderTexture? DefaultColor;
         private RenderTexture? DefaultVolume;
+        private RenderTexture? DefaultBlackVolume;
+        private RenderTexture? DefaultCubeArray;
         private RenderTexture? DefaultTextureArray;
         /// <summary>Gets or sets the maximum anisotropy level applied to newly loaded textures when anisotropic filtering is enabled.</summary>
         public static float MaxTextureMaxAnisotropy { get; set; }
@@ -77,6 +80,7 @@ namespace ValveResourceFormat.Renderer.Materials
             }
 
             OwnedMaterials.Clear();
+            ErrorMaterial = null;
             Materials.Clear();
 
             foreach (var item in Textures)
@@ -238,6 +242,38 @@ namespace ValveResourceFormat.Renderer.Materials
             }
 
             return tex;
+        }
+
+        /// <summary>
+        /// Drops a texture from the cache and deletes it, for one whose contents were copied into another, such as a
+        /// light probe volume packed into an atlas. A texture the cache does not hold is left alone.
+        /// </summary>
+        /// <param name="texture">The texture, as <see cref="GetTexture"/> returned it.</param>
+        /// <returns>Whether the cache held the texture.</returns>
+        public bool EvictTexture(RenderTexture texture)
+        {
+            ArgumentNullException.ThrowIfNull(texture);
+
+            var evicted = false;
+
+            foreach (var cache in (Dictionary<string, RenderTexture>[])[Textures, TexturesSrgb])
+            {
+                foreach (var (name, cached) in cache)
+                {
+                    if (ReferenceEquals(cached, texture))
+                    {
+                        cache.Remove(name);
+                        evicted = true;
+                    }
+                }
+            }
+
+            if (evicted)
+            {
+                texture.Delete();
+            }
+
+            return evicted;
         }
 
         /// <summary>
@@ -624,9 +660,14 @@ namespace ValveResourceFormat.Renderer.Materials
 
         private RenderMaterial GetErrorMaterial()
         {
-            var errorMat = new RenderMaterial(RendererContext.ShaderLoader.LoadShader("error"));
-            OwnedMaterials.Add(errorMat);
-            return errorMat;
+            if (ErrorMaterial != null)
+            {
+                return ErrorMaterial;
+            }
+
+            ErrorMaterial = new RenderMaterial(RendererContext.ShaderLoader.LoadShader("error"));
+            OwnedMaterials.Add(ErrorMaterial);
+            return ErrorMaterial;
         }
 
         /// <summary>Returns a lazily created 4x4 checkerboard error texture used as a fallback for missing textures.</summary>
@@ -682,20 +723,40 @@ namespace ValveResourceFormat.Renderer.Materials
         /// <summary>
         /// Returns a lazily created 1x1x1 white volume texture.
         /// </summary>
-        public RenderTexture GetDefaultVolume()
+        public RenderTexture GetDefaultVolume() => DefaultVolume ??= CreateSolidVolume("DefaultVolume", WhiteTexel);
+
+        /// <summary>
+        /// Returns a lazily created 1x1x1 black volume texture.
+        /// </summary>
+        public RenderTexture GetDefaultBlackVolume() => DefaultBlackVolume ??= CreateSolidVolume("DefaultBlackVolume", BlackTexel);
+
+        /// <summary>
+        /// Returns a lazily created 1x1 black cube map array with a single cube.
+        /// </summary>
+        public RenderTexture GetDefaultCubeArray()
         {
-            if (DefaultVolume == null)
+            if (DefaultCubeArray == null)
             {
-                DefaultVolume = RenderTexture.Create3D(TextureTarget.Texture3D, 1, 1, 1, ImageFormat.RGBA8888, 1, "DefaultVolume");
-                DefaultVolume.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
-                DefaultVolume.SetWrapMode(RsTextureAddressMode.Clamp);
-                GL.TextureSubImage3D(DefaultVolume.Handle, 0, 0, 0, 0, 1, 1, 1, PixelFormat.Rgb, PixelType.UnsignedByte, WhiteTexel);
+                DefaultCubeArray = RenderTexture.Create3D(TextureTarget.TextureCubeMapArray, 1, 1, 6, ImageFormat.RGBA8888, 1, "DefaultCubeArray");
+                DefaultCubeArray.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
+                GL.ClearTexImage(DefaultCubeArray.Handle, 0, PixelFormat.Rgba, PixelType.UnsignedByte, IntPtr.Zero);
             }
 
-            return DefaultVolume;
+            return DefaultCubeArray;
+        }
+
+        private static RenderTexture CreateSolidVolume(string label, byte[] texel)
+        {
+            var volume = RenderTexture.Create3D(TextureTarget.Texture3D, 1, 1, 1, ImageFormat.RGBA8888, 1, label);
+            volume.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
+            volume.SetWrapMode(RsTextureAddressMode.Clamp);
+            GL.TextureSubImage3D(volume.Handle, 0, 0, 0, 0, 1, 1, 1, PixelFormat.Rgb, PixelType.UnsignedByte, texel);
+
+            return volume;
         }
 
         private static readonly byte[] WhiteTexel = [255, 255, 255];
+        private static readonly byte[] BlackTexel = [0, 0, 0];
 
         /// <summary>Returns the readback format appropriate for exporting a rendered image: 8-bit BGRA, or 32-bit float RGBA for HDR.</summary>
         /// <param name="hdr">Whether to use the HDR (32-bit float) format.</param>

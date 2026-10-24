@@ -117,6 +117,20 @@ namespace ValveResourceFormat.IO
         public bool IsCounterStrike2 => SteamAppId == CounterStrike2SteamAppId;
 
         /// <summary>
+        /// Gets whether the first game found fogs particles whose renderer leaves fog to the game, which its
+        /// <c>gameinfo.gi</c> gives as <c>Particles/ParticlesFoggedByDefault</c>.
+        /// </summary>
+        public bool ParticlesFoggedByDefault { get; private set; }
+
+        /// <summary>
+        /// Gets whether the first game found switches particle shader features at run time rather than through
+        /// static combos, which its <c>gameinfo.gi</c> gives as <c>Particles/EnableParticleShaderFeatureBranching</c>.
+        /// </summary>
+        public bool ParticleShaderFeatureBranching { get; private set; }
+
+        private bool ParticleSettingsRead;
+
+        /// <summary>
         /// Initializes a new instance of the <see cref="GameFileLoader"/> class.
         /// </summary>
         /// <param name="currentPackage">The current package to search for files in.</param>
@@ -273,12 +287,11 @@ namespace ValveResourceFormat.IO
             // Check additional packages
             foreach (var package in CurrentGamePackages)
             {
-                entry = package?.FindEntry(file);
+                entry = package.FindEntry(file);
 
                 if (entry != null)
                 {
 #if DEBUG_FILE_LOAD
-                    Debug.Assert(package != null);
                     Logger.LogDebug("Loaded \"{File}\" from preloaded vpk \"{Package}\"", file, package.FileName);
 #endif
 
@@ -343,7 +356,7 @@ namespace ValveResourceFormat.IO
                     }
                     else if (foundFile.PackageEntry != null)
                     {
-                        var stream = GetPackageEntryStream(foundFile.Package!, foundFile.PackageEntry);
+                        var stream = foundFile.Package!.GetMemoryMappedStreamIfPossible(foundFile.PackageEntry);
                         shaderFile.Read(fileName, stream);
                     }
 
@@ -420,7 +433,7 @@ namespace ValveResourceFormat.IO
             }
             else if (foundFile.PackageEntry != null)
             {
-                return GetPackageEntryStream(foundFile.Package!, foundFile.PackageEntry);
+                return foundFile.Package!.GetMemoryMappedStreamIfPossible(foundFile.PackageEntry);
             }
             else
             {
@@ -452,7 +465,7 @@ namespace ValveResourceFormat.IO
                 }
                 else if (foundFile.PackageEntry != null)
                 {
-                    var stream = GetPackageEntryStream(foundFile.Package!, foundFile.PackageEntry);
+                    var stream = foundFile.Package!.GetMemoryMappedStreamIfPossible(foundFile.PackageEntry);
                     resource.Read(stream);
                     resourceToReturn = resource;
                     resource = null;
@@ -505,6 +518,17 @@ namespace ValveResourceFormat.IO
         {
             var gameName = gameInfo.TryGetValue("game", out var game) ? game.ToString() : null;
             Logger.LogInformation("Found \"{GameName}\" from \"{GameInfo}\"", gameName, gameinfoPath);
+
+            if (!ParticleSettingsRead)
+            {
+                ParticleSettingsRead = true;
+
+                if (gameInfo.TryGetValue("Particles", out var particles))
+                {
+                    ParticlesFoggedByDefault = particles.GetBooleanProperty("ParticlesFoggedByDefault");
+                    ParticleShaderFeatureBranching = particles.GetBooleanProperty("EnableParticleShaderFeatureBranching");
+                }
+            }
 
             if (gameInfo.TryGetValue("Physics", out var physics) && physics.GetBooleanProperty("BuildMeshWings"))
             {
@@ -676,14 +700,14 @@ namespace ValveResourceFormat.IO
 
             var packageName = GetFullPackageName(searchPath);
 
-            if (IsSamePackage(CurrentFileName, packageName) || IsSamePackage(CurrentPackage?.FileName, packageName))
+            if (IsSamePackageName(CurrentFileName, packageName))
             {
                 return true;
             }
 
-            foreach (var package in EnumerateMountedPackages())
+            foreach (var package in EnumerateSearchedPackages())
             {
-                if (IsSamePackage(package.FileName, packageName))
+                if (IsSamePackageName(package.FilePath, packageName))
                 {
                     return true;
                 }
@@ -692,10 +716,62 @@ namespace ValveResourceFormat.IO
             return false;
         }
 
-        private static bool IsSamePackage(string? fileName, string packageName)
-            => fileName != null && string.Equals(GetFullPackageName(fileName), packageName, StringComparison.OrdinalIgnoreCase);
+        /// <summary>
+        /// Returns whether a package opened from the entry of the outer package is mounted, including <see cref="CurrentPackage"/>.
+        /// </summary>
+        private bool IsPackageMounted(Package outerPackage, PackageEntry entry)
+        {
+            foreach (var package in EnumerateSearchedPackages())
+            {
+                if (package is NestedPackage nested && IsSameEntry(nested.Parent, nested.ParentEntry, outerPackage, entry))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsSamePackageName(string? path, string packageName)
+            => path != null && string.Equals(GetFullPackageName(path), packageName, StringComparison.OrdinalIgnoreCase);
 
         private static string GetFullPackageName(string path) => Path.GetFullPath(PackageFileNames.GetPackageName(path));
+
+        /// <summary>
+        /// Returns whether two packages read the same file, or the same entry of the same package.
+        /// </summary>
+        private static bool IsSamePackage(Package package, Package other)
+        {
+            if (package == other)
+            {
+                return true;
+            }
+
+            if (package.FilePath is { } filePath)
+            {
+                return filePath.Equals(other.FilePath, StringComparison.OrdinalIgnoreCase);
+            }
+
+            return package is NestedPackage nested
+                && other is NestedPackage otherNested
+                && IsSameEntry(nested.Parent, nested.ParentEntry, otherNested.Parent, otherNested.ParentEntry);
+        }
+
+        private static bool IsSameEntry(Package package, PackageEntry entry, Package otherPackage, PackageEntry otherEntry)
+            => entry == otherEntry || (entry.GetFullPath() == otherEntry.GetFullPath() && IsSamePackage(package, otherPackage));
+
+        private IEnumerable<Package> EnumerateSearchedPackages()
+        {
+            if (CurrentPackage != null)
+            {
+                yield return CurrentPackage;
+            }
+
+            foreach (var package in EnumerateMountedPackages())
+            {
+                yield return package;
+            }
+        }
 
         private IEnumerable<Package> EnumerateMountedPackages()
         {
@@ -753,15 +829,14 @@ namespace ValveResourceFormat.IO
                 }
 
                 var (pathOnDisk, outerPackage, entry) = FindFile(mapPackagePath);
-                var path = pathOnDisk ?? entry?.GetFullPath();
 
-                if (path == null)
+                if (pathOnDisk == null && entry == null)
                 {
                     return false;
                 }
 
                 // The opened package, or one the game or an addon mounts, is searched already
-                if (IsPackageMounted(path))
+                if (pathOnDisk != null ? IsPackageMounted(pathOnDisk) : IsPackageMounted(outerPackage!, entry!))
                 {
                     return true;
                 }
@@ -805,26 +880,11 @@ namespace ValveResourceFormat.IO
             }
         }
 
-        private Package ReadInnerPackage(Package outerPackage, PackageEntry entry)
+        private NestedPackage ReadInnerPackage(Package outerPackage, PackageEntry entry)
         {
-            var innerPath = entry.GetFullPath();
-            Logger.LogInformation("Preloading vpk \"{InnerPath}\" from \"{Package}\"", innerPath, outerPackage.FileName);
+            Logger.LogInformation("Preloading vpk \"{InnerPath}\" from \"{Package}\"", entry.GetFullPath(), outerPackage.FileName);
 
-            var package = new Package();
-
-            try
-            {
-                package.SetFileName(innerPath);
-                package.OptimizeEntriesForBinarySearch(StringComparison.OrdinalIgnoreCase);
-                package.Read(GetPackageEntryStream(outerPackage, entry));
-
-                return package;
-            }
-            catch
-            {
-                package.Dispose();
-                throw;
-            }
+            return NestedPackage.Open(outerPackage, entry);
         }
 
         private void AddGamePackageToSearch(string searchPath)
@@ -839,11 +899,7 @@ namespace ValveResourceFormat.IO
         {
             Logger.LogInformation("Preloading vpk \"{SearchPath}\"", searchPath);
 
-            var package = new Package();
-            package.OptimizeEntriesForBinarySearch(StringComparison.OrdinalIgnoreCase);
-            package.Read(searchPath);
-
-            return package;
+            return Package.Open(searchPath);
         }
 
         /// <summary>
@@ -939,7 +995,7 @@ namespace ValveResourceFormat.IO
                 {
                     FindGameFoldersForWorkshopFile(folders);
 
-                    if (assumedGameRoot.EndsWith(AddonsSuffix, StringComparison.InvariantCultureIgnoreCase))
+                    if (assumedGameRoot.EndsWith(AddonsSuffix, StringComparison.OrdinalIgnoreCase))
                     {
                         var mainGameDir = assumedGameRoot[..^AddonsSuffix.Length];
                         var mainGameInfo = Path.Join(mainGameDir, GameinfoGi);
@@ -996,7 +1052,7 @@ namespace ValveResourceFormat.IO
                 Logger.LogDebug("Scanning \"{Directory}\"", directory);
 #endif
 
-                if (directory.EndsWith(AddonsSuffix, StringComparison.InvariantCultureIgnoreCase))
+                if (directory.EndsWith(AddonsSuffix, StringComparison.OrdinalIgnoreCase))
                 {
                     var mainGameDir = directory[..^AddonsSuffix.Length];
                     var mainGameInfo = Path.Join(mainGameDir, GameinfoGi);
@@ -1136,7 +1192,7 @@ namespace ValveResourceFormat.IO
             }
 
             // Check if vpk with same file name exists in addons folder
-            var fileName = Path.GetFileNameWithoutExtension(CurrentFileName);
+            var fileName = CurrentPackage?.FileName is { } packageName ? Path.GetFileName(packageName) : Path.GetFileNameWithoutExtension(CurrentFileName);
 
             foreach (var officialAddonPath in CurrentGameOfficialAddonsPaths)
             {
@@ -1265,7 +1321,7 @@ namespace ValveResourceFormat.IO
             // If we're loading a file from steamapps/workshop folder, attempt to discover gameinfos and load vpks for the game
             const string STEAMAPPS_WORKSHOP_CONTENT = "steamapps/workshop/content";
             var filePath = CurrentFileName!.Replace('\\', '/');
-            var contentIndex = filePath.IndexOf(STEAMAPPS_WORKSHOP_CONTENT, StringComparison.InvariantCultureIgnoreCase);
+            var contentIndex = filePath.IndexOf(STEAMAPPS_WORKSHOP_CONTENT, StringComparison.OrdinalIgnoreCase);
 
             if (contentIndex == -1)
             {
@@ -1424,13 +1480,5 @@ namespace ValveResourceFormat.IO
                 }
             }
         }
-
-        /// <summary>
-        /// Gets a stream for reading a package entry.
-        /// </summary>
-        /// <remarks>
-        /// Do not use this method, it will be removed in the future in favor of a method in the ValvePak library.
-        /// </remarks>
-        public static Stream GetPackageEntryStream(Package package, PackageEntry entry) => package.GetMemoryMappedStreamIfPossible(entry);
     }
 }

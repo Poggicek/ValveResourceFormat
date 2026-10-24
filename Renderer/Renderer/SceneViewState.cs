@@ -17,7 +17,7 @@ public sealed class SceneViewState : IDisposable
     /// <summary>Gets or sets the PVS bitfield for the cluster this view looks from, empty to cull nothing.</summary>
     public ReadOnlyMemory<byte> Pvs { get; set; }
 
-    /// <summary>Gets whether any material drawn after the framebuffer grab samples the scene color.</summary>
+    /// <summary>Gets whether anything drawn after the framebuffer grab samples the scene color.</summary>
     public bool WantsSceneColor { get; private set; }
 
     /// <summary>Gets whether anything drawn after the framebuffer grab samples the scene depth.</summary>
@@ -34,6 +34,9 @@ public sealed class SceneViewState : IDisposable
 
     /// <summary>Gets whether any water surface is queued to draw this frame.</summary>
     public bool HasWater => renderLists[RenderPass.Water].Count > 0;
+
+    /// <summary>Gets whether the translucent layer has shapes for <see cref="RenderOrderIndependentFills"/> this frame.</summary>
+    internal bool HasOrderIndependentFills => orderIndependentFills.Count > 0;
 
     internal RenderTexture? DepthPyramid { get; set; }
 
@@ -77,6 +80,9 @@ public sealed class SceneViewState : IDisposable
     /// <summary>Translucent draws that go to the water effects map instead of the scene.</summary>
     private readonly List<MeshBatchRenderer.Request> waterEffectsRenderList = [];
     private readonly List<MeshBatchRenderer.Request> effectsBloomRenderList = [];
+
+    /// <summary>Translucent shapes whose fills skip the sorted translucent layer when it draws them order independently.</summary>
+    private readonly List<ShapeSceneNode> orderIndependentFills = [];
 
     /// <summary>Visible nodes that draw themselves, listed once each however many passes they draw in.</summary>
     private readonly List<SceneNode> customBufferNodes = [];
@@ -180,7 +186,7 @@ public sealed class SceneViewState : IDisposable
     {
         Debug.Assert(request.Call is not null);
 
-        if (!Scene.ShowToolsMaterials && request.Call.Material.IsToolsMaterial)
+        if (!Scene.Settings.ShowToolsMaterials && request.Call.Material.IsToolsMaterial)
         {
             return;
         }
@@ -210,7 +216,7 @@ public sealed class SceneViewState : IDisposable
                     alphaTestAggregateDraws.Add(request);
                     return;
                 }
-                else if (Scene.EnableDepthPrepass && material.CanPrimeDepth)
+                else if (Scene.Settings.EnableDepthPrepass && material.CanPrimeDepth)
                 {
                     var bucket = Scene.GetDepthOnlyBucket(request.Call);
                     depthOnlyDraws[bucket].Add(request);
@@ -289,6 +295,7 @@ public sealed class SceneViewState : IDisposable
 
         waterEffectsRenderList.Clear();
         effectsBloomRenderList.Clear();
+        orderIndependentFills.Clear();
         customBufferNodes.Clear();
         alphaTestAggregateDraws.Clear();
         alphaTestOpaqueDraws.Clear();
@@ -434,6 +441,7 @@ public sealed class SceneViewState : IDisposable
                 };
 
                 WantsSceneDepth |= node is ParticleSceneNode { WantsSceneDepth: true };
+                WantsSceneColor |= node is ParticleSceneNode { WantsSceneColor: true };
 
                 var customPasses = node.RenderPasses;
 
@@ -454,6 +462,11 @@ public sealed class SceneViewState : IDisposable
                 if ((customPasses & CustomRenderPasses.Translucent) != 0)
                 {
                     customLists[RenderPass.Translucent].Add(customRender);
+
+                    if (node is ShapeSceneNode { HasOrderIndependentFill: true } shape)
+                    {
+                        orderIndependentFills.Add(shape);
+                    }
                 }
 
                 if ((customPasses & CustomRenderPasses.WaterEffects) != 0)
@@ -624,7 +637,7 @@ public sealed class SceneViewState : IDisposable
 
         cullShader.SetUniform("g_bCpuHiddenEnabled", cpuHiddenActive);
 
-        var occlusionDebugEnabled = scene.OcclusionDebugEnabled && scene.OcclusionDebug != null;
+        var occlusionDebugEnabled = scene.Settings.OcclusionDebugEnabled && scene.OcclusionDebug != null;
 
         // Bind debug buffer for occluded bounds visualization
         if (occlusionDebugEnabled)
@@ -685,7 +698,7 @@ public sealed class SceneViewState : IDisposable
         using var passScope = GraphicsContext.RenderState.Scope();
 
         var drawIndirect = Scene.DrawMeshletsIndirect;
-        var depthPrepass = depthOnlyShader != null && Scene.EnableDepthPrepass;
+        var depthPrepass = depthOnlyShader != null && Scene.Settings.EnableDepthPrepass;
 
         if (drawIndirect)
         {
@@ -800,9 +813,30 @@ public sealed class SceneViewState : IDisposable
     public void RenderTranslucentLayer(Scene.RenderContext renderContext)
     {
         using (new GLDebugGroup("Translucent Render"))
+        using (GraphicsContext.RenderState.Scope(depthFunc: RsComparison.CloserEqual))
         {
             renderContext.RenderPass = RenderPass.Translucent;
             MeshBatchRenderer.Render(renderLists[RenderPass.Translucent], renderContext);
+        }
+    }
+
+    /// <summary>
+    /// Draws the fills of the translucent layer's shapes with <see cref="ShapeSceneNode.HasOrderIndependentFill"/>
+    /// into the order independent layers, in any order.
+    /// </summary>
+    internal void RenderOrderIndependentFills()
+    {
+        foreach (var shape in orderIndependentFills)
+        {
+            shape.RenderOrderIndependentFill();
+        }
+    }
+
+    internal void RenderOrderIndependentLines()
+    {
+        foreach (var shape in orderIndependentFills)
+        {
+            shape.RenderOrderIndependentLines();
         }
     }
 

@@ -27,6 +27,8 @@ namespace ValveResourceFormat.Particles.Operators
             setMethod = parse.Enum<ParticleSetMethod>("m_nSetMethod", setMethod);
         }
 
+        public override bool IsOrderImportant => true;
+
         /// <summary>
         /// All four bounds are collection scoped, so they are evaluated once for the whole call rather
         /// than per particle. The input bounds address particle slots, so they truncate to whole slots
@@ -57,7 +59,7 @@ namespace ValveResourceFormat.Particles.Operators
 
                 finalValue = particle.ModifyScalarBySetMethod(particles, outputField, finalValue, setMethod);
 
-                particle.SetScalar(outputField, float.Lerp(particle.GetScalar(outputField), finalValue, strength));
+                particle.SetScalar(outputField, MathUtils.Lerp(particle.GetScalar(outputField), finalValue, strength));
             }
         }
     }

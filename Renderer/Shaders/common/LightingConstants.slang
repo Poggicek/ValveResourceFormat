@@ -3,6 +3,8 @@
 #ifndef VRF_LIGHTINGCONSTANTS_INCLUDE
 #define VRF_LIGHTINGCONSTANTS_INCLUDE
 
+#include "utils.slang"
+
 #define MAX_LIGHTS 256
 
 layout(std140, binding = 1) uniform LightingConstants {
@@ -24,5 +26,36 @@ layout(std140, binding = 1) uniform LightingConstants {
 
     vec4 g_vAmbientLightingSH[3];    // per color channel, xyz: against the normal, w: constant
 };
+
+// The lightmap atlas coordinates in xy, and a hash of the unscaled coordinates in zw. The hash only
+// interpolates to a constant across a triangle whose vertices all share one lightmap position.
+vec4 GetLightmapCoordinates(vec2 lightmapUV)
+{
+    uvec2 bits = floatBitsToUint(lightmapUV);
+    bits ^= bits << 13u;
+    bits ^= bits >> 17u;
+    bits ^= bits << 5u;
+
+    vec2 hash = (uintBitsToFloat(0x3F800000u | (bits >> 9u)) - 1.0) * 65535.0;
+
+    return vec4(lightmapUV * g_vLightmapUvScale, hash);
+}
+
+// The sky's irradiance arriving around a direction
+vec3 GetSkyAmbientLighting(vec3 direction)
+{
+    return vec4(direction, 1.0) * mat3x4(g_vAmbientLightingSH[0], g_vAmbientLightingSH[1], g_vAmbientLightingSH[2]);
+}
+
+// The luminance of GetSkyAmbientLighting, packed like an environment map's normalization harmonic
+vec4 GetSkyAmbientLuminanceSH()
+{
+    vec4 luminance = GetLuma(g_vAmbientLightingSH[0], g_vAmbientLightingSH[1], g_vAmbientLightingSH[2]);
+
+    // Kept from turning negative opposite the sky
+    luminance.z = min(luminance.z, 0.95 * luminance.w);
+
+    return luminance;
+}
 
 #endif

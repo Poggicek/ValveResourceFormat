@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
 using System.Text.Json.Nodes;
 using SharpGLTF.Memory;
@@ -24,7 +25,7 @@ public partial class GltfModelExporter
 
     // TODO: Using floats as hash key is kind of unhinged
     private readonly record struct ExportedMaterial(string Name, Vector4 Tint);
-    private readonly record struct ExportedMaterialData(Material Material, bool IsOverlay);
+    private readonly record struct ExportedMaterialData(Material Material, bool IsOverlay, bool VertexColorIsData);
     private readonly Dictionary<ExportedMaterial, ExportedMaterialData> ExportedMaterials = [];
 
     private readonly Dictionary<string, VMaterial.VsInputSignature> MaterialInputSignatures = [];
@@ -70,7 +71,7 @@ public partial class GltfModelExporter
         }
     }
 
-    private Mesh CreateGltfMesh(string meshName, VMesh vmesh, VBIB vbib, ModelRoot exportedModel, int[]? boneRemapTable, Dictionary<string, string>? skinMaterialTable, Vector4 tintColor)
+    private Mesh CreateGltfMesh(string meshName, VMesh vmesh, VBIB vbib, ModelRoot exportedModel, int[]? boneRemapTable, Dictionary<KVObject, string>? drawCallMaterials, Vector4 tintColor)
     {
         ProgressReporter?.Report($"Creating mesh: {meshName}");
 
@@ -86,20 +87,32 @@ public partial class GltfModelExporter
         // rather than once per draw call.
         var flexData = vmesh.MorphData?.GetFlexVertexData();
         var normalData = vmesh.MorphData?.GetFlexVertexData(MorphBundleType.NormalWrinkle);
+        var hasMorphData = flexData != null && normalData != null;
+        var morphTargetNames = hasMorphData ? GetMorphTargetNames(vmesh.MorphData!, flexData!) : [];
 
         foreach (var sceneObject in vmesh.Data.GetArray("m_sceneObjects"))
         {
             foreach (var drawCall in sceneObject.GetArray("m_drawCalls"))
             {
-                var primitive = CreateMeshFromDrawCall(drawCall, mesh, vbib, vertexBufferAttributes, exportedModel, skinMaterialTable, tintColor);
+                var vertexCount = drawCall.GetInt32Property("m_nVertexCount");
 
-                if (flexData != null && normalData != null)
+                if (!IsDrawCallSkipped(drawCall, drawCallMaterials))
                 {
-                    var vertexCount = drawCall.GetInt32Property("m_nVertexCount");
-                    AddMorphTargetsToPrimitive(vmesh.MorphData!, flexData, normalData, primitive, exportedModel, vertexOffset, vertexCount);
-                    vertexOffset += vertexCount;
+                    var primitive = CreateMeshFromDrawCall(drawCall, mesh, vbib, vertexBufferAttributes, exportedModel, drawCallMaterials, tintColor);
+
+                    if (hasMorphData)
+                    {
+                        AddMorphTargetsToPrimitive(morphTargetNames, flexData!, normalData!, primitive, exportedModel, vertexOffset, vertexCount);
+                    }
                 }
+
+                vertexOffset += vertexCount;
             }
+        }
+
+        if (morphTargetNames.Count > 0)
+        {
+            AddMorphTargetNames(morphTargetNames, mesh);
         }
 
         return mesh;
@@ -340,7 +353,7 @@ public partial class GltfModelExporter
     }
 
     private MeshPrimitive CreateMeshFromDrawCall(KVObject drawCall, Mesh mesh, VBIB vbib, Dictionary<string,
-        VertexAttribute>[] vertexBufferAttributes, ModelRoot exportedModel, Dictionary<string, string>? skinMaterialTable, Vector4 parentTintColor)
+        VertexAttribute>[] vertexBufferAttributes, ModelRoot exportedModel, Dictionary<KVObject, string>? drawCallMaterials, Vector4 parentTintColor)
     {
         CancellationToken.ThrowIfCancellationRequested();
 
@@ -348,12 +361,7 @@ public partial class GltfModelExporter
         var indexBufferIndex = indexBufferInfo.GetInt32Property("m_hBuffer");
         var indexBuffer = vbib.IndexBuffers[indexBufferIndex];
 
-        var materialPath = VMesh.GetMaterialName(drawCall)!;
-
-        if (skinMaterialTable != null && skinMaterialTable.TryGetValue(materialPath, out var skinMaterialPath))
-        {
-            materialPath = skinMaterialPath;
-        }
+        var materialPath = GetDrawCallMaterial(drawCall, drawCallMaterials);
 
         Resource? materialResource = null;
 
@@ -405,7 +413,7 @@ public partial class GltfModelExporter
                 }
                 else if (attributeKey.StartsWith("COLOR_", StringComparison.Ordinal))
                 {
-                    key = $"COLOR_{colorCounter++}";
+                    key = material?.VertexColorIsData == true ? $"_COLOR_{colorCounter++}" : $"COLOR_{colorCounter++}";
                 }
                 else
                 {
@@ -461,7 +469,7 @@ public partial class GltfModelExporter
 
         if (material != null)
         {
-            primitive.WithMaterial(material.Value.Material);
+            primitive.Material = material.Value.Material;
         }
 
         return primitive;
@@ -478,13 +486,43 @@ public partial class GltfModelExporter
         return element.Name is "vLightmapUV" or "vLightmapUVW";
     }
 
+    private static string GetDrawCallMaterial(KVObject drawCall, Dictionary<KVObject, string>? drawCallMaterials)
+    {
+        return drawCallMaterials?.GetValueOrDefault(drawCall) ?? VMesh.GetMaterialName(drawCall)!;
+    }
+
+    private bool IsDrawCallSkipped(KVObject drawCall, Dictionary<KVObject, string>? drawCallMaterials)
+    {
+        if (!SkipToolsMaterials)
+        {
+            return false;
+        }
+
+        var materialPath = GetDrawCallMaterial(drawCall, drawCallMaterials);
+
+        if (!ToolsMaterials.TryGetValue(materialPath, out var isToolsMaterial))
+        {
+            using var materialResource = FileLoader.LoadFileCompiled(materialPath);
+            isToolsMaterial = materialResource?.DataBlock is VMaterial vMaterial && vMaterial.IntAttributes.ContainsKey("tools.toolsmaterial");
+            ToolsMaterials.Add(materialPath, isToolsMaterial);
+        }
+
+        return isToolsMaterial;
+    }
+
+    private bool HasExportedDrawCalls(VMesh mesh, Dictionary<KVObject, string>? drawCallMaterials)
+    {
+        return mesh.Data.GetArray("m_sceneObjects")
+            .Any(sceneObject => sceneObject.GetArray("m_drawCalls").Any(drawCall => !IsDrawCallSkipped(drawCall, drawCallMaterials)));
+    }
+
     private ExportedMaterialData? GetOrCreateMaterial(KVObject drawCall, string materialPath, Resource? materialResource, ModelRoot exportedModel, Vector4 parentTintColor)
     {
         var modelTintColor = parentTintColor;
 
         if (drawCall.ContainsKey("m_vTintColor"))
         {
-            var drawCallTintColor = drawCall.GetSubCollection("m_vTintColor").ToVector3();
+            var drawCallTintColor = ColorSpace.SrgbLinearToGamma(drawCall.GetSubCollection("m_vTintColor").ToVector3());
             var dcTintColorWithAlpha = new Vector4(drawCallTintColor, 1.0f);
 
             if (drawCall.ContainsKey("m_flAlpha"))
@@ -513,11 +551,11 @@ public partial class GltfModelExporter
         }
 
         var renderMaterial = (VMaterial)materialResource.DataBlock!;
-        var material = exportedModel
-            .CreateMaterial(materialNameTrimmed)
-            .WithDefault();
+        var material = exportedModel.CreateMaterial(materialNameTrimmed);
+        material.InitializePBRMetallicRoughness();
 
-        var exportedMaterial = new ExportedMaterialData(material, IsMaterialOverlay(renderMaterial));
+        // csgo_foliage holds wind parameters in its vertex color
+        var exportedMaterial = new ExportedMaterialData(material, IsMaterialOverlay(renderMaterial), renderMaterial.ShaderName == "csgo_foliage.vfx");
         ExportedMaterials.Add(materialHashKey, exportedMaterial);
 
         // TODO: Realistically it should export a material without a tint, and then if it needs a model tint,
@@ -624,6 +662,11 @@ public partial class GltfModelExporter
                 continue;
             }
 
+            if (IsDrawCallSkipped(drawCall, drawCallMaterials: null))
+            {
+                continue;
+            }
+
             var tintColor = Vector4.One;
 
             if (fragmentData.ContainsKey("m_vTintColor"))
@@ -637,9 +680,10 @@ public partial class GltfModelExporter
             var mesh = exportedModel.CreateMesh(meshName);
             mesh.Extras = new JsonObject();
 
-            CreateMeshFromDrawCall(drawCall, mesh, vbib, vertexBufferAttributes, exportedModel, skinMaterialTable: null, tintColor);
+            CreateMeshFromDrawCall(drawCall, mesh, vbib, vertexBufferAttributes, exportedModel, drawCallMaterials: null, tintColor);
 
-            var newNode = scene.CreateNode(meshName).WithMesh(mesh);
+            var newNode = scene.CreateNode(meshName);
+            newNode.Mesh = mesh;
             // The conversion is baked into the geometry (CreateVertexBufferAttributes), so the placement
             // transform is conjugated by it rather than multiplied on top - otherwise it applies twice.
             newNode.WorldMatrix = GetPlacementTransform(transform);
@@ -648,22 +692,17 @@ public partial class GltfModelExporter
         return true;
     }
 
-    private static void AddMorphTargetsToPrimitive(VMorph morph, Dictionary<string, Vector3[]> flexData,
+    private static void AddMorphTargetsToPrimitive(List<string> morphTargetNames, Dictionary<string, Vector3[]> flexData,
         Dictionary<string, Vector4[]> normalData, MeshPrimitive primitive, ModelRoot model, int vertexOffset, int vertexCount)
     {
-        var morphIndex = 0;
-        var flexDesc = morph.GetFlexDescriptors();
-
         // Morph deltas are mostly zero, so targets are sparse accessors over one shared zero run.
         // A buffer view read by several accessors must declare its stride.
         var zeroes = model.CreateBufferView(3 * sizeof(float) * vertexCount, 3 * sizeof(float), BufferMode.ARRAY_BUFFER);
 
-        foreach (var morphName in flexDesc)
+        for (var morphIndex = 0; morphIndex < morphTargetNames.Count; morphIndex++)
         {
-            if (!flexData.TryGetValue(morphName, out var rectData))
-            {
-                continue;
-            }
+            var morphName = morphTargetNames[morphIndex];
+            var rectData = flexData[morphName];
 
             // Morph deltas share the base mesh's vertex space, which is baked into glTF units, so bake them too.
             // The delta grid follows a vertex count the compiler is free to change, so it can end short.
@@ -709,10 +748,45 @@ public partial class GltfModelExporter
                 }
             }
 
-            primitive.SetMorphTargetAccessors(morphIndex++, dict);
+            primitive.SetMorphTargetAccessors(morphIndex, dict);
         }
 
         DebugValidateGLTF();
+    }
+
+    /// <summary>
+    /// Gets the mesh's morph targets: the flex descriptors that have flex data, in descriptor order.
+    /// </summary>
+    internal static List<string> GetMorphTargetNames(VMorph morph, Dictionary<string, Vector3[]> flexData)
+    {
+        var targetNames = new List<string>();
+
+        foreach (var morphName in morph.GetFlexDescriptors())
+        {
+            if (flexData.ContainsKey(morphName))
+            {
+                targetNames.Add(morphName);
+            }
+        }
+
+        return targetNames;
+    }
+
+    /// <summary>
+    /// Names the mesh's morph targets in extras.targetNames, the convention importers such as Blender and three.js
+    /// read shape key names from.
+    /// </summary>
+    internal static void AddMorphTargetNames(List<string> morphTargetNames, Mesh mesh)
+    {
+        var targetNames = new JsonArray();
+
+        foreach (var morphName in morphTargetNames)
+        {
+            targetNames.Add((JsonNode)morphName);
+        }
+
+        mesh.Extras["targetNames"] = targetNames;
+        mesh.SetMorphWeights(new float[morphTargetNames.Count]);
     }
 
     /// <summary>
@@ -767,18 +841,13 @@ public partial class GltfModelExporter
         if (indexBuffer.ElementSizeInBytes == 4)
         {
             System.Buffer.BlockCopy(indexBuffer.Data, byteStart, indices, 0, byteCount);
-            for (var i = 0; i < count; i++)
-            {
-                indices[i] += baseVertex;
-            }
+            TensorPrimitives.Add(indices, baseVertex, indices);
         }
         else if (indexBuffer.ElementSizeInBytes == 2)
         {
             var shortIndices = MemoryMarshal.Cast<byte, ushort>(indexBuffer.Data).Slice(start, count);
-            for (var i = 0; i < count; i++)
-            {
-                indices[i] = baseVertex + shortIndices[i];
-            }
+            TensorPrimitives.ConvertTruncating(shortIndices, indices.AsSpan());
+            TensorPrimitives.Add(indices, baseVertex, indices);
         }
 
         return indices;
@@ -866,7 +935,7 @@ public partial class GltfModelExporter
 
         for (var i = 0; i < floats.Length; i++)
         {
-            bytes[i] = (byte)MathF.Round(floats[i] * 255f);
+            bytes[i] = (byte)Math.Clamp(MathF.Round(floats[i] * 255f), 0f, 255f);
         }
 
         var accessor = exportedModel.CreateAccessor();
@@ -880,12 +949,7 @@ public partial class GltfModelExporter
     /// </summary>
     private static Accessor CreateJointsAccessor(ModelRoot exportedModel, ushort[] joints)
     {
-        var maxJoint = 0;
-
-        foreach (var joint in joints)
-        {
-            maxJoint = Math.Max(maxJoint, joint);
-        }
+        var maxJoint = joints.Length > 0 ? TensorPrimitives.Max<ushort>(joints) : 0;
 
         var accessor = exportedModel.CreateAccessor();
         var count = joints.Length / 4;
@@ -893,12 +957,7 @@ public partial class GltfModelExporter
         if (maxJoint <= byte.MaxValue)
         {
             var bytesView = exportedModel.CreateBufferView(joints.Length, 4 * sizeof(byte), BufferMode.ARRAY_BUFFER);
-            var bytes = ((Memory<byte>)bytesView.Content).Span;
-
-            for (var i = 0; i < joints.Length; i++)
-            {
-                bytes[i] = (byte)joints[i];
-            }
+            TensorPrimitives.ConvertTruncating<ushort, byte>(joints, ((Memory<byte>)bytesView.Content).Span);
 
             accessor.SetVertexData(bytesView, 0, count, new AttributeFormat(DimensionType.VEC4, EncodingType.UNSIGNED_BYTE));
 
@@ -919,30 +978,26 @@ public partial class GltfModelExporter
     /// </summary>
     private static void SetIndices(MeshPrimitive primitive, PrimitiveType primitiveType, int[] indices)
     {
-        var maxIndex = 0;
+        var maxIndex = indices.Length > 0 ? TensorPrimitives.Max<int>(indices) : 0;
 
-        foreach (var index in indices)
-        {
-            maxIndex = Math.Max(maxIndex, index);
-        }
+        var model = primitive.LogicalParent.LogicalParent;
+        var accessor = model.CreateAccessor();
 
         if (maxIndex > ushort.MaxValue - 1)
         {
-            primitive.WithIndicesAccessor(primitiveType, indices);
-            return;
+            var intView = model.CreateBufferView(sizeof(int) * indices.Length, 0, BufferMode.ELEMENT_ARRAY_BUFFER);
+            indices.CopyTo(MemoryMarshal.Cast<byte, int>(((Memory<byte>)intView.Content).Span));
+            accessor.SetIndexData(intView, 0, indices.Length, IndexEncodingType.UNSIGNED_INT);
         }
-
-        var model = primitive.LogicalParent.LogicalParent;
-        var bufferView = model.CreateBufferView(sizeof(ushort) * indices.Length, 0, BufferMode.ELEMENT_ARRAY_BUFFER);
-        var shorts = MemoryMarshal.Cast<byte, ushort>(((Memory<byte>)bufferView.Content).Span);
-
-        for (var i = 0; i < indices.Length; i++)
+        else
         {
-            shorts[i] = (ushort)indices[i];
-        }
+            var shortView = model.CreateBufferView(sizeof(ushort) * indices.Length, 0, BufferMode.ELEMENT_ARRAY_BUFFER);
+            var shorts = MemoryMarshal.Cast<byte, ushort>(((Memory<byte>)shortView.Content).Span);
 
-        var accessor = model.CreateAccessor();
-        accessor.SetIndexData(bufferView, 0, indices.Length, IndexEncodingType.UNSIGNED_SHORT);
+            TensorPrimitives.ConvertToUInt16(indices, shorts);
+
+            accessor.SetIndexData(shortView, 0, indices.Length, IndexEncodingType.UNSIGNED_SHORT);
+        }
 
         primitive.SetIndexAccessor(accessor);
         primitive.DrawPrimitiveType = primitiveType;
@@ -1074,13 +1129,13 @@ public partial class GltfModelExporter
 
         var positions = (Vector3[])positionAttribute.Data;
         var normals = (Vector3[])normalAttribute.Data;
-
         var updatedPositions = new Vector3[positions.Length];
 
-        for (var i = 0; i < positions.Length; i++)
-        {
-            updatedPositions[i] = positions[i] + normals[i] * OverlayNormalOffsetDistance;
-        }
+        var positionFloats = MemoryMarshal.Cast<Vector3, float>(positions);
+        var normalFloats = MemoryMarshal.Cast<Vector3, float>(normals.AsSpan(0, positions.Length));
+        var updatedFloats = MemoryMarshal.Cast<Vector3, float>(updatedPositions.AsSpan());
+
+        TensorPrimitives.MultiplyAddEstimate(normalFloats, OverlayNormalOffsetDistance, positionFloats, updatedFloats);
 
         offsetAccessor = CreateAccessor(exportedModel, updatedPositions);
         positionAttribute.OverlayPositionAccessors.Add(normalAttribute, offsetAccessor);

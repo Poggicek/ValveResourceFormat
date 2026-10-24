@@ -79,6 +79,22 @@ namespace ValveResourceFormat.Utils
         }
 
         /// <summary>
+        /// Interpolates as <c>from + (to - from) * amount</c>. Unlike <see cref="float.Lerp(float, float, float)"/>,
+        /// which weights the two ends, it gives <paramref name="from"/> exactly when both ends are equal, so a
+        /// collapsed range keeps its value through a later truncation.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float Lerp(float from, float to, float amount) => ((to - from) * amount) + from;
+
+        /// <inheritdoc cref="Lerp(float, float, float)"/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 Lerp(Vector3 from, Vector3 to, float amount) => ((to - from) * amount) + from;
+
+        /// <inheritdoc cref="Lerp(float, float, float)"/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 Lerp(Vector3 from, Vector3 to, Vector3 amount) => ((to - from) * amount) + from;
+
+        /// <summary>
         /// Scales <paramref name="value"/> to unit length, returning <see cref="Vector3.Zero"/> for a
         /// vector with no length rather than the NaN a plain divide would give.
         /// </summary>
@@ -121,6 +137,17 @@ namespace ValveResourceFormat.Utils
         {
             return Vector3.Cross(b - a, c - a);
         }
+
+        /// <summary>
+        /// The rotation matrix with <paramref name="x"/>, <paramref name="y"/> and <paramref name="z"/> as its
+        /// rows, which carries +X, +Y and +Z onto those axes.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Matrix4x4 CreateBasis(Vector3 x, Vector3 y, Vector3 z) => new(
+            x.X, x.Y, x.Z, 0f,
+            y.X, y.Y, y.Z, 0f,
+            z.X, z.Y, z.Z, 0f,
+            0f, 0f, 0f, 1f);
 
         /// <summary>
         /// The largest of the given values, compared with <see cref="MathF.Max(float, float)"/>.
@@ -389,5 +416,57 @@ namespace ValveResourceFormat.Utils
         /// </summary>
         public static float MaxAxisScale(this Matrix4x4 m)
             => Max(m.AxisScale(0), m.AxisScale(1), m.AxisScale(2));
+
+        /// <summary>
+        /// Wraps <paramref name="index"/> into [0, <paramref name="count"/>), so a negative index counts
+        /// back from the end.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int WrapIndex(int index, int count)
+        {
+            return ((index % count) + count) % count;
+        }
+
+        /// <summary>
+        /// Scales <paramref name="value"/> down to a non-negative <paramref name="maxLength"/> when it is
+        /// longer, and returns it unchanged otherwise.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static Vector3 ClampLength(Vector3 value, float maxLength)
+        {
+            var lengthSquared = value.LengthSquared();
+
+            return lengthSquared > maxLength * maxLength ? value * (maxLength / MathF.Sqrt(lengthSquared)) : value;
+        }
+
+        /// <summary>
+        /// The area of the triangle with corners <paramref name="a"/>, <paramref name="b"/> and <paramref name="c"/>.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static float TriangleArea(Vector3 a, Vector3 b, Vector3 c)
+        {
+            return TriangleCross(a, b, c).Length() * 0.5f;
+        }
+
+        /// <summary>
+        /// The radical inverse of a non-negative <paramref name="index"/> in base <paramref name="radix"/>: its
+        /// digits mirrored about the radix point, giving a value in [0, 1). Successive indices in bases 2, 3 and
+        /// 5 give the coordinates of a Halton sequence.
+        /// </summary>
+        public static float RadicalInverse(int index, int radix)
+        {
+            var inverseRadix = 1f / radix;
+            var digitScale = inverseRadix;
+            var result = 0f;
+
+            while (index > 0)
+            {
+                result += index % radix * digitScale;
+                index /= radix;
+                digitScale *= inverseRadix;
+            }
+
+            return result;
+        }
     }
 }

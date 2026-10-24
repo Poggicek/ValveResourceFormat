@@ -740,7 +740,7 @@ internal sealed partial class MovementServices
         UpMove = mv.UpMove;
         LastMovementImpulses = mv.LastMovementImpulses;
 
-        AbsOrigin = mv.AbsOrigin;
+        SetAbsOrigin(mv.AbsOrigin);
         AbsVelocity = mv.Velocity;
         ViewAngles = mv.ViewAngles;
 
@@ -789,7 +789,7 @@ internal sealed partial class MovementServices
             ForceButtonState(InputButtons.Jump, Buttons.IsHeld(InputButtons.Jump));
         }
 
-        AbsOrigin = mv.AbsOrigin;
+        SetAbsOrigin(mv.AbsOrigin);
         AbsVelocity = mv.Velocity;
 
         UpdateDuckRootOffset(FrameTime);
@@ -806,6 +806,33 @@ internal sealed partial class MovementServices
         }
 
         WalkWishVel = mv.WalkWishVel;
+    }
+
+    /// <summary>
+    /// Moves the player the way the server's scene node does: an origin that is not finite, or within
+    /// 1/256 of the current one on every axis, is ignored, so a move that small is lost.
+    /// </summary>
+    private void SetAbsOrigin(Vector3 origin)
+    {
+        if (!float.IsFinite(origin.X) || !float.IsFinite(origin.Y) || !float.IsFinite(origin.Z))
+        {
+            return;
+        }
+
+        if (IsSameOriginAxis(AbsOrigin.X, origin.X) && IsSameOriginAxis(AbsOrigin.Y, origin.Y) && IsSameOriginAxis(AbsOrigin.Z, origin.Z))
+        {
+            return;
+        }
+
+        AbsOrigin = origin;
+    }
+
+    private static bool IsSameOriginAxis(float current, float origin)
+    {
+        // The relative part only exceeds 1/256 outside the world, MapMaxCoord in gameinfo.gi
+        const float MaxCoord = 16384f;
+        var tolerance = MathF.Max(1f / 256f, MathF.Max(MathF.Abs(current), MathF.Abs(origin)) * ((1f / 256f) / MaxCoord));
+        return MathF.Abs(current - origin) <= tolerance;
     }
 
     private void AddSubtickSplits(MoveData mv)

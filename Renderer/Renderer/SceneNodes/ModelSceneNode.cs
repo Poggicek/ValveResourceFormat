@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
+using ValveResourceFormat.Renderer.Materials;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.ResourceTypes.ModelAnimation;
 using ValveResourceFormat.ResourceTypes.ModelAnimation2;
@@ -16,6 +17,9 @@ namespace ValveResourceFormat.Renderer.SceneNodes
     /// </summary>
     public partial class ModelSceneNode : MeshCollectionNode
     {
+        /// <summary>Gets the model resource this node renders.</summary>
+        internal Model Model { get; }
+
         /// <summary>Gets the animation controller managing skeletal pose and flex data for this model.</summary>
         public AnimationController AnimationController { get; }
 
@@ -52,6 +56,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         public ModelSceneNode(Scene scene, Model model, string? skin = null, bool isWorldPreview = false)
             : base(scene)
         {
+            Model = model;
             materialGroups = model.GetMaterialGroups().ToArray();
             AnimationGraphReferences = model.AnimGraph2References;
             meshGroups = model.MeshGroups;
@@ -136,11 +141,18 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         /// </summary>
         private void SetCharacterEyeRenderParams()
         {
-            var eyeEnablingMaterials = meshRenderers
-                .SelectMany(Mesh => Mesh.DrawCallsOpaque.Select(Draw => (Mesh, Draw)))
-                .Where(meshDraw => meshDraw.Draw.Material.IntParams.GetValueOrDefault("F_EYEBALLS") == 1)
-                .Select(meshDraw => (meshDraw.Mesh, meshDraw.Draw.Material))
-                .ToList();
+            var eyeEnablingMaterials = new List<(RenderableMesh Mesh, RenderMaterial Material)>();
+
+            foreach (var mesh in meshRenderers)
+            {
+                foreach (var drawCall in mesh.DrawCallsOpaque)
+                {
+                    if (drawCall.Material.IntParams.GetValueOrDefault("F_EYEBALLS") == 1)
+                    {
+                        eyeEnablingMaterials.Add((mesh, drawCall.Material));
+                    }
+                }
+            }
 
             if (eyeEnablingMaterials.Count == 0)
             {

@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using GUI.Utils;
 using ValveKeyValue;
+using ValvePak;
 using ValveResourceFormat.IO;
 
 namespace GUI.Controls
@@ -106,8 +107,10 @@ namespace GUI.Controls
             };
             treeView.Nodes.Add(scanningTreeNode);
 
+            string[] listedFiles = [.. Settings.Config.RecentFiles, .. Settings.Config.BookmarkedFiles];
+
             // Scan for vpks
-            var scanTask = Task.Run(ScanForSteamGames);
+            var scanTask = Task.Run(() => ScanForSteamGames(listedFiles));
             scanTask.ContinueWith(async t =>
             {
                 Log.Error(nameof(ExplorerControl), t.Exception!.ToString());
@@ -128,7 +131,7 @@ namespace GUI.Controls
             }, CancellationToken.None, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
         }
 
-        private async Task ScanForSteamGames()
+        private async Task ScanForSteamGames(string[] listedFiles)
         {
             if (GameFolderLocator.SteamPath == null)
             {
@@ -210,13 +213,7 @@ namespace GUI.Controls
                     return false;
                 }
 
-                if (!PackageFileNames.IsArchiveChunk(entry.FileName))
-                {
-                    return true;
-                }
-
-                // If we matched dota_683.vpk, make sure dota_dir.vpk exists before excluding it from results
-                return !File.Exists(PackageFileNames.GetDirectoryFile(entry.ToFullPath()));
+                return !PackageFileNames.IsArchiveChunk(entry.ToFullPath());
             }
 
             var gamesToScan = steamGames
@@ -370,20 +367,22 @@ namespace GUI.Controls
 
                     TreeData.Insert(dataIndex, newNode);
 
-                    treeView.BeginUpdate();
-                    treeView.Nodes.Insert(dataIndex, treeNode);
-                    treeView.EndUpdate();
-
                     if (filterTextBox.Text.Length > 0)
                     {
                         OnFilterTextBoxTextChanged(null, EventArgs.Empty); // Hack: re-filter
+                    }
+                    else
+                    {
+                        treeView.BeginUpdate();
+                        treeView.Nodes.Insert(dataIndex, treeNode);
+                        treeView.EndUpdate();
                     }
                 }, cancellationToken).ConfigureAwait(false);
             });
 
             // Find all games to be displayed in the recent and bookmarked files
             // to instantly load their icons before rendering the list
-            foreach (var path in Settings.Config.RecentFiles.Concat(Settings.Config.BookmarkedFiles))
+            foreach (var path in listedFiles)
             {
                 if (GameFolderLocator.FindSteamGameContainingPath(path, steamGames) is { } game)
                 {
@@ -854,11 +853,9 @@ namespace GUI.Controls
 
             using var stream = Program.Assembly.GetManifestResourceStream(name);
             Debug.Assert(stream != null);
-            using var ms = new MemoryStream((int)stream.Length);
 
-            using var package = new ValvePak.Package();
-            stream.CopyTo(ms);
-            var file = package.AddFile(name, ms.ToArray());
+            var package = new Package();
+            var file = package.AddFile(name, stream);
 
             using var contextPackage = new VrfGuiContext("vrf_embedded.vpk", null)
             {

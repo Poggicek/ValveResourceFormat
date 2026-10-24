@@ -42,6 +42,12 @@ namespace ValveResourceFormat.Particles.Operators
             hasRun = false;
         }
 
+        public override void Restart(ParticleSystemState particleSystemState)
+        {
+        }
+
+        public override bool IsOrderImportant => true;
+
         public override void Operate(ParticleCollection particles, float frameTime, ParticleSystemState particleSystemState, float strength)
         {
             if (hasRun || !particleSystemState.InEndCap)
@@ -66,7 +72,7 @@ namespace ValveResourceFormat.Particles.Operators
 
                 finalValue = particle.ModifyScalarBySetMethod(particles, outputField, finalValue, setMethod);
 
-                particle.SetScalar(outputField, float.Lerp(particle.GetScalar(outputField), finalValue, strength));
+                particle.SetScalar(outputField, MathUtils.Lerp(particle.GetScalar(outputField), finalValue, strength));
             }
         }
     }

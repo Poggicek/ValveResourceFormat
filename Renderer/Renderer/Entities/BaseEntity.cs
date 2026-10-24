@@ -155,11 +155,14 @@ public abstract class BaseEntity
 
         foreach (var candidate in EntitySystem.FindAllByTargetNameInWorldGroup(parentName, Scene))
         {
-            if (candidate != this)
-            {
-                MoveParent = candidate;
-                break;
-            }
+            MoveParent = candidate;
+            break;
+        }
+
+        if (MoveParent == this)
+        {
+            EntitySystem.Logger.LogWarning("{Classname} '{TargetName}' is parented to itself", Classname, TargetName);
+            MoveParent = null;
         }
 
         if (MoveParent == null)
@@ -169,6 +172,14 @@ public abstract class BaseEntity
 
         // Its world pose has to be final before this one is made relative to it
         EntitySystem.ResolveMoveParentChain(MoveParent);
+
+        if (IsMoveAncestor(MoveParent))
+        {
+            EntitySystem.Logger.LogWarning("{Classname} '{TargetName}' is parented to '{ParentName}', which is parented back to it",
+                Classname, TargetName, MoveParent.TargetName);
+            MoveParent = null;
+            return;
+        }
 
         var data = Data!;
         var useLocalOffset = data.GetBooleanProperty("uselocaloffset");
@@ -314,8 +325,8 @@ public abstract class BaseEntity
     public bool IsTrigger { get; set; }
 
     /// <summary>
-    /// Gets or sets whether the entity's geometry is drawn. Every node it owns follows through
-    /// <see cref="SceneNode.Visible"/>.
+    /// Gets or sets whether the game draws the entity's geometry. Every node it owns follows through
+    /// <see cref="SceneNode.Visible"/>, unless a stopped <see cref="EntitySystem.Enabled"/> keeps it shown.
     /// </summary>
     public bool IsDrawn
     {
@@ -326,10 +337,13 @@ public abstract class BaseEntity
 
             foreach (var node in ownedNodes)
             {
-                node.Visible = value;
+                node.Visible = IsShown;
             }
         }
     } = true;
+
+    /// <summary>Gets whether the entity's geometry ends up shown, which in an editor it is even while the game hides it.</summary>
+    public bool IsShown => IsDrawn || !EntitySystem.Enabled;
 
     /// <summary>
     /// Gets whether the entity currently takes part in collision traces, which are only made in the main
@@ -377,12 +391,13 @@ public abstract class BaseEntity
         ModelName = data.GetStringProperty("model");
 
         // Authored in the world of the map they were compiled in, and moved with whatever placed it
-        var authored = EntityTransformHelper.ToRigidTransformationMatrix(data.GetVector3Property("angles"), data.GetVector3Property("origin"))
+        var authoredAngles = data.GetVector3Property("angles");
+        var authored = EntityTransformHelper.ToRigidTransformationMatrix(authoredAngles, data.GetVector3Property("origin"))
             * spawnInfo.ParentTransform;
 
         origin = authored.Translation;
         angles = spawnInfo.ParentTransform.IsIdentity
-            ? data.GetVector3Property("angles")
+            ? authoredAngles
             : EntityTransformHelper.ToEulerAngles(Quaternion.CreateFromRotationMatrix(authored));
         previousOrigin = origin;
         previousAngles = angles;
@@ -888,6 +903,19 @@ public abstract class BaseEntity
         }
     }
 
+    private bool IsMoveAncestor(BaseEntity entity)
+    {
+        for (var ancestor = entity; ancestor != null; ancestor = ancestor.MoveParent)
+        {
+            if (ancestor == this)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>
     /// Whether the push has to move the player: anyone standing on the pushers rides them, anyone else only
     /// when the new pose overlaps them. Both only within the volume the pushers now fill, stretched back
@@ -1337,7 +1365,7 @@ public abstract class BaseEntity
         }
 
         // Only the hidden state is imposed, so a node that manages its own Visible keeps it while drawn
-        if (!IsDrawn)
+        if (!IsShown)
         {
             node.Visible = false;
         }

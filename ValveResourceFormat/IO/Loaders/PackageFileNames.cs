@@ -1,5 +1,9 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO;
+using System.IO.Enumeration;
+using System.Linq;
+using ValvePak;
 
 namespace ValveResourceFormat.IO
 {
@@ -13,32 +17,53 @@ namespace ValveResourceFormat.IO
         private const string DirectorySuffix = "_dir";
 
         /// <summary>
-        /// Whether a path names an archive chunk of a split package, such as <c>pak01_003.vpk</c>.
+        /// Whether a path is an archive chunk of a split package, such as <c>pak01_003.vpk</c> next to an existing
+        /// <c>pak01_dir.vpk</c>. Without that directory file, a name such as <c>surf_2024.vpk</c> is a package of its own.
         /// </summary>
-        public static bool IsArchiveChunk(ReadOnlySpan<char> path)
+        public static bool IsArchiveChunk(string path) => TryGetArchiveChunkDirectoryFile(path, out _);
+
+        /// <summary>
+        /// Returns why a package can not be written to a path, or <see langword="null"/> when it can. The name must end in
+        /// <c>.vpk</c>, must not be an archive chunk (see <see cref="IsArchiveChunk"/>), and must end in <c>_dir.vpk</c>
+        /// when the package is split into chunk files. A single file package may also be named <c>_dir.vpk</c>, which games
+        /// need to mount it, such as a <c>pakNN_dir.vpk</c> addon.
+        /// </summary>
+        /// <param name="path">The path to write the package to.</param>
+        /// <param name="splitIntoChunks">Whether the package is written split into chunk files.</param>
+        public static string? GetPackageFileNameError(string path, bool splitIntoChunks)
         {
+            ArgumentNullException.ThrowIfNull(path);
+
             if (!path.EndsWith(Extension, StringComparison.OrdinalIgnoreCase))
             {
-                return false;
+                return "The file name must end in \".vpk\".";
             }
 
-            var name = path[..^Extension.Length];
+            if (TryGetArchiveChunkDirectoryFile(path, out var directoryFile))
+            {
+                return $"The file name is taken by a chunk file of \"{Path.GetFileName(directoryFile)}\".";
+            }
 
-            return name.Length > 4 && name[^4] == '_' && char.IsAsciiDigit(name[^3]) && char.IsAsciiDigit(name[^2]) && char.IsAsciiDigit(name[^1]);
+            if (splitIntoChunks && !Path.GetFileNameWithoutExtension(path).EndsWith(DirectorySuffix, StringComparison.OrdinalIgnoreCase))
+            {
+                return "A VPK split into chunk files must be named \"*_dir.vpk\".";
+            }
+
+            return null;
         }
 
         /// <summary>
         /// Gets the name of a package without the <c>.vpk</c> extension and the <c>_dir</c> or archive chunk suffix, such as
         /// <c>pak01</c> for <c>pak01_dir.vpk</c> and <c>pak01_003.vpk</c>. A package read from a <c>_dir.vpk</c> file has
-        /// this as its file name.
+        /// this as its file name. The chunk suffix is only removed from an archive chunk, see <see cref="IsArchiveChunk"/>.
         /// </summary>
         public static string GetPackageName(string path)
         {
             ArgumentNullException.ThrowIfNull(path);
 
-            if (IsArchiveChunk(path))
+            if (TryGetArchiveChunkDirectoryFile(path, out var directoryFile))
             {
-                return path[..^(Extension.Length + 4)];
+                return directoryFile[..^(DirectorySuffix.Length + Extension.Length)];
             }
 
             if (path.EndsWith(Extension, StringComparison.OrdinalIgnoreCase))
@@ -56,17 +81,87 @@ namespace ValveResourceFormat.IO
 
         /// <summary>
         /// Gets the <c>_dir.vpk</c> directory file of a package, such as <c>pak01_dir.vpk</c> for <c>pak01_003.vpk</c> or
-        /// <c>pak01.vpk</c>.
+        /// <c>pak01.vpk</c>. The chunk suffix is only removed from an archive chunk, see <see cref="IsArchiveChunk"/>.
         /// </summary>
         public static string GetDirectoryFile(string path) => string.Concat(GetPackageName(path), DirectorySuffix, Extension);
 
+        private static bool TryGetChunkDirectoryFileName(string path, [NotNullWhen(true)] out string? directoryFile)
+        {
+            directoryFile = Package.TryParseChunkFilePath(path, out var baseName, out _) ? string.Concat(baseName, DirectorySuffix, Extension) : null;
+
+            return directoryFile != null;
+        }
+
         /// <summary>
-        /// Gets the file name of an archive chunk of a split package, such as <c>pak01_003.vpk</c>.
+        /// Gets the existing <c>_dir.vpk</c> directory file of an archive chunk, such as <c>pak01_dir.vpk</c> for
+        /// <c>pak01_003.vpk</c>, see <see cref="IsArchiveChunk"/>.
         /// </summary>
-        /// <param name="packageName">The package name, see <see cref="GetPackageName"/>.</param>
-        /// <param name="archiveIndex">The index of the chunk.</param>
-        public static string GetArchiveChunkFile(string packageName, int archiveIndex)
-            => string.Create(CultureInfo.InvariantCulture, $"{packageName}_{archiveIndex:D3}{Extension}");
+        /// <returns>False if the path is not an archive chunk.</returns>
+        public static bool TryGetArchiveChunkDirectoryFile(string path, [NotNullWhen(true)] out string? directoryFile)
+        {
+            directoryFile = TryGetChunkDirectoryFileName(path, out var chunkDirectoryFile) && File.Exists(chunkDirectoryFile) ? chunkDirectoryFile : null;
+
+            return directoryFile != null;
+        }
+
+        /// <summary>
+        /// Lists the files in a folder and its subfolders to pack, with their path relative to the folder.
+        /// Files and folders that start with a dot, such as <c>.git</c>, are skipped.
+        /// </summary>
+        /// <param name="folder">The folder to pack.</param>
+        /// <param name="outputPackagePath">Full path of the package being written, which is skipped along with its chunk files.</param>
+        /// <param name="entryPathPrefix">Prepended to each entry path.</param>
+        public static List<(string PathOnDisk, string EntryPath)> GetFilesToPack(string folder, string? outputPackagePath, string entryPathPrefix = "")
+        {
+            var enumeration = new FileSystemEnumerable<string>(folder, (ref entry) => entry.ToFullPath(), new EnumerationOptions { RecurseSubdirectories = true })
+            {
+                ShouldIncludePredicate = (ref entry) => !entry.IsDirectory && !entry.FileName.StartsWith('.'),
+                ShouldRecursePredicate = (ref entry) => !entry.FileName.StartsWith('.'),
+            };
+
+            var files = new List<(string PathOnDisk, string EntryPath)>();
+
+            foreach (var path in enumeration)
+            {
+                if (path.Equals(outputPackagePath, StringComparison.OrdinalIgnoreCase)
+                    || (TryGetChunkDirectoryFileName(path, out var directoryFile) && directoryFile.Equals(outputPackagePath, StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+
+                files.Add((path, string.Concat(entryPathPrefix, Path.GetRelativePath(folder, path).Replace('\\', '/'))));
+            }
+
+            return files;
+        }
+
+        /// <summary>
+        /// Whether the file data of a package that is not split into chunk files still fits into it, at most
+        /// <see cref="Package.MaxDirectoryFileDataSize"/>, after adding files to it.
+        /// </summary>
+        /// <param name="files">Entry paths and lengths of the files to add.</param>
+        /// <param name="package">The package the files are added to, or <see langword="null"/> for a new package.</param>
+        /// <param name="replace">Whether files replace the entries already at their path, or are skipped.</param>
+        public static bool FitsIntoSingleFile(IEnumerable<(string EntryPath, long Length)> files, Package? package = null, bool replace = true)
+        {
+            ArgumentNullException.ThrowIfNull(files);
+
+            var size = package?.Entries?.Values.Sum(static entries => entries.Sum(static entry => (long)entry.Length)) ?? 0;
+
+            foreach (var (entryPath, length) in files)
+            {
+                if (package?.FindEntry(entryPath) is not { } existingEntry)
+                {
+                    size += length;
+                }
+                else if (replace)
+                {
+                    size += length - existingEntry.Length;
+                }
+            }
+
+            return size <= Package.MaxDirectoryFileDataSize;
+        }
 
         /// <summary>
         /// Gets the number of a <c>pakNN_dir.vpk</c> file name, or -1 for any other name.

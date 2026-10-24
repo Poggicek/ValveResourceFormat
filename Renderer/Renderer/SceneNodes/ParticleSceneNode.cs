@@ -20,7 +20,16 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         /// <summary>Gets whether this system samples the resolved opaque depth.</summary>
         public bool WantsSceneDepth { get; }
 
+        /// <summary>Gets whether this system samples the resolved opaque colour.</summary>
+        public bool WantsSceneColor { get; }
+
         internal IEnumerable<ParticleFunctionRenderer> Renderers => particleRenderer.EnumerateRenderers();
+
+        /// <summary>Gets the simulation this node draws, with its particles, control points and child systems.</summary>
+        internal ParticleSystemSimulation ParticleSimulation => particleRenderer.Simulation;
+
+        /// <summary>Gets the renderer classes of this system and its children that are not implemented, and so draw nothing.</summary>
+        internal IEnumerable<string> SkippedRendererClasses => particleRenderer.EnumerateSkippedRendererClasses();
 
         /// <summary>
         /// Gets the preview model scene node loaded from particle preview state, if any.
@@ -28,6 +37,8 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         public ModelSceneNode? PreviewModel { get; private set; }
 
         private string? PreviewModelAttachmentPoint { get; set; }
+
+        private ParticleModelNodeObject? previewModelObject;
 
         /// <summary>Gets or sets a time-scale multiplier applied to the particle simulation each frame.</summary>
         public float FrametimeMultiplier { get; set; } = 1.0f;
@@ -82,6 +93,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
             RenderPasses = particleRenderer.Passes;
             WantsSceneDepth = particleRenderer.WantsSceneDepth;
+            WantsSceneColor = particleRenderer.WantsSceneColor;
 
             Simulation = NodeSimulation.Parallel;
 
@@ -92,6 +104,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             {
                 Preview = true;
                 Loop = true;
+                ApplyControlPointDefaults();
                 PreviewModel = CreatePreviewModel(particleSystem);
                 if (PreviewModel != null)
                 {
@@ -101,6 +114,27 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             else if (!playedByEntity)
             {
                 ApplyRuntimeControlPointValues(particleSystem);
+            }
+        }
+
+        /// <summary>
+        /// Places the control points the effect reads at the defaults the particle editor previews them at,
+        /// such as white for a tint control point. The preview configuration's drivers are applied after
+        /// this and win.
+        /// </summary>
+        private void ApplyControlPointDefaults()
+        {
+            var defaults = new ControlPointDefaults();
+            particleRenderer.Simulation.AddControlPointDefaults(defaults);
+
+            foreach (var renderer in particleRenderer.EnumerateRenderers())
+            {
+                renderer.AddControlPointDefaults(defaults);
+            }
+
+            foreach (var (index, value) in defaults.Values)
+            {
+                GetControlPoint(index).Position = value;
             }
         }
 
@@ -146,7 +180,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
             foreach (var driver in drivers)
             {
-                var controlPoint = driver.ContainsKey("m_iControlPoint") ? driver.GetInt32Property("m_iControlPoint") : 0;
+                var controlPoint = driver.GetInt32Property("m_iControlPoint");
                 if (controlPoint == 0)
                 {
                     continue;
@@ -165,7 +199,8 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         /// <summary>
         /// Creates particle nodes for the systems in a model's <c>particles_list</c> and attaches each
         /// per its <c>attachment_type</c>. Custom and world origin are placed once at spawn; the other
-        /// types track the model or its attachment point. Unknown types are skipped.
+        /// types track the model or its attachment point. Unknown types are skipped. Control point 0
+        /// of each system carries the model, for the model inputs that read it.
         /// </summary>
         /// <param name="scene">The scene the nodes belong to.</param>
         /// <param name="model">The model referencing the particle systems.</param>
@@ -215,6 +250,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                         Name = particleName,
                     };
 
+                    particleNode.GetControlPoint(0).ModelObject = new ParticleModelNodeObject(model, modelNode, scene.RendererContext.FileLoader);
                     AttachOnModel(modelNode, particleNode, attachmentType, attachmentPoint, offset);
                     nodes.Add(particleNode);
                 }
@@ -274,6 +310,21 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         public void Stop() => IsPlaying = false;
 
         private bool pendingRestart;
+        private bool isSeeded;
+
+        /// <summary>
+        /// Seeds each placed instance of an effect apart, the same way on every load, from its name and
+        /// where it first runs.
+        /// </summary>
+        private int PlacementSeed()
+        {
+            var position = Transform.Translation;
+
+            return unchecked((int)ValveResourceFormat.Utils.StringToken.Get(particleRenderer.Simulation.Name)
+                ^ ((int)MathF.Round(position.X) * 73856093)
+                ^ ((int)MathF.Round(position.Y) * 19349663)
+                ^ ((int)MathF.Round(position.Z) * 83492791));
+        }
 
         // Until a restart has run, what is alive is left over from the last time the system played
         private bool IsDrawable => IsPlaying && !pendingRestart;
@@ -442,6 +493,9 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 Name = previewModelData.Name,
             };
 
+            previewModelObject = new ParticleModelNodeObject(previewModelData, previewModelNode, Scene.RendererContext.FileLoader);
+            GetControlPoint(0).ModelObject = previewModelObject;
+
             var sequenceName = previewState.GetStringProperty("m_sequenceName");
             if (!string.IsNullOrEmpty(sequenceName))
             {
@@ -482,7 +536,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
             foreach (var driver in drivers)
             {
-                var controlPoint = driver.ContainsKey("m_iControlPoint") ? driver.GetInt32Property("m_iControlPoint") : 0;
+                var controlPoint = driver.GetInt32Property("m_iControlPoint");
                 // Deadlock drivers commonly omit m_iAttachType entirely.
                 var attachType = driver.ContainsKey("m_iAttachType")
                     ? driver.GetEnumValue<ParticleAttachment>("m_iAttachType")
@@ -515,6 +569,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                     point.Rotation = EntityTransformHelper.EulerAnglesToQuaternion(angleOffset);
                 }
                 point.AttachType = attachType;
+                point.ModelObject = previewModelObject;
 
                 if (controlPoint == 0)
                 {
@@ -617,6 +672,19 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         {
             var frameTime = context.Timestep * FrametimeMultiplier;
 
+            if (!isSeeded)
+            {
+                isSeeded = true;
+                particleRenderer.Simulation.SeedRandom(PlacementSeed());
+                lastDrawnUptime = context.Uptime;
+            }
+
+            if (drawnSinceSimulate)
+            {
+                drawnSinceSimulate = false;
+                lastDrawnUptime = context.Uptime;
+            }
+
             if (pendingRestart)
             {
                 pendingRestart = false;
@@ -636,7 +704,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 }
             }
 
-            if (IsPaused)
+            if (IsPaused || IsAsleep(context.Uptime))
             {
                 return;
             }
@@ -673,6 +741,28 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
         /// <summary>Whether <see cref="Simulate"/> stepped, so there is something to finish.</summary>
         private bool stepped;
+
+        /// <summary>Set when the effect is drawn, and taken by the next <see cref="Simulate"/>.</summary>
+        private bool drawnSinceSimulate;
+
+        private float lastDrawnUptime;
+
+        /// <summary>
+        /// Whether the effect has gone undrawn for long enough to stop simulating. It holds where it is
+        /// until it is drawn again, without catching up. An effect with no particles stays awake, so it
+        /// can start emitting, and so does one playing its end cap.
+        /// </summary>
+        private bool IsAsleep(float uptime)
+        {
+            var simulation = particleRenderer.Simulation;
+
+            if (Preview || endCapPlayed || simulation.Particles.Count == 0)
+            {
+                return false;
+            }
+
+            return uptime - lastDrawnUptime > simulation.NoDrawTimeToGoToSleep;
+        }
 
         /// <summary>
         /// Finishes the step, on the particles it left and where reaching past the effect is safe, and
@@ -715,6 +805,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         {
             if (IsDrawable && LayerEnabled)
             {
+                drawnSinceSimulate = true;
                 particleRenderer.UpdateBuffers(camera);
             }
         }
