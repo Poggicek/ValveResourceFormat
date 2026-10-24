@@ -5,13 +5,21 @@ using ValveResourceFormat.Renderer.Entities;
 
 namespace ValveResourceFormat.Renderer.Movement;
 
-/// <summary>One tick of a recording: the state it started from, its command, and where it left the player.</summary>
-internal sealed record RecordedTick(int Tick, IReadOnlyList<string> Markers, JsonElement State, UserCmd Command, Vector3 OriginAfter, Vector3 VelocityAfter);
+/// <summary>
+/// One tick of a recording: the state it started from, its command, and where it left the player.
+/// Recordings made on a server also have the full state the tick ended in, and mark commands that ran
+/// late, with no time passing.
+/// </summary>
+internal sealed record RecordedTick(int Tick, IReadOnlyList<string> Markers, JsonElement State, UserCmd Command, Vector3 OriginAfter, Vector3 VelocityAfter,
+    JsonElement? StateAfter, bool Late);
 
 /// <summary>A movement recording read back from what <see cref="MovementRecorder.Export"/> wrote.</summary>
 internal sealed class MovementRecording
 {
     public string? Map { get; private init; }
+
+    /// <summary>Gets the entity index of the player recorded, for recordings made on a server.</summary>
+    public int? Player { get; private init; }
     public required MovementVars Vars { get; init; }
     public required IReadOnlyList<RecordedTick> Ticks { get; init; }
 
@@ -22,30 +30,68 @@ internal sealed class MovementRecording
         // The elements are kept past the document, so they are cloned out of it
         var root = document.RootElement.Clone();
         var ticks = new List<RecordedTick>();
+        var player = FindMovingPlayer(root.GetProperty("ticks"));
 
         foreach (var tick in root.GetProperty("ticks").EnumerateArray())
         {
+            if (player != null && tick.GetProperty("player").GetInt32() != player)
+            {
+                continue;
+            }
+
             var markers = tick.TryGetProperty("markers", out var markerArray)
                 ? markerArray.EnumerateArray().Select(static marker => marker.GetString()!).ToList()
                 : [];
 
             var after = tick.GetProperty("after");
+            var command = tick.GetProperty("command");
 
             ticks.Add(new RecordedTick(
                 tick.GetProperty("tick").GetInt32(),
                 markers,
                 tick.GetProperty("state"),
-                ReadCommand(tick.GetProperty("command")),
+                ReadCommand(command),
                 MovementJson.ReadVector(after.GetProperty("origin")),
-                MovementJson.ReadVector(after.GetProperty("velocity"))));
+                MovementJson.ReadVector(after.GetProperty("velocity")),
+                tick.TryGetProperty("stateAfter", out var stateAfter) ? stateAfter : null,
+                command.TryGetProperty("late", out var late) && late.GetBoolean()));
+        }
+
+        if (ticks.Count == 0)
+        {
+            throw new InvalidDataException("The recording has no ticks.");
         }
 
         return new MovementRecording
         {
             Map = root.GetProperty("map").GetString(),
+            Player = player,
             Vars = MovementVarsJson.Read(root.GetProperty("vars")),
             Ticks = ticks,
         };
+    }
+
+    /// <summary>
+    /// Finds the player a server recording is of: every player on the server is recorded, and the one
+    /// who moved the most is taken to be the one playing.
+    /// </summary>
+    /// <returns>The player's entity index, or null when the recording is of a single player.</returns>
+    private static int? FindMovingPlayer(JsonElement ticks)
+    {
+        var movesByPlayer = new Dictionary<int, int>();
+
+        foreach (var tick in ticks.EnumerateArray())
+        {
+            if (!tick.TryGetProperty("player", out var player))
+            {
+                return null;
+            }
+
+            var moved = MovementJson.ReadVector(tick.GetProperty("before").GetProperty("origin")) != MovementJson.ReadVector(tick.GetProperty("after").GetProperty("origin"));
+            movesByPlayer[player.GetInt32()] = movesByPlayer.GetValueOrDefault(player.GetInt32()) + (moved ? 1 : 0);
+        }
+
+        return movesByPlayer.Count == 0 ? null : movesByPlayer.MaxBy(static entry => entry.Value).Key;
     }
 
     private static UserCmd ReadCommand(JsonElement command)
@@ -94,33 +140,46 @@ internal sealed class MovementRecording
 internal sealed class MovementReplay
 {
     private readonly MovementRecording Recording;
-    private readonly EntitySystem? Entities;
+    private readonly Func<uint, int, float?>? WeaponMaxSpeed;
 
     public MovementReplay(MovementRecording recording, PhysicsWorld? world, EntitySystem? entities, SurfacePropertyTable? surfaces)
-    {
-        Recording = recording;
-        Entities = entities;
-        Collision = new MovementCollision { World = world, Entities = entities };
-        Recorder = new MovementRecorder(recording.Vars);
-        Services = new MovementServices(recording.Vars, Collision)
+        : this(recording, new MovementServices(recording.Vars, new MovementCollision { World = world, Entities = entities })
         {
             Surfaces = surfaces ?? SurfacePropertyTable.Empty,
-            Recorder = Recorder,
-        };
+            Recorder = new MovementRecorder(recording.Vars),
+        })
+    {
     }
 
-    public MovementCollision Collision { get; }
+    /// <param name="recording">The recording to run.</param>
+    /// <param name="services">The movement to run the commands through, which takes the recording's settings.</param>
+    /// <param name="weaponMaxSpeed">
+    /// The max speed of a weapon by subclass and firing mode, for recordings made on a server, which name
+    /// the weapon held instead of its speed.
+    /// </param>
+    public MovementReplay(MovementRecording recording, MovementServices services, Func<uint, int, float?>? weaponMaxSpeed = null)
+    {
+        Recording = recording;
+        Services = services;
+        WeaponMaxSpeed = weaponMaxSpeed;
+        MovementVarsJson.Copy(recording.Vars, services.Vars);
+    }
+
     public MovementServices Services { get; }
-    public MovementRecorder Recorder { get; }
+    public MovementCollision Collision => Services.Collision;
+    public MovementRecorder? Recorder => Services.Recorder;
 
     /// <summary>Gets the index of the next tick to run.</summary>
     public int Position { get; private set; }
+
+    /// <summary>Gets whether every tick has been run.</summary>
+    public bool Finished => Position >= Recording.Ticks.Count;
 
     /// <summary>Puts the player in the state the tick at <paramref name="index"/> started from.</summary>
     public void Seek(int index)
     {
         Position = index;
-        Restore(Recording.Ticks[index]);
+        Restore(Recording.Ticks[index].State);
     }
 
     /// <summary>Runs the next tick's command.</summary>
@@ -132,10 +191,18 @@ internal sealed class MovementReplay
         // A teleport or reset happened before this tick, outside the movement
         if (tick.Markers.Count > 0)
         {
-            Restore(tick);
+            Restore(tick.State);
         }
 
-        Services.RunCommand(tick.Command);
+        // The movement has no commands that run late, with no time passing, so the player is put where it left them
+        if (tick.Late && tick.StateAfter is { } after)
+        {
+            Restore(after);
+        }
+        else
+        {
+            Services.RunCommand(tick.Command);
+        }
 
         return Services.AbsOrigin == tick.OriginAfter && Services.AbsVelocity == tick.VelocityAfter;
     }
@@ -157,14 +224,22 @@ internal sealed class MovementReplay
         return -1;
     }
 
-    private void Restore(RecordedTick tick)
+    private void Restore(JsonElement state)
     {
-        Services.VisitState(new JsonStateReader(tick.State));
+        Services.VisitState(new JsonStateReader(state));
+
+        if (WeaponMaxSpeed != null && !state.TryGetProperty(nameof(MovementServices.WeaponMaxSpeed), out _))
+        {
+            Services.WeaponMaxSpeed = state.TryGetProperty("WeaponSubclass", out var subclass)
+                ? WeaponMaxSpeed(subclass.GetUInt32(), state.TryGetProperty("WeaponMode", out var mode) ? mode.GetInt32() : 0)
+                : null;
+        }
 
         // Only the world can be found again by name; standing on anything else replays as standing on nothing
-        var onWorld = tick.State.TryGetProperty("GroundEntity", out var ground)
-            && Entities?.World is { } world && ground.GetString() == world.Classname;
+        var entities = Services.Collision.Entities;
+        var onWorld = state.TryGetProperty("GroundEntity", out var ground)
+            && entities?.World is { } world && ground.GetString() == world.Classname;
 
-        Services.GroundEntity = onWorld ? Entities!.World : null;
+        Services.GroundEntity = onWorld ? entities!.World : null;
     }
 }

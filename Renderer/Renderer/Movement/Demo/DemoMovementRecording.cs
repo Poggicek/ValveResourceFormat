@@ -10,11 +10,12 @@ internal sealed record DemoCommand(int ServerTick, UserCmd Command);
 /// <param name="ServerTick">The tick it is the end of.</param>
 /// <param name="Origin">Where the player's feet are.</param>
 /// <param name="Velocity">The velocity, quantized as networked.</param>
+/// <param name="ViewAngles">The view angles of the last command the server ran, rounded to about 1e-4 degrees as networked.</param>
 /// <param name="GroundEntityIndex">What the player stands on, -1 for nothing and 0 for the world.</param>
 /// <param name="WeaponSubclass">The string token of the held weapon's class in <c>weapons.vdata</c>, 0 for none.</param>
 /// <param name="WeaponMode">Which of the weapon's firing modes is in use: 1 when scoped.</param>
 /// <param name="Values">The rest, named and typed as <see cref="MovementServices.VisitState"/> names them.</param>
-internal sealed record NetworkedMovementState(int ServerTick, Vector3 Origin, Vector3 Velocity, int GroundEntityIndex, uint WeaponSubclass, int WeaponMode, IReadOnlyDictionary<string, object> Values);
+internal sealed record NetworkedMovementState(int ServerTick, Vector3 Origin, Vector3 Velocity, Vector3 ViewAngles, int GroundEntityIndex, uint WeaponSubclass, int WeaponMode, IReadOnlyDictionary<string, object> Values);
 
 /// <summary>A player in a demo who sent user commands.</summary>
 internal sealed record DemoPlayer(int Slot, string Name, int CommandCount);
@@ -104,6 +105,7 @@ internal sealed class DemoMovementRecording
         var decoder = new UserCommandDecoder();
         var commandsBySlot = new Dictionary<int, List<DemoCommand>>();
         var statesBySlot = new Dictionary<int, Dictionary<int, NetworkedMovementState>>();
+        var undecodedBySlot = new Dictionary<int, List<ServerUserCommand>>();
         var names = new Dictionary<int, string>();
         DemoParser? parser = null;
 
@@ -111,13 +113,24 @@ internal sealed class DemoMovementRecording
         {
             UserCommand = command =>
             {
-                if (!commandsBySlot.TryGetValue(command.PlayerSlot, out var commands))
+                commandsBySlot.TryAdd(command.PlayerSlot, []);
+
+                // A demo started after the player connected opens with deltas from a command it does
+                // not have. They wait for the player's pawn, whose view angles stand in for the base's
+                // until the commands send them again.
+                if (undecodedBySlot.TryGetValue(command.PlayerSlot, out var undecoded))
                 {
-                    commands = [];
-                    commandsBySlot[command.PlayerSlot] = commands;
+                    undecoded.Add(command);
+                    return;
                 }
 
-                commands.Add(new DemoCommand(command.ServerTickExecuted, decoder.Decode(command)));
+                if (command.Data == null && !decoder.HasBase(command.PlayerSlot))
+                {
+                    undecodedBySlot[command.PlayerSlot] = [command];
+                    return;
+                }
+
+                Decode(command);
             },
             EntitiesUpdated = tick =>
             {
@@ -135,11 +148,23 @@ internal sealed class DemoMovementRecording
                     }
 
                     states[tick] = state;
+
+                    if (undecodedBySlot.Remove(slot, out var undecoded))
+                    {
+                        decoder.SeedBase(slot, state.ViewAngles);
+                        undecoded.ForEach(Decode);
+                    }
                 }
             },
         };
 
         parser.Parse(stream);
+
+        // Players whose pawn never showed up decode from defaults
+        foreach (var undecoded in undecodedBySlot.Values)
+        {
+            undecoded.ForEach(Decode);
+        }
 
         var players = commandsBySlot
             .Select(pair => new DemoPlayer(pair.Key, names.GetValueOrDefault(pair.Key, $"Player {pair.Key}"), pair.Value.Count))
@@ -155,6 +180,11 @@ internal sealed class DemoMovementRecording
         playerCommands.Sort(static (a, b) => a.Command.CommandNumber.CompareTo(b.Command.CommandNumber));
 
         return new DemoMovementRecording(parser.MapName, player, players, playerCommands, statesBySlot.GetValueOrDefault(player.Slot) ?? []);
+
+        void Decode(ServerUserCommand command)
+        {
+            commandsBySlot[command.PlayerSlot].Add(new DemoCommand(command.ServerTickExecuted, decoder.Decode(command)));
+        }
     }
 
     private static NetworkedMovementState? CaptureState(DemoParser parser, int slot, int tick, Dictionary<int, string> names)
@@ -180,6 +210,13 @@ internal sealed class DemoMovementRecording
             {
                 values[state] = value;
             }
+        }
+
+        // The stashed speed is networked on a grid almost half a step off the velocity quantizer the server
+        // stashes it with, so the nearest velocity step is the value the server holds
+        if (values.GetValueOrDefault("FrictionStashedSpeed") is float stashedSpeed)
+        {
+            values["FrictionStashedSpeed"] = QuantizedFloat.Velocity.Quantize(stashedSpeed);
         }
 
         if (pawn.Class.FindPath(ForceSubtickMoveWhenField) is { } forceWhenPath)
@@ -211,6 +248,8 @@ internal sealed class DemoMovementRecording
             pawn.Get("m_vecVelocity.m_vecY", 0f),
             pawn.Get("m_vecVelocity.m_vecZ", 0f));
 
+        var viewAngles = pawn.Get("m_angEyeAngles", Vector3.Zero);
+
         var groundHandle = pawn.Get("m_hGroundEntity", uint.MaxValue);
         var groundIndex = groundHandle == uint.MaxValue || (groundHandle & DemoEntity.HandleIndexMask) == DemoEntity.HandleIndexMask
             ? -1
@@ -226,18 +265,14 @@ internal sealed class DemoMovementRecording
             weaponMode = (int)weapon.Get("m_weaponMode", 0u);
         }
 
-        return new NetworkedMovementState(tick, origin, velocity, groundIndex, weaponSubclass, weaponMode, values);
+        return new NetworkedMovementState(tick, origin, velocity, viewAngles, groundIndex, weaponSubclass, weaponMode, values);
     }
 
-    // Positions are sent as a cell of the world and an offset inside it
     private static float CellCoordinate(DemoEntity pawn, string axis)
     {
-        const int CellBits = 9;
-        const float MaxCoord = 1 << 14;
-
         var cell = pawn.Get($"CBodyComponent.m_skeletonInstance.m_vecOrigin.m_cell{axis}", 0u);
         var offset = pawn.Get($"CBodyComponent.m_skeletonInstance.m_vecOrigin.m_vec{axis}", 0f);
 
-        return ((cell << CellBits) - MaxCoord) + offset;
+        return NetworkOrigin.FromSentCell((int)cell, offset);
     }
 }

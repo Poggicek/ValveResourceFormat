@@ -192,6 +192,19 @@ internal static class MovementVarsJson
         ("sv_subtick_movement_view_angles", v => v.SubtickMovementViewAngles, (v, x) => v.SubtickMovementViewAngles = x),
     ];
 
+    public static void Copy(MovementVars from, MovementVars to)
+    {
+        foreach (var (_, get, set) in Floats)
+        {
+            set(to, get(from));
+        }
+
+        foreach (var (_, get, set) in Booleans)
+        {
+            set(to, get(from));
+        }
+    }
+
     public static MovementVars Read(JsonElement vars)
     {
         var result = new MovementVars();

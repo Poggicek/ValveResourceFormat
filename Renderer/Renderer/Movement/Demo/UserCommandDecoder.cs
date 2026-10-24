@@ -17,7 +17,31 @@ internal sealed class UserCommandDecoder
 {
     private readonly Dictionary<int, ProtoMessage> PreviousBySlot = [];
 
+    /// <summary>Gets whether the player has a previous command for their next delta to apply to.</summary>
+    public bool HasBase(int playerSlot) => PreviousBySlot.ContainsKey(playerSlot);
+
+    /// <summary>
+    /// Stands in for a player's previous command when the demo starts after it, with the view angles
+    /// the server networked for it. Its other fields are taken as their defaults.
+    /// </summary>
+    public void SeedBase(int playerSlot, Vector3 viewAngles)
+    {
+        var angles = new ProtoMessage();
+        angles.SetFloat(1, viewAngles.X);
+        angles.SetFloat(2, viewAngles.Y);
+        angles.SetFloat(3, viewAngles.Z);
+
+        var baseCmd = new ProtoMessage();
+        baseCmd.SetMessage(4, angles);
+
+        var message = new ProtoMessage();
+        message.SetMessage(1, baseCmd);
+
+        PreviousBySlot[playerSlot] = message;
+    }
+
     /// <summary>Decodes a command and remembers it as the base of the player's next one.</summary>
+    /// <remarks>A delta whose base was not recorded or seeded is taken as a delta from defaults.</remarks>
     public UserCmd Decode(ServerUserCommand command)
     {
         ProtoMessage message;
@@ -28,12 +52,7 @@ internal sealed class UserCommandDecoder
         }
         else
         {
-            if (!PreviousBySlot.TryGetValue(command.PlayerSlot, out var previous))
-            {
-                throw new InvalidDataException($"Command {command.CommandNumber} is a delta from a command that was not recorded.");
-            }
-
-            message = previous.Clone();
+            message = PreviousBySlot.TryGetValue(command.PlayerSlot, out var previous) ? previous.Clone() : new ProtoMessage();
             message.MergeDelta(command.DeltaData ?? [], ProtoSchema.CsgoUserCmd);
         }
 
@@ -204,9 +223,15 @@ internal sealed class UserCommandDecoder
                     continue;
                 }
 
-                if (reader.WireType != WireType.LengthDelimited || reader.Field >= list.Count)
+                if (reader.WireType != WireType.LengthDelimited)
                 {
-                    throw new InvalidDataException($"Repeated field edit {reader.Field} ({reader.WireType}) is outside the list of {list.Count}.");
+                    throw new InvalidDataException($"Repeated field edit {reader.Field} has wire type {reader.WireType}.");
+                }
+
+                // Past the end only when the base was not recorded
+                while (list.Count <= reader.Field)
+                {
+                    list.Add(new ProtoMessage());
                 }
 
                 list[reader.Field].MergeDelta(reader.ReadBytes(), elementSchema);
@@ -240,6 +265,10 @@ internal sealed class UserCommandDecoder
         }
 
         public ProtoMessage? GetMessage(int field) => Fields.GetValueOrDefault(field) as ProtoMessage;
+
+        public void SetMessage(int field, ProtoMessage message) => Fields[field] = message;
+
+        public void SetFloat(int field, float value) => Fields[field] = BitConverter.SingleToUInt32Bits(value);
 
         public IReadOnlyList<ProtoMessage> GetList(int field) => Fields.GetValueOrDefault(field) as List<ProtoMessage> ?? [];
 

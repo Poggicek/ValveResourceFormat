@@ -52,7 +52,7 @@ namespace GUI.Types.GLViewers
         private volatile HashSet<string> chosenPhysicsGroups = [];
         private SimulationState simulationState;
         private int simulationRequest;
-        private DemoPlayback? pendingPlayback;
+        private MovementPlayback? pendingPlayback;
         private bool ignoreLayersChangeEvents = true;
         private string[] unlistedEnabledLayers = [];
         private List<Matrix4x4> CameraMatrices = [];
@@ -1244,7 +1244,7 @@ namespace GUI.Types.GLViewers
             playPauseButton = UiControl.AddToolbarButton(playImage, "Play", () => RequestSimulation(SimulationRequest.PlayOrPause), centered: true);
             stopButton = UiControl.AddToolbarButton(stopImage, "Stop", () => RequestSimulation(SimulationRequest.Stop), centered: true);
             UiControl.AddToolbarButton("Export Movement", ExportMovementRecording, centered: true);
-            UiControl.AddToolbarButton("Replay Demo", ReplayDemo, centered: true);
+            UiControl.AddToolbarButton("Replay Movement", ReplayMovement, centered: true);
 
             toolEntitiesButton = UiControl.AddToolbarToggle("Tool Entities", tools.ShowToolEntities, v =>
             {
@@ -1290,32 +1290,37 @@ namespace GUI.Types.GLViewers
             GLControl?.Focus();
         }
 
-        // A demo's user commands run through the movement, to compare it with where the server had the player
-        private void ReplayDemo()
+        // A demo's or movement recording's user commands run through the movement, to compare it with where the game had the player
+        private void ReplayMovement()
         {
-            var fileName = AppFileDialogs.OpenFile("Replay demo movement", "CS2 demo (*.dem)|*.dem");
+            var fileName = AppFileDialogs.OpenFile("Replay movement",
+                "CS2 demo or movement recording (*.dem;*.json)|*.dem;*.json|CS2 demo (*.dem)|*.dem|Movement recording (*.json)|*.json");
 
             if (fileName != null)
             {
-                _ = LoadDemoAsync(fileName);
+                _ = LoadPlaybackAsync(fileName);
             }
         }
 
-        private async Task LoadDemoAsync(string fileName)
+        private async Task LoadPlaybackAsync(string fileName)
         {
-            DemoPlayback playback;
+            MovementPlayback playback;
 
             try
             {
-                playback = await Task.Run(() =>
+                playback = await Task.Run<MovementPlayback>(() =>
                 {
                     using var stream = File.OpenRead(fileName);
-                    return DemoPlayback.Load(stream);
+
+                    // Recordings are exported from this movement or a server plugin; anything else is taken as a demo
+                    return Path.GetExtension(fileName).Equals(".json", StringComparison.OrdinalIgnoreCase)
+                        ? RecordingPlayback.Load(stream)
+                        : DemoPlayback.Load(stream);
                 }).ConfigureAwait(true);
             }
             catch (Exception e) when (e is InvalidDataException or IOException)
             {
-                await AppMessageDialogs.ShowMessageAsync($"Could not read the demo: {e.Message}", "Replay demo", MessageIcon.Error).ConfigureAwait(true);
+                await AppMessageDialogs.ShowMessageAsync($"Could not read {Path.GetFileName(fileName)}: {e.Message}", "Replay movement", MessageIcon.Error).ConfigureAwait(true);
                 return;
             }
 
@@ -1324,8 +1329,8 @@ namespace GUI.Types.GLViewers
             if (playback.MapName != null && mapName != null && !string.Equals(playback.MapName, mapName, StringComparison.OrdinalIgnoreCase))
             {
                 await AppMessageDialogs.ShowMessageAsync(
-                    $"The demo was recorded on {playback.MapName}, but {mapName} is open. It plays anyway, through the wrong world.",
-                    "Replay demo", MessageIcon.Warning).ConfigureAwait(true);
+                    $"The movement was recorded on {playback.MapName}, but {mapName} is open. It plays anyway, through the wrong world.",
+                    "Replay movement", MessageIcon.Warning).ConfigureAwait(true);
             }
 
             Log.Info(nameof(GLWorldViewer), string.Create(CultureInfo.InvariantCulture,
@@ -1377,7 +1382,7 @@ namespace GUI.Types.GLViewers
 
         private void ApplySimulationRequest()
         {
-            // A demo starts from a fresh world played from the start, as it was when recorded
+            // A playback starts from a fresh world played from the start, as it was when recorded
             if (Interlocked.Exchange(ref pendingPlayback, null) is { } playback)
             {
                 ApplySimulation(SimulationRequest.Stop);
@@ -1439,7 +1444,7 @@ namespace GUI.Types.GLViewers
 
             var state = simulationState;
 
-            // A demo playing pauses with the world
+            // A playback pauses with the world
             Input.PlayerMovement.Playback?.Paused = state == SimulationState.Paused;
 
             if (UiControl is { IsHandleCreated: true } control)

@@ -5,7 +5,7 @@ namespace ValveResourceFormat.Renderer.Movement.Demo;
 /// <summary>How one replayed command compares with what the server networked after running it.</summary>
 /// <param name="Index">The command's index in the recording.</param>
 /// <param name="ServerTick">The tick the server ran it in.</param>
-/// <param name="Origin">Where the replay left the player.</param>
+/// <param name="Origin">Where the replay left the player, rounded as networked.</param>
 /// <param name="Velocity">The velocity the replay left the player with, quantized as networked.</param>
 /// <param name="Expected">What the server networked, or null when the demo has no state for the tick.</param>
 internal sealed record DemoReplayStep(int Index, int ServerTick, Vector3 Origin, Vector3 Velocity, NetworkedMovementState? Expected)
@@ -176,7 +176,7 @@ internal sealed class DemoReplay
             QuantizedFloat.Velocity.Quantize(Services.AbsVelocity.Y),
             QuantizedFloat.Velocity.Quantize(Services.AbsVelocity.Z));
 
-        return new DemoReplayStep(index, command.ServerTick, Services.AbsOrigin, velocity, ExpectedAfter(index));
+        return new DemoReplayStep(index, command.ServerTick, NetworkOrigin.Round(Services.AbsOrigin), velocity, ExpectedAfter(index));
     }
 
     /// <summary>

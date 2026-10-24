@@ -4,11 +4,11 @@ using ValveResourceFormat.Renderer.SceneNodes;
 namespace ValveResourceFormat.Renderer
 {
     /// <summary>
-    /// Draws a demo playback against the demo: the path the replayed player took, the path the server
-    /// had them take, the hull where the server had them on the last tick played and, for a camera off
+    /// Draws a movement playback against its recording: the path the replayed player took, the path the
+    /// game had them take, the hull where the game had them on the last tick played and, for a camera off
     /// the player, the replayed player's own hull.
     /// </summary>
-    public class DemoPlaybackDebugRenderer : LineDebugRenderer
+    public class MovementPlaybackDebugRenderer : LineDebugRenderer
     {
         private static readonly Color32 ReplayedColor = new(0.25f, 1f, 1f, 1f);
         private static readonly Color32 ServerColor = new(1f, 0.5f, 0f, 1f);
@@ -20,8 +20,8 @@ namespace ValveResourceFormat.Renderer
 
         /// <summary>Initializes the renderer and creates GPU resources.</summary>
         /// <param name="rendererContext">Renderer context for loading shaders.</param>
-        public DemoPlaybackDebugRenderer(RendererContext rendererContext)
-            : base(rendererContext, nameof(DemoPlaybackDebugRenderer))
+        public MovementPlaybackDebugRenderer(RendererContext rendererContext)
+            : base(rendererContext, nameof(MovementPlaybackDebugRenderer))
         {
         }
 

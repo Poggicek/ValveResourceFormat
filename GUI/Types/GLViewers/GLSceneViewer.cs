@@ -71,9 +71,9 @@ namespace GUI.Types.GLViewers
         protected bool ShowSpeed { get; set; }
         private bool showPhysicsTraces;
         private PhysicsTraceDebugRenderer? physicsTraceRenderer;
-        private DemoPlaybackDebugRenderer? demoPlaybackRenderer;
-        private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer demoProgressText = new(96);
-        private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer demoErrorText = new(96);
+        private MovementPlaybackDebugRenderer? playbackRenderer;
+        private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer playbackProgressText = new(96);
+        private readonly ValveResourceFormat.Renderer.TextRenderer.TextBuffer playbackErrorText = new(96);
 
         private enum PerfDisplay
         {
@@ -148,8 +148,8 @@ namespace GUI.Types.GLViewers
             physicsTraceRenderer?.Delete();
             physicsTraceRenderer = null;
 
-            demoPlaybackRenderer?.Delete();
-            demoPlaybackRenderer = null;
+            playbackRenderer?.Delete();
+            playbackRenderer = null;
 
             selectionVisuals?.Delete();
             selectionVisuals = null;
@@ -804,8 +804,8 @@ namespace GUI.Types.GLViewers
             AddLine(showMaxVelText.Format($"max: {showPosMaxSpeed,10:0.00}"));
         }
 
-        /// <summary>Draws how far a demo playback has got and how far it is from where the server had the player.</summary>
-        private void DrawDemoPlaybackStatus()
+        /// <summary>Draws how far a movement playback has got and how far it is from where the game had the player.</summary>
+        private void DrawPlaybackStatus()
         {
             if (Input.PlayerMovement.Playback is not { } playback)
             {
@@ -823,7 +823,7 @@ namespace GUI.Types.GLViewers
                 Y = 0.07f,
                 Scale = 14f,
                 Color = Color32.White,
-                Text = demoProgressText.Format($"demo tick {playback.ServerTick}  {playback.CommandsPlayed} / {playback.CommandsPlayable}{state}"),
+                Text = playbackProgressText.Format($"tick {playback.ServerTick}  {playback.CommandsPlayed} / {playback.CommandsPlayable}{state}"),
                 CenterHorizontal = true,
             }, Renderer.Camera);
 
@@ -833,7 +833,7 @@ namespace GUI.Types.GLViewers
                 Y = 0.1f,
                 Scale = 14f,
                 Color = playback.FirstMismatchTick == null ? Color32.Green : new Color32(1f, 0.5f, 0f, 1f),
-                Text = demoErrorText.Format($"off by {playback.OriginError:0.000} u, {playback.VelocityError:0.000} u/s  {mismatch}"),
+                Text = playbackErrorText.Format($"off by {playback.OriginError:0.000} u, {playback.VelocityError:0.000} u/s  {mismatch}"),
                 CenterHorizontal = true,
             }, Renderer.Camera);
         }
@@ -993,8 +993,8 @@ namespace GUI.Types.GLViewers
 
                 if (Input.PlayerMovement.Playback != null)
                 {
-                    demoPlaybackRenderer ??= new DemoPlaybackDebugRenderer(Scene.RendererContext);
-                    demoPlaybackRenderer.Render(Input.PlayerMovement, drawPlayerHull: !Input.WalkMode);
+                    playbackRenderer ??= new MovementPlaybackDebugRenderer(Scene.RendererContext);
+                    playbackRenderer.Render(Input.PlayerMovement, drawPlayerHull: !Input.WalkMode);
                 }
 
                 if (showPhysicsTraces && !Renderer.EntitySystem.PhysicsWorld.IsEmpty)
@@ -1094,7 +1094,7 @@ namespace GUI.Types.GLViewers
             }
 
             DrawShowPos();
-            DrawDemoPlaybackStatus();
+            DrawPlaybackStatus();
 
             if (showVisDebug && Scene.VoxelVisibility != null)
             {

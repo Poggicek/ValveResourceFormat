@@ -46,7 +46,7 @@ public sealed class PlayerMovement : IPlayerController
     private WeaponSpeedTable? weaponSpeeds;
 
     // The playback the player was last placed for, and the aim of the command it last played
-    private DemoPlayback? StartedPlayback;
+    private MovementPlayback? StartedPlayback;
     private Vector3 PlaybackViewAngles;
 
     // Buttons seen since the entity tick last collected them, and what it collected that time
@@ -75,13 +75,13 @@ public sealed class PlayerMovement : IPlayerController
     public bool Initialize { get; set; }
 
     /// <summary>
-    /// Gets or sets a demo whose commands move the player instead of the input, or null to walk.
-    /// The player is placed where the demo starts on the next frame.
+    /// Gets or sets a demo or recording whose commands move the player instead of the input, or null
+    /// to walk. The player is placed where it starts on the next frame.
     /// </summary>
-    public DemoPlayback? Playback { get; set; }
+    public MovementPlayback? Playback { get; set; }
 
     /// <summary>
-    /// Plays the demo on without placing the camera, for watching it from a camera flying freely.
+    /// Plays the playback on without placing the camera, for watching it from a camera flying freely.
     /// </summary>
     /// <param name="deltaTime">Seconds since the last frame.</param>
     public void UpdateDetachedPlayback(float deltaTime)
@@ -242,7 +242,7 @@ public sealed class PlayerMovement : IPlayerController
         SoundEffects.Update();
     }
 
-    private void ProcessPlayback(Camera? camera, float deltaTime, DemoPlayback playback)
+    private void ProcessPlayback(Camera? camera, float deltaTime, MovementPlayback playback)
     {
         if (StartedPlayback != playback && !BeginPlayback(playback))
         {
@@ -289,20 +289,20 @@ public sealed class PlayerMovement : IPlayerController
         SoundEffects.Update();
     }
 
-    private bool BeginPlayback(DemoPlayback playback)
+    private bool BeginPlayback(MovementPlayback playback)
     {
         surfaces ??= SurfacePropertyTable.Load(Input.RendererContext.FileLoader);
         weaponSpeeds ??= WeaponSpeedTable.Load(Input.RendererContext.FileLoader);
         Services.Surfaces = surfaces;
 
-        if (playback.Begin(Services, weaponSpeeds.Get) is not { } viewAngles)
+        if (playback.Begin(Services, weaponSpeeds) is not { } viewAngles)
         {
             return false;
         }
 
         StartedPlayback = playback;
         PlaybackViewAngles = viewAngles;
-        Recorder.Mark("demo");
+        Recorder.Mark("playback");
 
         Accumulator = 0f;
         InLandingDip = false;

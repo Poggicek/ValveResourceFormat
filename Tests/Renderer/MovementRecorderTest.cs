@@ -149,7 +149,7 @@ namespace Tests.Renderer
             fromMiddle.Collision.Hulls.Add(Wall);
 
             await Assert.That(fromMiddle.Run(start: 137)).IsEqualTo(-1);
-            await Assert.That(fromMiddle.Recorder.TickCount).IsEqualTo(256 - 137);
+            await Assert.That(fromMiddle.Recorder!.TickCount).IsEqualTo(256 - 137);
         }
 
         [Test]

@@ -829,9 +829,8 @@ internal sealed partial class MovementServices
 
     private static bool IsSameOriginAxis(float current, float origin)
     {
-        // The relative part only exceeds 1/256 outside the world, MapMaxCoord in gameinfo.gi
-        const float MaxCoord = 16384f;
-        var tolerance = MathF.Max(1f / 256f, MathF.Max(MathF.Abs(current), MathF.Abs(origin)) * ((1f / 256f) / MaxCoord));
+        // The relative part only exceeds 1/256 outside the world
+        var tolerance = MathF.Max(1f / 256f, MathF.Max(MathF.Abs(current), MathF.Abs(origin)) * ((1f / 256f) / NetworkOrigin.MaxCoord));
         return MathF.Abs(current - origin) <= tolerance;
     }
 
