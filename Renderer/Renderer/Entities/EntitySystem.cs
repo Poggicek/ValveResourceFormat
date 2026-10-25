@@ -422,7 +422,7 @@ public sealed class EntitySystem
 
             // Against the volume, not its surface, so a player deep inside a big trigger still touches it.
             // Rejects on world bounds first, so a distant trigger costs one box test.
-            var isOverlapping = volume.OverlapsVolume(center, halfExtents);
+            var isOverlapping = volume.TouchesTrigger(center, halfExtents);
 
             entity.UpdateTouchLink(player, isOverlapping);
             player.UpdateTouchLink(entity, isOverlapping);

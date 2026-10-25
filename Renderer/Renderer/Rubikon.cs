@@ -29,6 +29,16 @@ public class Rubikon
     public const float SurfaceEpsilon = 1f / 32f;
 
     /// <summary>
+    /// How far a box may stay from a trigger's mesh triangle and still touch it: the separation the
+    /// contact test accepts. Trigger hulls have no such tolerance, they must overlap.
+    /// </summary>
+    public const float TriggerMeshContactDistance = 1f / 8f;
+
+    // Grown on every side of the box before it culls a trigger mesh's tree, whose compiled node bounds
+    // already carry another 1/32. The tighter of the two limits next to an axis-aligned face.
+    private const float TriggerMeshBoundsSlop = 1f / 16f;
+
+    /// <summary>
     /// Triangle mesh collision data for ray tracing.
     /// </summary>
     /// <seealso href="https://s2v.app/SchemaExplorer/cs2/physicslib/RnMesh_t">RnMesh_t</seealso>
@@ -568,10 +578,25 @@ public class Rubikon
     /// <param name="collisionName">Collision interaction name used to filter shapes.</param>
     /// <returns><see langword="true"/> if the box is inside or touching one of the hulls.</returns>
     public bool IntersectsOrContainsAABB(Vector3 center, Vector3 halfExtents, string collisionName)
+        => IntersectsOrContainsAABB(center, halfExtents, collisionName, isTrigger: false);
+
+    /// <summary>
+    /// Tests whether a box at rest touches this shape as a trigger volume: like
+    /// <see cref="IntersectsOrContainsAABB(Vector3, Vector3, string)"/>, but a mesh triangle within
+    /// <see cref="TriggerMeshContactDistance"/> of the box touches it too.
+    /// </summary>
+    /// <param name="center">Center of the box.</param>
+    /// <param name="halfExtents">Half-extents of the box.</param>
+    /// <param name="collisionName">Collision interaction name used to filter shapes.</param>
+    /// <returns><see langword="true"/> if the box touches the trigger.</returns>
+    public bool TouchesTriggerAABB(Vector3 center, Vector3 halfExtents, string collisionName)
+        => IntersectsOrContainsAABB(center, halfExtents, collisionName, isTrigger: true);
+
+    private bool IntersectsOrContainsAABB(Vector3 center, Vector3 halfExtents, string collisionName, bool isTrigger)
     {
         var filter = CollisionFilter.Named(collisionName);
 
-        if (CheckCompoundOverlap(center, halfExtents, filter, CompoundOverlap.Volume))
+        if (CheckCompoundOverlap(center, halfExtents, filter, CompoundOverlap.Volume, isTrigger))
         {
             return true;
         }
@@ -588,10 +613,10 @@ public class Rubikon
         }
 
         // A triangle mesh is a surface and encloses nothing, so contact is the only overlap it can report
-        return CheckMeshOverlap(center, halfExtents, filter);
+        return CheckMeshOverlap(center, halfExtents, filter, isTrigger);
     }
 
-    private bool CheckMeshOverlap(Vector3 center, Vector3 halfExtents, CollisionFilter filter)
+    private bool CheckMeshOverlap(Vector3 center, Vector3 halfExtents, CollisionFilter filter, bool isTrigger = false)
     {
         foreach (var mesh in Meshes)
         {
@@ -600,7 +625,7 @@ public class Rubikon
                 continue;
             }
 
-            var meshQuery = new OverlapMeshQuery(center, halfExtents, mesh);
+            var meshQuery = new OverlapMeshQuery(center, halfExtents, mesh, isTrigger);
             TraverseBvh(mesh.PhysicsTree, ref meshQuery);
 
             if (meshQuery.Overlaps)
@@ -716,11 +741,14 @@ public class Rubikon
         }
     }
 
-    private struct OverlapMeshQuery(Vector3 center, Vector3 halfExtents, PhysicsMeshData mesh) : IBvhQuery
+    private struct OverlapMeshQuery(Vector3 center, Vector3 halfExtents, PhysicsMeshData mesh, bool isTrigger) : IBvhQuery
     {
         public bool Overlaps;
 
-        public readonly bool IntersectsNode(in Node node) => BoxIntersectsAABB(center, halfExtents, node.Min, node.Max);
+        private readonly Vector3 nodeHalfExtents = isTrigger ? halfExtents + new Vector3(TriggerMeshBoundsSlop) : halfExtents;
+        private readonly float contactDistance = isTrigger ? TriggerMeshContactDistance : 0f;
+
+        public readonly bool IntersectsNode(in Node node) => BoxIntersectsAABB(center, nodeHalfExtents, node.Min, node.Max);
 
         public readonly bool DescendLeftFirst(int splitAxis) => true;
 
@@ -733,7 +761,7 @@ public class Rubikon
                 var v1 = mesh.VertexPositions[triangle.Y];
                 var v2 = mesh.VertexPositions[triangle.Z];
 
-                if (TriangleOverlaps(center, halfExtents, v0, v1, v2))
+                if (TriangleOverlaps(center, halfExtents, v0, v1, v2, contactDistance))
                 {
                     Overlaps = true;
                     return true;
@@ -981,7 +1009,7 @@ public class Rubikon
         HullVolumeOnly,
     }
 
-    private bool CheckCompoundOverlap(Vector3 center, Vector3 halfExtents, CollisionFilter filter, CompoundOverlap mode)
+    private bool CheckCompoundOverlap(Vector3 center, Vector3 halfExtents, CollisionFilter filter, CompoundOverlap mode, bool isTrigger = false)
     {
         foreach (var compound in Compounds)
         {
@@ -990,7 +1018,7 @@ public class Rubikon
                 continue;
             }
 
-            var query = new CompoundOverlapQuery(center, halfExtents, compound, mode);
+            var query = new CompoundOverlapQuery(center, halfExtents, compound, mode, isTrigger);
             TraverseCompound(compound.Tree, ref query);
 
             if (query.Overlaps)
@@ -1002,11 +1030,14 @@ public class Rubikon
         return false;
     }
 
-    private struct CompoundOverlapQuery(Vector3 center, Vector3 halfExtents, PhysicsCompoundData compound, CompoundOverlap mode) : ICompoundQuery
+    private struct CompoundOverlapQuery(Vector3 center, Vector3 halfExtents, PhysicsCompoundData compound, CompoundOverlap mode, bool isTrigger) : ICompoundQuery
     {
         public bool Overlaps;
 
-        public readonly bool IntersectsNode(Vector3 min, Vector3 max) => BoxIntersectsAABB(center, halfExtents, min, max);
+        // Only culls, so reaching as far as a trigger mesh child can touch is enough
+        private readonly Vector3 nodeHalfExtents = isTrigger ? halfExtents + new Vector3(TriggerMeshContactDistance) : halfExtents;
+
+        public readonly bool IntersectsNode(Vector3 min, Vector3 max) => BoxIntersectsAABB(center, nodeHalfExtents, min, max);
 
         public readonly bool FirstChildFirst(int splitAxis) => true;
 
@@ -1017,7 +1048,7 @@ public class Rubikon
                 if (mode != CompoundOverlap.HullVolumeOnly)
                 {
                     var mesh = compound.Meshes[childId - compound.MeshBaseIndex];
-                    var meshQuery = new OverlapMeshQuery(center, halfExtents, mesh);
+                    var meshQuery = new OverlapMeshQuery(center, halfExtents, mesh, isTrigger);
                     TraverseBvh(mesh.PhysicsTree, ref meshQuery);
                     Overlaps = meshQuery.Overlaps;
                 }
@@ -1087,9 +1118,10 @@ public class Rubikon
 
     /// <summary>
     /// 13-axis SAT overlap test between a box at rest and a triangle: the face normal,
-    /// 9 edge cross products, and 3 box axes.
+    /// 9 edge cross products, and 3 box axes. A separation of up to <paramref name="contactDistance"/>
+    /// along an axis still counts as overlapping.
     /// </summary>
-    private static bool TriangleOverlaps(Vector3 center, Vector3 halfExtents, Vector3 v0, Vector3 v1, Vector3 v2)
+    private static bool TriangleOverlaps(Vector3 center, Vector3 halfExtents, Vector3 v0, Vector3 v1, Vector3 v2, float contactDistance = 0f)
     {
         ReadOnlySpan<Vector3> triangle = [v0, v1, v2];
         Span<Vector3> axes = stackalloc Vector3[13];
@@ -1098,8 +1130,14 @@ public class Rubikon
         foreach (var axisVector in axes[..axisCount])
         {
             // The separation test is scale-invariant: boxExtent and the projections both scale
-            // with the axis length, so the axis does not need to be normalized
+            // with the axis length, so the axis does not need to be normalized. The contact distance
+            // is a length, so it does scale.
             var boxExtent = Vector3.Dot(Vector3.Abs(axisVector), halfExtents);
+
+            if (contactDistance > 0f)
+            {
+                boxExtent += contactDistance * axisVector.Length();
+            }
 
             // Project the triangle onto the axis, relative to the box center
             float min = float.PositiveInfinity, max = float.NegativeInfinity;

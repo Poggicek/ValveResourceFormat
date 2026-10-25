@@ -152,6 +152,22 @@ public sealed class EntityCollider
         return Shape.IntersectsOrContainsAABB(Vector3.Transform(center, inverseTransform), halfExtents, "player");
     }
 
+    /// <summary>
+    /// Tests whether a resting axis-aligned box touches this shape as a trigger volume, which reaches a
+    /// little past a mesh's surface. See <see cref="Rubikon.TouchesTriggerAABB"/>.
+    /// </summary>
+    public bool TouchesTrigger(Vector3 center, Vector3 halfExtents)
+    {
+        var reach = halfExtents + new Vector3(Rubikon.TriggerMeshContactDistance);
+
+        if (IsEmpty || !WorldBounds.Intersects(new AABB(center - reach, center + reach)))
+        {
+            return false;
+        }
+
+        return Shape.TouchesTriggerAABB(Vector3.Transform(center, inverseTransform), halfExtents, "player");
+    }
+
     /// <summary>Tests whether a world-space point is inside this shape's solid volume.</summary>
     public bool ContainsPoint(Vector3 point)
     {
