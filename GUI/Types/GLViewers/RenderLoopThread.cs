@@ -12,6 +12,9 @@ namespace GUI.Types.GLViewers
         private static int instances;
         private static Thread? loopThread;
         private static GLBaseControl? currentGLControl;
+
+        // The control whose context the loop kept current after drawing it. Only touched by the loop thread.
+        private static GLBaseControl? keptContextControl;
         private static readonly ManualResetEventSlim renderSignal = new(initialState: true);
 
         public static void Initialize(Form form)
@@ -148,6 +151,7 @@ namespace GUI.Types.GLViewers
             {
                 if (currentGLControl == null)
                 {
+                    ReleaseKeptContext();
                     renderSignal.Wait();
                     continue;
                 }
@@ -164,6 +168,8 @@ namespace GUI.Types.GLViewers
                         break;
                     }
 
+                    // Other threads can use the context while the loop sleeps
+                    ReleaseKeptContext();
                     renderSignal.Wait();
                     continue;
                 }
@@ -183,6 +189,8 @@ namespace GUI.Types.GLViewers
                 */
             }
 
+            ReleaseKeptContext();
+
 #if DEBUG
             GUI.Utils.Log.Debug(nameof(RenderLoop), $"Thread quit (#{localHash})");
 #endif
@@ -195,6 +203,12 @@ namespace GUI.Types.GLViewers
         private static bool? DrawCurrentControl()
         {
             var control = currentGLControl;
+
+            // A thread has one current context, and another control's would be left current nowhere
+            if (keptContextControl != control)
+            {
+                ReleaseKeptContext();
+            }
 
             if (control == null || control.TryPrewarm())
             {
@@ -220,10 +234,17 @@ namespace GUI.Types.GLViewers
             OnFrameStarting(control);
 
             var presented = control.Draw(isPaused);
+            keptContextControl = control;
 
             OnFrameDrawn(control);
 
             return presented;
+        }
+
+        private static void ReleaseKeptContext()
+        {
+            keptContextControl?.ReleaseRenderLoopContext();
+            keptContextControl = null;
         }
 
         // Implemented by automation in debug builds only; elsewhere these calls are compiled out

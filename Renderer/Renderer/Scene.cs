@@ -255,14 +255,11 @@ namespace ValveResourceFormat.Renderer
         private ObjectLodInfo[]? lodDataCpu;
         private readonly List<SceneNode> nodeScratch = [];
         private List<OpenTK.Mathematics.Matrix3x4>? transformDataCpu;
-        private int transformUploadStart = int.MaxValue;
+        private readonly DirtyRanges dirtyInstances = new();
+        private readonly DirtyRanges dirtyTransforms = new();
         private readonly List<SceneAggregate> lodAggregates = [];
         private uint[] activeLodBits = [];
         private int objectEntryCount;
-        private int firstDynamicId;
-        private int dynamicTransformStart;
-        private int dynamicDrawEntryStart;
-        private int drawEntryEnd;
         private int morphAtlasLayoutVersion;
 
         // Bound probes in precedence order: most indoor first, then smallest, so the first volume
@@ -794,16 +791,13 @@ namespace ValveResourceFormat.Renderer
 
             var entryCount = (int)maxId + 1;
             objectEntryCount = entryCount;
-            firstDynamicId = entryCount;
 
             // Mesh draw calls get entries of their own behind the node entries, since tint and skinning differ
-            // per draw. The dynamic nodes' come last, so the per frame refresh uploads one span.
+            // per draw. The dynamic nodes' come last, so the ones a frame changes sit close together.
             var totalEntryCount = entryCount;
 
             AssignObjectIndices(staticNodes, ref totalEntryCount);
-            dynamicDrawEntryStart = totalEntryCount;
             AssignObjectIndices(dynamicNodes, ref totalEntryCount);
-            drawEntryEnd = totalEntryCount;
 
             if (instanceDataCpu == null || instanceDataCpu.Length < totalEntryCount)
             {
@@ -831,13 +825,6 @@ namespace ValveResourceFormat.Renderer
             for (var nodeIndex = 0; nodeIndex < nodes.Count; nodeIndex++)
             {
                 var node = nodes[nodeIndex];
-
-                if (nodeIndex == staticNodes.Count)
-                {
-                    firstDynamicId = (int)node.Id;
-                    dynamicTransformStart = transformData.Count;
-                }
-
                 var neverChangesTransform = nodeIndex < staticNodes.Count && node is not ModelSceneNode { SkinningTransformCount: > 0 };
 
                 uint transformIndex;
@@ -914,12 +901,9 @@ namespace ValveResourceFormat.Renderer
 
             ActiveLodBitsGpu = Upload<uint>(ActiveLodBitsGpu, activeLodBits, ReservedBufferSlots.BufferSlot11, "ActiveLodBits");
 
-            transformUploadStart = int.MaxValue;
-
-            if (nodes.Count == staticNodes.Count)
-            {
-                dynamicTransformStart = transformData.Count;
-            }
+            // Everything went up whole
+            dirtyInstances.Clear();
+            dirtyTransforms.Clear();
 
             morphAtlasLayoutVersion = RendererContext.MorphAtlas.LayoutVersion;
         }
@@ -984,19 +968,19 @@ namespace ValveResourceFormat.Renderer
                     entry.MorphAtlasStride = (uint)composite.Width;
                 }
 
-                Write(entries, node.TintAlpha, mesh.DrawCallsOpaque, entry, morphed);
-                Write(entries, node.TintAlpha, mesh.DrawCallsOverlay, entry, morphed);
-                Write(entries, node.TintAlpha, mesh.DrawCallsBlended, entry, morphed);
+                Write(dirtyInstances, entries, node.TintAlpha, mesh.DrawCallsOpaque, entry, morphed);
+                Write(dirtyInstances, entries, node.TintAlpha, mesh.DrawCallsOverlay, entry, morphed);
+                Write(dirtyInstances, entries, node.TintAlpha, mesh.DrawCallsBlended, entry, morphed);
             }
 
-            static void Write(InstanceDataStandard[] entries, Vector4 tint, List<DrawCall> calls, InstanceDataStandard entry, bool morphed)
+            static void Write(DirtyRanges dirty, InstanceDataStandard[] entries, Vector4 tint, List<DrawCall> calls, InstanceDataStandard entry, bool morphed)
             {
                 foreach (var call in calls)
                 {
                     entry.TintAlpha = PackTint(tint * call.TintColor);
                     entry.MorphVertexIdOffset = morphed ? call.VertexIdOffset : -1;
 
-                    entries[call.InstanceBufferIndex] = entry;
+                    dirty.Store<InstanceDataStandard>(entries, (int)call.InstanceBufferIndex, entry);
                 }
             }
         }
@@ -1029,14 +1013,15 @@ namespace ValveResourceFormat.Renderer
                     RebindMovedNodeLighting(node, rebindProbes, rebindEnvMaps);
                 }
 
-                ref var entry = ref instanceDataCpu[node.Id];
+                var entry = instanceDataCpu[node.Id];
                 entry.TintAlpha = EntryTint(node);
                 entry.LightingData = LightingEntry(node);
+                dirtyInstances.Store<InstanceDataStandard>(instanceDataCpu, (int)node.Id, entry);
 
                 // An aggregate's slot starts its own run of instance transforms
                 if (entry.TransformIndex != 0 && node is not SceneAggregate { InstanceTransforms.Count: > 0 })
                 {
-                    transforms[(int)entry.TransformIndex] = node.Transform.To3x4();
+                    dirtyTransforms.Store(transforms, (int)entry.TransformIndex, node.Transform.To3x4());
                 }
 
                 if (node is MeshCollectionNode meshNode)
@@ -1045,13 +1030,11 @@ namespace ValveResourceFormat.Renderer
                 }
             }
 
-            var drawEntryStart = dynamicDrawEntryStart;
             var atlasVersion = RendererContext.MorphAtlas.LayoutVersion;
 
             if (morphAtlasLayoutVersion != atlasVersion)
             {
                 morphAtlasLayoutVersion = atlasVersion;
-                drawEntryStart = objectEntryCount;
 
                 foreach (var node in staticNodes)
                 {
@@ -1062,13 +1045,8 @@ namespace ValveResourceFormat.Renderer
                 }
             }
 
-            UploadRange(InstanceBufferGpu, instanceDataCpu, firstDynamicId, objectEntryCount);
-            UploadRange(InstanceBufferGpu, instanceDataCpu, drawEntryStart, drawEntryEnd);
-
-            // Static skinned models' bones sit before the dynamic span, and move it down when they changed
-            transformUploadStart = Math.Min(transformUploadStart, dynamicTransformStart);
-            UploadRange(TransformBufferGpu, transforms, transformUploadStart, transforms.Length);
-            transformUploadStart = int.MaxValue;
+            dirtyInstances.Upload<InstanceDataStandard>(InstanceBufferGpu, instanceDataCpu);
+            dirtyTransforms.Upload<OpenTK.Mathematics.Matrix3x4>(TransformBufferGpu, transforms);
         }
 
         private void RebindMovedNodeLighting(SceneNode node, bool rebindProbes, bool rebindEnvMaps)
@@ -1100,14 +1078,6 @@ namespace ValveResourceFormat.Renderer
         // Gives a node that has no lighting cache yet one
         private static SceneNodeLightingCache EnableLightingCache(SceneNode node)
             => node.LightingCache ??= new SceneNodeLightingCache();
-
-        private static void UploadRange<T>(StorageBuffer buffer, ReadOnlySpan<T> data, int start, int end) where T : unmanaged
-        {
-            if (end > start)
-            {
-                buffer.Update<T>(data[start..end], start * Unsafe.SizeOf<T>());
-            }
-        }
 
         // Light probe volume index in the low 16 bits, env map index in the high 16. Both arrays cap
         // far below 65535, so they share a word.
@@ -1169,7 +1139,7 @@ namespace ValveResourceFormat.Renderer
 
             model.WriteSkinningTransforms(transforms.Slice(boneStart, skinningSlots));
 
-            transformUploadStart = Math.Min(transformUploadStart, boneStart);
+            dirtyTransforms.Add(boneStart, boneStart + skinningSlots);
         }
 
         /// <summary>
