@@ -102,6 +102,9 @@ public class PerfStats
     /// <summary>Gets the managed allocation and GC statistics for the same frame. Captured independently of <see cref="Capture"/>.</summary>
     public AllocStats Allocations { get; } = new();
 
+    /// <summary>Gets the video memory held by the textures and buffers of the current device, measured on demand.</summary>
+    public VramStats Vram { get; } = new();
+
     // Debug groups opened outside a marked frame are not timed.
     private bool timingFrame;
 

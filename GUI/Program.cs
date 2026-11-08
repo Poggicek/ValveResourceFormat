@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Threading;
 using System.Windows.Forms;
 using GUI.Utils;
+using ValveResourceFormat.Renderer;
 using Windows.Win32;
 using Windows.Win32.System.LibraryLoader;
 
@@ -72,6 +73,8 @@ namespace GUI
 
             // The explorer and tab paths need the installed games, find them while the window is being created
             _ = InstalledSteamGames.FindAsync();
+
+            VramStats.ProcessMemoryQuery = ProcessVideoMemoryReader.Read;
 
             Assembly = Assembly.GetExecutingAssembly();
 

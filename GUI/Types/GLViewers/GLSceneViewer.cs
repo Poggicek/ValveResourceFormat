@@ -79,6 +79,7 @@ namespace GUI.Types.GLViewers
             Stats,
             Timings,
             Allocations,
+            Vram,
         }
 
         private PerfDisplay perfDisplay;
@@ -260,7 +261,7 @@ namespace GUI.Types.GLViewers
                 UiControl.AddCheckBox("Disable threaded sim", !Renderer.ParallelSimulation, v => Renderer.ParallelSimulation = !v);
 
                 perfDisplayComboBox = UiControl.AddSelection("Debug Performance", (_, i) => perfDisplay = (PerfDisplay)i);
-                perfDisplayComboBox.Items.AddRange([nameof(PerfDisplay.Off), nameof(PerfDisplay.Stats), nameof(PerfDisplay.Timings), nameof(PerfDisplay.Allocations)]);
+                perfDisplayComboBox.Items.AddRange([nameof(PerfDisplay.Off), nameof(PerfDisplay.Stats), nameof(PerfDisplay.Timings), nameof(PerfDisplay.Allocations), "VRAM"]);
                 perfDisplayComboBox.SelectedIndex = (int)perfDisplay;
             }
 
@@ -1085,6 +1086,10 @@ namespace GUI.Types.GLViewers
             else if (perfDisplay == PerfDisplay.Allocations)
             {
                 Renderer.PerfStats.Allocations.DisplayAllocations(TextRenderer, Renderer.Camera);
+            }
+            else if (perfDisplay == PerfDisplay.Vram)
+            {
+                Renderer.PerfStats.Vram.DisplayVram(TextRenderer, Renderer.Camera);
             }
 
             TextRenderer.Render(Renderer.Camera, Renderer.ResolvedSceneDepth);

@@ -77,3 +77,7 @@ RegisterWindowMessage
 TaskbarList
 ImageList_GetIcon
 DestroyIcon
+CreateDXGIFactory1
+IDXGIFactory1
+IDXGIAdapter3
+DXGI_ERROR_NOT_FOUND

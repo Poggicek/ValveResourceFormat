@@ -610,6 +610,46 @@ internal sealed partial class McpTools
         };
     }
 
+    [Tool("Measure the video memory of a 3D tab's textures and buffers, the numbers behind the VRAM performance overlay. Sizes are read from the driver's storage of each object. 'process' is what Windows charges to the whole viewer on its adapter, which also holds other tabs, window buffers, shaders and the driver's own memory. Textures and buffers are grouped by name, so a count above 1 is the same name loaded more than once, and 'smallest' describes the smallest of them.")]
+    private static async Task<object> GetVideoMemory(
+        GLSceneViewer viewer,
+        [Description("Largest texture and buffer names to list.")][Range(1, 500)] int top = 30,
+        CancellationToken cancellationToken = default)
+    {
+        var report = await WithGl(viewer, () => viewer.Renderer.PerfStats.Vram.Measure(top, top), cancellationToken).ConfigureAwait(false);
+
+        static double Megabytes(long bytes) => Math.Round(bytes / (1024.0 * 1024.0), 2);
+
+        static object Describe(VramStats.Group group) => new
+        {
+            group.Name,
+            Mb = Megabytes(group.Bytes),
+            group.Count,
+            Detail = group.Detail.Length > 0 ? group.Detail : null,
+            Smallest = group.SmallestDetail.Length > 0 ? group.SmallestDetail : null,
+        };
+
+        return new
+        {
+            TotalMb = Megabytes(report.TotalBytes),
+            TextureMb = Megabytes(report.TextureBytes),
+            report.TextureCount,
+            TextureViews = NonZero(report.ViewCount),
+            BufferMb = Megabytes(report.BufferBytes),
+            report.BufferCount,
+            Process = report.Process is { } process ? new
+            {
+                DedicatedMb = Megabytes(process.Dedicated),
+                BudgetMb = Megabytes(process.DedicatedBudget),
+                SharedMb = Megabytes(process.Shared),
+            } : null,
+            Categories = report.Categories.Select(Describe).ToList(),
+            Formats = report.Formats.Select(Describe).ToList(),
+            Textures = report.Textures.Select(Describe).ToList(),
+            Buffers = report.Buffers.Select(Describe).ToList(),
+        };
+    }
+
     [Tool("Move the camera of a 3D tab at once to frame an entity, a node or a box, from a point with a clear view. With none of them, it frames the whole scene. 'select' also selects the entity or node and enables its layer and physics group, as a double click in the entity list does.", Redraws = true)]
     private async Task<object> Frame(
         GLSceneViewer viewer,

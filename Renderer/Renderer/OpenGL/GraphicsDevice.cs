@@ -12,6 +12,9 @@ public sealed class GraphicsDevice
 {
     internal static GraphicsDevice Current => GraphicsContext.Current.Device;
 
+    /// <summary>The live textures and buffers created on this device.</summary>
+    internal GpuObjectRegistry Objects { get; } = new();
+
     /// <summary>
     /// Creates a device. Called once per set of GPU objects that can be used with each other.
     /// </summary>
@@ -85,6 +88,7 @@ public sealed class GraphicsDevice
     {
         GL.CreateBuffers(1, out int handle);
         Label(ObjectLabelIdentifier.Buffer, handle, name);
+        Objects.AddBuffer(handle, name);
         return handle;
     }
 
@@ -112,6 +116,7 @@ public sealed class GraphicsDevice
     {
         GL.CreateTextures(target, 1, out int handle);
         Label(ObjectLabelIdentifier.Texture, handle, name);
+        Objects.AddTexture(handle, target, name, isView: false);
         return handle;
     }
 
@@ -121,6 +126,7 @@ public sealed class GraphicsDevice
         var handle = GL.GenTexture();
         GL.TextureView(handle, target, texture, (PixelInternalFormat)format.ToGLSizedInternalFormat(), minLevel, numLevels, minLayer, numLayers);
         Label(ObjectLabelIdentifier.Texture, handle, name);
+        Objects.AddTexture(handle, target, name, isView: true);
         return handle;
     }
 
