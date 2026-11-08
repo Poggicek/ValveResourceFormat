@@ -164,6 +164,16 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Gets whether the active animation clip has finished playing.</summary>
         public bool ActiveClipFinished => player.ActiveClipFinished;
 
+        /// <summary>
+        /// Raised for every event of a sequence crossed while the model's own player advances, see
+        /// <see cref="AnimationPlayer.SequenceEventFired"/>. Sequences never play on an external skeleton.
+        /// </summary>
+        public event Action<AnimationEvent>? SequenceEventFired
+        {
+            add => modelPlayer.SequenceEventFired += value;
+            remove => modelPlayer.SequenceEventFired -= value;
+        }
+
         /// <summary>Gets the clips of the player currently driving the pose.</summary>
         public IReadOnlyDictionary<string, AnimationPlayer.PlaybackClip> Clips => player.Clips;
 
