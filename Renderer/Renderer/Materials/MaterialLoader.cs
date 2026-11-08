@@ -159,7 +159,7 @@ namespace ValveResourceFormat.Renderer.Materials
                 }
 
                 var srgbRead = mat.Shader.SrgbUniforms.Contains(textureName);
-                mat.Textures[textureName] = GetTexture(texturePath, srgbRead, anisotropicFiltering: true, streaming: true);
+                mat.Textures[textureName] = GetCachedTexture(texturePath, srgbRead, anisotropicFiltering: true, streaming: true, sizedByMeshes: true);
             }
 
             return mat;
@@ -171,6 +171,11 @@ namespace ValveResourceFormat.Renderer.Materials
         /// <param name="anisotropicFiltering">Whether to apply anisotropic filtering when <see cref="MaxTextureMaxAnisotropy"/> is sufficient.</param>
         /// <param name="streaming">Whether mips may arrive over later frames.</param>
         public RenderTexture GetTexture(string name, bool srgbRead = false, bool anisotropicFiltering = false, bool streaming = false)
+            => GetCachedTexture(name, srgbRead, anisotropicFiltering, streaming, sizedByMeshes: false);
+
+        // A texture only materials use streams to the resolution the meshes drawing it need. Any other user,
+        // such as a particle, has no mesh to measure, so it gets the whole chain.
+        private RenderTexture GetCachedTexture(string name, bool srgbRead, bool anisotropicFiltering, bool streaming, bool sizedByMeshes)
         {
             // TODO: Create texture view for srgb textures
             var cache = srgbRead ? TexturesSrgb : Textures;
@@ -180,7 +185,11 @@ namespace ValveResourceFormat.Renderer.Materials
                 // A non-streaming caller needs the texture complete, even when a material started it streaming
                 if (!streaming)
                 {
-                    RendererContext.TextureStreaming.FinishStreaming(tex);
+                    TextureStreamingHelper.FinishStreaming(tex);
+                }
+                else if (!sizedByMeshes && tex.Stream is { } cachedStream)
+                {
+                    cachedStream.NeedsWholeChain = true;
                 }
 
                 return tex;
@@ -188,6 +197,11 @@ namespace ValveResourceFormat.Renderer.Materials
 
             tex = LoadTexture(name, srgbRead, async: streaming);
             cache.Add(name, tex);
+
+            if (!sizedByMeshes && tex.Stream is { } stream)
+            {
+                stream.NeedsWholeChain = true;
+            }
 
             if (anisotropicFiltering && MaxTextureMaxAnisotropy >= 4)
             {
@@ -198,10 +212,30 @@ namespace ValveResourceFormat.Renderer.Materials
         }
 
         /// <summary>
+        /// Returns a cached <see cref="RenderTexture"/> for an already loaded texture resource, uploading it on first
+        /// access. Shares one upload between every user of the same file, such as the instances of a model.
+        /// </summary>
+        /// <param name="textureResource">The loaded texture resource, cached by its file name.</param>
+        public RenderTexture GetTexture(Resource textureResource)
+        {
+            ArgumentNullException.ThrowIfNull(textureResource);
+
+            var name = textureResource.FileName ?? throw new ArgumentException("The texture resource has no file name to cache it by", nameof(textureResource));
+
+            if (!Textures.TryGetValue(name, out var tex))
+            {
+                tex = LoadTexture(textureResource);
+                Textures.Add(name, tex);
+            }
+
+            return tex;
+        }
+
+        /// <summary>
         /// Drops a texture from the cache and deletes it, for one whose contents were copied into another, such as a
         /// light probe volume packed into an atlas. A texture the cache does not hold is left alone.
         /// </summary>
-        /// <param name="texture">The texture, as <see cref="GetTexture"/> returned it.</param>
+        /// <param name="texture">The texture, as <see cref="GetTexture(string, bool, bool, bool)"/> returned it.</param>
         /// <returns>Whether the cache held the texture.</returns>
         public bool EvictTexture(RenderTexture texture)
         {
@@ -386,8 +420,12 @@ namespace ValveResourceFormat.Renderer.Materials
                     AllocHeight = texHeight,
                     AllocDepth = texDepth,
                     ResidentChainLevel = chainLevels - 1,
+                    AllocatedChainLevel = chainLevels - 1,
+                    TargetChainLevel = chainLevels - 1,
                     Mips = new PlannedMip[chainLevels - 1],
                 };
+
+                tex.Stream = stream;
 
                 var planned = 0;
 

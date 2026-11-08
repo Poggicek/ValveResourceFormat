@@ -196,6 +196,49 @@ namespace ValveResourceFormat.Renderer.Materials
         private uint InputsVersion => unchecked(
             IntParams.Version + FloatParams.Version + VectorParams.Version + Matrices.Version + Textures.Version);
 
+        private float texCoordScale = 1f;
+        private uint texCoordScaleVersion = uint.MaxValue;
+
+        /// <summary>
+        /// Gets the largest factor the material tiles texture coordinates by, at least 1. Texture streaming
+        /// multiplies the mesh's texel density by it, since a texture tiled twice needs twice the texels.
+        /// </summary>
+        internal float TexCoordScale
+        {
+            get
+            {
+                var version = unchecked(FloatParams.Version + VectorParams.Version);
+
+                if (version == texCoordScaleVersion)
+                {
+                    return texCoordScale;
+                }
+
+                var scale = 1f;
+
+                foreach (var (name, value) in FloatParams)
+                {
+                    if (name.Contains("TexCoordScale", StringComparison.Ordinal))
+                    {
+                        scale = Math.Max(scale, Math.Abs(value));
+                    }
+                }
+
+                foreach (var (name, value) in VectorParams)
+                {
+                    if (name.Contains("TexCoordScale", StringComparison.Ordinal))
+                    {
+                        scale = Math.Max(scale, Math.Max(Math.Abs(value.X), Math.Abs(value.Y)));
+                    }
+                }
+
+                texCoordScale = float.IsFinite(scale) ? scale : 1f;
+                texCoordScaleVersion = version;
+
+                return texCoordScale;
+            }
+        }
+
         private readonly IShaderDataProvider shaderDataProvider;
         private RsBlendMode srcBlend;
         private RsBlendMode destBlend;

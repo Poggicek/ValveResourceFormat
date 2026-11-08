@@ -177,6 +177,19 @@ namespace ValveResourceFormat.Utils
             0f, 0f, 0f, 1f);
 
         /// <summary>
+        /// The largest factor <paramref name="transform"/> scales a length by along any of its axes, which is
+        /// the length of its longest row since the matrices are row-vector.
+        /// </summary>
+        public static float MaxAxisScale(in Matrix4x4 transform)
+        {
+            var x = new Vector3(transform.M11, transform.M12, transform.M13).LengthSquared();
+            var y = new Vector3(transform.M21, transform.M22, transform.M23).LengthSquared();
+            var z = new Vector3(transform.M31, transform.M32, transform.M33).LengthSquared();
+
+            return MathF.Sqrt(Max(x, y, z));
+        }
+
+        /// <summary>
         /// The largest of the given values, compared with <see cref="MathF.Max(float, float)"/>.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

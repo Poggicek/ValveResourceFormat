@@ -2622,6 +2622,8 @@ public class Renderer : ISceneHost
 
         if (!Prewarming)
         {
+            RendererContext.TextureStreaming.GatherDemand(Camera, Scenes);
+
             if (RendererContext.TextureStreaming.Mode == TextureStreamingMode.Immediate)
             {
                 RendererContext.TextureStreaming.FinishAllStreaming(RendererContext.CancellationToken);

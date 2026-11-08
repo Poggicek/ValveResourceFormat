@@ -22,18 +22,24 @@ namespace ValveResourceFormat.Renderer.Materials
 
     /// <summary>
     /// Reads texture mip data on background threads and gives it to the GPU over the frames that follow.
-    /// A streamed texture starts out holding only its smallest mip and grows one level at a time as data arrives.
+    /// A streamed texture starts out holding only its smallest mip. A texture materials draw then grows to
+    /// the resolution the closest mesh drawing it needs, measured by <see cref="GatherDemand"/>, and gives
+    /// back mips no mesh has needed for a while. Any other texture grows to its whole chain.
     /// </summary>
     public sealed class TextureStreamingHelper(RendererContext rendererContext)
     {
-        // Streams waiting to ask for their next mip: new textures, and chains parked by the throttle
+        // Streams waiting to ask for their next mips: chains heading to a target, and chains parked by the throttle
         private readonly ConcurrentQueue<StreamedTexture> pendingLoadRequests = new();
 
         // One FIFO for everything: a texture only has one request out at a time, so this is already in chain order
         private readonly ConcurrentQueue<LoadedMipBits> loadedMipBits = new();
 
-        // Streams by texture, so a caller that needs a texture whole can finish its chain inline
-        private readonly ConcurrentDictionary<RenderTexture, StreamedTexture> incompleteStreams = new();
+        // Textures created since the last slice, which may happen on a loading thread
+        private readonly ConcurrentQueue<StreamedTexture> newStreams = new();
+
+        // Every live streamed texture, owned by the thread doing the slices
+        private readonly List<StreamedTexture> streams = [];
+        private readonly Lock streamsLock = new();
 
         // Cap on buffer bytes between a load request and its hookup.
         private const long MaxBitsInFlight = 256L * 1024 * 1024;
@@ -42,31 +48,37 @@ namespace ValveResourceFormat.Renderer.Materials
 
         private long lastSliceDuration;
 
+        // smallest mips are batched together, up to this size
+        private const int RequestByteBudget = 32 * 1024; // 32KB, ~128x128 with block compression
+
+        // How often the meshes are measured, and how long a texture no mesh measured waits before it is
+        // taken to be drawn by something else and streamed whole.
+        private const float DemandIntervalSeconds = 0.25f;
+        private const float UnmeasuredGraceSeconds = 1f;
+
+        // How long a texture holds mips it no longer needs, so looking around does not reload them
+        private const float ShrinkDelaySeconds = 3f;
+        private const int MaxShrinksPerSlice = 32;
+
+        // The demand is measured to the closest point of a mesh's bounds as if it faced the camera, which
+        // undershoots at the edges of a wide view, so it asks for a little more than it works out
+        private const float DemandBiasLevels = 0.5f;
+
+        private int demandPass;
+        private long lastDemandTimestamp;
+
         /// <summary>
         /// How textures load. Safe to change at any point; chains already under way finish either way.
         /// </summary>
         public TextureStreamingMode Mode { get; set; }
 
-        // smallest mips are batched together, up to this size
-        private const int RequestByteBudget = 32 * 1024; // 32KB, ~128x128 with block compression
-
-        // How far up the chain requests may reach. The whole chain for now; eviction will raise this under
-        // memory pressure so a texture stops short of level 0.
-        private const int TargetChainLevel = 0;
-
         private int RequestBudget => Mode == TextureStreamingMode.Immediate ? int.MaxValue : RequestByteBudget;
 
         internal void BeginStreaming(StreamedTexture stream)
         {
-            incompleteStreams.TryAdd(stream.Texture, stream);
-            pendingLoadRequests.Enqueue(stream);
-        }
-
-        // Ends a chain, however it ended: finished, failed, or its texture went away. Idempotent, because a
-        // retired stream can still be sitting in a queue and get dequeued later.
-        private void RetireStream(StreamedTexture stream)
-        {
-            incompleteStreams.TryRemove(stream.Texture, out _);
+            stream.RegisteredTimestamp = Stopwatch.GetTimestamp();
+            stream.TargetChainLevel = stream.ResidentChainLevel;
+            newStreams.Enqueue(stream);
         }
 
         /// <summary>
@@ -77,7 +89,7 @@ namespace ValveResourceFormat.Renderer.Materials
         {
             while (pendingLoadRequests.TryDequeue(out var stream))
             {
-                RetireStream(stream);
+                stream.Queued = false;
             }
 
             // Drained rather than cleared: these buffers belong to the pool, not the garbage collector. The
@@ -87,10 +99,15 @@ namespace ValveResourceFormat.Renderer.Materials
             {
                 ArrayPool<byte>.Shared.Return(bits.Buffer);
                 Interlocked.Add(ref bitsInFlight, -bits.ByteSize);
-                RetireStream(bits.Stream);
+                bits.Stream.LoadInFlight = false;
             }
 
-            incompleteStreams.Clear();
+            newStreams.Clear();
+
+            using (streamsLock.EnterScope())
+            {
+                streams.Clear();
+            }
         }
 
         /// <summary>
@@ -108,7 +125,7 @@ namespace ValveResourceFormat.Renderer.Materials
                 {
                     ArrayPool<byte>.Shared.Return(bits.Buffer);
                     Interlocked.Add(ref bitsInFlight, -bits.ByteSize);
-                    RetireStream(bits.Stream);
+                    bits.Stream.LoadInFlight = false;
                 }
 
                 if (Stopwatch.GetTimestamp() >= deadline)
@@ -123,8 +140,204 @@ namespace ValveResourceFormat.Renderer.Materials
             }
         }
 
-        // Grows the storage to fit the new mips, then uploads them. A texture's bits always arrive smallest
-        // first, so every level in the storage has been written and nothing can ever sample as black.
+        /// <summary>
+        /// Measures the resolution each streamed texture needs, from the distance to the closest mesh that
+        /// draws it, the mesh's texel density and the camera's projection. Runs a few times a second, or
+        /// every call while textures load immediately. Call before the slice, on a thread with a GL context.
+        /// </summary>
+        /// <param name="camera">The camera the scenes are seen through.</param>
+        /// <param name="scenes">The scenes drawn, with sky scenes mapped into the viewer's world.</param>
+        internal void GatherDemand(Camera camera, IReadOnlyList<Scene> scenes)
+        {
+            if (Mode == TextureStreamingMode.Timesliced && newStreams.IsEmpty && lastDemandTimestamp != 0
+                && Stopwatch.GetElapsedTime(lastDemandTimestamp).TotalSeconds < DemandIntervalSeconds)
+            {
+                return;
+            }
+
+            lastDemandTimestamp = Stopwatch.GetTimestamp();
+            demandPass++;
+
+            // Pixels a world unit covers at distance 1. An orthographic projection is the same at any distance.
+            var projection = camera.ProjectionMatrix;
+            var orthographic = projection.M44 == 1f;
+            var pixelsPerUnitAtUnitDistance = projection.M22 * camera.WindowSize.Y * 0.5f;
+
+            foreach (var scene in scenes)
+            {
+                var toViewerWorld = scene.ToViewerWorld;
+                var sceneScale = MathUtils.MaxAxisScale(toViewerWorld);
+
+                GatherNodeDemand(scene.StaticNodes, camera.Location, toViewerWorld, sceneScale, orthographic, pixelsPerUnitAtUnitDistance);
+                GatherNodeDemand(scene.DynamicNodes, camera.Location, toViewerWorld, sceneScale, orthographic, pixelsPerUnitAtUnitDistance);
+            }
+        }
+
+        private void GatherNodeDemand(IReadOnlyList<SceneNode> nodes, Vector3 eye, in Matrix4x4 toViewerWorld, float sceneScale, bool orthographic, float pixelsPerUnitAtUnitDistance)
+        {
+            for (var i = 0; i < nodes.Count; i++)
+            {
+                var node = nodes[i];
+
+                if (!node.LayerEnabled || node is not (MeshCollectionNode or SceneAggregate.Fragment))
+                {
+                    continue;
+                }
+
+                var distance = MathF.Sqrt(node.BoundingBox.Transform(toViewerWorld).DistanceSquared(eye));
+                var pixelsPerUnit = orthographic ? pixelsPerUnitAtUnitDistance : pixelsPerUnitAtUnitDistance / Math.Max(distance, 1f);
+                var worldScale = sceneScale * MathUtils.MaxAxisScale(node.Transform);
+
+                if (node is SceneAggregate.Fragment fragment)
+                {
+                    AddDemand(fragment.DrawCall, pixelsPerUnit, worldScale);
+                    continue;
+                }
+
+                foreach (var mesh in ((MeshCollectionNode)node).AllRenderableMeshes)
+                {
+                    AddDemand(mesh.DrawCallsOpaque, pixelsPerUnit, worldScale);
+                    AddDemand(mesh.DrawCallsBlended, pixelsPerUnit, worldScale);
+                    AddDemand(mesh.DrawCallsOverlay, pixelsPerUnit, worldScale);
+                }
+            }
+        }
+
+        private void AddDemand(List<DrawCall> drawCalls, float pixelsPerUnit, float worldScale)
+        {
+            foreach (var drawCall in drawCalls)
+            {
+                AddDemand(drawCall, pixelsPerUnit, worldScale);
+            }
+        }
+
+        private void AddDemand(DrawCall drawCall, float pixelsPerUnit, float worldScale)
+        {
+            var material = drawCall.Material;
+
+            // World units one unit of the coordinates the textures are sampled with spans
+            var unitsPerUv = drawCall.UvDensity * worldScale / material.TexCoordScale;
+
+            foreach (var (_, texture) in material.Textures)
+            {
+                if (texture.Stream is not { } stream)
+                {
+                    continue;
+                }
+
+                var level = 0;
+
+                // A mesh without a density, or a cube map, which is not sampled by texture coordinates, needs it whole
+                if (unitsPerUv > 0f && texture.Target is not (TextureTarget.TextureCubeMap or TextureTarget.TextureCubeMapArray))
+                {
+                    var texelsPerPixel = Math.Max(stream.AllocWidth, stream.AllocHeight) / (unitsPerUv * pixelsPerUnit);
+                    var levelFromSize = MathF.Floor(MathF.Log2(texelsPerPixel) - DemandBiasLevels);
+
+                    level = float.IsFinite(levelFromSize) ? (int)Math.Clamp(levelFromSize, 0f, stream.ChainLevels - 1) : 0;
+                }
+
+                if (stream.DemandPass != demandPass)
+                {
+                    stream.DemandPass = demandPass;
+                    stream.DemandChainLevel = level;
+                }
+                else if (level < stream.DemandChainLevel)
+                {
+                    stream.DemandChainLevel = level;
+                }
+            }
+        }
+
+        // The chain level a texture should hold, from its last measured demand
+        private int ChooseTarget(StreamedTexture stream, bool immediate)
+        {
+            if (stream.NeedsWholeChain)
+            {
+                return 0;
+            }
+
+            if (stream.DemandPass == demandPass && demandPass != 0)
+            {
+                return stream.DemandChainLevel;
+            }
+
+            // Measured before but by no mesh now, such as one on a hidden layer: hold what it has
+            if (stream.DemandPass != 0)
+            {
+                return stream.ResidentChainLevel;
+            }
+
+            // Never measured, so either no mesh draws it, or the measure has not run since it loaded
+            if (immediate || Stopwatch.GetElapsedTime(stream.RegisteredTimestamp).TotalSeconds >= UnmeasuredGraceSeconds)
+            {
+                return 0;
+            }
+
+            return stream.ResidentChainLevel;
+        }
+
+        // Points every texture at its target: queues loads for those that need more, and shrinks those that
+        // have held more than they need for a while.
+        private void UpdateTargets(bool immediate)
+        {
+            using var _ = streamsLock.EnterScope();
+
+            while (newStreams.TryDequeue(out var stream))
+            {
+                streams.Add(stream);
+            }
+
+            var now = Stopwatch.GetTimestamp();
+            var shrinkDelay = (long)(ShrinkDelaySeconds * Stopwatch.Frequency);
+            var shrinks = 0;
+
+            for (var i = streams.Count - 1; i >= 0; i--)
+            {
+                var stream = streams[i];
+
+                if (stream.Texture.Handle == 0 || stream.Failed)
+                {
+                    streams[i] = streams[^1];
+                    streams.RemoveAt(streams.Count - 1);
+                    continue;
+                }
+
+                var target = ChooseTarget(stream, immediate);
+                stream.TargetChainLevel = target;
+
+                if (target < stream.ResidentChainLevel)
+                {
+                    stream.ExcessSinceTimestamp = 0;
+
+                    if (!stream.LoadInFlight && !stream.Queued)
+                    {
+                        stream.Queued = true;
+                        pendingLoadRequests.Enqueue(stream);
+                    }
+                }
+                else if (target > stream.AllocatedChainLevel && !immediate)
+                {
+                    if (stream.ExcessSinceTimestamp == 0)
+                    {
+                        stream.ExcessSinceTimestamp = now;
+                    }
+                    else if (now - stream.ExcessSinceTimestamp >= shrinkDelay && !stream.LoadInFlight && !stream.Queued && shrinks < MaxShrinksPerSlice)
+                    {
+                        ReplaceStorage(stream, target);
+                        stream.ExcessSinceTimestamp = 0;
+                        shrinks++;
+                    }
+                }
+                else
+                {
+                    stream.ExcessSinceTimestamp = 0;
+                }
+            }
+        }
+
+        // Uploads the new mips, first making storage for the level the chain heads to if it has none yet.
+        // A texture's bits always arrive smallest first, and the base level only reveals the levels that
+        // arrived, so nothing can ever sample as black.
         private static void HookUpMipBits(in LoadedMipBits bits)
         {
             var stream = bits.Stream;
@@ -137,9 +350,16 @@ namespace ValveResourceFormat.Renderer.Materials
 
             Debug.Assert(bits.MipCount == 1 || stream.Mips[stream.NextMip] == bits.Mip);
 
-            // Grow once, to the largest mip in the batch; level indices then count from the new top
             var lastMip = bits.MipCount == 1 ? bits.Mip : stream.Mips[stream.NextMip + bits.MipCount - 1];
-            AddMipLevels(stream, lastMip.ChainLevel);
+
+            // Made once for the whole way to the target, instead of growing a level at a time: every growth
+            // is a new allocation, and the driver does not hand the old ones back
+            var storageLevel = Math.Min(lastMip.ChainLevel, stream.TargetChainLevel);
+
+            if (storageLevel < stream.AllocatedChainLevel)
+            {
+                ReplaceStorage(stream, storageLevel);
+            }
 
             var offset = 0;
 
@@ -147,9 +367,12 @@ namespace ValveResourceFormat.Renderer.Materials
             {
                 var mip = i == 0 ? bits.Mip : stream.Mips[stream.NextMip + i];
 
-                SubImageMip(stream, mip.ChainLevel - stream.ResidentChainLevel, mip, bits.Buffer, offset);
+                SubImageMip(stream, mip.ChainLevel - stream.AllocatedChainLevel, mip, bits.Buffer, offset);
                 offset += mip.BufferSize;
             }
+
+            stream.ResidentChainLevel = lastMip.ChainLevel;
+            UpdateBaseLevel(stream);
         }
 
         private static unsafe void SubImageMip(StreamedTexture stream, int level, in PlannedMip mip, byte[] buffer, int offset)
@@ -183,15 +406,11 @@ namespace ValveResourceFormat.Renderer.Materials
             }
         }
 
-        // Immutable storage cannot grow, so bigger levels mean a new texture object: allocate one, copy the
-        // levels already there into its tail, and swap the handle over. VRAM stays packed to what arrived.
-        private static void AddMipLevels(StreamedTexture stream, int chainLevel)
+        // Immutable storage cannot change size, so a different top level means a new texture object: allocate
+        // one, copy the resident levels it keeps into it, and swap the handle over. Growing leaves the new
+        // levels for the loads to fill, and shrinking drops the levels above the new top.
+        private static void ReplaceStorage(StreamedTexture stream, int chainLevel)
         {
-            if (chainLevel >= stream.ResidentChainLevel)
-            {
-                return;
-            }
-
             var texture = stream.Texture;
             var target = texture.Target;
             var levels = stream.ChainLevels - chainLevel;
@@ -200,24 +419,34 @@ namespace ValveResourceFormat.Renderer.Materials
             var newHandle = GraphicsDevice.CreateTexture(target, stream.Name);
             MaterialLoader.CreateStorageForTarget(newHandle, target, levels, stream.SizedInternalFormat, width, height, depth);
 
-            for (var c = stream.ResidentChainLevel; c < stream.ChainLevels; c++)
+            for (var c = Math.Max(stream.ResidentChainLevel, chainLevel); c < stream.ChainLevels; c++)
             {
                 // For array and cube targets the copy's depth spans the layers; cubes count six faces
                 var (levelWidth, levelHeight, levelDepth) = MaterialLoader.GetChainLevelSize(target, stream.AllocWidth, stream.AllocHeight, stream.AllocDepth, c);
 
                 GL.CopyImageSubData(
-                    texture.Handle, (ImageTarget)target, c - stream.ResidentChainLevel, 0, 0, 0,
+                    texture.Handle, (ImageTarget)target, c - stream.AllocatedChainLevel, 0, 0, 0,
                     newHandle, (ImageTarget)target, c - chainLevel, 0, 0, 0,
                     levelWidth, levelHeight, levelDepth);
             }
 
             texture.ReplaceHandle(newHandle, levels);
-            stream.ResidentChainLevel = chainLevel;
+            stream.AllocatedChainLevel = chainLevel;
+            stream.ResidentChainLevel = Math.Max(stream.ResidentChainLevel, chainLevel);
+            UpdateBaseLevel(stream);
+        }
+
+        // Samples only the levels whose data arrived
+        private static void UpdateBaseLevel(StreamedTexture stream)
+        {
+            var levels = stream.ChainLevels - stream.AllocatedChainLevel;
+            stream.Texture.SetBaseMaxLevel(stream.ResidentChainLevel - stream.AllocatedChainLevel, levels - 1);
         }
 
         /// <summary>
-        /// Does one frame's worth of streaming: starts the loads it can, and gives the GPU whatever mip data
-        /// has arrived since last time. Call once per frame, on a thread with a GL context.
+        /// Does one frame's worth of streaming: points textures at the resolution they need, starts the
+        /// loads it can, and gives the GPU whatever mip data has arrived since last time. Call once per
+        /// frame, after <see cref="GatherDemand"/>, on a thread with a GL context.
         /// </summary>
         /// <param name="frameTime">Length of the previous frame in seconds. This call gets 20% of it, minus
         /// what the previous call spent, so its own cost cannot grow its budget.</param>
@@ -226,6 +455,7 @@ namespace ValveResourceFormat.Renderer.Materials
             var start = Stopwatch.GetTimestamp();
             var budgetSeconds = Math.Max(0f, frameTime * 0.2f - (float)lastSliceDuration / Stopwatch.Frequency);
 
+            UpdateTargets(immediate: false);
             RunUntil(deadline: start + (long)(budgetSeconds * Stopwatch.Frequency));
 
             lastSliceDuration = Stopwatch.GetTimestamp() - start;
@@ -236,7 +466,7 @@ namespace ValveResourceFormat.Renderer.Materials
         {
             var hookedUp = false;
 
-            // Start newly loaded textures and restart chains parked by the throttle
+            // Start chains heading to a new target and restart chains parked by the throttle
             while (Interlocked.Read(ref bitsInFlight) < MaxBitsInFlight && pendingLoadRequests.TryDequeue(out var stream))
             {
                 IssueLoadRequest(stream);
@@ -252,12 +482,12 @@ namespace ValveResourceFormat.Renderer.Materials
                     Interlocked.Add(ref bitsInFlight, -bits.ByteSize);
 
                     var stream = bits.Stream;
+                    stream.LoadInFlight = false;
 
                     // Texture deleted while the load was in flight; the chain ends here
                     if (stream.Texture.Handle == 0)
                     {
                         ArrayPool<byte>.Shared.Return(bits.Buffer);
-                        RetireStream(stream);
                         continue;
                     }
 
@@ -268,15 +498,9 @@ namespace ValveResourceFormat.Renderer.Materials
                     ArrayPool<byte>.Shared.Return(bits.Buffer);
 
                     // Only a hookup moves a chain forward, which is what paces the whole pipeline
-                    stream.NextMip += bits.MipCount;
-
-                    if (stream.NextMip < stream.Mips.Length)
+                    if (stream.ResidentChainLevel > stream.TargetChainLevel)
                     {
                         IssueLoadRequest(stream);
-                    }
-                    else
-                    {
-                        RetireStream(stream);
                     }
 
                     if (Stopwatch.GetTimestamp() >= deadline)
@@ -294,12 +518,15 @@ namespace ValveResourceFormat.Renderer.Materials
             => !pendingLoadRequests.IsEmpty || !loadedMipBits.IsEmpty || Interlocked.Read(ref bitsInFlight) > 0;
 
         /// <summary>
-        /// Blocks until nothing is left to stream, to no budget. Must be called on a thread with a GL context.
+        /// Blocks until every texture holds what it needs, to no budget. Must be called on a thread with a
+        /// GL context, after <see cref="GatherDemand"/>.
         /// </summary>
         /// <param name="cancellationToken">Stops early, leaving chains unfinished.</param>
         public void FinishAllStreaming(CancellationToken cancellationToken = default)
         {
             var backoff = new SpinWait();
+
+            UpdateTargets(immediate: true);
 
             while (HasPendingWork && !cancellationToken.IsCancellationRequested)
             {
@@ -314,18 +541,21 @@ namespace ValveResourceFormat.Renderer.Materials
             }
         }
 
-        // Asks for a stream's next mip, or parks it until the throttle lets up. Only ever runs on the thread
-        // doing the slice, so reading the byte count cannot race the adds made right below it.
+        // Asks for a stream's next mips toward its target, or parks it until the throttle lets up. Only ever
+        // runs on the thread doing the slice, so reading the byte count cannot race the adds made right below it.
         private void IssueLoadRequest(StreamedTexture stream)
         {
-            // A parked chain that was finished inline by a non-streaming request has nothing left to do
-            if (stream.NextMip >= stream.Mips.Length)
+            stream.Queued = false;
+
+            // Already loading, finished inline by a non-streaming request, or gone
+            if (stream.LoadInFlight || stream.Failed || stream.Texture.Handle == 0)
             {
                 return;
             }
 
             if (Interlocked.Read(ref bitsInFlight) >= MaxBitsInFlight)
             {
+                stream.Queued = true;
                 pendingLoadRequests.Enqueue(stream);
                 return;
             }
@@ -335,14 +565,13 @@ namespace ValveResourceFormat.Renderer.Materials
             // Nothing left this side of the target, so there is no request to make
             if (stream.RequestMipCount == 0)
             {
-                RetireStream(stream);
                 return;
             }
 
             // Counted from the request, not from the enqueue, so the throttle bounds rented buffers too
             Interlocked.Add(ref bitsInFlight, stream.GateBytes);
 
-            stream.Started = true;
+            stream.LoadInFlight = true;
             ThreadPool.UnsafeQueueUserWorkItem(stream, preferLocal: false);
         }
 
@@ -354,7 +583,7 @@ namespace ValveResourceFormat.Renderer.Materials
             var count = 0;
             var bytes = 0;
 
-            for (var i = stream.NextMip; i < stream.Mips.Length && stream.Mips[i].ChainLevel >= TargetChainLevel; i++)
+            for (var i = stream.NextMip; i < stream.Mips.Length && stream.Mips[i].ChainLevel >= stream.TargetChainLevel; i++)
             {
                 var size = stream.Mips[i].BufferSize;
 
@@ -371,32 +600,33 @@ namespace ValveResourceFormat.Renderer.Materials
             stream.GateBytes = bytes;
         }
 
-        // Finishes a chain on the spot, for a caller that needs the whole texture rather than the stub a
-        // material left growing. Only works before the chain started, which no chain has by the time the
-        // first slice runs, so this is a rule rather than a fallback. Returns true if texture is whole.
-        internal bool FinishStreaming(RenderTexture tex)
+        // Finishes a chain on the spot, for a caller that needs the whole texture rather than the part
+        // the meshes drawing it asked for, and keeps it whole from then on. Returns true if texture is whole.
+        internal static bool FinishStreaming(RenderTexture tex)
         {
-            if (!incompleteStreams.TryRemove(tex, out var stream))
+            if (tex.Stream is not { } stream)
             {
                 return true;
             }
 
-            if (stream.Started)
+            stream.NeedsWholeChain = true;
+            stream.TargetChainLevel = 0;
+
+            if (stream.ResidentChainLevel == 0)
             {
-                // A started chain has a load in flight whose bookkeeping this would race
-                Debug.Assert(false, $"Non-streaming request for {stream.Name} while its chain is already streaming");
-                incompleteStreams.TryAdd(tex, stream);
+                return true;
+            }
+
+            if (stream.LoadInFlight)
+            {
+                // The load in flight has bookkeeping this would race; the chain finishes through the slices
                 return false;
             }
 
-            while (stream.NextMip < stream.Mips.Length)
+            while (stream.ResidentChainLevel > 0)
             {
                 LoadAndHookUpMip(stream, stream.Mips[stream.NextMip]);
-                stream.NextMip++;
             }
-
-            // The stream may still sit in the pending queue; a later slice discards finished chains
-            RetireStream(stream);
 
             return true;
         }
@@ -434,7 +664,7 @@ namespace ValveResourceFormat.Renderer.Materials
             if (stream.Texture.Handle == 0)
             {
                 Interlocked.Add(ref bitsInFlight, -gateBytes);
-                RetireStream(stream);
+                stream.LoadInFlight = false;
                 return;
             }
 
@@ -467,7 +697,8 @@ namespace ValveResourceFormat.Renderer.Materials
             {
                 rendererContext.Logger.LogError(e, "Loading mips of {Texture} failed", stream.Name);
                 Interlocked.Add(ref bitsInFlight, -gateBytes);
-                RetireStream(stream);
+                stream.Failed = true;
+                stream.LoadInFlight = false;
             }
             finally
             {
